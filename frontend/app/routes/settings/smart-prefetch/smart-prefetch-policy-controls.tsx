@@ -110,12 +110,12 @@ export function SmartPrefetchPolicyControls({
           onChange={(event) => onChange({ ...settings, Enabled: event.target.checked })}
         />
         <Toggle
-          label="Warm movies"
+          label="Movies"
           checked={settings.MovieEnabled}
           onChange={(event) => onChange({ ...settings, MovieEnabled: event.target.checked })}
         />
         <Toggle
-          label="Warm TV episodes"
+          label="TV episodes"
           checked={settings.TvEnabled}
           onChange={(event) => onChange({ ...settings, TvEnabled: event.target.checked })}
         />
@@ -143,7 +143,7 @@ export function SmartPrefetchPolicyControls({
       </div>
 
       <div className="rounded-box border border-base-content/10 bg-base-200/40 p-4">
-        <strong>{customized ? "Customized policy" : "Smart defaults"}</strong>
+        <strong>{customized ? "Customized policy" : "Smart defaults are on"}</strong>
         <p className="mt-1 text-sm text-base-content/60">
           Verified playback, next episodes, whole files, pause during playback, and conservative
           concurrency.

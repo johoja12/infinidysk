@@ -60,8 +60,57 @@ describe("Plex settings", () => {
     await userEvent.type(screen.getByLabelText("Server 1 mapping 1 Plex path"), "/Plex");
     await userEvent.selectOptions(screen.getByLabelText("Server 1 mapping 1 target type"), "local");
     await userEvent.type(screen.getByLabelText("Server 1 mapping 1 target path"), "/mnt/library");
-    await userEvent.click(screen.getByRole("button", { name: "Save Plex servers" }));
+    await userEvent.click(screen.getByRole("button", { name: "Save advanced server changes" }));
     expect(await screen.findByRole("option", { name: "Home" })).toBeTruthy();
+  });
+  it("removes a disconnected server from Smart Prefetch without reloading", async () => {
+    let disconnected = false;
+    const base = responses({
+      servers: {
+        servers: [
+          {
+            id: "machine",
+            name: "Home",
+            url: "http://localhost:32400",
+            token: "masked-token",
+            enabled: true,
+            pathMappings: [],
+          },
+        ],
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((url: string, init: RequestInit) => {
+        const operation = url.split("/api/plex/")[1];
+        if (operation === "disconnect") {
+          disconnected = true;
+          return Promise.resolve(new Response(JSON.stringify({ status: true })));
+        }
+        if (operation === "servers" && disconnected)
+          return Promise.resolve(new Response(JSON.stringify({ servers: [] })));
+        return base(url, init);
+      }),
+    );
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    render(
+      <>
+        <PlexSettings />
+        <PlexSources settings={parsePrefetchSettings(undefined)} onChange={vi.fn()} />
+      </>,
+    );
+
+    expect(await screen.findByRole("option", { name: "Home" })).toBeTruthy();
+    await userEvent.click(screen.getByText("Advanced server configuration"));
+    await userEvent.click(screen.getByRole("button", { name: "Add manual server" }));
+    await userEvent.type(screen.getByLabelText("Server 2 name"), "Unsaved draft");
+    await userEvent.click(screen.getByRole("button", { name: "Remove server 1" }));
+
+    await waitFor(() => expect(screen.queryByRole("option", { name: "Home" })).toBeNull());
+    expect(screen.queryByRole("option", { name: "Unsaved draft" })).toBeNull();
   });
   it("allows readonly selection of an environment-managed account for server discovery", async () => {
     vi.stubGlobal(
@@ -84,6 +133,72 @@ describe("Plex settings", () => {
     expect(select.closest("fieldset")?.disabled ?? false).toBe(false);
     await userEvent.click(select);
     expect(await screen.findByRole("button", { name: "Discover Plex servers" })).toBeTruthy();
+  });
+  it("saves the selected discovered server without dropping existing servers", async () => {
+    const fetcher = responses({
+      accounts: { accounts: [{ id: "account", name: "Owner", token: "masked" }] },
+      servers: {
+        servers: [
+          {
+            id: "existing-machine",
+            name: "Existing",
+            url: "http://existing:32400",
+            token: "masked-existing-token",
+            enabled: true,
+            pathMappings: [],
+          },
+        ],
+      },
+      "account/select": {
+        handle: "account-handle",
+        url: "",
+        expiresAt: new Date(Date.now() + 900000).toISOString(),
+      },
+      discover: {
+        servers: [
+          {
+            handle: "home-handle",
+            id: "home-machine",
+            name: "Home",
+            connections: [{ uri: "http://home:32400", local: true, relay: false }],
+          },
+          {
+            handle: "backup-handle",
+            id: "backup-machine",
+            name: "Backup",
+            connections: [{ uri: "https://backup:32400", local: false, relay: false }],
+          },
+        ],
+      },
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(<PlexSettings />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Use account Owner" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Discover Plex servers" }));
+
+    const save = await screen.findByRole("button", { name: "Save selected server" });
+    expect(save.hasAttribute("disabled")).toBe(true);
+    expect(fetcher.mock.calls.some((call) => String(call[0]).endsWith("/api/plex/save"))).toBe(
+      false,
+    );
+
+    await userEvent.click(screen.getByRole("radio", { name: "Select Plex server Home" }));
+    expect(save.hasAttribute("disabled")).toBe(false);
+    await userEvent.click(save);
+
+    await screen.findByText("Home saved. It is ready for Smart Prefetch.");
+    const saveCall = fetcher.mock.calls.find((call) => String(call[0]).endsWith("/api/plex/save"));
+    const body = JSON.parse(typeof saveCall?.[1].body === "string" ? saveCall[1].body : "{}") as {
+      servers: { id: string; handle?: string }[];
+    };
+    expect(body.servers).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "existing-machine" }),
+        expect.objectContaining({ id: "home-machine", handle: "home-handle" }),
+      ]),
+    );
+    expect(body.servers).toHaveLength(2);
   });
   it("does not revive a cancelled sign-in when an earlier poll completes", async () => {
     let release!: (response: Response) => void;
@@ -145,10 +260,8 @@ describe("Plex settings", () => {
     await userEvent.click(screen.getByRole("button", { name: "Switch Plex Home user" }));
     await screen.findByText("Plex Home user connected and saved.");
     await userEvent.click(screen.getByRole("button", { name: "Discover Plex servers" }));
-    await userEvent.click(await screen.findByRole("button", { name: "Choose Home" }));
-    await userEvent.click(screen.getByRole("button", { name: "Test server 1" }));
-    await screen.findByText("Server 1 identity and authorization verified.");
-    await userEvent.click(screen.getByRole("button", { name: "Save Plex servers" }));
+    await userEvent.click(await screen.findByRole("radio", { name: "Select Plex server Home" }));
+    await userEvent.click(screen.getByRole("button", { name: "Save selected server" }));
     await waitFor(() =>
       expect(fetcher).toHaveBeenCalledWith(
         expect.stringContaining("/api/plex/save"),
@@ -196,7 +309,7 @@ describe("Plex settings", () => {
     await userEvent.type(screen.getByLabelText("Server 1 mapping 1 Plex path"), "/Plex");
     await userEvent.selectOptions(screen.getByLabelText("Server 1 mapping 1 target type"), "local");
     await userEvent.type(screen.getByLabelText("Server 1 mapping 1 target path"), "/mnt/library");
-    await userEvent.click(screen.getByRole("button", { name: "Save Plex servers" }));
+    await userEvent.click(screen.getByRole("button", { name: "Save advanced server changes" }));
     await waitFor(() =>
       expect(fetcher).toHaveBeenCalledWith(
         expect.stringContaining("/api/plex/save"),

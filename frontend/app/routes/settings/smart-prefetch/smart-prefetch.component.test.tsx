@@ -127,15 +127,28 @@ describe("Smart Prefetch settings", () => {
     vi.stubGlobal("fetch", fakeApi());
     render(<Harness />);
     expect(screen.getByLabelText("Enable Smart Prefetch")).toBeTruthy();
-    expect(screen.getByLabelText("Warm movies")).toBeTruthy();
-    expect(screen.getByLabelText("Warm TV episodes")).toBeTruthy();
+    expect(screen.getByLabelText("Movies")).toBeTruthy();
+    expect(screen.getByLabelText("TV episodes")).toBeTruthy();
     expect(screen.getByLabelText("Daily download budget (GB/day)")).toBeTruthy();
-    expect(screen.getByText("Smart defaults")).toBeTruthy();
+    expect(screen.getByText("Smart defaults are on")).toBeTruthy();
+    expect(await screen.findByText("Home connected")).toBeTruthy();
     const details = screen.getByText("Advanced settings").closest("details");
     expect(details?.open).toBe(false);
     expect(details?.contains(screen.getByLabelText("Episodes to queue ahead"))).toBe(true);
+    const sources = screen.getByText("Plex libraries and sources").closest("details");
+    expect(sources?.open).toBe(false);
+    expect(sources?.contains(screen.getByLabelText("Plex source server"))).toBe(true);
+    const activity = screen.getByText("Prefetch activity").closest("details");
+    expect(activity?.open).toBe(false);
+    expect(
+      activity?.contains(await screen.findByRole("button", { name: "Preview policies" })),
+    ).toBe(true);
     await userEvent.click(screen.getByText("Advanced settings"));
     expect(details?.open).toBe(true);
+    await userEvent.click(screen.getByText("Plex libraries and sources"));
+    expect(sources?.open).toBe(true);
+    await userEvent.click(screen.getByText("Prefetch activity"));
+    expect(activity?.open).toBe(true);
   });
 
   it("marks customized policy and resets defaults without losing identity selections", async () => {
@@ -179,7 +192,7 @@ describe("Smart Prefetch settings", () => {
         initial={{ ...parsePrefetchSettings(undefined), MaxBytesPerItem: 123_000_000_000 }}
       />,
     );
-    await userEvent.click(screen.getByLabelText("Warm movies"));
+    await userEvent.click(screen.getByLabelText("Movies"));
     const config = JSON.parse(screen.getByTestId("config").textContent) as Record<string, string>;
     const saved = parsePrefetchSettings(config["smart-prefetch.settings"]);
     expect(saved.MovieEnabled).toBe(false);

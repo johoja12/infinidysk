@@ -28,6 +28,7 @@ export function PlexSettings() {
   const [homeId, setHomeId] = useState("");
   const [pin, setPin] = useState("");
   const [candidates, setCandidates] = useState<PlexCandidate[]>([]);
+  const [selectedCandidateHandle, setSelectedCandidateHandle] = useState("");
   const [connections, setConnections] = useState<Record<string, string>>({});
   const polling = useRef(false);
   const loginGeneration = useRef(0);
@@ -124,15 +125,52 @@ export function PlexSettings() {
       setCandidates([]);
       setPin("");
     });
+  const saveServers = async (nextServers: PlexServer[], successMessage: string) => {
+    const result = await plexRequest<{ servers: PlexServer[] }>("save", {
+      servers: nextServers.map(serverSaveRequest),
+    });
+    setServers(result.servers);
+    setSavedIds(result.servers.map((server) => server.id));
+    publishPlexServers(result.servers);
+    setMessage(successMessage);
+  };
   const save = () =>
     act(async () => {
-      const result = await plexRequest<{ servers: PlexServer[] }>("save", {
-        servers: servers.map(serverSaveRequest),
+      await saveServers(servers, "Plex servers saved. General Apply is not required.");
+    });
+  const discover = () =>
+    act(async () => {
+      const result = await plexRequest<{ servers: PlexCandidate[] }>("discover", {
+        handle: login?.handle,
       });
-      setServers(result.servers);
-      setSavedIds(result.servers.map((server) => server.id));
-      publishPlexServers(result.servers);
-      setMessage("Plex servers saved. General Apply is not required.");
+      setCandidates(result.servers);
+      setSelectedCandidateHandle((current) =>
+        result.servers.some((candidate) => candidate.handle === current) ? current : "",
+      );
+    });
+  const selectedCandidate = candidates.find(
+    (candidate) => candidate.handle === selectedCandidateHandle,
+  );
+  const saveSelectedCandidate = () =>
+    act(async () => {
+      if (!selectedCandidate) return;
+      const existing = servers.find((server) => server.id === selectedCandidate.id);
+      const selected: PlexServer = {
+        id: selectedCandidate.id,
+        name: selectedCandidate.name,
+        url: connections[selectedCandidate.handle] ?? selectedCandidate.connections[0]?.uri ?? "",
+        token: "",
+        enabled: true,
+        pathMappings: existing?.pathMappings ?? [],
+        handle: selectedCandidate.handle,
+      };
+      const nextServers = existing
+        ? servers.map((server) => (server.id === selected.id ? selected : server))
+        : [...servers, selected];
+      await saveServers(
+        nextServers,
+        `${selectedCandidate.name} saved. It is ready for Smart Prefetch.`,
+      );
     });
   return (
     <div className="space-y-5">
@@ -339,132 +377,156 @@ export function PlexSettings() {
         >
           <ManagedSetting configKey="plex.servers">
             {state === "connected" && login && (
-              <Button
-                type="button"
-                disabled={busy}
-                onClick={() =>
-                  void act(async () => {
-                    setCandidates(
-                      (
-                        await plexRequest<{ servers: PlexCandidate[] }>("discover", {
-                          handle: login.handle,
-                        })
-                      ).servers,
-                    );
-                  })
-                }
-              >
+              <Button type="button" disabled={busy} onClick={() => void discover()}>
                 Discover Plex servers
               </Button>
             )}
-            {candidates.map((candidate) => (
-              <div
-                key={candidate.handle}
-                className="my-3 space-y-2 rounded border border-base-content/10 p-3"
-              >
-                <p>
-                  {candidate.name} ({candidate.id})
-                </p>
-                <label>
-                  Connection for {candidate.name}
-                  <Select
-                    aria-label={`Connection for ${candidate.name}`}
-                    value={connections[candidate.handle] ?? candidate.connections[0]?.uri ?? ""}
-                    onChange={(event) =>
-                      setConnections((current) => ({
+            {candidates.length > 0 && (
+              <div className="my-4 space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <h3 className="text-base font-semibold">Detected servers</h3>
+                  <span className="badge badge-success badge-soft">{candidates.length} found</span>
+                </div>
+                {candidates.map((candidate) => {
+                  const selected = selectedCandidateHandle === candidate.handle;
+                  return (
+                    <div
+                      key={candidate.handle}
+                      className={`space-y-3 rounded-lg border p-4 transition-colors ${
+                        selected
+                          ? "border-primary bg-primary/10"
+                          : "border-base-content/10 bg-base-200/30"
+                      }`}
+                    >
+                      <label className="flex cursor-pointer items-start gap-3">
+                        <input
+                          className="radio radio-primary mt-0.5"
+                          type="radio"
+                          name="plex-discovered-server"
+                          aria-label={`Select Plex server ${candidate.name}`}
+                          checked={selected}
+                          onChange={() => setSelectedCandidateHandle(candidate.handle)}
+                        />
+                        <span className="min-w-0">
+                          <strong className="block">{candidate.name}</strong>
+                          <span className="text-xs text-base-content/50">{candidate.id}</span>
+                        </span>
+                      </label>
+                      <label>
+                        Connection for {candidate.name}
+                        <Select
+                          aria-label={`Connection for ${candidate.name}`}
+                          value={
+                            connections[candidate.handle] ?? candidate.connections[0]?.uri ?? ""
+                          }
+                          onChange={(event) =>
+                            setConnections((current) => ({
+                              ...current,
+                              [candidate.handle]: event.target.value,
+                            }))
+                          }
+                        >
+                          {candidate.connections.map((connection) => (
+                            <option key={connection.uri} value={connection.uri}>
+                              {connection.uri} (
+                              {connection.relay ? "relay" : connection.local ? "local" : "remote"})
+                            </option>
+                          ))}
+                        </Select>
+                      </label>
+                    </div>
+                  );
+                })}
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    variant="primary"
+                    disabled={
+                      busy || !selectedCandidate || selectedCandidate.connections.length === 0
+                    }
+                    onClick={() => void saveSelectedCandidate()}
+                  >
+                    Save selected server
+                  </Button>
+                  <Button type="button" disabled={busy} onClick={() => void discover()}>
+                    Refresh
+                  </Button>
+                </div>
+              </div>
+            )}
+            <details className="collapse collapse-arrow border border-base-content/10 bg-base-200/40">
+              <summary className="collapse-title text-sm font-semibold">
+                Advanced server configuration
+              </summary>
+              <div className="collapse-content space-y-3">
+                {servers.map((server, index) => (
+                  <PlexServerEditor
+                    key={index}
+                    server={server}
+                    index={index}
+                    busy={busy}
+                    onChange={(next) =>
+                      setServers((current) =>
+                        current.map((item, position) => (position === index ? next : item)),
+                      )
+                    }
+                    onTest={() =>
+                      void act(async () => {
+                        await plexRequest("test", { server: serverSaveRequest(server) });
+                        setMessage(`Server ${index + 1} identity and authorization verified.`);
+                      })
+                    }
+                    onRemove={() =>
+                      void act(async () => {
+                        if (savedIds.includes(server.id)) {
+                          if (
+                            !globalThis.confirm(
+                              "Remove this saved server? Cached media is retained.",
+                            )
+                          )
+                            return;
+                          await plexRequest("disconnect", { serverId: server.id });
+                          await refreshServers();
+                          return;
+                        }
+                        const nextServers = servers.filter((_, position) => position !== index);
+                        setServers(nextServers);
+                      })
+                    }
+                  />
+                ))}
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    disabled={busy || servers.length >= 32}
+                    onClick={() =>
+                      setServers((current) => [
                         ...current,
-                        [candidate.handle]: event.target.value,
-                      }))
+                        {
+                          id: "",
+                          name: "",
+                          url: "",
+                          token: "",
+                          enabled: true,
+                          pathMappings: [],
+                        },
+                      ])
                     }
                   >
-                    {candidate.connections.map((connection) => (
-                      <option key={connection.uri} value={connection.uri}>
-                        {connection.uri} (
-                        {connection.relay ? "relay" : connection.local ? "local" : "remote"})
-                      </option>
-                    ))}
-                  </Select>
-                </label>
-                <Button
-                  type="button"
-                  disabled={busy || candidate.connections.length === 0}
-                  onClick={() => {
-                    const server: PlexServer = {
-                      id: candidate.id,
-                      name: candidate.name,
-                      url: connections[candidate.handle] ?? candidate.connections[0]!.uri,
-                      token: "",
-                      enabled: true,
-                      pathMappings:
-                        servers.find((item) => item.id === candidate.id)?.pathMappings ?? [],
-                      handle: candidate.handle,
-                    };
-                    setServers((current) =>
-                      current.some((item) => item.id === candidate.id)
-                        ? current.map((item) => (item.id === candidate.id ? server : item))
-                        : [...current, server],
-                    );
-                  }}
-                >
-                  Choose {candidate.name}
-                </Button>
+                    Add manual server
+                  </Button>
+                  <Button
+                    type="button"
+                    disabled={
+                      busy || servers.length === 0 || servers.some((server) => !validServer(server))
+                    }
+                    onClick={() => void save()}
+                  >
+                    Save advanced server changes
+                  </Button>
+                </div>
               </div>
-            ))}
-            <div className="my-3 space-y-3">
-              {servers.map((server, index) => (
-                <PlexServerEditor
-                  key={index}
-                  server={server}
-                  index={index}
-                  busy={busy}
-                  onChange={(next) =>
-                    setServers((current) =>
-                      current.map((item, position) => (position === index ? next : item)),
-                    )
-                  }
-                  onTest={() =>
-                    void act(async () => {
-                      await plexRequest("test", { server: serverSaveRequest(server) });
-                      setMessage(`Server ${index + 1} identity and authorization verified.`);
-                    })
-                  }
-                  onRemove={() =>
-                    void act(async () => {
-                      if (savedIds.includes(server.id)) {
-                        if (
-                          !globalThis.confirm("Remove this saved server? Cached media is retained.")
-                        )
-                          return;
-                        await plexRequest("disconnect", { serverId: server.id });
-                        setSavedIds((current) => current.filter((id) => id !== server.id));
-                      }
-                      setServers((current) => current.filter((_, position) => position !== index));
-                    })
-                  }
-                />
-              ))}
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button
-                type="button"
-                disabled={busy || servers.length >= 32}
-                onClick={() =>
-                  setServers((current) => [
-                    ...current,
-                    { id: "", name: "", url: "", token: "", enabled: true, pathMappings: [] },
-                  ])
-                }
-              >
-                Add manual server
-              </Button>
-              <Button
-                type="button"
-                disabled={busy || servers.some((server) => !validServer(server))}
-                onClick={() => void save()}
-              >
-                Save Plex servers
-              </Button>
-            </div>
+            </details>
           </ManagedSetting>
         </SettingsCard>
       )}

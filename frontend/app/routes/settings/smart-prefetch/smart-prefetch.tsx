@@ -9,6 +9,7 @@ import {
   type PrefetchSettings,
 } from "./smart-prefetch-model";
 import { SmartPrefetchPolicyControls } from "./smart-prefetch-policy-controls";
+import { PlexServerStatus } from "./plex-server-status";
 export function SmartPrefetchSettings({
   config,
   setNewConfig,
@@ -34,10 +35,11 @@ export function SmartPrefetchSettings({
         <ManagedSetting configKey={PREFETCH_KEY}>
           <SettingsCard
             icon="auto_awesome"
-            title="Smart Prefetch policies"
-            description="Off by default. Start with fixed, safe policy defaults; expand Advanced only when you need to tune scheduling, predictions, or provider work. Save Native cache settings and restart before enabling."
+            title="Smart Prefetch"
+            description="Keep the next thing you watch ready. Save Native cache settings and restart before enabling."
           >
             <SmartPrefetchPolicyControls settings={settings} error={error} onChange={update} />
+            <PlexServerStatus />
             <p className="text-xs text-base-content/60">
               Raw read activity is not verified Plex playback. Local-library eligibility still
               requires a symlink or STRM path that resolves to an imported DAV file; regular local
@@ -45,18 +47,28 @@ export function SmartPrefetchSettings({
               capacity, and all warming remains below foreground playback admission.
             </p>
           </SettingsCard>
-          <div className="mt-5">
-            <SettingsCard
-              icon="video_library"
-              title="Plex libraries, users and sources"
-              description="Choose movie or TV hubs and collections. Enable flags, per-source limits and excluded TV show IDs save with General Apply."
-            >
-              <PlexSources settings={settings} onChange={update} />
-            </SettingsCard>
-          </div>
+          <details className="collapse collapse-arrow mt-5 border border-base-content/10 bg-base-200/40">
+            <summary className="collapse-title text-sm font-semibold">
+              Plex libraries and sources
+            </summary>
+            <div className="collapse-content">
+              <SettingsCard
+                icon="video_library"
+                title="Plex libraries, users and sources"
+                description="Choose movie or TV hubs and collections. Enable flags, per-source limits and excluded TV show IDs save with General Apply."
+              >
+                <PlexSources settings={settings} onChange={update} />
+              </SettingsCard>
+            </div>
+          </details>
         </ManagedSetting>
       )}
-      <PrefetchQueue />
+      <details className="collapse collapse-arrow border border-base-content/10 bg-base-200/40">
+        <summary className="collapse-title text-sm font-semibold">Prefetch activity</summary>
+        <div className="collapse-content">
+          <PrefetchQueue />
+        </div>
+      </details>
     </div>
   );
 }
