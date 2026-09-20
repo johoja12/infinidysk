@@ -64,22 +64,32 @@ describe("Plex settings", () => {
     expect(await screen.findByRole("option", { name: "Home" })).toBeTruthy();
   });
   it("removes a disconnected server from Smart Prefetch without reloading", async () => {
+    let disconnected = false;
+    const base = responses({
+      servers: {
+        servers: [
+          {
+            id: "machine",
+            name: "Home",
+            url: "http://localhost:32400",
+            token: "masked-token",
+            enabled: true,
+            pathMappings: [],
+          },
+        ],
+      },
+    });
     vi.stubGlobal(
       "fetch",
-      responses({
-        servers: {
-          servers: [
-            {
-              id: "machine",
-              name: "Home",
-              url: "http://localhost:32400",
-              token: "masked-token",
-              enabled: true,
-              pathMappings: [],
-            },
-          ],
-        },
-        disconnect: { status: true },
+      vi.fn().mockImplementation((url: string, init: RequestInit) => {
+        const operation = url.split("/api/plex/")[1];
+        if (operation === "disconnect") {
+          disconnected = true;
+          return Promise.resolve(new Response(JSON.stringify({ status: true })));
+        }
+        if (operation === "servers" && disconnected)
+          return Promise.resolve(new Response(JSON.stringify({ servers: [] })));
+        return base(url, init);
       }),
     );
     vi.stubGlobal(
@@ -95,9 +105,12 @@ describe("Plex settings", () => {
 
     expect(await screen.findByRole("option", { name: "Home" })).toBeTruthy();
     await userEvent.click(screen.getByText("Advanced server configuration"));
+    await userEvent.click(screen.getByRole("button", { name: "Add manual server" }));
+    await userEvent.type(screen.getByLabelText("Server 2 name"), "Unsaved draft");
     await userEvent.click(screen.getByRole("button", { name: "Remove server 1" }));
 
     await waitFor(() => expect(screen.queryByRole("option", { name: "Home" })).toBeNull());
+    expect(screen.queryByRole("option", { name: "Unsaved draft" })).toBeNull();
   });
   it("allows readonly selection of an environment-managed account for server discovery", async () => {
     vi.stubGlobal(

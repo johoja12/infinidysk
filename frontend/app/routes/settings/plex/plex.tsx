@@ -486,11 +486,11 @@ export function PlexSettings() {
                           )
                             return;
                           await plexRequest("disconnect", { serverId: server.id });
-                          setSavedIds((current) => current.filter((id) => id !== server.id));
+                          await refreshServers();
+                          return;
                         }
                         const nextServers = servers.filter((_, position) => position !== index);
                         setServers(nextServers);
-                        publishPlexServers(nextServers);
                       })
                     }
                   />
