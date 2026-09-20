@@ -63,7 +63,10 @@ public sealed class LegacyCompatibilityTests : IDisposable
         var unmatched = new LegacyIdentityExtractor().Extract(row, document, "release");
         Assert.Equal("excluded", unmatched.ExtractionStatus);
         Assert.DoesNotContain("secret-article", unmatched.ExclusionReason!, StringComparison.Ordinal);
-        document.Files.Add(document.Files[0]);
+        var repeated = new NzbWebDAV.Models.Nzb.NzbFile { Subject = "normalized duplicate" };
+        repeated.Segments.Add(new NzbWebDAV.Models.Nzb.NzbSegment
+            { Bytes = 100, Number = 1, MessageId = " <direct-1@test> " });
+        document.Files.Add(repeated);
         var duplicate = new LegacyIdentityExtractor().Extract(row with
             { NzbSegmentsJson = "[\"direct-1@test\",\"direct-2@test\"]" }, document, "release");
         Assert.Equal("excluded", duplicate.ExtractionStatus);

@@ -43,6 +43,9 @@ public sealed class CanaryPackageWriterTests : IDisposable
         Assert.True(File.Exists(Path.Join(output, "SHA256SUMS")));
         Assert.True(File.Exists(Path.Join(output, "payloads", "release-1.nzb")));
         Assert.Equal(originalBytes, await File.ReadAllBytesAsync(Path.Join(output, "payloads", "release-1.nzb")));
+        if (!OperatingSystem.IsWindows())
+            foreach (var path in Directory.GetFiles(output, "*", SearchOption.AllDirectories))
+                Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(path));
         var manifest = NzbDavExportManifestJson.Deserialize(
             await File.ReadAllTextAsync(Path.Join(output, "manifest.json")));
         Assert.Equal("canary-test", manifest.PackageId);
@@ -50,6 +53,16 @@ public sealed class CanaryPackageWriterTests : IDisposable
             StringComparison.OrdinalIgnoreCase);
         Assert.Contains("manifest.json", await File.ReadAllTextAsync(Path.Join(output, "SHA256SUMS")),
             StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void InventoryOutput_CreatesPrivateFile()
+    {
+        Directory.CreateDirectory(_root);
+        var path = Path.Join(_root, "inventory.json");
+        using var stream = CanaryPackageWriter.CreatePrivateFile(path);
+        if (!OperatingSystem.IsWindows())
+            Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(path));
     }
 
     [Fact]

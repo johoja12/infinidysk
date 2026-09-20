@@ -39,6 +39,8 @@ public sealed class LegacyBlobResolver
         CancellationToken cancellationToken = default)
     {
         var path = ResolvePath(id);
+        if (Directory.Exists(path))
+            throw new InvalidDataException("Legacy NZB blob path is a directory; it must be a regular file.");
         for (var directory = new DirectoryInfo(Path.GetDirectoryName(path)!); directory is not null;
              directory = directory.Parent)
         {

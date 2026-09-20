@@ -61,6 +61,15 @@ public sealed class LegacyBlobResolverTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadNzbAsync_DoesNotFallbackWhenBlobPathIsADirectory()
+    {
+        var id = Guid.NewGuid();
+        Directory.CreateDirectory(BlobPath(id));
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new LegacyBlobResolver(_root).ReadNzbAsync(id, "<nzb />"));
+    }
+
+    [Fact]
     public async Task ReadNzbAsync_RejectsSymlinkedBlob()
     {
         var id = Guid.Parse("33333333-3333-3333-3333-333333333333");
