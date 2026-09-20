@@ -47,7 +47,7 @@ public sealed record PrefetchSettings
     public int MaxConcurrentJobs { get; init; } = 1;
     public int ConnectionsPerJob { get; init; } = 2;
     public long MaxBytesPerItem { get; init; } = 500_000_000_000;
-    public long DailyByteBudget { get; init; } = 1_000_000_000_000;
+    public long DailyByteBudget { get; init; } = 10_000_000_000;
     public int MinimumHeadMb { get; init; } = 16;
     public int MinimumTailMb { get; init; } = 8;
     public string[] Users { get; init; } = [];

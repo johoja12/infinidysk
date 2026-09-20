@@ -50,7 +50,7 @@ describe("Smart Prefetch persisted settings", () => {
     const defaults = parsePrefetchSettings(undefined);
     expect(defaults.Enabled).toBe(false);
     expect(defaults.RealtimeEnabled).toBe(true);
-    expect(defaults.DailyByteBudget).toBe(1_000_000_000_000);
+    expect(defaults.DailyByteBudget).toBe(10_000_000_000);
     const configured = {
       ...defaults,
       Users: ["server-a:7"],

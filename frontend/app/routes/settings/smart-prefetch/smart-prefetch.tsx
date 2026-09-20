@@ -65,7 +65,7 @@ export function SmartPrefetchSettings({
           <SettingsCard
             icon="auto_awesome"
             title="Smart Prefetch policies"
-            description="Advanced and off by default. Apply saves these policies; queue actions below act immediately. Native cache must be active and writable."
+            description="Advanced and off by default; daily provider-payload budget defaults to 10 GB. Save Native cache settings and restart before enabling. Apply verifies a writable folder; disable Smart Prefetch before changing cache mode or folders. Queue actions below act immediately."
           >
             <div className="grid gap-3 md:grid-cols-2">
               {toggles.map((toggle) => (

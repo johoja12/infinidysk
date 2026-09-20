@@ -22,6 +22,7 @@ public sealed class PrefetchSettingsTests
     {
         var settings = PrefetchSettings.Parse(null);
         Assert.False(settings.Enabled);
+        Assert.Equal(10_000_000_000, settings.DailyByteBudget);
         Assert.True(settings.FullFileWarming);
         Assert.InRange(settings.MaxConcurrentJobs, 1, 4);
     }

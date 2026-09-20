@@ -29,7 +29,7 @@ export const numericDefaults = {
   MaxConcurrentJobs: 1,
   ConnectionsPerJob: 2,
   MaxBytesPerItem: 500_000_000_000,
-  DailyByteBudget: 1_000_000_000_000,
+  DailyByteBudget: 10_000_000_000,
   MinimumHeadMb: 16,
   MinimumTailMb: 8,
 };

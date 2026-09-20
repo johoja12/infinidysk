@@ -21,6 +21,7 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "plex-policy-" + Guid.NewGuid().ToString("N"));
     private string? _previous;
+    private string? _previousApiKey;
     private SqliteConnection _connection = null!;
     private FileBlobStore _blobs = null!;
     private RepairPatchStore _repairs = null!;
@@ -34,6 +35,8 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
     public async Task InitializeAsync()
     {
         _previous = Environment.GetEnvironmentVariable("CONFIG_PATH");
+        _previousApiKey = Environment.GetEnvironmentVariable("FRONTEND_BACKEND_API_KEY");
+        Environment.SetEnvironmentVariable("FRONTEND_BACKEND_API_KEY", "isolated-policy-tests");
         Directory.CreateDirectory(Path.Combine(_root, "media"));
         Environment.SetEnvironmentVariable("CONFIG_PATH", _root);
         _config = new ConfigManager();
@@ -51,6 +54,81 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
         _services = new ServiceCollection().AddScoped(_ => new DavDatabaseContext(options))
             .AddScoped(sp => new DavDatabaseClient(sp.GetRequiredService<DavDatabaseContext>(), _blobs)).BuildServiceProvider();
         _runtime = new PrefetchRuntime(_config, _native, _services.GetRequiredService<IServiceScopeFactory>(), new ActiveReadRegistry());
+    }
+
+    [Fact]
+    public async Task NativeSettingsValidation_TimeoutRetainsSingleAdmissionUntilIoCompletes()
+    {
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var calls = 0;
+        var first = ConfigUpdateService.ValidateNativeStorageAsync(_config, () =>
+        {
+            Interlocked.Increment(ref calls);
+            entered.SetResult();
+            release.Wait();
+            finished.SetResult();
+        }, TimeSpan.FromMilliseconds(50), CancellationToken.None);
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await Assert.ThrowsAsync<ArgumentException>(() => first);
+            await Assert.ThrowsAsync<ArgumentException>(() => ConfigUpdateService.ValidateNativeStorageAsync(_config,
+                () => Interlocked.Increment(ref calls), TimeSpan.FromMilliseconds(50), CancellationToken.None));
+            Assert.Equal(1, calls);
+        }
+        finally { release.Set(); await finished.Task.WaitAsync(TimeSpan.FromSeconds(5)); }
+    }
+
+    [Fact]
+    public async Task EnablePrefetch_RequiresActiveNativeAndWritableReadinessBeforeStaging()
+    {
+        using var scope = _services.CreateScope();
+        var database = scope.ServiceProvider.GetRequiredService<DavDatabaseClient>();
+        var updates = new ConfigUpdateService(database, _config);
+        Set(ConfigKeys.CacheMode, "off");
+        await Assert.ThrowsAsync<ArgumentException>(() => updates.StageAsync([
+            new ConfigItem { ConfigName = ConfigKeys.SmartPrefetchSettings, ConfigValue = "{\"Enabled\":true}" }
+        ]));
+        Assert.False(database.Ctx.ChangeTracker.HasChanges());
+    }
+
+    [Fact]
+    public async Task EnablePrefetch_ProbesActiveStorageAndRejectsOfflineStorageOrPendingFolderChanges()
+    {
+        using var scope = _services.CreateScope();
+        var database = scope.ServiceProvider.GetRequiredService<DavDatabaseClient>();
+        var updates = new ConfigUpdateService(database, _config, _native);
+        ConfigItem enabled = new() { ConfigName = ConfigKeys.SmartPrefetchSettings, ConfigValue = "{\"Enabled\":true}" };
+        using (var batch = await updates.StageAsync([enabled])) { }
+        database.Ctx.ChangeTracker.Clear();
+        var path = Path.Combine(_root, "media");
+        Directory.Move(path, path + "-offline");
+        try { await Assert.ThrowsAsync<ArgumentException>(() => updates.StageAsync([enabled])); }
+        finally { Directory.Move(path + "-offline", path); }
+        Assert.False(database.Ctx.ChangeTracker.HasChanges());
+        await Assert.ThrowsAsync<ArgumentException>(() => updates.StageAsync([enabled,
+            new ConfigItem { ConfigName = ConfigKeys.NativeCacheFolders, ConfigValue = JsonSerializer.Serialize(new[] {
+                new NativeCacheFolder { Id = "disk", Path = path, ReadOnly = true, MinFreeBytes = 0 } }) }
+        ]));
+        Assert.False(database.Ctx.ChangeTracker.HasChanges());
+    }
+
+    [Fact]
+    public async Task EnabledPrefetch_RequiresAtomicDisableBeforeLeavingNativeMode()
+    {
+        using var scope = _services.CreateScope();
+        var database = scope.ServiceProvider.GetRequiredService<DavDatabaseClient>();
+        var updates = new ConfigUpdateService(database, _config, _native);
+        Set(ConfigKeys.SmartPrefetchSettings, "{\"Enabled\":true}");
+        await Assert.ThrowsAsync<ArgumentException>(() => updates.StageAsync([
+            new ConfigItem { ConfigName = ConfigKeys.CacheMode, ConfigValue = "off" }
+        ]));
+        using var batch = await updates.StageAsync([
+            new ConfigItem { ConfigName = ConfigKeys.CacheMode, ConfigValue = "off" },
+            new ConfigItem { ConfigName = ConfigKeys.SmartPrefetchSettings, ConfigValue = "{\"Enabled\":false}" }
+        ]);
     }
 
     [Fact]
@@ -128,6 +206,7 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
         await _native.DisposeAsync();
         _repairs.Dispose(); _blobs.Dispose(); await _connection.DisposeAsync();
         Environment.SetEnvironmentVariable("CONFIG_PATH", _previous);
+        Environment.SetEnvironmentVariable("FRONTEND_BACKEND_API_KEY", _previousApiKey);
         Directory.Delete(_root, true);
     }
 }
