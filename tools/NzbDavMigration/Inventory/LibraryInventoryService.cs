@@ -52,6 +52,9 @@ public sealed class LibraryInventoryService
         if (item is null)
             return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
                 link.LegacyDavItemId, null, "excluded", "missing-database-row", null);
+        if (item.ResolutionExclusion is not null || item.HistoryItemId is null)
+            return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
+                link.LegacyDavItemId, item, "excluded", item.ResolutionExclusion ?? "missing-history", null);
         if (item.HistoryDownloadStatus is not null and not 1)
             return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
                 link.LegacyDavItemId, item, "excluded", "history-not-completed", null);
@@ -59,12 +62,11 @@ public sealed class LibraryInventoryService
             return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
                 link.LegacyDavItemId, item, "excluded", "missing-nzb-blob-id", null);
         var blobPath = resolver.ResolvePath(item.NzbBlobId.Value);
-        if (!File.Exists(blobPath))
+        if (!File.Exists(blobPath) && string.IsNullOrWhiteSpace(item.NzbContents))
             return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
                 link.LegacyDavItemId, item, "excluded", "missing-nzb-blob", blobPath);
         return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
-            link.LegacyDavItemId, item, item.HistoryItemId is null ? "candidate-no-history" : "candidate",
-            null, blobPath);
+            link.LegacyDavItemId, item, "candidate", null, File.Exists(blobPath) ? blobPath : null);
     }
 
     private static void Walk(

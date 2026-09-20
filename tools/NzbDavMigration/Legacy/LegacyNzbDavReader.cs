@@ -10,7 +10,6 @@ public sealed record LegacyDavItemRow(
     long? FileSize,
     int Type,
     Guid? HistoryItemId,
-    Guid? FileBlobId,
     Guid? NzbBlobId,
     string? HistoryFileName = null,
     string? HistoryJobName = null,
@@ -18,7 +17,10 @@ public sealed record LegacyDavItemRow(
     int? HistoryDownloadStatus = null,
     string? NzbSegmentsJson = null,
     string? RarPartsJson = null,
-    string? MultipartMetadataJson = null);
+    string? MultipartMetadataJson = null,
+    string? NzbContents = null,
+    string? ReleaseRootPath = null,
+    string? ResolutionExclusion = null);
 
 public sealed record LegacyReadResult(
     IReadOnlyList<LegacyDavItemRow> Items,
@@ -29,15 +31,47 @@ public sealed class LegacyNzbDavReader
     public const string ConnectionEnvironmentVariable = "NZBDAV_MIGRATION_LEGACY_DB";
 
     public const string ItemQuery = """
-        SELECT d."Id", d."Path", d."FileSize", d."Type", d."HistoryItemId",
-               d."FileBlobId", d."NzbBlobId", h."FileName", h."JobName",
+        WITH RECURSIVE ancestry AS (
+            SELECT d."Id" AS leaf, d."Id", d."ParentId", d."Path",
+                   ARRAY[d."Id"] AS visited, false AS cycle, 0 AS depth
+            FROM "DavItems" d WHERE d."Id" = ANY (@ids)
+            UNION ALL
+            SELECT a.leaf, p."Id", p."ParentId", p."Path",
+                   a.visited || p."Id", p."Id" = ANY(a.visited), a.depth + 1
+            FROM ancestry a JOIN "DavItems" p ON p."Id" = a."ParentId"
+            WHERE NOT a.cycle AND a.depth < 128
+        ), state AS (
+            SELECT a.leaf, bool_or(a.cycle OR (a.depth = 128 AND a."ParentId" IS NOT NULL)
+                OR (a."ParentId" IS NOT NULL AND NOT EXISTS (
+                    SELECT 1 FROM "DavItems" p WHERE p."Id" = a."ParentId"))) AS invalid
+            FROM ancestry a GROUP BY a.leaf
+        ), owners AS (
+            SELECT DISTINCT a.leaf, h."Id", a."Path" AS root_path
+            FROM ancestry a JOIN "HistoryItems" h ON h."DownloadDirId" = a."Id"
+        ), ownership AS (
+            SELECT leaf, count(*) AS owner_count, (array_agg("Id"))[1] AS owner_id,
+                   min(root_path) AS root_path
+            FROM owners GROUP BY leaf
+        )
+        SELECT d."Id", d."Path", d."FileSize", d."Type", h."Id",
+               h."FileName", h."JobName",
                h."Category", h."DownloadStatus", nf."SegmentIds",
-               rf."RarParts", mf."Metadata"
+               rf."RarParts", mf."Metadata", h."NzbContents", o.root_path,
+               CASE WHEN s.invalid THEN 'invalid-ancestry'
+                    WHEN o.owner_count > 1 THEN 'ambiguous-history'
+                    WHEN h."Id" IS NULL THEN 'missing-history'
+                    WHEN d."IsCorrupted" OR d."RepairStatus" <> 0 OR d."ZeroPadCorruptSegments"
+                      OR lower(trim(d."HealthCheckQueueReason")) = 'source-validation'
+                      OR EXISTS (SELECT 1 FROM "SourceValidationBlocks" b
+                          WHERE b."DavItemId" = d."Id" AND b."Status" IN (1,2,3,5))
+                    THEN 'legacy-health-excluded' END
         FROM "DavItems" AS d
-        LEFT JOIN "HistoryItems" AS h ON h."Id" = d."HistoryItemId"
-        LEFT JOIN "DavNzbFiles" AS nf ON nf."Id" = d."Id"
-        LEFT JOIN "DavRarFiles" AS rf ON rf."Id" = d."Id"
-        LEFT JOIN "DavMultipartFiles" AS mf ON mf."Id" = d."Id"
+        JOIN state s ON s.leaf = d."Id"
+        LEFT JOIN ownership o ON o.leaf = d."Id"
+        LEFT JOIN "HistoryItems" AS h ON h."Id" = o.owner_id AND o.owner_count = 1 AND NOT s.invalid
+        LEFT JOIN "DavNzbFiles" AS nf ON nf."Id" = d."Id" AND h."Id" IS NOT NULL
+        LEFT JOIN "DavRarFiles" AS rf ON rf."Id" = d."Id" AND h."Id" IS NOT NULL
+        LEFT JOIN "DavMultipartFiles" AS mf ON mf."Id" = d."Id" AND h."Id" IS NOT NULL
         WHERE d."Id" = ANY (@ids)
         ORDER BY d."Id"
         """;
@@ -72,41 +106,29 @@ public sealed class LegacyNzbDavReader
         await RequireSelectOnlyLoginAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
 
         var rows = new List<LegacyDavItemRow>();
-        await using (var command = new NpgsqlCommand(ItemQuery, connection, transaction))
+        foreach (var batch in ids.Chunk(256))
         {
+            await using var command = new NpgsqlCommand(ItemQuery, connection, transaction);
             command.Parameters.Add(new NpgsqlParameter<Guid[]>("ids", NpgsqlDbType.Array | NpgsqlDbType.Uuid)
             {
-                TypedValue = ids,
+                TypedValue = batch,
             });
             await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
             while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
             {
                 var fileSizeNull = await reader.IsDBNullAsync(2, cancellationToken).ConfigureAwait(false);
                 var historyIdNull = await reader.IsDBNullAsync(4, cancellationToken).ConfigureAwait(false);
-                var fileBlobIdNull = await reader.IsDBNullAsync(5, cancellationToken).ConfigureAwait(false);
-                var nzbBlobIdNull = await reader.IsDBNullAsync(6, cancellationToken).ConfigureAwait(false);
-                var historyFileNull = await reader.IsDBNullAsync(7, cancellationToken).ConfigureAwait(false);
-                var historyJobNull = await reader.IsDBNullAsync(8, cancellationToken).ConfigureAwait(false);
-                var historyCategoryNull = await reader.IsDBNullAsync(9, cancellationToken).ConfigureAwait(false);
-                var historyStatusNull = await reader.IsDBNullAsync(10, cancellationToken).ConfigureAwait(false);
-                var nzbSegmentsNull = await reader.IsDBNullAsync(11, cancellationToken).ConfigureAwait(false);
-                var rarPartsNull = await reader.IsDBNullAsync(12, cancellationToken).ConfigureAwait(false);
-                var multipartMetadataNull = await reader.IsDBNullAsync(13, cancellationToken).ConfigureAwait(false);
+                var historyStatusNull = await reader.IsDBNullAsync(8, cancellationToken).ConfigureAwait(false);
+                string? Text(int index) => reader.IsDBNull(index) ? null : reader.GetString(index);
                 rows.Add(new LegacyDavItemRow(
                     reader.GetGuid(0),
                     reader.GetString(1),
                     fileSizeNull ? null : reader.GetInt64(2),
                     reader.GetInt32(3),
                     historyIdNull ? null : reader.GetGuid(4),
-                    fileBlobIdNull ? null : reader.GetGuid(5),
-                    nzbBlobIdNull ? null : reader.GetGuid(6),
-                    historyFileNull ? null : reader.GetString(7),
-                    historyJobNull ? null : reader.GetString(8),
-                    historyCategoryNull ? null : reader.GetString(9),
-                    historyStatusNull ? null : reader.GetInt32(10),
-                    nzbSegmentsNull ? null : reader.GetString(11),
-                    rarPartsNull ? null : reader.GetString(12),
-                    multipartMetadataNull ? null : reader.GetString(13)));
+                    historyIdNull ? null : reader.GetGuid(4),
+                    Text(5), Text(6), Text(7), historyStatusNull ? null : reader.GetInt32(8),
+                    Text(9), Text(10), Text(11), Text(12), Text(13), Text(14)));
             }
         }
 
