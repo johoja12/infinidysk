@@ -95,6 +95,16 @@ public sealed class NativeCacheAdminTests
         Assert.Equal("cancelled", Assert.Single(runtime.Jobs.List()).State);
         using var invalid = await client.PostAsJsonAsync("/api/prefetch/operations", new { operation = "warm", itemIds = new[] { Guid.NewGuid() } });
         Assert.Equal(HttpStatusCode.Accepted, invalid.StatusCode);
+        runtime.ReportMetadataFailure();
+        using var unhealthy = await client.GetAsync("/api/prefetch");
+        unhealthy.EnsureSuccessStatusCode();
+        using var unhealthyJson = JsonDocument.Parse(await unhealthy.Content.ReadAsStringAsync());
+        Assert.False(unhealthyJson.RootElement.GetProperty("healthy").GetBoolean());
+        Assert.NotNull(unhealthyJson.RootElement.GetProperty("runtimeError").GetString());
+        using var stopped = await client.PostAsJsonAsync("/api/prefetch/operations", new { operation = "sync" });
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, stopped.StatusCode);
+        using var stillAlive = await client.GetAsync("/health");
+        stillAlive.EnsureSuccessStatusCode();
     }
 
     [Fact]

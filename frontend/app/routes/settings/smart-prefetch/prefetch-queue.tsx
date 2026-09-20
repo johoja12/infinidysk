@@ -19,6 +19,8 @@ type Job = {
 };
 type QueueStatus = {
   available: boolean;
+  healthy?: boolean;
+  runtimeError?: string;
   paused: boolean;
   initializationError: string | null;
   jobs: Job[];
@@ -35,7 +37,14 @@ type Prediction = {
   length: number;
   fileSize: number;
 };
-type ItemOutcome = { itemId: string; status: string; jobId?: string; start: number; length: number; reason?: string };
+type ItemOutcome = {
+  itemId: string;
+  status: string;
+  jobId?: string;
+  start: number;
+  length: number;
+  reason?: string;
+};
 export function PrefetchQueue() {
   const [status, setStatus] = useState<QueueStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -156,18 +165,26 @@ export function PrefetchQueue() {
       {error && <Alert variant="danger">{error}</Alert>}
       {previewWarning && <Alert variant="warning">{previewWarning}</Alert>}
       {status?.initializationError && <Alert variant="warning">{status.initializationError}</Alert>}
+      {status?.runtimeError && <Alert variant="warning">{status.runtimeError}</Alert>}
       {status?.lastError && <Alert variant="warning">{status.lastError}</Alert>}
       <p className="text-xs">
         Last successful policy refresh:{" "}
         {status?.lastSuccess ? new Date(status.lastSuccess).toLocaleString() : "not yet completed"}.
       </p>
       {message && <p role="status">{message}</p>}
-      {outcomes.length > 0 && <div aria-label="Bulk warming results" className="space-y-1 text-xs">
-        {outcomes.map(outcome => <p key={outcome.itemId}>
-          {outcome.itemId} — {outcome.status}{outcome.jobId ? ` · job ${outcome.jobId}` : ""}
-          {outcome.reason ? ` · ${outcome.reason}` : ` · from ${outcome.start.toLocaleString()}, ${outcome.length === 0 ? "through end of file" : `${outcome.length.toLocaleString()} bytes`}`}
-        </p>)}
-      </div>}
+      {outcomes.length > 0 && (
+        <div aria-label="Bulk warming results" className="space-y-1 text-xs">
+          {outcomes.map((outcome) => (
+            <p key={outcome.itemId}>
+              {outcome.itemId} — {outcome.status}
+              {outcome.jobId ? ` · job ${outcome.jobId}` : ""}
+              {outcome.reason
+                ? ` · ${outcome.reason}`
+                : ` · from ${outcome.start.toLocaleString()}, ${outcome.length === 0 ? "through end of file" : `${outcome.length.toLocaleString()} bytes`}`}
+            </p>
+          ))}
+        </div>
+      )}
       <p>
         {status?.available
           ? status.paused
@@ -204,16 +221,23 @@ export function PrefetchQueue() {
               <p className="text-xs">
                 {prediction.source} — {prediction.reason}
               </p>
-              {prediction.eligible === false ? <p className="text-xs">Not eligible for warming</p> : <p className="text-xs">
-                {prediction.itemId} · {prediction.length.toLocaleString()} requested bytes from{" "}
-                {prediction.start.toLocaleString()} · file {prediction.fileSize.toLocaleString()}{" "}
-                bytes
-              </p>}
+              {prediction.eligible === false ? (
+                <p className="text-xs">Not eligible for warming</p>
+              ) : (
+                <p className="text-xs">
+                  {prediction.itemId} · {prediction.length.toLocaleString()} requested bytes from{" "}
+                  {prediction.start.toLocaleString()} · file {prediction.fileSize.toLocaleString()}{" "}
+                  bytes
+                </p>
+              )}
             </div>
           ))}
         </div>
       )}
-      <fieldset disabled={busy || !status?.available} className="space-y-3">
+      <fieldset
+        disabled={busy || !status?.available || status?.healthy === false}
+        className="space-y-3"
+      >
         <div className="flex flex-wrap gap-2">
           <Button
             type="button"

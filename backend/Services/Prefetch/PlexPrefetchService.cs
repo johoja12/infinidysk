@@ -54,6 +54,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         deadline.CancelAfter(preview is null ? TimeSpan.FromMinutes(2) : TimeSpan.FromSeconds(20));
         try
         {
+            if (runtime.RuntimeError is not null) { LastError = runtime.RuntimeError; return; }
             var settings = runtime.Settings();
             var servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers));
             if (preview is null) _playback.RetainServers(settings.Enabled && settings.RealtimeEnabled
@@ -97,6 +98,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         { LastError = "Policy refresh reached its bounded time window; remaining sources will be retried."; _serverCursor++; }
+        catch (Exception exception) when (exception is IOException or Microsoft.Data.Sqlite.SqliteException or InvalidOperationException)
+        { runtime.ReportMetadataFailure(); LastError = runtime.RuntimeError; }
         finally { _preview = null; _sync.Release(); }
     }
 

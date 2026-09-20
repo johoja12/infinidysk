@@ -194,7 +194,7 @@ public sealed class SupportPackService(
 
         try
         {
-            var jobs = prefetch?.Jobs;
+            var jobs = prefetch?.Healthy == true ? prefetch.Jobs : null;
             await WriteJsonAsync(archive, "metrics/native-cache-prefetch.json", new
             {
                 GeneratedAt = generatedAt,
@@ -202,6 +202,8 @@ public sealed class SupportPackService(
                 ReservedBufferBytes = nativeCache?.ReservedBufferBytes ?? 0,
                 Counters = (nativeCache?.Statistics ?? new NativeCache.NativeCacheStatistics()).Snapshot(),
                 WarmingPaused = jobs?.Paused ?? true,
+                WarmingHealthy = prefetch?.Healthy ?? false,
+                WarmingError = prefetch?.RuntimeError,
                 AccountingBlocked = jobs?.WireBudgetBlocked ?? false,
                 QueueStates = (jobs?.List() ?? []).GroupBy(job => job.State)
                     .Select(group => new { State = group.Key, Count = group.Count() }).ToArray()

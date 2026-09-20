@@ -229,6 +229,30 @@ describe("Smart Prefetch settings", () => {
     render(<Harness managed />);
     expect(screen.getByLabelText("Enable Smart Prefetch").closest("fieldset")?.disabled).toBe(true);
   });
+  it("shows runtime metadata failure and disables warming mutations", async () => {
+    const fallback = fakeApi();
+    vi.stubGlobal("fetch", (url: string, init?: RequestInit) =>
+      url.endsWith("/api/prefetch")
+        ? Promise.resolve(
+            new Response(
+              JSON.stringify({
+                available: true,
+                healthy: false,
+                jobs: [],
+                runtimeError: "Warming paused after metadata failure; playback remains available.",
+              }),
+            ),
+          )
+        : fallback(url, init),
+    );
+    render(<Harness />);
+    expect(
+      await screen.findByText("Warming paused after metadata failure; playback remains available."),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Sync Plex policies now" }).closest("fieldset")?.disabled,
+    ).toBe(true);
+  });
   it("shows per-item bulk results including deduplication and rejection reasons", async () => {
     const fallback = fakeApi();
     vi.stubGlobal("fetch", (url: string, init?: RequestInit) =>

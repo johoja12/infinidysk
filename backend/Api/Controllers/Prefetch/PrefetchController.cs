@@ -12,12 +12,23 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
     protected override async Task<IActionResult> HandleRequest()
     {
         await runtime.WaitForInitializationAsync(HttpContext.RequestAborted).ConfigureAwait(false);
-        var jobs = runtime.Jobs?.List() ?? [];
+        IReadOnlyList<PrefetchJob> jobs = [];
+        var paused = true;
+        try
+        {
+            if (runtime.Healthy && runtime.Jobs is { } store)
+            {
+                jobs = store.List();
+                paused = store.Paused;
+            }
+        }
+        catch (Exception exception) when (exception is IOException or Microsoft.Data.Sqlite.SqliteException or InvalidOperationException)
+        { runtime.ReportMetadataFailure(); }
         var items = (await database.GetItemsByIdsBatchedAsync(jobs.Select(job => job.ItemId).Distinct().ToArray(),
             ct: HttpContext.RequestAborted).ConfigureAwait(false)).ToDictionary(item => item.Id);
         return Ok(new {
-        available = runtime.Jobs is not null, runtime.InitializationError,
-        paused = runtime.Jobs?.Paused ?? true, jobs = jobs.Select(job => job with
+        available = runtime.Jobs is not null, runtime.InitializationError, runtime.RuntimeError, runtime.Healthy,
+        paused, jobs = jobs.Select(job => job with
         {
             DisplayName = items.GetValueOrDefault(job.ItemId)?.Name ?? "Removed media",
             FileSize = items.GetValueOrDefault(job.ItemId)?.FileSize,
@@ -49,7 +60,18 @@ public sealed class PrefetchOperationController(PrefetchRuntime runtime, DavData
     public sealed record ItemOutcome(Guid ItemId, string Status, string? JobId, long Start, long Length, string? Reason);
     protected override async Task<IActionResult> HandleRequest()
     {
+        try { return await HandleOperationAsync().ConfigureAwait(false); }
+        catch (Exception exception) when (exception is IOException or Microsoft.Data.Sqlite.SqliteException or InvalidOperationException)
+        {
+            runtime.ReportMetadataFailure();
+            return StatusCode(StatusCodes.Status503ServiceUnavailable, new { error = runtime.RuntimeError });
+        }
+    }
+    private async Task<IActionResult> HandleOperationAsync()
+    {
         await runtime.WaitForInitializationAsync(HttpContext.RequestAborted).ConfigureAwait(false);
+        if (runtime.RuntimeError is not null)
+            return StatusCode(StatusCodes.Status503ServiceUnavailable, new { error = runtime.RuntimeError });
         var request = await HttpContext.Request.ReadFromJsonAsync<OperationRequest>(HttpContext.RequestAborted).ConfigureAwait(false)
             ?? throw new ArgumentException("A prefetch operation is required.");
         var jobs = runtime.Jobs ?? throw new ArgumentException("Activate Native cache and restart before warming media.");
