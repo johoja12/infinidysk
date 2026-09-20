@@ -29,6 +29,8 @@ claim that every repository or real-provider integration test was run.
   built Linux x64 native yEnc library. No real-provider integration tests were run.
 - Frontend: **61 passed across 9 files**, plus typecheck, scoped ESLint and
   production frontend/server builds.
+- Application, UsenetSharp and benchmark builds with repository analyzers enabled:
+  **0 warnings, 0 errors**. Backend test compilation also passed with analyzers enabled.
 - Admin OpenAPI export/contract test passed; generated contract is committed.
 - Strict documentation build passed.
 - Real isolated frontend/backend browser smoke saved two Native folders, restarted
@@ -36,6 +38,12 @@ claim that every repository or real-provider integration test was run.
   policies. Browser console/page errors: none. Test servers were stopped afterward.
 - Plex browser sign-in/discovery/test/save was exercised with **mock HTTP responses**;
   this verifies UI wiring, not real Plex authentication or account behavior.
+
+The final pass caught a test-fixture cleanup race: memory snapshot capture correctly
+does not await native storage initialization, but the fixture deleted its temporary
+directory before late initialization ended. The fixture now explicitly waits for
+its owned background work before deleting test data; runtime bounded shutdown is
+unchanged. The focused cache-service suite passed all 15 tests after this fix.
 
 ## Scale evidence and limits
 
@@ -59,6 +67,10 @@ and playback comparisons, and a bounded **24-hour soak**. No claim is made that 
 hardware/account-dependent gates have passed. Use separate configuration and cache
 roots; back up `/config` before testing an upgrade. Never share writable cache roots
 between production and the test instance.
+
+At handoff the fork exposed no GitHub Actions runs or PR check results. Local
+verification is recorded here, but CI approval is not claimed; run the normal PR
+lanes before considering a merge.
 
 The original design/plan checklists remain planning records. This report describes
 what was implemented and distinguishes automated evidence from pending operational
