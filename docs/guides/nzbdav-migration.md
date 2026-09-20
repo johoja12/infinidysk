@@ -77,6 +77,11 @@ source payload is not a successful migration. Preserve those exclusions until
 each has a reviewed outcome. An inventory candidate is not yet a verified import
 or a playback result.
 
+For the success canary, exclude corrupted, zero-padded, quarantined and repaired
+or repairing files. A previously repaired file may rely on local patches that
+the original NZB does not contain. Repeated normalized article IDs within an NZB
+are also excluded from this workflow rather than silently choosing one entry.
+
 Choose 20–50 representative candidates across media types and representations. Create `selection.json` with exact path/ID pairs from the inventory:
 
 ```json
