@@ -16,6 +16,12 @@ internal sealed record MigrationConnectionValues(
     int? MaxQueueDepth,
     int? SubmitWorkers);
 
+internal sealed record NzbDavMigrationConnectionValues(
+    string SourcePackageRoot,
+    int MaxQueueDepth,
+    int SubmitWorkers,
+    IReadOnlyList<string> SourceCategories);
+
 internal sealed record MigrationCategoryMappingChange(
     string AltmountCategory,
     string? TargetCategory,
@@ -210,6 +216,9 @@ public sealed class UsenetMigrationStore : IDisposable
         var now = DateTime.UtcNow;
         var session = await ctx.SessionState.SingleAsync(s => s.Id == SessionId, ct)
             .ConfigureAwait(false);
+        session.SourceType = MigrationSourceTypes.Altmount;
+        session.SourcePackageRoot = null;
+        session.CanaryLibraryRoot = null;
         session.AltmountMetadataRoot = values.MetadataRoot;
         session.AltmountConfigPath = values.ConfigPath;
         session.AltmountStoreRoot = values.StoreRoot;
@@ -228,6 +237,9 @@ public sealed class UsenetMigrationStore : IDisposable
             ctx.Preferences.Add(preferences);
         }
 
+        preferences.SourceType = MigrationSourceTypes.Altmount;
+        preferences.SourcePackageRoot = null;
+        preferences.CanaryLibraryRoot = null;
         preferences.AltmountMetadataRoot = values.MetadataRoot;
         preferences.AltmountConfigPath = values.ConfigPath;
         preferences.AltmountStoreRoot = values.StoreRoot;
@@ -238,6 +250,67 @@ public sealed class UsenetMigrationStore : IDisposable
         preferences.UpdatedAt = now;
 
         await SeedCategoryMapFromConfigAsync(ctx, categories, now, ct).ConfigureAwait(false);
+        await ctx.SaveChangesAsync(ct).ConfigureAwait(false);
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        return transition;
+    }
+
+    internal async Task<MigrationSessionTransitionResult> ApplyNzbDavConnectionAsync(
+        NzbDavMigrationConnectionValues values,
+        CancellationToken ct = default)
+    {
+        await using var ctx = ContextFactory();
+        await GetOrCreateSessionAsync(ctx, ct).ConfigureAwait(false);
+        ctx.ChangeTracker.Clear();
+        await using var transaction = await ctx.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
+        var transition = await TryTransitionSessionAsync(ctx, MigrationSessionTransition.Connect, ct)
+            .ConfigureAwait(false);
+        if (!transition.Succeeded)
+        {
+            await transaction.RollbackAsync(ct).ConfigureAwait(false);
+            return transition;
+        }
+
+        var now = DateTime.UtcNow;
+        var session = await ctx.SessionState.SingleAsync(item => item.Id == SessionId, ct)
+            .ConfigureAwait(false);
+        session.SourceType = MigrationSourceTypes.NzbDav;
+        session.SourcePackageRoot = values.SourcePackageRoot;
+        session.CanaryLibraryRoot = "/mnt/plex2";
+        session.AltmountMetadataRoot = null;
+        session.AltmountConfigPath = null;
+        session.AltmountStoreRoot = null;
+        session.MaxQueueDepth = ClampMaxQueueDepth(values.MaxQueueDepth);
+        session.SubmitWorkers = ClampSubmitWorkers(values.SubmitWorkers, session.MaxQueueDepth);
+        session.UpdatedAt = now;
+
+        var preferences = await ctx.Preferences.FirstOrDefaultAsync(item => item.Id == SessionId, ct)
+            .ConfigureAwait(false);
+        if (preferences is null)
+        {
+            preferences = new MigrationPreferences { Id = SessionId };
+            ctx.Preferences.Add(preferences);
+        }
+        preferences.SourceType = MigrationSourceTypes.NzbDav;
+        preferences.SourcePackageRoot = values.SourcePackageRoot;
+        preferences.CanaryLibraryRoot = "/mnt/plex2";
+        preferences.MaxQueueDepth = session.MaxQueueDepth;
+        preferences.SubmitWorkers = session.SubmitWorkers;
+        preferences.UpdatedAt = now;
+
+        await ctx.CategoryMap.ExecuteDeleteAsync(ct).ConfigureAwait(false);
+        ctx.CategoryMap.AddRange(values.SourceCategories
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .Select(category => new MigrationCategoryMap
+            {
+                AltmountCategory = category,
+                AltmountDir = category,
+                AltmountSanitizedDir = category,
+                Action = "migrate",
+                DiscoveredBy = "scan",
+                UpdatedAt = now,
+            }));
         await ctx.SaveChangesAsync(ct).ConfigureAwait(false);
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return transition;
@@ -435,7 +508,7 @@ public sealed class UsenetMigrationStore : IDisposable
         var now = DateTime.UtcNow;
         var run = new MigrationRun
         {
-            SourceType = MigrationSourceTypes.Altmount,
+            SourceType = session.SourceType,
             Status = "running",
             StartedAt = now,
         };
