@@ -297,7 +297,9 @@ public class BaseNntpClient : NntpClient
     private static async Task<T> WithBudgetCompletionAsync<T>(Func<ArticleBodyCompletionHandler?, Task<T>> start,
         ArticleBodyCompletionHandler? original)
     {
+#pragma warning disable CA2000 // Ownership transfers to the BODY completion callback; setup failure disposes below.
         var lease = PrefetchWireBudget.Current?.BeginOperation();
+#pragma warning restore CA2000
         try
         {
             return await start(lease is null ? original : (result, exception) =>

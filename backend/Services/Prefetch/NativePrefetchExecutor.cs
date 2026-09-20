@@ -34,8 +34,8 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         using var attribution = wireBudget.Enter();
         try
         {
-        await using var readScope = BaseStoreStreamFile.BeginReadScope(config, scope.ServiceProvider, wireBudget.Token,
-            SemaphorePriority.Low, settings.ConnectionsPerJob);
+        await using var readScope = BaseStoreStreamFile.BeginReadScope(config, scope.ServiceProvider,
+            SemaphorePriority.Low, settings.ConnectionsPerJob, wireBudget.Token);
         Stream admitted;
         try { admitted = await native.WrapAsync(item, token => factory.OpenAsync(item, token), wireBudget.Token, requireNative: true).ConfigureAwait(false); }
         catch (InvalidOperationException) { throw new PrefetchDeferredException("Native cache buffers or metadata are unavailable."); }

@@ -21,6 +21,7 @@ public sealed class PrefetchJobStore : IDisposable
     private readonly int _capacity;
     private readonly Func<PrefetchSettings>? _settings;
     private int Capacity => Math.Min(_capacity, _settings?.Invoke().QueueCapacity ?? _capacity);
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "CA2213", Justification = "Non-owning alias: Atomic owns the transaction with a using declaration and clears this reference in finally.")]
     private SqliteTransaction? _transaction;
     private int _wireBudgetBlocked;
     private readonly CancellationTokenSource _wireBudgetFailure = new();

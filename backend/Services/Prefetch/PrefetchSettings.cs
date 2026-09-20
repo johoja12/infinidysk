@@ -18,6 +18,11 @@ public sealed record PrefetchSource
 
 public sealed record PrefetchSettings
 {
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
+    };
     public bool Enabled { get; init; }
     public bool HistoryEnabled { get; init; }
     public bool RealtimeEnabled { get; init; } = true;
@@ -58,7 +63,7 @@ public sealed record PrefetchSettings
         try
         {
             settings = string.IsNullOrWhiteSpace(json) ? new() : JsonSerializer.Deserialize<PrefetchSettings>(json,
-                new JsonSerializerOptions { PropertyNameCaseInsensitive = true, UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow })
+                JsonOptions)
                 ?? throw new ArgumentException("Smart Prefetch settings must be an object.");
         }
         catch (JsonException) { throw new ArgumentException("Smart Prefetch settings contain invalid or unknown properties."); }

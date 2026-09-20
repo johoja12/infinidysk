@@ -23,7 +23,7 @@ public sealed class ConfigUpdateService(
     {
         cancellationToken.ThrowIfCancellationRequested();
         var admission = NativeValidationGates.GetValue(config, static _ => new SemaphoreSlim(1, 1));
-        if (!admission.Wait(0)) throw new ArgumentException("A previous native storage validation is still waiting on the filesystem. Restore the mount before retrying.");
+        if (!admission.Wait(0, cancellationToken)) throw new ArgumentException("A previous native storage validation is still waiting on the filesystem. Restore the mount before retrying.");
         var pending = Task.Run(() =>
         {
             try { validate(); }

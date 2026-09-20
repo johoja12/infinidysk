@@ -20,6 +20,7 @@ public sealed record PrefetchPrediction(Guid ItemId, string DisplayName, string 
 public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api, PrefetchRuntime runtime,
     IServiceScopeFactory scopes, ActiveReadRegistry reads, PlexPlaybackRegistry? playback = null) : BackgroundService
 {
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "CA2213", Justification = "Managed-only semaphore: in-flight HTTP previews can release after hosted-service disposal. AvailableWaitHandle is never used.")]
     private readonly SemaphoreSlim _sync = new(1, 1);
     private readonly Dictionary<string, DateTimeOffset> _last = new(StringComparer.Ordinal);
     private readonly PlexPlaybackRegistry _playback = playback ?? new(TimeProvider.System);

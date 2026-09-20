@@ -214,7 +214,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
         for (var page = 0; page < MaximumPages && result.Count < limit; page++)
         {
             var size = include is null ? Math.Min(100, limit - result.Count) : 100;
-            var separator = path.Contains('?') ? '&' : '?';
+            var separator = path.Contains('?', StringComparison.Ordinal) ? '&' : '?';
             var document = await GetXmlAsync(server, $"{path}{separator}X-Plex-Container-Start={start}&X-Plex-Container-Size={size}", ct,
                 bytes =>
                 {
@@ -288,7 +288,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
             while ((read = await stream.ReadAsync(buffer, bounded).ConfigureAwait(false)) > 0)
             {
                 if (output.Length + read > MaximumResponseBytes) throw new PlexRequestException("Plex response exceeded the size limit.");
-                output.Write(buffer, 0, read);
+                await output.WriteAsync(buffer.AsMemory(0, read), bounded).ConfigureAwait(false);
             }
             return output.ToArray();
         }
@@ -304,12 +304,12 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
 
     private static bool IsSafeSourceKey(string key)
     {
-        if (string.IsNullOrEmpty(key) || key.Length > 2048 || key.Contains('\\') || key.Contains('#')) return false;
+        if (string.IsNullOrEmpty(key) || key.Length > 2048 || key.Contains('\\', StringComparison.Ordinal) || key.Contains('#', StringComparison.Ordinal)) return false;
         var decoded = key;
         for (var i = 0; i < 3; i++) decoded = Uri.UnescapeDataString(decoded);
         return (decoded.StartsWith("/library/", StringComparison.Ordinal) || decoded.StartsWith("/hubs/", StringComparison.Ordinal)) &&
             !decoded.Contains("..", StringComparison.Ordinal) && !decoded.Contains("//", StringComparison.Ordinal) &&
-            !decoded.Contains("x-plex-token", StringComparison.OrdinalIgnoreCase) && !decoded.Contains('\\') &&
+            !decoded.Contains("x-plex-token", StringComparison.OrdinalIgnoreCase) && !decoded.Contains('\\', StringComparison.Ordinal) &&
             !decoded.Any(char.IsControl);
     }
 

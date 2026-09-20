@@ -73,7 +73,7 @@ public sealed class PrefetchWireBudget : IAsyncDisposable
             {
                 Volatile.Write(ref _accountingFailed, 1);
                 Volatile.Write(ref _exceeded, 1);
-                _cancellation.Cancel();
+                await _cancellation.CancelAsync().ConfigureAwait(false);
             }
             if (AccountingFailed) throw new OperationCanceledException(Token);
             var pending = Interlocked.Exchange(ref _pending, 0);
@@ -100,7 +100,7 @@ public sealed class PrefetchWireBudget : IAsyncDisposable
                 // in-flight excess too; never hide failed/cancelled provider traffic.
                 await Task.Run(() => _store.ReserveDailyCredit(pending - grant, 0, day)).ConfigureAwait(false);
                 Volatile.Write(ref _exceeded, 1);
-                _cancellation.Cancel();
+                await _cancellation.CancelAsync().ConfigureAwait(false);
                 _credit = 0;
             }
             else _credit = grant - pending;
@@ -114,7 +114,7 @@ public sealed class PrefetchWireBudget : IAsyncDisposable
             Volatile.Write(ref _accountingFailed, 1);
             Volatile.Write(ref _exceeded, 1);
             _store.BlockWireBudget();
-            _cancellation.Cancel();
+            await _cancellation.CancelAsync().ConfigureAwait(false);
             throw new OperationCanceledException("Warming payload accounting is unavailable.", exception, Token);
         }
         finally { _settlement.Release(); }
@@ -128,7 +128,7 @@ public sealed class PrefetchWireBudget : IAsyncDisposable
             _closing = true;
             if (_operations == 0) _completed.TrySetResult();
         }
-        _cancellation.Cancel();
+        await _cancellation.CancelAsync().ConfigureAwait(false);
         await _completed.Task.ConfigureAwait(false);
         if (!AccountingFailed && !_store.WireBudgetBlocked)
         {
