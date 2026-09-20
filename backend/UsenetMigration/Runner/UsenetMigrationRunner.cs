@@ -33,7 +33,8 @@ public sealed class UsenetMigrationRunner : BackgroundService
 
     private readonly UsenetMigrationStore _store;
     private readonly ConfigManager _configManager;
-    private readonly AltmountScanRunner _scanRunner;
+    private readonly MigrationScanDispatcher _scanDispatcher;
+    private readonly AltmountScanRunner? _altmountScanRunner;
     private readonly SubmissionWorkerPool _workerPool;
     private readonly SubmissionReconciler _reconciler;
     private readonly SymlinkPlanner _symlinkPlanner;
@@ -50,10 +51,26 @@ public sealed class UsenetMigrationRunner : BackgroundService
         QueueManager queueManager,
         ConfigManager configManager,
         WebsocketManager websocketManager)
+        : this(
+            store,
+            queueManager,
+            configManager,
+            websocketManager,
+            CreateDefaultScanDispatcher(store, configManager))
+    {
+    }
+
+    public UsenetMigrationRunner(
+        UsenetMigrationStore store,
+        QueueManager queueManager,
+        ConfigManager configManager,
+        WebsocketManager websocketManager,
+        MigrationScanDispatcher scanDispatcher)
     {
         _store = store;
         _configManager = configManager;
-        _scanRunner = new AltmountScanRunner(store, configManager);
+        _scanDispatcher = scanDispatcher;
+        _altmountScanRunner = scanDispatcher.Resolve(MigrationSourceTypes.Altmount) as AltmountScanRunner;
         _workerPool = new SubmissionWorkerPool(store, queueManager, configManager, websocketManager);
         _reconciler = new SubmissionReconciler(store);
         _symlinkPlanner = new SymlinkPlanner(store, configManager);
@@ -71,7 +88,8 @@ public sealed class UsenetMigrationRunner : BackgroundService
     internal void InterruptScan() => _scanGate.Interrupt();
     internal void InterruptStep6() => _linkGate.Interrupt();
 
-    internal AltmountScanRunner ScanRunnerForTests => _scanRunner;
+    internal AltmountScanRunner ScanRunnerForTests => _altmountScanRunner
+        ?? throw new InvalidOperationException("The injected AltMount scanner is not an AltmountScanRunner.");
     internal SubmissionWorkerPool WorkerPoolForTests => _workerPool;
     internal SubmissionReconciler ReconcilerForTests => _reconciler;
     internal SymlinkPlanner SymlinkPlannerForTests => _symlinkPlanner;
@@ -315,9 +333,12 @@ public sealed class UsenetMigrationRunner : BackgroundService
             if (session.Status is not "scanning")
                 return;
 
+            // Resolve before a source runner can clear or rebuild scan artifacts.
+            var scanRunner = _scanDispatcher.Resolve(session.SourceType);
+
             try
             {
-                interrupted = await _scanRunner.RunAsync(scanOperation.Token).ConfigureAwait(false) is null;
+                interrupted = await scanRunner.ScanAsync(scanOperation.Token).ConfigureAwait(false) is null;
             }
             catch (OperationCanceledException) when (
                 scanOperation.Token.IsCancellationRequested && !ct.IsCancellationRequested)
@@ -328,6 +349,14 @@ public sealed class UsenetMigrationRunner : BackgroundService
 
         if (interrupted)
             await _store.CompleteScanCancellationAsync(ct).ConfigureAwait(false);
+    }
+
+    private static MigrationScanDispatcher CreateDefaultScanDispatcher(
+        UsenetMigrationStore store,
+        ConfigManager configManager)
+    {
+        IUsenetMigrationScanRunner[] scanners = [new AltmountScanRunner(store, configManager)];
+        return new MigrationScanDispatcher(scanners);
     }
 
     private async Task RunTickAsync(CancellationToken ct)
