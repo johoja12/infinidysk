@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -270,13 +271,26 @@ public sealed class NzbDavMigrationController(
             Path.Join(DavDatabaseContext.ConfigPath, "migration-output", "nzbdav"),
             session.CurrentRunId.Value,
             package.PackageDigest);
-        var path = Path.Join(directory, "plan.json");
-        if (!System.IO.File.Exists(path))
+        var planPath = Path.Join(directory, "plan.json");
+        var checksumsPath = Path.Join(directory, "SHA256SUMS");
+        if (!System.IO.File.Exists(planPath) || !System.IO.File.Exists(checksumsPath))
             throw new BadHttpRequestException("No NzbDav canary plan is available.");
+
+        await using var bundle = new MemoryStream();
+        using (var archive = new ZipArchive(bundle, ZipArchiveMode.Create, leaveOpen: true))
+        {
+            foreach (var path in new[] { planPath, checksumsPath })
+            {
+                var entry = archive.CreateEntry(Path.GetFileName(path), CompressionLevel.NoCompression);
+                await using var output = await entry.OpenAsync(HttpContext.RequestAborted).ConfigureAwait(false);
+                await using var input = System.IO.File.OpenRead(path);
+                await input.CopyToAsync(output, HttpContext.RequestAborted).ConfigureAwait(false);
+            }
+        }
         return File(
-            await System.IO.File.ReadAllBytesAsync(path, HttpContext.RequestAborted).ConfigureAwait(false),
-            "application/json",
-            $"nzbdav-canary-plan-run-{session.CurrentRunId.Value}.json");
+            bundle.ToArray(),
+            "application/zip",
+            $"nzbdav-canary-plan-run-{session.CurrentRunId.Value}.zip");
     });
 
     private async Task<MigrationSessionState> RequireNzbDavSessionAsync()

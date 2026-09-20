@@ -188,7 +188,13 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         Assert.IsType<OkObjectResult>(await controller.GenerateCanaryPlan());
         var download = Assert.IsType<FileContentResult>(await controller.DownloadCanaryPlan());
         Assert.NotEmpty(download.FileContents);
-        Assert.Equal("application/json", download.ContentType);
+        Assert.Equal("application/zip", download.ContentType);
+        using var archive = new System.IO.Compression.ZipArchive(
+            new MemoryStream(download.FileContents),
+            System.IO.Compression.ZipArchiveMode.Read);
+        Assert.Equal(
+            ["plan.json", "SHA256SUMS"],
+            archive.Entries.Select(entry => entry.FullName).Order().ToArray());
     }
 
     private NzbDavMigrationController CreateController(MigrationTestHarness harness)
