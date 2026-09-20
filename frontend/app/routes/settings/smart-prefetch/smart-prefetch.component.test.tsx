@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ManagedEnvProvider } from "~/components/ui";
+import { publishPlexServers } from "../plex/plex-api";
 import { SmartPrefetchSettings } from "./smart-prefetch";
 import { parsePrefetchSettings } from "./smart-prefetch-model";
 
@@ -120,6 +121,17 @@ afterEach(() => {
 });
 
 describe("Smart Prefetch settings", () => {
+  it("clears a selected source server when a refresh removes it", async () => {
+    vi.stubGlobal("fetch", fakeApi());
+    render(<Harness />);
+    await screen.findByRole("option", { name: "Home" });
+    const selector = screen.getByLabelText<HTMLSelectElement>("Plex source server");
+    await userEvent.selectOptions(selector, "server");
+    expect(selector.value).toBe("server");
+    act(() => publishPlexServers([]));
+    await waitFor(() => expect(selector.value).toBe(""));
+    expect(screen.getByLabelText("Plex source library").hasAttribute("disabled")).toBe(true);
+  });
   it("selects real Plex collection records using their owning library media type", async () => {
     vi.stubGlobal("fetch", fakeApi(true));
     render(<Harness />);
