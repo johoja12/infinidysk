@@ -32,6 +32,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\backend\NzbWebDAV.csproj" />
     <ProjectReference Include="..\..\backend.Benchmarks\NzbWebDAV.Benchmarks.csproj" />
+    <ProjectReference Include="..\..\tools\NzbDavMigration\NzbDavMigration.csproj" />
   </ItemGroup>
 
   <ItemGroup>
