@@ -488,9 +488,9 @@ export function PlexSettings() {
                           await plexRequest("disconnect", { serverId: server.id });
                           setSavedIds((current) => current.filter((id) => id !== server.id));
                         }
-                        setServers((current) =>
-                          current.filter((_, position) => position !== index),
-                        );
+                        const nextServers = servers.filter((_, position) => position !== index);
+                        setServers(nextServers);
+                        publishPlexServers(nextServers);
                       })
                     }
                   />

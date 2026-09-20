@@ -63,6 +63,42 @@ describe("Plex settings", () => {
     await userEvent.click(screen.getByRole("button", { name: "Save advanced server changes" }));
     expect(await screen.findByRole("option", { name: "Home" })).toBeTruthy();
   });
+  it("removes a disconnected server from Smart Prefetch without reloading", async () => {
+    vi.stubGlobal(
+      "fetch",
+      responses({
+        servers: {
+          servers: [
+            {
+              id: "machine",
+              name: "Home",
+              url: "http://localhost:32400",
+              token: "masked-token",
+              enabled: true,
+              pathMappings: [],
+            },
+          ],
+        },
+        disconnect: { status: true },
+      }),
+    );
+    vi.stubGlobal(
+      "confirm",
+      vi.fn(() => true),
+    );
+    render(
+      <>
+        <PlexSettings />
+        <PlexSources settings={parsePrefetchSettings(undefined)} onChange={vi.fn()} />
+      </>,
+    );
+
+    expect(await screen.findByRole("option", { name: "Home" })).toBeTruthy();
+    await userEvent.click(screen.getByText("Advanced server configuration"));
+    await userEvent.click(screen.getByRole("button", { name: "Remove server 1" }));
+
+    await waitFor(() => expect(screen.queryByRole("option", { name: "Home" })).toBeNull());
+  });
   it("allows readonly selection of an environment-managed account for server discovery", async () => {
     vi.stubGlobal(
       "fetch",
