@@ -18,6 +18,12 @@ React Router/TypeScript/Vitest, versioned filesystem manifests, existing Docker 
 
 ## Scope and execution rules
 
+Detailed planning requested by the user on 2026-09-20. Execute using the
+[contracts and dependency order](2026-09-20-cache-prefetch-execution-contracts.md):
+cache-mode validation comes before activating native storage; Plex login/catalogue
+and smart policies remain required. Those contracts refine this task list without
+authorizing implementation, merging, or production deployment.
+
 Read the [design](../specs/2026-09-20-smart-prefetch-native-cache-design.md) first.
 Also read the [50 TB architecture comparison](../specs/2026-09-20-50tb-cache-architecture-comparison.md):
 the confirmed workload is HDD/NAS and mostly whole movies/episodes. Prefer one

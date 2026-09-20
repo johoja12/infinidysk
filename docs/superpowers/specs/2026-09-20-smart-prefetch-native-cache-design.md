@@ -1,6 +1,7 @@
 # Smart prefetch and native file cache integration design
 
-Status: proposed design for a testing branch; no feature implementation or deployment.
+Status: user accepted the direction for detailed planning; implementation and
+performance validation remain outstanding. No feature deployment.
 Date: 2026-09-20.
 
 User requirements clarified on 2026-09-20: Segment and Native are mutually
@@ -430,3 +431,6 @@ baseline image and disable the optional features, retaining test artifacts.
 The [implementation plan](../plans/2026-09-20-smart-prefetch-native-cache.md)
 defines file ownership, sequencing, tests, and the canary procedure. Completing
 the planning PR does not authorize merging an implementation PR or deploying it.
+The [execution contracts](../plans/2026-09-20-cache-prefetch-execution-contracts.md)
+define cache-mode resolution, wizard behavior, persistence transitions, Plex
+configuration and dependency gates for implementation.
