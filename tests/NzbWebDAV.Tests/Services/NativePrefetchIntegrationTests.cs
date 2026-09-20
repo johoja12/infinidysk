@@ -106,6 +106,7 @@ public sealed class NativePrefetchIntegrationTests
         public int Opens { get; private set; }
         public Task<Stream> OpenAsync(DavItem item, CancellationToken cancellationToken)
         {
+            Assert.NotNull(PrefetchWireBudget.Current);
             Assert.Equal(SemaphorePriority.Low, cancellationToken.GetContext<DownloadPriorityContext>()?.Priority);
             Opens++;
             return Task.FromResult<Stream>(new VerifiedStream());

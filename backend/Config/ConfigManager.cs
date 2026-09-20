@@ -470,6 +470,13 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
         var jsonOptions = rejectUnknownJsonProperties ? RejectUnknownPropertiesJsonOptions : null;
         foreach (var item in configItems)
         {
+            NzbWebDAV.Services.Plex.PlexSettings.ValidateItem(item.ConfigName, item.ConfigValue, rejectUnknownJsonProperties);
+            if (item.ConfigName == ConfigKeys.SmartPrefetchSettings)
+            {
+                _ = NzbWebDAV.Services.Prefetch.PrefetchSettings.Parse(item.ConfigValue);
+                continue;
+            }
+            if (NzbWebDAV.Services.NativeCache.NativeCacheSettings.ValidateItem(item)) continue;
             if (item.ConfigName == ConfigKeys.CacheMode)
             {
                 CacheModeResolver.Parse(item.ConfigValue);
