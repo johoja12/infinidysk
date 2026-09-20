@@ -60,6 +60,13 @@ public sealed class PlexServerConfigService(ConfigManager config, ConfigUpdateSe
             // credentials cancelled or disconnected while this request was waiting for the lease.
             for (var index = 0; index < requests.Count; index++)
             {
+                if (requests[index].Token is { } masked && ConfigSecretMasker.IsMaskToken(masked))
+                {
+                    var currentServer = PlexSettings.ParseServers(config.GetEffectiveConfigValue(PlexSettings.ServersKey))
+                        .SingleOrDefault(server => server.Id == servers[index].Id);
+                    if (currentServer is null || currentServer.Token != servers[index].Token)
+                        throw new InvalidOperationException("Plex credentials changed; reload the server settings before saving.");
+                }
                 if (string.IsNullOrEmpty(requests[index].Handle)) continue;
                 var current = accounts.ResolveServer(owner, requests[index].Handle!);
                 if (current.Id != servers[index].Id || current.Token != servers[index].Token ||
