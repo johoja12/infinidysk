@@ -66,7 +66,7 @@ public sealed class PrefetchJobStoreTests : IDisposable
         var item = Guid.NewGuid();
         var outcomes = await Task.WhenAll(Enumerable.Range(0, 8)
             .Select(index => Task.Run(() => jobs.EnqueueWithOutcome(item, "owner-" + index, 0))));
-        Assert.Single(outcomes.Where(outcome => outcome.Created));
+        Assert.Single(outcomes, outcome => outcome.Created);
         Assert.Single(outcomes.Select(outcome => outcome.Job.Id).Distinct());
         Assert.Single(jobs.List());
     }
