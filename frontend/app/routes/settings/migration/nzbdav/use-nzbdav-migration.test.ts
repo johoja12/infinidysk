@@ -29,7 +29,8 @@ describe("NzbDav migration requests", () => {
     const [url, init] = fetcher.mock.calls[0]!;
     expect(url).toBe("/api/migration/nzbdav/connect");
     expect(init?.method).toBe("POST");
-    expect(JSON.parse(String(init?.body))).toEqual({
+    const requestBody = typeof init?.body === "string" ? init.body : "";
+    expect(JSON.parse(requestBody)).toEqual({
       packagePath: "/config/migration-input/nzbdav-canary",
       maxQueueDepth: 5,
       submitWorkers: 1,
