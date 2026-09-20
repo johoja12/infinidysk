@@ -11,7 +11,8 @@ public sealed record CanaryExportRelease(
     string SourceReleaseId,
     Guid NzbBlobId,
     string PayloadSourcePath,
-    IReadOnlyList<NzbDavExportLeaf> Leaves);
+    IReadOnlyList<NzbDavExportLeaf> Leaves,
+    byte[]? PayloadBytes = null);
 
 public sealed record CanaryExportRequest(
     string PackageId,
@@ -45,7 +46,8 @@ public sealed partial class CanaryPackageWriter(int minimumLinks = 20, int maxim
         var parent = Path.GetDirectoryName(output) ?? throw new InvalidDataException("Export destination has no parent.");
         Directory.CreateDirectory(parent);
         var stage = Path.Join(parent, $".{Path.GetFileName(output)}.tmp-{Guid.NewGuid():N}");
-        Directory.CreateDirectory(stage);
+        if (OperatingSystem.IsWindows()) Directory.CreateDirectory(stage);
+        else Directory.CreateDirectory(stage, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
         var committed = false;
         try
         {
@@ -60,7 +62,10 @@ public sealed partial class CanaryPackageWriter(int minimumLinks = 20, int maxim
                     throw new InvalidDataException($"Unsafe source release id '{release.SourceReleaseId}'.");
                 var relativePath = $"payloads/{release.SourceReleaseId}.nzb";
                 var destination = Path.Join(stage, relativePath.Replace('/', Path.DirectorySeparatorChar));
-                await CopyAndFlushAsync(release.PayloadSourcePath, destination, cancellationToken).ConfigureAwait(false);
+                if (release.PayloadBytes is { } bytes)
+                    await WriteBytesAndFlushAsync(destination, bytes, cancellationToken).ConfigureAwait(false);
+                else
+                    await CopyAndFlushAsync(release.PayloadSourcePath, destination, cancellationToken).ConfigureAwait(false);
                 var info = new FileInfo(destination);
                 var digest = await ComputeSha256Async(destination, cancellationToken).ConfigureAwait(false);
                 payloads.Add(new NzbDavPayloadFile(relativePath, info.Length, digest));
@@ -138,8 +143,7 @@ public sealed partial class CanaryPackageWriter(int minimumLinks = 20, int maxim
             throw new InvalidDataException("Export payload must not be a symbolic link.");
         await using var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read,
             64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        await using var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-            64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using var output = CreatePrivateFile(destination);
         await input.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
         await output.FlushAsync(cancellationToken).ConfigureAwait(false);
 #pragma warning disable CA1849 // Atomic export durability requires fsync before rename.
@@ -148,15 +152,28 @@ public sealed partial class CanaryPackageWriter(int minimumLinks = 20, int maxim
     }
 
     private static async Task WriteAndFlushAsync(string path, string content, CancellationToken cancellationToken)
+        => await WriteBytesAndFlushAsync(path, Encoding.UTF8.GetBytes(content), cancellationToken).ConfigureAwait(false);
+
+    private static async Task WriteBytesAndFlushAsync(string path, byte[] bytes, CancellationToken cancellationToken)
     {
-        await using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-            16 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        var bytes = Encoding.UTF8.GetBytes(content);
+        await using var output = CreatePrivateFile(path);
         await output.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
         await output.FlushAsync(cancellationToken).ConfigureAwait(false);
 #pragma warning disable CA1849 // Atomic export durability requires fsync before rename.
         output.Flush(flushToDisk: true);
 #pragma warning restore CA1849
+    }
+
+    internal static FileStream CreatePrivateFile(string path)
+    {
+        var options = new FileStreamOptions
+        {
+            Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None,
+            BufferSize = 16 * 1024, Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
+        };
+        if (!OperatingSystem.IsWindows())
+            options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        return new FileStream(path, options);
     }
 
     private static async Task<string> ComputeSha256Async(string path, CancellationToken cancellationToken)

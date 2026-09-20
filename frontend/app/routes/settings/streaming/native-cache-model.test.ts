@@ -27,9 +27,15 @@ describe("native cache settings", () => {
       /overlap/i,
     );
     expect(validateNativeFolders([{ ...first, maxBytes: -1 }])).toMatch(/quota/i);
-    expect(validateNativeFolders([{ ...first, highWaterPercent: 60, lowWaterPercent: 60 }])).toMatch(/watermark/i);
-    expect(validateNativeFolders([{ ...first, highWaterPercent: 101, lowWaterPercent: 50 }])).toMatch(/watermark/i);
-    expect(validateNativeFolders([{ ...first, highWaterPercent: 75, lowWaterPercent: 50 }])).toBeNull();
+    expect(
+      validateNativeFolders([{ ...first, highWaterPercent: 60, lowWaterPercent: 60 }]),
+    ).toMatch(/watermark/i);
+    expect(
+      validateNativeFolders([{ ...first, highWaterPercent: 101, lowWaterPercent: 50 }]),
+    ).toMatch(/watermark/i);
+    expect(
+      validateNativeFolders([{ ...first, highWaterPercent: 75, lowWaterPercent: 50 }]),
+    ).toBeNull();
   });
   it("does not silently replace malformed saved folders with an empty list", () => {
     expect(() => parseNativeFolders("not json")).toThrow();

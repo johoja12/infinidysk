@@ -146,10 +146,13 @@ export async function setSessionUser(
 }
 
 /** Plex account handles belong to one verified admin login, never a supplied header. */
-export async function ensurePlexOwnerSession(request: Request | IncomingMessage): Promise<{ owner: string | null; cookie?: string }> {
+export async function ensurePlexOwnerSession(
+  request: Request | IncomingMessage,
+): Promise<{ owner: string | null; cookie?: string }> {
   const session = await sessionStorage.getSession(getCookieHeader(request));
   const user = session.get("user") as User | undefined;
-  if (!IS_FRONTEND_AUTH_DISABLED && (!user?.username || user.role === "readonly")) return { owner: null };
+  if (!IS_FRONTEND_AUTH_DISABLED && (!user?.username || user.role === "readonly"))
+    return { owner: null };
   const existing: unknown = session.get("plexOwnerNonce");
   if (typeof existing === "string" && existing.length > 0) return { owner: existing };
   const owner = crypto.randomUUID();
@@ -157,7 +160,9 @@ export async function ensurePlexOwnerSession(request: Request | IncomingMessage)
   return { owner, cookie: await sessionStorage.commitSession(session) };
 }
 
-export async function getPlexOwnerSession(request: Request | IncomingMessage): Promise<string | null> {
+export async function getPlexOwnerSession(
+  request: Request | IncomingMessage,
+): Promise<string | null> {
   if (IS_FRONTEND_AUTH_DISABLED) return null;
   const session = await sessionStorage.getSession(getCookieHeader(request));
   const user = session.get("user") as User | undefined;

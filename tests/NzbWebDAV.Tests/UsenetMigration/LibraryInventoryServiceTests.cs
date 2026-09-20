@@ -59,16 +59,16 @@ public sealed class LibraryInventoryServiceTests : IDisposable
         };
         var rows = new[]
         {
-            new LegacyDavItemRow(withHistory, "/content/a.mkv", 1, 3, Guid.NewGuid(), null, availableBlob,
+            new LegacyDavItemRow(withHistory, "/content/a.mkv", 1, 3, Guid.NewGuid(), availableBlob,
                 HistoryDownloadStatus: 1),
-            new LegacyDavItemRow(withoutHistory, "/content/b.mkv", 1, 3, null, null, availableBlob),
-            new LegacyDavItemRow(unresolvedBlob, "/content/d.mkv", 1, 3, null, null, Guid.NewGuid()),
+            new LegacyDavItemRow(withoutHistory, "/content/b.mkv", 1, 3, null, availableBlob),
+            new LegacyDavItemRow(unresolvedBlob, "/content/d.mkv", 1, 3, Guid.NewGuid(), Guid.NewGuid()),
         };
 
         var result = new LibraryInventoryService().Enrich(links, rows, new LegacyBlobResolver(blobRoot));
 
         Assert.Equal("candidate", result.Single(item => item.LegacyDavItemId == withHistory).Status);
-        Assert.Equal("candidate-no-history", result.Single(item => item.LegacyDavItemId == withoutHistory).Status);
+        Assert.Equal("missing-history", result.Single(item => item.LegacyDavItemId == withoutHistory).ExclusionReason);
         Assert.Equal("missing-database-row", result.Single(item => item.LegacyDavItemId == missingRow).ExclusionReason);
         Assert.Equal("missing-nzb-blob", result.Single(item => item.LegacyDavItemId == unresolvedBlob).ExclusionReason);
     }

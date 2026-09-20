@@ -23,7 +23,10 @@ import { NativeCacheSettings } from "./native-cache";
 import { cacheMode, NATIVE_CACHE_KEYS, nativeSettingsValid } from "./native-cache-model";
 import { PlexSettings } from "../plex/plex";
 import { SmartPrefetchSettings } from "../smart-prefetch/smart-prefetch";
-import { hasSmartPrefetchSettingsChanged, isSmartPrefetchSettingsValid } from "../smart-prefetch/smart-prefetch-model";
+import {
+  hasSmartPrefetchSettingsChanged,
+  isSmartPrefetchSettingsValid,
+} from "../smart-prefetch/smart-prefetch-model";
 
 export const SEGMENT_CACHE_READ_AHEAD_WARNING_KEY = "segment-cache-read-ahead-warning-dismissed";
 
