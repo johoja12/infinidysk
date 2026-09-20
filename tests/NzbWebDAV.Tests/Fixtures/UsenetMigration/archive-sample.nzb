@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="migration@test" date="0" subject="&quot;Canary.Archive.part1.rar&quot; yEnc (1/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="10" number="1">archive-1a@test</segment>
+      <segment bytes="10" number="2">archive-1b@test</segment>
+    </segments>
+  </file>
+  <file poster="migration@test" date="0" subject="&quot;Canary.Archive.part2.rar&quot; yEnc (2/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="10" number="1">archive-2a@test</segment>
+      <segment bytes="10" number="2">archive-2b@test</segment>
+    </segments>
+  </file>
+</nzb>
