@@ -317,9 +317,14 @@
 - Create: `tools/NzbDavMigration/Canary/CanaryLinkApplier.cs`
 - Create: `tools/NzbDavMigration/Canary/CanaryLinkRollback.cs`
 - Create: `tools/NzbDavMigration/Canary/CanaryValidator.cs`
+- Create: `tools/NzbDavMigration/Canary/CanaryPerformanceProbe.cs`
+- Create: `tools/NzbDavMigration/Canary/CanaryPerformanceReportWriter.cs`
+- Create: `tools/NzbDavMigration/Canary/CanaryPerformanceModels.cs`
 - Create: `tests/NzbWebDAV.Tests/UsenetMigration/CanaryLinkApplierTests.cs`
 - Create: `tests/NzbWebDAV.Tests/UsenetMigration/CanaryLinkRollbackTests.cs`
 - Create: `tests/NzbWebDAV.Tests/UsenetMigration/CanaryValidatorTests.cs`
+- Create: `tests/NzbWebDAV.Tests/UsenetMigration/CanaryPerformanceProbeTests.cs`
+- Create: `tests/NzbWebDAV.Tests/UsenetMigration/CanaryPerformanceReportWriterTests.cs`
 
 - [ ] Write failing filesystem tests in a temporary root for traversal, symlinked parents, an existing regular file, a differently targeted existing symlink, an already-correct link, a target that disappears between plan and apply, and rollback after partial apply.
 - [ ] Add `apply-links --plan ... --library-root /mnt/plex2 --target-root /mnt/remote/infinidysk`. Resolve and verify both roots before work; require the library root to be local rather than NFS/FUSE; reject any parent component that is a symlink; and never overwrite an existing object.
@@ -327,14 +332,45 @@
 - [ ] Treat an already-correct link recorded by the same plan as idempotent success. A link not in the journal is never owned by the tool.
 - [ ] Add `rollback-links --journal ...`. Re-read each link without following it, remove it only when its current target still equals the recorded target, then prune only empty directories created by that run. Never delete targets.
 - [ ] Add `validate-links` with bounded `stat`, beginning/middle/end reads, optional bounded `ffprobe`, and JSON results. Range/stream tests must have explicit byte and time limits.
+- [ ] Define a benchmark-selection JSON contract containing exactly six reviewed
+  library-relative paths, legacy DavItem ID, InfiniDysk DavItem ID, expected size,
+  representation (`direct` or `rar-multipart`), resolution class, and whether the
+  file is the required large-file case. Reject an automatically sampled, duplicate,
+  missing, size-mismatched, or non-exactly-correlated selection.
+- [ ] Write failing probe tests with controlled streams and a monotonic fake clock.
+  Cover seek offsets at 10%, 50%, and 90%; an 8 MiB bounded read after each seek;
+  a 128 MiB sequential throughput window; short reads; cancellation; timeout;
+  sub-128 MiB files; and independent legacy/InfiniDysk failures.
+- [ ] Add `benchmark-links` with paired roots `/mnt/plex` and `/mnt/plex2`. For
+  each of the six paths, verify both sides are regular readable targets with the
+  expected size, then run one first-pass and one repeat-pass matrix. Measure time
+  until the first successful read returns, total bounded-read duration, bytes read,
+  and MiB/s using a monotonic clock. Read `min(128 MiB, file size)` for the
+  sequential window and record the actual byte count. A local `Seek` call is not a
+  successful seek result until the following bounded read returns data.
+- [ ] Never call `drop_caches`, delete VFS cache entries, restart rclone, or pre-warm
+  a path. Accept optional cache-root evidence and label a measurement
+  `observed-cold`/`observed-warm` only when the exact resolved target's cache state
+  can be proven. Otherwise label it `cache-state-unknown-first-pass` or
+  `cache-state-unknown-repeat-pass`.
+- [ ] Require explicit legacy and InfiniDysk route descriptions in the command
+  metadata, including effective WebDAV URL/port and whether it is direct-backend
+  or frontend-proxied. Mark frontend-proxied InfiniDysk throughput as diagnostic.
+- [ ] Write `performance-results.json` containing every individual observation and
+  `performance-results.md` containing the actual side-by-side values for all six
+  files. The Markdown table must show file, representation, size, cache label,
+  route, 10%/50%/90% time-to-first-byte and completion latency, bounded sequential
+  MiB/s, requested/actual bytes read, and error/timeout. Never omit a failed row.
 - [ ] Run:
 
   ```bash
   dotnet test tests/NzbWebDAV.Tests/NzbWebDAV.Tests.csproj -c Release \
-    --filter 'FullyQualifiedName~CanaryLinkApplierTests|FullyQualifiedName~CanaryLinkRollbackTests|FullyQualifiedName~CanaryValidatorTests'
+    --filter 'FullyQualifiedName~CanaryLinkApplierTests|FullyQualifiedName~CanaryLinkRollbackTests|FullyQualifiedName~CanaryValidatorTests|FullyQualifiedName~CanaryPerformanceProbeTests|FullyQualifiedName~CanaryPerformanceReportWriterTests'
   ```
 
-  Expected: safe apply/rollback cases pass, including the interrupted-run journal case.
+  Expected: safe apply/rollback cases and deterministic performance-report cases
+  pass, including interrupted-run journals, timeouts, and failed rows retained in
+  both report formats.
 
 - [ ] Commit:
 
@@ -413,6 +449,10 @@
 
 - [ ] Document the two-stage trust boundary: read-only export from legacy, then ordinary InfiniDysk import from an immutable package.
 - [ ] Document dedicated category creation, the non-Plex `/mnt/plex2` rule, source/target roots, checksums, plan review, apply journal, validation, rollback, and report retention.
+- [ ] Document the six-file paired benchmark, exact selection requirements,
+  first-pass/repeat-pass cache labels, 10%/50%/90% seek reads, 128 MiB throughput
+  window, raw JSON, Markdown results table, and the ban on cache purges or service
+  restarts merely to manufacture a cold result.
 - [ ] Add the introducing-release `since` pill used by nearby docs.
 - [ ] State the setup-wizard impact review explicitly: this is an advanced migration tool, not a new-install critical setting, so `frontend/app/routes/setup/` and `SetupWizardService.CurrentWizardVersion` do not change.
 - [ ] State that frontend-proxied rclone is acceptable only for functional canary work; direct backend WebDAV is required before making throughput claims.
@@ -473,6 +513,11 @@ This phase is a separate, explicitly approved production operation after the imp
 - [ ] Select approximately 12–20 releases yielding 20–50 leaves across TV, movies, anime, HD, 4K, MKV, MP4, direct NZB, RAR/multipart, warm, cold, small, medium, and large cases.
 - [ ] Exclude known broken, missing-article, quarantined, and repairing records from the success set. Record potential negative tests separately.
 - [ ] Review the exact selection artifact before export. The review checks every library-relative path, legacy ID, expected size, representation, and reason for inclusion.
+- [ ] From the successful set, approve exactly six paired performance leaves and
+  save `/opt/infinidysk-migration/canary/benchmark-selection.json`. Include direct
+  NZB and RAR/multipart media, HD and 4K, and at least one large file. Every entry
+  must identify the same relative path on `/mnt/plex` and `/mnt/plex2`; do not let
+  the benchmark command choose files automatically.
 
 ### Task 16: Export, import, and correlate without touching Plex
 
@@ -488,9 +533,29 @@ This phase is a separate, explicitly approved production operation after the imp
 - [ ] Run `apply-links` on nuc-1 with exact roots `/mnt/plex2` and `/mnt/remote/infinidysk`. Preserve the apply journal and checksum it.
 - [ ] Confirm link count equals the reviewed plan count, all links remain beneath `/mnt/plex2`, and no inode/mtime beneath `/mnt/plex` changed during the window.
 - [ ] Run bounded automated validation for every leaf: `lstat`, target existence, exact size, beginning/middle/end reads, WebDAV HEAD/range probes, and supported `ffprobe`.
-- [ ] Manually test representative direct, RAR/multipart, large, cold, warm, and 4K cases without adding `/mnt/plex2` to Plex. Record playback method, timestamps, seek points, and outcome.
+- [ ] Record the effective routes before benchmarking: legacy NzbDav's WebDAV
+  URL/port and InfiniDysk's WebDAV URL/port, plus whether each rclone path reaches
+  a backend directly or a frontend proxy. If InfiniDysk still uses frontend port
+  3004, label its throughput diagnostic and do not claim backend performance.
+- [ ] Run the host CLI `benchmark-links` for the six approved paths using paired
+  roots `/mnt/plex` and `/mnt/plex2`, an 8 MiB read after seeks at 10%, 50%, and
+  90%, a 128 MiB sequential throughput window, and explicit per-operation timeout.
+  Run the first-pass and repeat-pass matrices without clearing caches or restarting
+  services.
+- [ ] Preserve both `/opt/infinidysk-migration/reports/canary-performance/performance-results.json`
+  and `/opt/infinidysk-migration/reports/canary-performance/performance-results.md`.
+  Review the actual values for every file and both sources; failed or timed-out
+  rows remain visible. Account for route, provider, cache-state, or representation
+  differences before interpreting a regression.
+- [ ] Manually test representative direct, RAR/multipart, large, first-pass,
+  repeat-pass, and 4K cases without adding `/mnt/plex2` to Plex. Record playback
+  method, timestamps, seek points, and outcome separately from the automated table.
 - [ ] Recheck legacy NzbDav health, mount readability, and restart counts against the before snapshot. Account for every difference.
-- [ ] Accept phase one only if 20–50 links exist, every intended link has an exact mapping, all failures/exclusions are explained, and no production-library/Plex/Arr mutation occurred.
+- [ ] Accept phase one only if 20–50 links exist, every intended link has an exact
+  mapping, all bounded reads and seeks complete, the report contains actual results
+  for all six paired files, all failures/exclusions are explained, and no
+  production-library/Plex/Arr mutation occurred. Defer performance conclusions
+  when the routes or cache states are not comparable.
 
 ### Task 18: Roll back or retain the isolated canary
 
@@ -507,5 +572,8 @@ This phase is a separate, explicitly approved production operation after the imp
 - Migration scan report, category map, run ID, submission outcomes, and correlation report.
 - Canary link plan, apply journal, and their checksums.
 - Per-leaf automated validation report and representative manual playback notes.
+- Raw six-file `performance-results.json` and the rendered
+  `performance-results.md` table containing actual legacy and InfiniDysk throughput
+  and seek measurements, including all failures/timeouts and route/cache metadata.
 - Before/after legacy service health, mount readability, and restart counts.
 - Proof that `/mnt/plex` was unchanged and `/mnt/plex2` was never registered with Plex or Arr.

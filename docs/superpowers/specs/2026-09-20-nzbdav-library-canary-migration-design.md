@@ -41,6 +41,13 @@ Select approximately 12–20 releases producing 20–50 media leaves. The exact 
 
 Known-broken, missing-article, quarantined, or currently repairing items are excluded from the success canary and listed separately as negative-test candidates.
 
+Six of the successful leaves form a reviewed performance subset. Reuse the same
+library-relative path on `/mnt/plex` and `/mnt/plex2` so every measurement compares
+the legacy and InfiniDysk representations of the same media. The subset must cover
+direct NZB and RAR/multipart media, HD and 4K, and at least one large file. Record
+the exact six paths in a benchmark-selection artifact rather than selecting files
+randomly at run time.
+
 ## Architecture
 
 ### 1. Read-only legacy exporter
@@ -132,7 +139,21 @@ article identity + exact size correlation → reviewed exact mappings
 - Link target exists on the InfiniDysk mount.
 - `stat`, WebDAV HEAD, and beginning/middle/end range reads succeed.
 - A bounded `ffprobe` succeeds for media formats it supports.
-- Representative large/4K files pass seek and sustained-read probes.
+- The six-file performance subset is tested side-by-side through
+  `/mnt/plex/<relative-path>` and `/mnt/plex2/<relative-path>`.
+- Each side records three bounded seeks at approximately 10%, 50%, and 90% of
+  the file and a bounded sequential read of `min(128 MiB, file size)`. Record time
+  to first byte,
+  seek/read completion latency, sustained MiB/s, bytes read, timeout/error, exact
+  file identity and size, source mount, WebDAV route/port, and timestamp.
+- Run a first-pass and repeat-pass matrix. Label a result `observed-cold` or
+  `observed-warm` only when cache inspection proves that state; otherwise use
+  `cache-state-unknown-first-pass` or `cache-state-unknown-repeat-pass`. Do not
+  drop host caches or purge either rclone cache for the canary.
+- Store raw machine-readable results and a human-readable table containing the
+  actual legacy and InfiniDysk numbers for all six files. Results obtained while
+  InfiniDysk rclone still uses frontend port 3004 are diagnostic and cannot be
+  called backend-throughput acceptance evidence.
 - Manual playback is recorded separately from automated acceptance.
 
 ### Phase-one acceptance
@@ -141,6 +162,10 @@ article identity + exact size correlation → reviewed exact mappings
 - No writes under `/mnt/plex` and no Plex/Arr configuration changes.
 - Existing NzbDav health, mount readability, and container restart counts remain unchanged.
 - Every failure or exclusion is accounted for in the canary report.
+- The canary report contains the six-file throughput and seek comparison with no
+  omitted, timed-out, or relabelled measurements. Functional canary success
+  requires every bounded read and seek to complete; performance conclusions are
+  deferred when route or cache state is not comparable.
 
 ## Rollback
 
