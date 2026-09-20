@@ -39,21 +39,19 @@ describe("native cache folder editor", () => {
   beforeEach(() =>
     vi.stubGlobal(
       "fetch",
-      vi
-        .fn()
-        .mockResolvedValue(
-          new Response(
-            JSON.stringify({
-              activeMode: "segment",
-              configuredMode: "segment",
-              restartRequired: false,
-              reservedBufferBytes: 0,
-              folders: [],
-              jobs: [],
-            }),
-            { status: 200 },
-          ),
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            activeMode: "segment",
+            configuredMode: "segment",
+            restartRequired: false,
+            reservedBufferBytes: 0,
+            folders: [],
+            jobs: [],
+          }),
+          { status: 200 },
         ),
+      ),
     ),
   );
   afterEach(() => {
@@ -127,51 +125,49 @@ describe("native cache folder editor", () => {
 
   it("browses bounded cache pages and pins media without changing folder configuration", async () => {
     const key = "a".repeat(64);
-    const fetcher = vi
-      .fn()
-      .mockImplementation((url: string) =>
-        Promise.resolve(
-          new Response(
-            JSON.stringify(
-              url.includes("/entries")
-                ? {
-                    entries: [
+    const fetcher = vi.fn().mockImplementation((url: string) =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify(
+            url.includes("/entries")
+              ? {
+                  entries: [
+                    {
+                      key,
+                      itemId: "movie",
+                      name: "Episode 1",
+                      generation: "source-revision",
+                      length: 100,
+                      verifiedBytes: 100,
+                      allocatedBytes: 128,
+                      pinned: false,
+                    },
+                  ],
+                  nextAfter: null,
+                }
+              : url.includes("/ranges")
+                ? { ranges: [{ offset: 0, count: 100 }], nextAfter: null }
+                : {
+                    activeMode: "native",
+                    configuredMode: "native",
+                    restartRequired: false,
+                    reservedBufferBytes: 0,
+                    folders: [
                       {
-                        key,
-                        itemId: "movie",
-                        name: "Episode 1",
-                        generation: "source-revision",
-                        length: 100,
-                        verifiedBytes: 100,
-                        allocatedBytes: 128,
-                        pinned: false,
+                        id: "disk",
+                        online: true,
+                        writable: true,
+                        committedBytes: 128,
+                        entries: 1,
                       },
                     ],
-                    nextAfter: null,
-                  }
-                : url.includes("/ranges")
-                  ? { ranges: [{ offset: 0, count: 100 }], nextAfter: null }
-                  : {
-                      activeMode: "native",
-                      configuredMode: "native",
-                      restartRequired: false,
-                      reservedBufferBytes: 0,
-                      folders: [
-                        {
-                          id: "disk",
-                          online: true,
-                          writable: true,
-                          committedBytes: 128,
-                          entries: 1,
-                        },
-                      ],
-                      jobs: [],
-                    },
-            ),
-            { status: 200 },
+                    jobs: [],
+                  },
           ),
+          { status: 200 },
         ),
-      );
+      ),
+    );
     vi.stubGlobal("fetch", fetcher);
     render(<Harness native />);
     await waitFor(() => expect(screen.getByText(/Online, writable/)).toBeTruthy());

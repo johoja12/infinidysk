@@ -138,9 +138,13 @@ describe("authentication sessions", () => {
     const owner = await authentication.getPlexOwnerSession(authenticatedRequest);
     expect(owner).toBeTruthy();
     const second = await authentication.setSessionUser(new Request("http://localhost/"), "alice");
-    expect(await authentication.getPlexOwnerSession(new Request("http://localhost/", {
-      headers: { Cookie: getSetCookie(second) },
-    }))).not.toBe(owner);
+    expect(
+      await authentication.getPlexOwnerSession(
+        new Request("http://localhost/", {
+          headers: { Cookie: getSetCookie(second) },
+        }),
+      ),
+    ).not.toBe(owner);
 
     const logoutResult = await authentication.logout(authenticatedRequest);
     const loggedOutCookie = getSetCookie(logoutResult);
