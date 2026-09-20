@@ -406,8 +406,12 @@ public sealed partial class Program
                 .AddSingleton<DatabaseBackupStore>()
                 .AddSingleton<NzbWebDAV.UsenetMigration.UsenetMigrationStore>()
                 .AddSingleton<NzbWebDAV.UsenetMigration.Runner.AltmountScanRunner>()
+                .AddSingleton<NzbWebDAV.UsenetMigration.Source.NzbDavPackageReader>()
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.NzbDavScanRunner>()
                 .AddSingleton<NzbWebDAV.UsenetMigration.Runner.IUsenetMigrationScanRunner>(sp =>
                     sp.GetRequiredService<NzbWebDAV.UsenetMigration.Runner.AltmountScanRunner>())
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.IUsenetMigrationScanRunner>(sp =>
+                    sp.GetRequiredService<NzbWebDAV.UsenetMigration.Runner.NzbDavScanRunner>())
                 .AddSingleton<NzbWebDAV.UsenetMigration.Runner.MigrationScanDispatcher>()
                 .AddSingleton<NzbWebDAV.UsenetMigration.Runner.UsenetMigrationRunner>()
                 .AddHostedService(sp => sp.GetRequiredService<NzbWebDAV.UsenetMigration.Runner.UsenetMigrationRunner>())
