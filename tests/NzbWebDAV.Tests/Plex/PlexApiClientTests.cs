@@ -7,6 +7,41 @@ namespace NzbWebDAV.Tests.Plex;
 public sealed class PlexApiClientTests
 {
     [Fact]
+    public async Task SourcePreview_HonorsConfiguredLimitsAboveTwoHundred()
+    {
+        var items = string.Concat(Enumerable.Range(0, 100).Select(index => $"<Video ratingKey='{index}' type='movie' title='Film'/>"));
+        using var handler = new FakePlexHandler(_ => Xml($"<MediaContainer totalSize='1000'>{items}</MediaContainer>"));
+        var api = new PlexApiClient(new HttpClient(handler), "installation");
+        Assert.Equal(250, (await api.GetPreviewAsync(Server(), "/hubs/home/recentlyAdded", 250)).Count);
+    }
+
+    [Fact]
+    public async Task CataloguePagination_OnlyProjectsDirectContainerItems()
+    {
+        var nested = string.Concat(Enumerable.Repeat("<Directory key='1' type='movie' title='Nested'>", 100))
+            + string.Concat(Enumerable.Repeat("</Directory>", 100));
+        using var handler = new FakePlexHandler(_ => Xml($"<MediaContainer>{nested}</MediaContainer>"));
+        var api = new PlexApiClient(new HttpClient(handler), "installation");
+        Assert.Single(await api.GetLibrariesAsync(Server()));
+    }
+
+    [Fact]
+    public async Task CatalogueProjection_RejectsOversizedTitle()
+    {
+        using var handler = new FakePlexHandler(_ => Xml($"<MediaContainer><Directory key='1' type='movie' title='{new string('x', 8192)}'/></MediaContainer>"));
+        var api = new PlexApiClient(new HttpClient(handler), "installation");
+        await Assert.ThrowsAsync<PlexRequestException>(() => api.GetLibrariesAsync(Server()));
+    }
+
+    [Fact]
+    public async Task Pagination_BoundsAggregateXmlBytes()
+    {
+        using var handler = new FakePlexHandler(_ => Xml($"<MediaContainer totalSize='2'><Directory key='1' type='movie' title='Movie'/><!--{new string('x', 2200000)}--></MediaContainer>"));
+        var api = new PlexApiClient(new HttpClient(handler), "installation");
+        await Assert.ThrowsAsync<PlexRequestException>(() => api.GetLibrariesAsync(Server()));
+    }
+
+    [Fact]
     public async Task Metadata_RejectsDifferentRatingKeyRatherThanEnrichingWrongItem()
     {
         using var handler = new FakePlexHandler(_ => Xml("""<MediaContainer><Video ratingKey="other" type="movie"/></MediaContainer>"""));

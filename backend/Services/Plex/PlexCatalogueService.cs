@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 
 namespace NzbWebDAV.Services.Plex;
 
@@ -10,6 +11,10 @@ public sealed class PlexCatalogueService(PlexApiClient api, TimeProvider clock)
 {
     private readonly object _gate = new();
     private readonly Dictionary<string, object> _entries = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, int> _weights = new(StringComparer.Ordinal);
+    private const int MaximumSnapshotBytes = 256 * 1024;
+    private const int MaximumRetainedBytes = 8 * 1024 * 1024;
+    private int _retainedBytes;
 
     public Task<PlexSnapshot<PlexLibrary>> GetLibrariesAsync(PlexServer server, bool forceRefresh = false, CancellationToken ct = default) =>
         GetAsync(server, "libraries", forceRefresh, token => api.GetLibrariesAsync(server, token), ct);
@@ -29,7 +34,7 @@ public sealed class PlexCatalogueService(PlexApiClient api, TimeProvider clock)
         {
             if (!_entries.TryGetValue(key, out var value))
             {
-                if (_entries.Count >= 128) _entries.Remove(_entries.Keys.First());
+                if (_entries.Count >= 128) Remove(_entries.Keys.First());
                 _entries[key] = value = new Entry<T>();
             }
             entry = (Entry<T>)value;
@@ -44,6 +49,21 @@ public sealed class PlexCatalogueService(PlexApiClient api, TimeProvider clock)
             try
             {
                 var data = await fetch(ct).ConfigureAwait(false);
+                var weight = JsonSerializer.SerializeToUtf8Bytes(data).Length;
+                if (weight > MaximumSnapshotBytes)
+                    throw new PlexRequestException("Plex catalogue snapshot exceeded the size limit.");
+                lock (_gate)
+                {
+                    // An entry evicted during its network request remains request-local.
+                    if (_entries.TryGetValue(key, out var retained) && ReferenceEquals(retained, entry))
+                    {
+                        _retainedBytes -= _weights.GetValueOrDefault(key);
+                        _weights[key] = weight;
+                        _retainedBytes += weight;
+                        while (_retainedBytes > MaximumRetainedBytes)
+                            Remove(_entries.Keys.First(candidate => candidate != key));
+                    }
+                }
                 entry.Snapshot = new(data, clock.GetUtcNow(), false, null);
                 entry.NextRefresh = clock.GetUtcNow().AddMinutes(1);
                 entry.RetryAfter = DateTimeOffset.MinValue;
@@ -57,6 +77,13 @@ public sealed class PlexCatalogueService(PlexApiClient api, TimeProvider clock)
             return entry.Snapshot;
         }
         finally { entry.Refresh.Release(); }
+    }
+
+    // Caller holds _gate. Budgets measure UTF-8 projection weight, not CLR object overhead.
+    private void Remove(string key)
+    {
+        _entries.Remove(key);
+        if (_weights.Remove(key, out var weight)) _retainedBytes -= weight;
     }
 
     private sealed class Entry<T>

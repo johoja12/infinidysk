@@ -145,7 +145,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
     public async Task<IReadOnlyList<PlexMediaItem>> GetPreviewAsync(PlexServer server, string key, int limit, CancellationToken ct = default)
     {
         ValidateSourceKey(key);
-        return (await ReadPagesAsync(server, key, Math.Clamp(limit, 1, 200), ["Video", "Directory"], ct).ConfigureAwait(false))
+        return (await ReadPagesAsync(server, key, Math.Clamp(limit, 1, 1000), ["Video", "Directory"], ct).ConfigureAwait(false))
             .Select(ParseMedia).ToArray();
     }
 
@@ -168,13 +168,24 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
     {
         var result = new List<XElement>();
         var start = 0;
+        var remainingBytes = MaximumResponseBytes;
         for (var page = 0; page < MaximumPages && result.Count < limit; page++)
         {
             var size = Math.Min(100, limit - result.Count);
             var separator = path.Contains('?') ? '&' : '?';
-            var document = await GetXmlAsync(server, $"{path}{separator}X-Plex-Container-Start={start}&X-Plex-Container-Size={size}", ct).ConfigureAwait(false);
-            var items = document.Root?.Descendants().Where(item => elementNames.Contains(item.Name.LocalName)).ToArray() ?? [];
-            result.AddRange(items.Take(limit - result.Count));
+            var document = await GetXmlAsync(server, $"{path}{separator}X-Plex-Container-Start={start}&X-Plex-Container-Size={size}", ct,
+                bytes =>
+                {
+                    remainingBytes -= bytes;
+                    if (remainingBytes < 0) throw new PlexRequestException("Plex catalogue exceeded the aggregate response limit.");
+                }).ConfigureAwait(false);
+            var roots = document.Root?.Elements().ToArray() ?? [];
+            var items = roots.Where(item => elementNames.Contains(item.Name.LocalName))
+                .Concat(roots.Where(item => item.Name.LocalName == "Hub" && !elementNames.Contains("Hub"))
+                    .SelectMany(hub => hub.Elements().Where(item => elementNames.Contains(item.Name.LocalName))))
+                .ToArray();
+            // Do not retain the document and unrelated siblings through each element's parent.
+            result.AddRange(items.Take(limit - result.Count).Select(item => new XElement(item)));
             if (items.Length == 0) break;
             start += items.Length;
             var total = Long(document.Root, "totalSize");
@@ -183,7 +194,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
         return result;
     }
 
-    private async Task<XDocument> GetXmlAsync(PlexServer server, string path, CancellationToken ct)
+    private async Task<XDocument> GetXmlAsync(PlexServer server, string path, CancellationToken ct, Action<int>? consumeBytes = null)
     {
         var root = PlexSettings.ValidateServerUri(server.Url);
         if (!path.StartsWith('/') || path.StartsWith("//", StringComparison.Ordinal)) throw new ArgumentException("Invalid Plex resource path.");
@@ -193,6 +204,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
         request.Headers.Accept.Clear();
         request.Headers.Accept.ParseAdd("application/xml");
         var bytes = await SendAsync(request, ct).ConfigureAwait(false);
+        consumeBytes?.Invoke(bytes.Length);
         try
         {
             using var stream = new MemoryStream(bytes);
@@ -281,7 +293,12 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
     private static string? Text(JsonElement item, string name) => item.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
     private static string? ScalarText(JsonElement item, string name) => item.TryGetProperty(name, out var value) && value.ValueKind is JsonValueKind.String or JsonValueKind.Number ? value.ToString() : null;
     private static bool Boolean(JsonElement item, string name) => item.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;
-    private static string? Attribute(XElement? item, string name) => item?.Attribute(name)?.Value;
+    private static string? Attribute(XElement? item, string name)
+    {
+        var value = item?.Attribute(name)?.Value;
+        if (value?.Length > 4096) throw new PlexRequestException("Plex returned an oversized metadata field.");
+        return value;
+    }
     private static long? Long(XElement? item, string name) => long.TryParse(Attribute(item, name), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : null;
     private static int? Integer(XElement item, string name) => int.TryParse(Attribute(item, name), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : null;
     private static PlexMediaItem ParseMedia(XElement item)
