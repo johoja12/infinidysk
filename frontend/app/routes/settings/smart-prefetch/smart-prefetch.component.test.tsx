@@ -6,19 +6,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ManagedEnvProvider } from "~/components/ui";
 import { publishPlexServers } from "../plex/plex-api";
 import { SmartPrefetchSettings } from "./smart-prefetch";
-import {
-  PREFETCH_KEY,
-  parsePrefetchSettings,
-  type PrefetchSettings,
-} from "./smart-prefetch-model";
+import { PREFETCH_KEY, parsePrefetchSettings, type PrefetchSettings } from "./smart-prefetch-model";
 
-function Harness({
-  managed = false,
-  initial,
-}: {
-  managed?: boolean;
-  initial?: PrefetchSettings;
-}) {
+function Harness({ managed = false, initial }: { managed?: boolean; initial?: PrefetchSettings }) {
   const [config, setConfig] = useState<Record<string, string>>(
     initial ? { [PREFETCH_KEY]: JSON.stringify(initial) } : {},
   );

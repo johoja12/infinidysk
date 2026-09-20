@@ -130,7 +130,10 @@ export function SmartPrefetchPolicyControls({
             suffix="GB/day"
             value={bytesToDecimalGb(settings.DailyByteBudget)}
             onChange={(event) =>
-              onChange({ ...settings, DailyByteBudget: decimalGbToBytes(Number(event.target.value)) })
+              onChange({
+                ...settings,
+                DailyByteBudget: decimalGbToBytes(Number(event.target.value)),
+              })
             }
           />
           <small className="block text-xs text-base-content/50">
