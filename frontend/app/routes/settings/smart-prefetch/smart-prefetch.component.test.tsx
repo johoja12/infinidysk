@@ -121,6 +121,21 @@ afterEach(() => {
 });
 
 describe("Smart Prefetch settings", () => {
+  it("shows essential policy choices and keeps expert controls in a collapsed disclosure", async () => {
+    vi.stubGlobal("fetch", fakeApi());
+    render(<Harness />);
+    expect(screen.getByLabelText("Enable Smart Prefetch")).toBeTruthy();
+    expect(screen.getByLabelText("Warm movies")).toBeTruthy();
+    expect(screen.getByLabelText("Warm TV episodes")).toBeTruthy();
+    expect(screen.getByLabelText("Daily download budget (GB/day)")).toBeTruthy();
+    expect(screen.getByText("Smart defaults")).toBeTruthy();
+    const details = screen.getByText("Advanced settings").closest("details");
+    expect(details?.open).toBe(false);
+    expect(details?.contains(screen.getByLabelText("Episodes to queue ahead"))).toBe(true);
+    await userEvent.click(screen.getByText("Advanced settings"));
+    expect(details?.open).toBe(true);
+  });
+
   it("clears a selected source server when a refresh removes it", async () => {
     vi.stubGlobal("fetch", fakeApi());
     render(<Harness />);
@@ -166,6 +181,7 @@ describe("Smart Prefetch settings", () => {
     vi.stubGlobal("fetch", fakeApi());
     render(<Harness />);
     await userEvent.click(screen.getByLabelText("Enable Smart Prefetch"));
+    await userEvent.click(screen.getByText("Advanced settings"));
     await userEvent.clear(screen.getByLabelText("Episodes to queue ahead"));
     await userEvent.type(screen.getByLabelText("Episodes to queue ahead"), "3");
     await waitFor(() => expect(screen.getByRole("option", { name: "Home" })).toBeTruthy());

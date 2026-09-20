@@ -1,44 +1,14 @@
 import type { Dispatch, SetStateAction } from "react";
-import { Alert, Input, ManagedSetting, SettingsCard, Toggle } from "~/components/ui";
+import { Alert, ManagedSetting, SettingsCard } from "~/components/ui";
 import { PlexSources } from "./plex-sources";
 import { PrefetchQueue } from "./prefetch-queue";
 import {
   PREFETCH_KEY,
-  numericFields,
   parsePrefetchSettings,
   validatePrefetchSettings,
   type PrefetchSettings,
 } from "./smart-prefetch-model";
-
-const toggles: {
-  key: keyof Pick<
-    PrefetchSettings,
-    | "Enabled"
-    | "HistoryEnabled"
-    | "RealtimeEnabled"
-    | "ReadActivityEnabled"
-    | "PredictionsEnabled"
-    | "MinimumWarmEnabled"
-    | "FullFileWarming"
-    | "MovieEnabled"
-    | "TvEnabled"
-    | "WarmLocalFiles"
-    | "PauseDuringPlayback"
-  >;
-  label: string;
-}[] = [
-  { key: "Enabled", label: "Enable Smart Prefetch" },
-  { key: "HistoryEnabled", label: "Use Plex watch history" },
-  { key: "RealtimeEnabled", label: "Use verified Plex playback" },
-  { key: "ReadActivityEnabled", label: "Use raw read-activity signals" },
-  { key: "PredictionsEnabled", label: "Predict upcoming episodes" },
-  { key: "MinimumWarmEnabled", label: "Warm minimum head and tail ranges" },
-  { key: "FullFileWarming", label: "Warm full files" },
-  { key: "MovieEnabled", label: "Warm movies" },
-  { key: "TvEnabled", label: "Warm TV episodes" },
-  { key: "WarmLocalFiles", label: "Allow mapped local library files" },
-  { key: "PauseDuringPlayback", label: "Pause background warming during playback" },
-];
+import { SmartPrefetchPolicyControls } from "./smart-prefetch-policy-controls";
 export function SmartPrefetchSettings({
   config,
   setNewConfig,
@@ -65,49 +35,14 @@ export function SmartPrefetchSettings({
           <SettingsCard
             icon="auto_awesome"
             title="Smart Prefetch policies"
-            description="Advanced and off by default; daily provider-payload budget defaults to 10 GB. Save Native cache settings and restart before enabling. Apply verifies a writable folder; disable Smart Prefetch before changing cache mode or folders. Queue actions below act immediately."
+            description="Off by default. Start with fixed, safe policy defaults; expand Advanced only when you need to tune scheduling, predictions, or provider work. Save Native cache settings and restart before enabling."
           >
-            <div className="grid gap-3 md:grid-cols-2">
-              {toggles.map((toggle) => (
-                <Toggle
-                  key={toggle.key}
-                  label={toggle.label}
-                  checked={settings[toggle.key]}
-                  onChange={(event) => update({ ...settings, [toggle.key]: event.target.checked })}
-                />
-              ))}
-            </div>
+            <SmartPrefetchPolicyControls settings={settings} onChange={update} />
             <p className="text-xs text-base-content/60">
               Raw read activity is not verified Plex playback. Local-library eligibility still
               requires a symlink or STRM path that resolves to an imported DAV file; regular local
-              files are skipped. It never starts a filesystem scan or another downloader. All
-              warming stays below foreground playback admission.
-            </p>
-            <div className="grid gap-3 md:grid-cols-2">
-              {numericFields.map((field) => (
-                <label key={field.key}>
-                  {field.label}
-                  <Input
-                    aria-label={field.label}
-                    type="number"
-                    min={field.min}
-                    max={field.max}
-                    step={field.step ?? 1}
-                    value={settings[field.key]}
-                    onChange={(event) =>
-                      update({ ...settings, [field.key]: Number(event.target.value) })
-                    }
-                  />
-                  <small className="block text-xs text-base-content/50">
-                    {field.min.toLocaleString()}–{field.max.toLocaleString()}
-                  </small>
-                </label>
-              ))}
-            </div>
-            <p className="text-xs">
-              Connection and concurrency caps do not create extra provider capacity. Daily bytes
-              include attempted provider work; cached hits do not consume the speculative budget.
-              Saving a disabled trigger retires work owned only by that trigger.
+              files are skipped. Connection and concurrency caps do not create extra provider
+              capacity, and all warming remains below foreground playback admission.
             </p>
           </SettingsCard>
           <div className="mt-5">
