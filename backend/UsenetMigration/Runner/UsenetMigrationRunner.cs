@@ -56,7 +56,8 @@ public sealed class UsenetMigrationRunner : BackgroundService
             queueManager,
             configManager,
             websocketManager,
-            CreateDefaultScanDispatcher(store, configManager))
+            CreateDefaultScanDispatcher(store, configManager),
+            CreateDefaultPayloadDispatcher())
     {
     }
 
@@ -66,12 +67,25 @@ public sealed class UsenetMigrationRunner : BackgroundService
         ConfigManager configManager,
         WebsocketManager websocketManager,
         MigrationScanDispatcher scanDispatcher)
+        : this(store, queueManager, configManager, websocketManager, scanDispatcher,
+            CreateDefaultPayloadDispatcher())
+    {
+    }
+
+    public UsenetMigrationRunner(
+        UsenetMigrationStore store,
+        QueueManager queueManager,
+        ConfigManager configManager,
+        WebsocketManager websocketManager,
+        MigrationScanDispatcher scanDispatcher,
+        MigrationPayloadBuilderDispatcher payloadBuilderDispatcher)
     {
         _store = store;
         _configManager = configManager;
         _scanDispatcher = scanDispatcher;
         _altmountScanRunner = scanDispatcher.Resolve(MigrationSourceTypes.Altmount) as AltmountScanRunner;
-        _workerPool = new SubmissionWorkerPool(store, queueManager, configManager, websocketManager);
+        _workerPool = new SubmissionWorkerPool(
+            store, queueManager, configManager, websocketManager, payloadBuilderDispatcher);
         _reconciler = new SubmissionReconciler(store);
         _symlinkPlanner = new SymlinkPlanner(store, configManager);
         _symlinkRewriter = new SymlinkRewriter(store, configManager);
@@ -357,6 +371,16 @@ public sealed class UsenetMigrationRunner : BackgroundService
     {
         IUsenetMigrationScanRunner[] scanners = [new AltmountScanRunner(store, configManager)];
         return new MigrationScanDispatcher(scanners);
+    }
+
+    private static MigrationPayloadBuilderDispatcher CreateDefaultPayloadDispatcher()
+    {
+        IMigrationPayloadBuilder[] builders =
+        [
+            new AltmountPayloadBuilder(),
+            new NzbDavPayloadBuilder(new Source.NzbDavPackageReader()),
+        ];
+        return new MigrationPayloadBuilderDispatcher(builders);
     }
 
     private async Task RunTickAsync(CancellationToken ct)
