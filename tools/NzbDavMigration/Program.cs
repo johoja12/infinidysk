@@ -20,7 +20,7 @@ internal static class NzbDavMigrationProgram
     {
         if (args.Length == 0 || args[0] is "-h" or "--help")
         {
-            await Console.Error.WriteLineAsync("Usage: NzbDavMigration inventory --library-root PATH --output FILE");
+            await Console.Error.WriteLineAsync("Usage: NzbDavMigration inventory --library-root PATH --blob-root PATH --output FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration export --selection FILE --inventory FILE --blob-root PATH --output DIR --package-id ID");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --library-root PATH --target-root PATH [--journal FILE]");
             await Console.Error.WriteLineAsync("       NzbDavMigration rollback-links --journal FILE");
@@ -116,7 +116,7 @@ internal static class NzbDavMigrationProgram
             .ConfigureAwait(false);
         var resolver = new LegacyBlobResolver(blobRoot);
         var report = new LibraryInventoryService().Enrich(links, rows.Items, resolver);
-        await using var stream = new FileStream(output, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        await using var stream = CanaryPackageWriter.CreatePrivateFile(output);
         await JsonSerializer.SerializeAsync(stream, report, ReportJsonOptions)
             .ConfigureAwait(false);
         await stream.FlushAsync().ConfigureAwait(false);
@@ -144,7 +144,9 @@ internal static class NzbDavMigrationProgram
                 candidate.LibraryRelativePath == item.LibraryRelativePath
                 && candidate.LegacyDavItemId == item.LegacyDavItemId))
             .ToArray();
-        var rejected = selected.Where(candidate => !candidate.Status.StartsWith("candidate", StringComparison.Ordinal))
+        var rejected = selected.Where(candidate => candidate.Status != "candidate"
+            || candidate.Item?.HistoryItemId is null || candidate.Item.NzbBlobId is null
+            || candidate.Item.ResolutionExclusion is not null)
             .ToArray();
         if (rejected.Length > 0)
             throw new InvalidDataException($"Selection contains {rejected.Length} excluded inventory candidates.");
@@ -154,13 +156,17 @@ internal static class NzbDavMigrationProgram
         var releases = new List<CanaryExportRelease>();
         foreach (var group in selected.GroupBy(candidate => candidate.Item!.NzbBlobId!.Value).OrderBy(group => group.Key))
         {
-            var nzb = await resolver.ReadNzbAsync(group.Key).ConfigureAwait(false);
+            var retained = group.Select(candidate => candidate.Item!.NzbContents)
+                .Where(contents => !string.IsNullOrWhiteSpace(contents)).Distinct(StringComparer.Ordinal).ToArray();
+            if (retained.Length > 1)
+                throw new InvalidDataException("Selected release has inconsistent retained history NZBs; refresh inventory.");
+            var nzb = await resolver.ReadNzbAsync(group.Key, retained.SingleOrDefault()).ConfigureAwait(false);
             var sourceReleaseId = group.Key.ToString();
             var leaves = group.Select(candidate => extractor.Extract(candidate.Item!, nzb.Document, sourceReleaseId))
                 .ToArray();
             if (leaves.Any(leaf => !string.Equals(leaf.ExtractionStatus, "ready", StringComparison.Ordinal)))
                 throw new InvalidDataException($"Release {sourceReleaseId} contains selected leaves without strong identity.");
-            releases.Add(new CanaryExportRelease(sourceReleaseId, group.Key, nzb.Path, leaves));
+            releases.Add(new CanaryExportRelease(sourceReleaseId, group.Key, nzb.Path, leaves, nzb.Bytes));
         }
 
         var selectedLinks = selected.Select(candidate => new NzbDavSelectedLibraryLink(
@@ -173,7 +179,7 @@ internal static class NzbDavMigrationProgram
     private static async Task<T?> ReadJsonAsync<T>(string path)
     {
         await using var stream = File.OpenRead(path);
-        return await JsonSerializer.DeserializeAsync<T>(stream).ConfigureAwait(false);
+        return await JsonSerializer.DeserializeAsync<T>(stream, ReportJsonOptions).ConfigureAwait(false);
     }
 
     private static async Task WriteJsonCreateNewAsync<T>(string path, T value)

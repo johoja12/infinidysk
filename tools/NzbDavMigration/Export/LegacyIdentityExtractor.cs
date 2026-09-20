@@ -35,7 +35,7 @@ public sealed class LegacyIdentityExtractor
         }
         catch (Exception exception) when (exception is JsonException or InvalidDataException or KeyNotFoundException)
         {
-            return Excluded(row, sourceReleaseId, $"identity-unavailable: {exception.Message}");
+            return Excluded(row, sourceReleaseId, "identity-unavailable: invalid or unmatched article metadata");
         }
     }
 
@@ -60,7 +60,7 @@ public sealed class LegacyIdentityExtractor
         _ = ResolveSegments(contributingIds, document);
         var releaseSegments = document.Files.Select(file => file.Segments.Select(ToIdentitySegment));
         var releaseDigest = NzbDavArticleIdentity.ComputeRelease(releaseSegments);
-        var innerPath = NormalizeArchivePath(row.Path, row.HistoryJobName);
+        var innerPath = NormalizeArchivePath(row.Path, row.ReleaseRootPath);
         return Ready(row, sourceReleaseId, NzbDavArticleIdentity.ArchiveMemberKind,
             NzbDavArticleIdentity.ComputeArchiveMember(releaseDigest, innerPath, row.FileSize!.Value));
     }
@@ -83,12 +83,14 @@ public sealed class LegacyIdentityExtractor
         IEnumerable<string> ids,
         NzbDocument document)
     {
-        var index = document.Files.SelectMany(file => file.Segments)
-            .GroupBy(segment => NormalizeMessageId(segment.MessageId), StringComparer.Ordinal)
-            .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
+        var groups = document.Files.SelectMany(file => file.Segments)
+            .GroupBy(segment => NormalizeMessageId(segment.MessageId), StringComparer.Ordinal).ToArray();
+        if (groups.Any(group => group.Count() != 1))
+            throw new InvalidDataException("Source NZB contains duplicate article IDs.");
+        var index = groups.ToDictionary(group => group.Key, group => group.Single(), StringComparer.Ordinal);
         var resolved = ids.Select(id => index.TryGetValue(NormalizeMessageId(id), out var segment)
                 ? ToIdentitySegment(segment)
-                : throw new KeyNotFoundException($"Article '{id}' is absent from the source NZB."))
+                : throw new KeyNotFoundException("An article is absent from the source NZB."))
             .ToArray();
         if (resolved.Length == 0)
             throw new InvalidDataException("Article metadata is empty.");
@@ -100,15 +102,18 @@ public sealed class LegacyIdentityExtractor
     private static NzbDavArticleSegment ToIdentitySegment(NzbSegment segment) =>
         new(segment.Number, segment.Bytes, segment.MessageId);
 
-    private static string NormalizeArchivePath(string path, string? jobName)
+    private static string NormalizeArchivePath(string path, string? releaseRoot)
     {
-        var normalized = path.Replace('\\', '/').TrimStart('/');
-        if (normalized.StartsWith("content/", StringComparison.Ordinal))
-            normalized = normalized["content/".Length..];
-        if (!string.IsNullOrWhiteSpace(jobName)
-            && normalized.StartsWith(jobName + "/", StringComparison.Ordinal))
-            normalized = normalized[(jobName.Length + 1)..];
-        return normalized;
+        var normalized = path.Replace('\\', '/');
+        if (string.IsNullOrWhiteSpace(releaseRoot))
+            throw new InvalidDataException("Release directory ancestry is missing.");
+        var prefix = releaseRoot.Replace('\\', '/').TrimEnd('/') + "/";
+        if (!normalized.StartsWith(prefix, StringComparison.Ordinal))
+            throw new InvalidDataException("File is outside the proven release directory.");
+        var relative = normalized[prefix.Length..];
+        if (relative.Split('/').Any(part => part is "" or "." or ".."))
+            throw new InvalidDataException("Archive member path is invalid.");
+        return relative;
     }
 
     private static NzbDavExportLeaf Ready(
