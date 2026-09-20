@@ -232,9 +232,11 @@ and cutover plan that preserves the existing Plex library paths, metadata and
 watch state. Passing the canary does not authorize bulk import or replacing the
 production symlink tree.
 
-Remove the temporary exporter/import adapter and revoke its legacy database
-access only after the full library has been reconciled, unresolved records have
-reviewed dispositions, and playback works independently of legacy NzbDav.
+Keep the temporary exporter/import adapter until the full library has been
+reconciled, unresolved records have reviewed dispositions, and playback works
+independently of legacy NzbDav. Revoke temporary legacy database credentials
+between export batches when not needed; retaining the tool does not require
+leaving its access enabled. Remove the adapter after full acceptance.
 Retain the checksummed packages, mapping reports and journals as private audit
 and recovery evidence. Do not remove shared migration infrastructure needed by
 other import sources, or the permanent native-cache and Plex-prefetch features.
