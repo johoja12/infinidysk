@@ -37,7 +37,8 @@ ghcr.io/infinidysk/infinidysk@sha256:797295beb67ac57e75224bf6354d8be227d8882854c
 - rclone Compose: `/opt/docker/rclone-infinidysk/docker-compose.yml`
 - rclone configuration: `/opt/docker/rclone-infinidysk/config/rclone.conf`
 - Public URL: `https://infin.sakhter.org`
-- Direct LAN URL: `http://192.168.20.65:3004`
+- Frontend LAN URL: `http://192.168.20.65:3004`
+- Backend WebDAV LAN URL: `http://192.168.20.65:8080` (trusted LAN only)
 - Nginx Proxy Manager host: ID `61`, wildcard certificate ID `7`, HTTP backend
   `192.168.20.65:3004`, forced TLS, HTTP/2, WebSockets, and exploit blocking
 
@@ -63,7 +64,7 @@ The Compose project in `/opt/docker/infinidysk` contains two services:
 | Image | pinned InfiniDysk digest above | `postgres:17-alpine` |
 | Container name | `infinidysk` | `infinidysk-postgres` |
 | Restart policy | `unless-stopped` | `unless-stopped` |
-| Published ports | host `3004` to container `3000` | none |
+| Published ports | host `3004` to container `3000`; `192.168.20.65:8080` to container `8080` | none |
 | Persistent bind | `/opt/infinidysk/config:/config` | `/opt/infinidysk/postgres:/var/lib/postgresql/data` |
 | Health check | `curl -fsSL http://localhost:3000/healthz` | `pg_isready -U infinidysk -d infinidysk` |
 | Dependency | waits for PostgreSQL health | none |
@@ -90,6 +91,12 @@ sudo docker compose --env-file secrets/app.env config --quiet
 sudo docker compose --env-file secrets/app.env up -d
 ```
 
+The backend WebDAV port is deliberately published only as
+`192.168.20.65:8080:8080`. Do not replace this with a wildcard (`8080:8080` or
+`0.0.0.0:8080:8080`) mapping and do not add an IPv6 mapping: rclone is the
+only intended direct consumer and stays on the trusted Docker/LAN path. Browser
+and public reverse-proxy traffic continue through frontend port `3004`.
+
 `RESET_ADMIN_PASSWORD` is deliberately absent from the running container. Add it
 only as a temporary one-shot override for the documented recovery flow, then
 recreate from the base Compose file immediately afterward.
@@ -107,7 +114,7 @@ configuration is read-only at `/config`; cache and logs are isolated beneath
 | Image | `sakhter86/rclone:latest` |
 | Compose file | `/opt/docker/rclone-infinidysk/docker-compose.yml` |
 | rclone remote | `infinidysk:` (`webdav`, vendor `other`) |
-| WebDAV target | `http://192.168.20.65:3004` |
+| WebDAV target | `http://192.168.20.65:8080` (trusted LAN backend) |
 | Credentials | protected in `/opt/docker/rclone-infinidysk/config/rclone.conf` |
 | Host mount | `/mnt/remote/infinidysk` |
 | VFS cache | `/opt/docker/rclone-infinidysk/cache`, maximum `10G` |
@@ -119,7 +126,7 @@ The sanitized remote definition is:
 ```ini
 [infinidysk]
 type = webdav
-url = http://192.168.20.65:3004
+url = http://192.168.20.65:8080
 vendor = other
 user = <stored only on host>
 pass = <stored only on host>
@@ -230,6 +237,12 @@ No bulk import, library rewrite, Plex/*Arr switch, or native-cache copy has occu
 # Application and database health
 sudo docker ps --filter name=infinidysk
 curl -fsS http://127.0.0.1:3004/healthz
+
+# The backend must be available only on the trusted LAN address.
+ss -ltn '( sport = :8080 )'
+curl -fsS http://192.168.20.65:8080/health
+# An unauthenticated WebDAV request must remain rejected.
+curl -o /dev/null -sS -w '%{http_code}\n' http://192.168.20.65:8080/view/
 
 # Independent mount and rclone state
 findmnt -T /mnt/remote/infinidysk
