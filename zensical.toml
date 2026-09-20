@@ -60,6 +60,7 @@ nav = [
     { "Queue" = "configuration/queue.md" },
     { "SABnzbd" = "configuration/sabnzbd.md" },
     { "Streaming" = "configuration/streaming.md" },
+    { "Native cache and Smart Prefetch" = "configuration/native-cache-prefetch.md" },
     { "WebDAV" = "configuration/webdav.md" },
     { "URL base (sub-path hosting)" = "configuration/url-base.md" },
     { "Watchdog" = "configuration/watchdog.md" },

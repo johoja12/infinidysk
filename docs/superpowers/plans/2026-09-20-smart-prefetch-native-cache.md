@@ -1,5 +1,9 @@
 # Smart Prefetch and Native Cache Implementation Plan
 
+Implementation status: see the [testing-branch report](../../testing/native-cache-implementation-report.md).
+The original checklists below are retained as planning records; live NAS/Plex and
+soak gates are not implied complete by implementation of their supporting code.
+
 > **For agentic workers:** Use `superpowers:executing-plans` to execute task by
 > task. Use `superpowers:subagent-driven-development` only if parallel agent work
 > is explicitly selected. Checkboxes describe future work, not completed features.
