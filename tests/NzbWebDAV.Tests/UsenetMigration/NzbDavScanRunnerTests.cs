@@ -11,7 +11,50 @@ namespace NzbWebDAV.Tests.UsenetMigration;
 
 public sealed class NzbDavScanRunnerTests : IDisposable
 {
+    private const string StandardNzbDoctype =
+        "<!DOCTYPE nzb PUBLIC \"-//newzBin//DTD NZB 1.1//EN\" \"http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd\">";
     private readonly string _root = Path.Join(Path.GetTempPath(), $"nzbdav-scan-{Guid.NewGuid():N}");
+
+    [Fact]
+    public async Task ScanAsync_AcceptsStandardExternalNzbDoctype()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var package = await CreatePackageAsync(doctype: StandardNzbDoctype);
+        await harness.Store.UpdateSessionAsync(session =>
+        {
+            session.Status = MigrationSessionStatus.Scanning;
+            session.SourceType = MigrationSourceTypes.NzbDav;
+            session.SourcePackageRoot = package;
+        });
+        await harness.Store.SetCategoryMappingAsync("Migration-TV", "migration-tv", "migrate");
+
+        var summary = await new NzbDavScanRunner(harness.Store, new ConfigManager(), new NzbDavPackageReader())
+            .ScanAsync();
+
+        Assert.Equal(1, summary!.GreenCount);
+        Assert.Equal(0, summary.RedCount);
+    }
+
+    [Theory]
+    [InlineData("<!DOCTYPE nzb SYSTEM \"https://example.invalid/not-the-nzb-dtd\">")]
+    [InlineData("<!DOCTYPE nzb [<!ENTITY unused SYSTEM \"file:///etc/passwd\">]>")]
+    [InlineData("<!DOCTYPE nzb PUBLIC \"-//newzBin//DTD NZB 1.1//EN\" \"http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd\" [<!ENTITY unused \"value\">]>")]
+    [InlineData("<!DOCTYPE nzb PUBLIC \"-//newzBin//DTD NZB 1.1//EN\" \"http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd\" [ ]>")]
+    public async Task ScanAsync_RejectsNonstandardAndInternalDoctypes(string doctype)
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var package = await CreatePackageAsync(doctype: doctype);
+        await harness.Store.UpdateSessionAsync(session =>
+        {
+            session.Status = MigrationSessionStatus.Scanning;
+            session.SourceType = MigrationSourceTypes.NzbDav;
+            session.SourcePackageRoot = package;
+        });
+        await harness.Store.SetCategoryMappingAsync("Migration-TV", "migration-tv", "migrate");
+
+        await Assert.ThrowsAnyAsync<System.Xml.XmlException>(() =>
+            new NzbDavScanRunner(harness.Store, new ConfigManager(), new NzbDavPackageReader()).ScanAsync());
+    }
 
     [Fact]
     public async Task ScanAsync_PersistsPackageRowsAndPendingSubmission()
@@ -65,11 +108,13 @@ public sealed class NzbDavScanRunnerTests : IDisposable
         Assert.NotEmpty(db.ScanErrors);
     }
 
-    private async Task<string> CreatePackageAsync(bool excluded = false)
+    private async Task<string> CreatePackageAsync(bool excluded = false, string? doctype = null)
     {
         Directory.CreateDirectory(_root);
         var payload = Path.Join(_root, $"source-{Guid.NewGuid():N}.nzb");
-        await File.WriteAllTextAsync(payload, """
+        await File.WriteAllTextAsync(payload, $$"""
+            <?xml version="1.0" encoding="UTF-8"?>
+            {{doctype ?? ""}}
             <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
               <file subject="sample"><segments><segment bytes="10" number="1">one@test</segment></segments></file>
             </nzb>

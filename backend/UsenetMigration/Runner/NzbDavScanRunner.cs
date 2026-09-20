@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Xml;
 using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database.Models.UsenetMigration;
@@ -179,19 +178,10 @@ public sealed class NzbDavScanRunner(
         string path,
         CancellationToken cancellationToken)
     {
-        var settings = new XmlReaderSettings
-        {
-            Async = true,
-            DtdProcessing = DtdProcessing.Prohibit,
-            XmlResolver = null,
-        };
-        await using (var validation = File.OpenRead(path))
-        using (var reader = XmlReader.Create(validation, settings))
-        {
-            while (await reader.ReadAsync().ConfigureAwait(false))
-                cancellationToken.ThrowIfCancellationRequested();
-        }
         await using var stream = File.OpenRead(path);
+        await NzbXmlSecurity.ValidateAsync(stream, cancellationToken: cancellationToken)
+            .ConfigureAwait(false);
+        stream.Position = 0;
         return await NzbDocument.LoadAsync(stream, cancellationToken).ConfigureAwait(false);
     }
 
