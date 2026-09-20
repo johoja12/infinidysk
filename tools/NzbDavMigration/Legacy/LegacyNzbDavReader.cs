@@ -118,6 +118,7 @@ public sealed class LegacyNzbDavReader
             {
                 var fileSizeNull = await reader.IsDBNullAsync(2, cancellationToken).ConfigureAwait(false);
                 var historyIdNull = await reader.IsDBNullAsync(4, cancellationToken).ConfigureAwait(false);
+                var historyStatusNull = await reader.IsDBNullAsync(8, cancellationToken).ConfigureAwait(false);
                 string? Text(int index) => reader.IsDBNull(index) ? null : reader.GetString(index);
                 rows.Add(new LegacyDavItemRow(
                     reader.GetGuid(0),
@@ -126,7 +127,7 @@ public sealed class LegacyNzbDavReader
                     reader.GetInt32(3),
                     historyIdNull ? null : reader.GetGuid(4),
                     historyIdNull ? null : reader.GetGuid(4),
-                    Text(5), Text(6), Text(7), reader.IsDBNull(8) ? null : reader.GetInt32(8),
+                    Text(5), Text(6), Text(7), historyStatusNull ? null : reader.GetInt32(8),
                     Text(9), Text(10), Text(11), Text(12), Text(13), Text(14)));
             }
         }
