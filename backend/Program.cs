@@ -430,6 +430,21 @@ public sealed partial class Program
                 .AddHostedService(sp => sp.GetRequiredService<WardenBackupService>())
                 .AddSingleton<DatabaseBackupStore>()
                 .AddSingleton<NzbWebDAV.UsenetMigration.UsenetMigrationStore>()
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.AltmountScanRunner>()
+                .AddSingleton<NzbWebDAV.UsenetMigration.Source.NzbDavPackageReader>()
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.NzbDavScanRunner>()
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.IUsenetMigrationScanRunner>(sp =>
+                    sp.GetRequiredService<NzbWebDAV.UsenetMigration.Runner.AltmountScanRunner>())
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.IUsenetMigrationScanRunner>(sp =>
+                    sp.GetRequiredService<NzbWebDAV.UsenetMigration.Runner.NzbDavScanRunner>())
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.MigrationScanDispatcher>()
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.AltmountPayloadBuilder>()
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.NzbDavPayloadBuilder>()
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.IMigrationPayloadBuilder>(sp =>
+                    sp.GetRequiredService<NzbWebDAV.UsenetMigration.Runner.AltmountPayloadBuilder>())
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.IMigrationPayloadBuilder>(sp =>
+                    sp.GetRequiredService<NzbWebDAV.UsenetMigration.Runner.NzbDavPayloadBuilder>())
+                .AddSingleton<NzbWebDAV.UsenetMigration.Runner.MigrationPayloadBuilderDispatcher>()
                 .AddSingleton<NzbWebDAV.UsenetMigration.Runner.UsenetMigrationRunner>()
                 .AddHostedService(sp => sp.GetRequiredService<NzbWebDAV.UsenetMigration.Runner.UsenetMigrationRunner>())
                 .AddSingleton<ProcessExitCoordinator>()
