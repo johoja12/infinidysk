@@ -20,4 +20,10 @@ public sealed class PlexPlaybackRegistry(TimeProvider clock)
             _expiry[serverId] = clock.GetUtcNow() + TimeSpan.FromSeconds(Math.Min(lifetime.TotalSeconds, 300));
         }
     }
+    public void RetainServers(IReadOnlyCollection<string> enabled)
+    {
+        lock (_gate)
+            foreach (var id in _expiry.Keys.Where(id => !enabled.Contains(id, StringComparer.Ordinal)).ToArray())
+                _expiry.Remove(id);
+    }
 }

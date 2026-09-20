@@ -5,6 +5,16 @@ namespace NzbWebDAV.Tests.Services;
 
 public sealed class PrefetchPolicyTests
 {
+    [Fact]
+    public void SourcePreview_ExplainsMappingAndExclusionsWithoutClaimingImportedCoverage()
+    {
+        var item = Episode("next", 1, 2);
+        PlexPathMapping[] mappings = [new("/plex", "/dav")];
+        Assert.Equal("mapped", PrefetchPolicy.DescribeSourceCandidate(item, new(), mappings).Status);
+        Assert.Equal("unmapped", PrefetchPolicy.DescribeSourceCandidate(item, new(), []).Status);
+        Assert.Equal("excluded", PrefetchPolicy.DescribeSourceCandidate(item, new(), mappings, new() { ExcludedShows = ["show"] }).Status);
+        Assert.Equal("episodes-required", PrefetchPolicy.DescribeSourceCandidate(item with { Type = "show", File = null }, new(), mappings).Status);
+    }
     [Theory]
     [InlineData("/plex/movies/A.mkv", "/dav/A.mkv")]
     [InlineData("/plex/movies-other/A.mkv", null)]

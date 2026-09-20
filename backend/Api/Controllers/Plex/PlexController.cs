@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using NzbWebDAV.Config;
 using NzbWebDAV.Services.Plex;
+using NzbWebDAV.Services.Prefetch;
 
 namespace NzbWebDAV.Api.Controllers.Plex;
 
@@ -12,7 +13,7 @@ namespace NzbWebDAV.Api.Controllers.Plex;
 [RequestSizeLimit(512 * 1024)]
 public sealed class PlexController(PlexOwnerAuthenticator owners, PlexAccountService accounts,
     PlexServerConfigService servers, PlexCatalogueService catalogue, PlexApiClient api,
-    PlexAccountConfigService accountConfig) : PostOnlyApiController
+    PlexAccountConfigService accountConfig, ConfigManager config) : PostOnlyApiController
 {
     private string _owner = "";
 
@@ -68,7 +69,16 @@ public sealed class PlexController(PlexOwnerAuthenticator owners, PlexAccountSer
                 case "sources":
                     return Ok(await catalogue.GetSourcesAsync(servers.GetServer(Required(request.ServerId)), request.LibraryId, request.ForceRefresh, ct).ConfigureAwait(false));
                 case "preview":
-                    return Ok(new { items = await api.GetPreviewAsync(servers.GetServer(Required(request.ServerId)), Required(request.Key), request.Limit, ct).ConfigureAwait(false) });
+                    var previewServer = servers.GetServer(Required(request.ServerId));
+                    var previewItems = await api.GetPreviewAsync(previewServer, Required(request.Key), request.Limit, ct).ConfigureAwait(false);
+                    previewServer = servers.GetServer(previewServer.Id);
+                    var settings = PrefetchSettings.Parse(config.GetEffectiveConfigValue(ConfigKeys.SmartPrefetchSettings));
+                    var source = settings.Sources.FirstOrDefault(source => source.ServerId == previewServer.Id && source.Key == request.Key);
+                    return Ok(new { items = previewItems.Select(item =>
+                    {
+                        var status = PrefetchPolicy.DescribeSourceCandidate(item, settings, previewServer.PathMappings, source);
+                        return item with { MappingStatus = status.Status, MappingReason = status.Reason };
+                    }) });
                 default:
                     return NotFound();
             }

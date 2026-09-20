@@ -56,6 +56,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         {
             var settings = runtime.Settings();
             var servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers));
+            if (preview is null) _playback.RetainServers(settings.Enabled && settings.RealtimeEnabled
+                ? servers.Where(server => server.Enabled).Select(server => server.Id).ToArray() : []);
             var revision = ConfigurationRevision(settings, servers);
             _passRevision = revision;
             _userResources.Clear();

@@ -50,7 +50,14 @@ function fakeApi(collection = false) {
           ]),
           preview: {
             items: [
-              { ratingKey: "42", title: "Episode one", type: "episode", file: "/Plex/episode.mkv" },
+              {
+                ratingKey: "42",
+                title: "Episode one",
+                type: "episode",
+                file: "/Plex/episode.mkv",
+                mappingStatus: "unmapped",
+                mappingReason: "No exact configured path mapping.",
+              },
             ],
           },
         } as Record<string, unknown>
@@ -129,6 +136,7 @@ describe("Smart Prefetch settings", () => {
     });
     await userEvent.click(screen.getByRole("button", { name: "Preview Recent TV" }));
     expect(await screen.findByText("Episode one")).toBeTruthy();
+    expect(screen.getByText(/unmapped.*No exact configured path mapping/)).toBeTruthy();
   });
   it("shows policy errors and whole-file coverage, and previews without enqueueing", async () => {
     const fetcher = fakeApi();
@@ -167,12 +175,25 @@ describe("Smart Prefetch settings", () => {
     const fallback = fakeApi();
     vi.stubGlobal("fetch", (url: string, init?: RequestInit) =>
       url.endsWith("/api/prefetch/preview")
-        ? Promise.resolve(new Response(JSON.stringify({
-            warning: "Watched status is unknown for this user.",
-            predictions: [{ itemId: "00000000-0000-0000-0000-000000000000", displayName: "Unmapped movie",
-              source: "Selected source", reason: "No exact configured path mapping", eligible: false,
-              start: 0, length: 0, fileSize: 0 }],
-          })))
+        ? Promise.resolve(
+            new Response(
+              JSON.stringify({
+                warning: "Watched status is unknown for this user.",
+                predictions: [
+                  {
+                    itemId: "00000000-0000-0000-0000-000000000000",
+                    displayName: "Unmapped movie",
+                    source: "Selected source",
+                    reason: "No exact configured path mapping",
+                    eligible: false,
+                    start: 0,
+                    length: 0,
+                    fileSize: 0,
+                  },
+                ],
+              }),
+            ),
+          )
         : fallback(url, init),
     );
     render(<Harness />);
@@ -210,14 +231,38 @@ describe("Smart Prefetch settings", () => {
   });
   it("shows per-item bulk results including deduplication and rejection reasons", async () => {
     const fallback = fakeApi();
-    vi.stubGlobal("fetch", (url: string, init?: RequestInit) => url.endsWith("/api/prefetch/operations") && init?.method === "POST"
-      ? Promise.resolve(new Response(JSON.stringify({ outcomes: [
-          { itemId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", status: "deduplicated", jobId: "existing", start: 0, length: 0 },
-          { itemId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", status: "rejected", start: 0, length: 0, reason: "Not an available imported streamable file." },
-        ] }))) : fallback(url, init));
+    vi.stubGlobal("fetch", (url: string, init?: RequestInit) =>
+      url.endsWith("/api/prefetch/operations") && init?.method === "POST"
+        ? Promise.resolve(
+            new Response(
+              JSON.stringify({
+                outcomes: [
+                  {
+                    itemId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    status: "deduplicated",
+                    jobId: "existing",
+                    start: 0,
+                    length: 0,
+                  },
+                  {
+                    itemId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                    status: "rejected",
+                    start: 0,
+                    length: 0,
+                    reason: "Not an available imported streamable file.",
+                  },
+                ],
+              }),
+            ),
+          )
+        : fallback(url, init),
+    );
     render(<Harness />);
     await screen.findByText(/Imported episode/);
-    await userEvent.type(screen.getByLabelText("Imported media IDs (up to 32)"), "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+    await userEvent.type(
+      screen.getByLabelText("Imported media IDs (up to 32)"),
+      "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Warm selected media" }));
     expect(await screen.findByText(/deduplicated.*existing/)).toBeTruthy();
     expect(screen.getByText(/Not an available imported streamable file/)).toBeTruthy();

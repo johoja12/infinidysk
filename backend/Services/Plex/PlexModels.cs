@@ -26,6 +26,8 @@ public sealed record PlexMediaItem(string RatingKey, string Type, string Title, 
     int? Season, int? Episode, string? File, long ViewOffset, long Duration, long? ViewedAt, string? UserId = null)
 {
     public string? WatchStateUserId { get; init; }
+    public string? MappingStatus { get; init; }
+    public string? MappingReason { get; init; }
 }
 public sealed record PlexSession(string Id, string UserId, string State, string? File, PlexMediaItem Item);
 public sealed record PlexIdentity(string MachineIdentifier, string Version);

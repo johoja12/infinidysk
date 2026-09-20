@@ -6,6 +6,15 @@ namespace NzbWebDAV.Tests.Services;
 public sealed class PlexPlaybackRegistryTests
 {
     [Fact]
+    public void DisabledServers_AreRemovedImmediatelyWithoutWaitingForExpiry()
+    {
+        var registry = new PlexPlaybackRegistry(TimeProvider.System);
+        var media = new PlexMediaItem("m", "movie", "Movie", null, null, null, "/movie.mkv", 1, 100, null);
+        registry.Record("server", [new PlexSession("session", "user", "playing", media.File, media)], TimeSpan.FromSeconds(300));
+        registry.RetainServers([]);
+        Assert.False(registry.HasActivePlayback);
+    }
+    [Fact]
     public void FailedPollCannotRefreshVerifiedPlayback_AndRawReadsAreSeparate()
     {
         var clock = new Clock();

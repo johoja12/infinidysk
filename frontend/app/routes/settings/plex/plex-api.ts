@@ -31,7 +31,14 @@ export type PlexSource = {
   title: string;
   type: string;
 };
-export type PlexMedia = { ratingKey: string; title: string; type: string; file: string | null };
+export type PlexMedia = {
+  ratingKey: string;
+  title: string;
+  type: string;
+  file: string | null;
+  mappingStatus?: string;
+  mappingReason?: string;
+};
 export type PlexSnapshot<T> = {
   data: T[];
   lastSuccess: string | null;

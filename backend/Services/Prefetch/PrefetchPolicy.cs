@@ -4,6 +4,18 @@ namespace NzbWebDAV.Services.Prefetch;
 
 public static class PrefetchPolicy
 {
+    public sealed record SourceCandidateStatus(string Status, string Reason);
+    public static SourceCandidateStatus DescribeSourceCandidate(PlexMediaItem item, PrefetchSettings settings,
+        IReadOnlyList<PlexPathMapping> mappings, PrefetchSource? source = null)
+    {
+        if (!IsEligible(item, settings, source)) return new("excluded", "Excluded show, disabled source, or disabled media policy.");
+        if (item.Type == "show") return new("episodes-required", "Show candidates require episode expansion; use Policy Preview to inspect imported episodes.");
+        if (item.File is null) return new("metadata-required", "Plex returned no file path; metadata must be resolved before warming.");
+        var mapped = PrefetchPathResolver.Map(item.File, mappings);
+        if (mapped is null) return new("unmapped", "No exact configured path mapping.");
+        if (mapped.LocalPath is not null && !settings.WarmLocalFiles) return new("excluded", "Mapped local-library warming is disabled.");
+        return new("mapped", "Exact path mapping found; Policy Preview verifies the imported item and warming limits.");
+    }
     public static IReadOnlyList<PlexMediaItem> HistoryCandidates(IEnumerable<PlexMediaItem> items, PrefetchSettings settings, string serverId, DateTimeOffset now)
     {
         var selected = items.Take(1000).Where(item => IsEligible(item, settings)
