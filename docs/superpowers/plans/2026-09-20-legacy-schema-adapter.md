@@ -42,8 +42,8 @@ Files: `docs/guides/nzbdav-migration.md`, this plan.
 
 - [x] Document actual schema resolution, private reports, exclusions and temporary-tool retirement after full acceptance.
 - [x] Perform independent spec and code-quality review; address findings and rerun affected tests.
-- [ ] Commit, push `chore/legacy-schema-adapter`, open a PR in `johoja12/infinidysk`, verify its head and leave primary checkout clean on `main`.
-- [ ] Report source/test status separately from live canary status. A new PR is not implicitly authorized for merge or deployment.
+- [x] Commit, push `chore/legacy-schema-adapter`, open [PR #7](https://github.com/johoja12/infinidysk/pull/7), and verify its head. Primary checkout is on synced `main`; unrelated untracked user artifacts are preserved.
+- [x] Report source/test status separately from live canary status. No merge, deployment or live import was performed for this change.
 
 ## Focused verification
 
@@ -70,5 +70,6 @@ The PostgreSQL container is test-only with tmpfs storage, loopback-only binding 
 - Focused adapter regression with PostgreSQL enabled: **20 passed, 0 failed, 0 skipped**, including actual SQL ownership queries, 270-ID batching and depth-limit rejection.
 - Initial clean-build attempts needed dependency restore and the native-build skip for the host's unsupported Ubuntu RID; these tests do not execute yEnc. Diagnostic iterations disable analyzers; the changed CLI receives a separate analyzer build.
 - CLI analyzer build passed with **0 warnings and 0 errors** after replacing a synchronous database null check with its awaited equivalent. Run it with `dotnet build tools/NzbDavMigration/NzbDavMigration.csproj -c Release --no-restore -p:BuildProjectReferences=false -p:SkipRapidYencNativeEnsure=true` after building the dependencies.
+- PR CI exposed an existing migration UI test's unsafe `String(init?.body)` coercion. A test-only string guard fixes the lint error; targeted ESLint and Prettier passed, and all **4** migration request tests passed. Frontend application behavior and dependencies are unchanged.
 - Running the entire SQLite-fixture group with `DATABASE_PROVIDER=postgres` causes EF pending-model setup errors. This was a test-invocation mistake, corrected by the split commands above; no schema migration or warning suppression was added.
 - Independent source/spec and code-quality reviews approved through `6131526a`. Production inputs were inspected read-only; this change did not perform a live inventory, import or Plex cutover.
