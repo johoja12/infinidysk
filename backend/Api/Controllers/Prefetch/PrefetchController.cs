@@ -22,7 +22,7 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
             DisplayName = items.GetValueOrDefault(job.ItemId)?.Name ?? "Removed media",
             FileSize = items.GetValueOrDefault(job.ItemId)?.FileSize,
             Source = PlexPrefetchService.SourceLabel(job.Trigger),
-            Reason = job.Trigger.EndsWith(":minimum", StringComparison.Ordinal) ? "Minimum head/tail" : job.Length == 0 ? "Whole-file warming" : "Resume/start range"
+            Reason = PlexPrefetchService.RangeReason(job.Trigger, job.Length)
         }),
         settings = runtime.Settings(), policies.LastSuccess, policies.LastError
         });

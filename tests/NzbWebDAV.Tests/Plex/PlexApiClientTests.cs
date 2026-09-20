@@ -6,6 +6,50 @@ namespace NzbWebDAV.Tests.Plex;
 
 public sealed class PlexApiClientTests
 {
+    [Theory]
+    [InlineData(true, "next-season")]
+    [InlineData(false, "owner-watched")]
+    public async Task NextUnwatched_UsesOnlyTheInitiatingUsersVerifiedCredential(bool sameUser, string expected)
+    {
+        using var handler = new FakePlexHandler(request => request.RequestUri!.AbsolutePath switch
+        {
+            "/library/metadata/show/children" => Xml("""<MediaContainer><Directory ratingKey="s1" index="1"/><Directory ratingKey="s2" index="2"/></MediaContainer>"""),
+            "/library/metadata/s1/children" => Xml("""<MediaContainer><Video ratingKey="owner-watched" type="episode" grandparentRatingKey="show" parentIndex="1" index="2" viewCount="1"/></MediaContainer>"""),
+            _ => Xml("""<MediaContainer><Video ratingKey="next-season" type="episode" grandparentRatingKey="show" parentIndex="2" index="1" viewCount="0"/></MediaContainer>""")
+        });
+        var api = new PlexApiClient(new HttpClient(handler), "installation");
+        var current = new PlexMediaItem("current", "episode", "Episode", "show", 1, 1, null, 0, 0, null,
+            sameUser ? "owner" : "another-user");
+        var result = await api.GetNextEpisodesAsync(Server() with { AccountId = "owner" }, current, 1);
+        Assert.Equal(expected, Assert.Single(result).RatingKey);
+        if (!sameUser) Assert.DoesNotContain(handler.Requests, request => request.Uri.Query.Contains("unwatched", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task UnwatchedShowSource_DoesNotRestartAtAlreadyWatchedEarlySeasons()
+    {
+        using var handler = new FakePlexHandler(request =>
+        {
+            Assert.Contains("unwatched=1", request.RequestUri!.Query);
+            Assert.EndsWith("/show/allLeaves", request.RequestUri.AbsolutePath);
+            return Xml("""<MediaContainer><Video ratingKey="late" type="episode" grandparentRatingKey="show" parentIndex="20" index="1"/></MediaContainer>""");
+        });
+        var api = new PlexApiClient(new HttpClient(handler), "installation");
+        var show = new PlexMediaItem("show", "show", "Show", null, null, null, null, 0, 0, null, "user");
+        Assert.Equal("late", Assert.Single(await api.GetNextEpisodesAsync(Server() with { AccountId = "user" }, show, 1)).RatingKey);
+    }
+
+    [Fact]
+    public async Task UnwatchedShowSource_FiltersSpecialsBeforeApplyingCandidateLimit()
+    {
+        var specials = string.Concat(Enumerable.Range(1, 20).Select(i => $"<Video ratingKey='special{i}' type='episode' grandparentRatingKey='show' parentIndex='0' index='{i}'/>"));
+        using var handler = new FakePlexHandler(_ => Xml($"<MediaContainer>{specials}<Video ratingKey='normal' type='episode' grandparentRatingKey='show' parentIndex='1' index='1'/></MediaContainer>"));
+        using var http = new HttpClient(handler);
+        var api = new PlexApiClient(http, "installation");
+        var show = new PlexMediaItem("show", "show", "Show", null, null, null, null, 0, 0, null, "user");
+        Assert.Equal("normal", Assert.Single(await api.GetNextEpisodesAsync(Server() with { AccountId = "user" }, show, 1)).RatingKey);
+    }
+
     [Fact]
     public async Task NextEpisodeWindow_StartsAtCurrentSeasonWithoutOwnersWatchedFilter()
     {

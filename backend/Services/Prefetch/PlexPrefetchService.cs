@@ -11,7 +11,11 @@ using System.Text.Json;
 
 namespace NzbWebDAV.Services.Prefetch;
 
-public sealed record PrefetchPrediction(Guid ItemId, string DisplayName, string Source, string Reason, long Start, long Length, long FileSize);
+public sealed record PrefetchPrediction(Guid ItemId, string DisplayName, string Source, string Reason, long Start, long Length, long FileSize)
+{
+    public bool Eligible { get; init; } = true;
+    public string? PlexRatingKey { get; init; }
+}
 
 public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api, PrefetchRuntime runtime,
     IServiceScopeFactory scopes, ActiveReadRegistry reads, PlexPlaybackRegistry? playback = null) : BackgroundService
@@ -23,6 +27,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     private int _remainingCandidates;
     private int _serverCursor;
     private string? _policyRevision;
+    private string? _passRevision;
+    private readonly Dictionary<string, IReadOnlyList<PlexDiscoveredServer>> _userResources = new(StringComparer.Ordinal);
     private List<PrefetchPrediction>? _preview;
     public DateTimeOffset? LastSuccess { get; private set; }
     public string? LastError { get; private set; }
@@ -50,8 +56,15 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         {
             var settings = runtime.Settings();
             var servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers));
-            var revision = Hash(JsonSerializer.Serialize(settings) + JsonSerializer.Serialize(servers));
-            if (preview is null && _policyRevision != revision) { _last.Clear(); _policyRevision = revision; }
+            var revision = ConfigurationRevision(settings, servers);
+            _passRevision = revision;
+            _userResources.Clear();
+            if (preview is null && _policyRevision != revision)
+            {
+                _last.Clear();
+                if (_policyRevision is not null) runtime.Coordinator?.PruneOwners(owner => owner == "manual");
+                _policyRevision = revision;
+            }
             await runtime.WaitForInitializationAsync(deadline.Token).ConfigureAwait(false);
             var jobs = runtime.Jobs;
             if (jobs is null) return;
@@ -133,8 +146,15 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
                 foreach (var item in items.Take(source.Limit))
                 {
                     ct.ThrowIfCancellationRequested();
-                    if (!PrefetchPolicy.IsEligible(item, settings, source)) continue;
-                    if (item.Type == "show") await QueueNextAsync(server, item, owner, 20, settings, source, ct).ConfigureAwait(false);
+                    if (!PrefetchPolicy.IsEligible(item, settings, source)) { RejectPreview(item, owner, "Excluded show or disabled media policy."); continue; }
+                    if (item.Type == "show")
+                    {
+                        var users = settings.Users.Where(user => user.StartsWith(server.Id + ":", StringComparison.Ordinal))
+                            .Select(user => user[(server.Id.Length + 1)..]).Take(16).ToArray();
+                        if (users.Length == 0) users = [server.AccountId ?? ""];
+                        foreach (var user in users)
+                            await QueueNextAsync(server, item with { UserId = user }, owner, 20, settings, source, ct).ConfigureAwait(false);
+                    }
                     else await QueueMediaAsync(server, item, owner, 20, settings, source, ct).ConfigureAwait(false);
                 }
             }
@@ -148,31 +168,62 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         if (_remainingCandidates <= 0 || !settings.TvEnabled || !PrefetchPolicy.IsEligible(current, settings, source)) return;
         var show = current.ShowRatingKey ?? (current.Type == "show" ? current.RatingKey : null);
         if (show is null) return;
-        var episodes = await api.GetNextEpisodesAsync(server, current, 20, ct).ConfigureAwait(false);
+        var userServer = await UserServerAsync(server, current.UserId, ct).ConfigureAwait(false);
+        if (userServer is null) LastError = "Watched status is unknown for a selected user. Connect that Plex/Home account to verify next-unwatched predictions; chronological candidates remain available.";
+        var episodes = await api.GetNextEpisodesAsync(userServer ?? server, current, 20, ct).ConfigureAwait(false);
         var remaining = Math.Min(settings.MaxQueueAhead, settings.TvEpisodesPerShow);
         foreach (var item in PrefetchPolicy.NextEpisodes(current, episodes, 20))
-            if (await QueueMediaAsync(server, item, owner, priority, settings, source, ct).ConfigureAwait(false) && --remaining == 0) break;
+            if (await QueueMediaAsync(server, item, owner, priority, settings, source, ct, prediction: true).ConfigureAwait(false) && --remaining == 0) break;
+    }
+
+    private async Task<PlexServer?> UserServerAsync(PlexServer server, string? user, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(user)) return null;
+        if (server.AccountId == user) return server;
+        var account = PlexSettings.ParseAccounts(config.GetEffectiveConfigValue(ConfigKeys.PlexAccounts)).FirstOrDefault(account => account.Id == user);
+        if (account is null) return null;
+        if (!_userResources.TryGetValue(user, out var resources))
+        {
+            try { resources = await api.DiscoverAsync(account.Token, ct).ConfigureAwait(false); }
+            catch (PlexRequestException) { resources = []; }
+            _userResources[user] = resources;
+        }
+        var resource = resources.FirstOrDefault(resource => resource.Id == server.Id);
+        return resource is null ? null : server with { AccountId = user, Token = resource.Token };
+    }
+
+    private string ConfigurationRevision(PrefetchSettings settings, IReadOnlyList<PlexServer> servers) =>
+        Hash(JsonSerializer.Serialize(settings) + JsonSerializer.Serialize(servers) + config.GetEffectiveConfigValue(ConfigKeys.PlexAccounts));
+
+    private bool RejectPreview(PlexMediaItem item, string owner, string reason)
+    {
+        if (_preview is { Count: < 100 } preview)
+            preview.Add(new(Guid.Empty, item.Title, SourceLabel(owner), reason, 0, 0, 0)
+                { Eligible = false, PlexRatingKey = item.RatingKey });
+        return false;
     }
 
     private async Task<bool> QueueMediaAsync(PlexServer server, PlexMediaItem item, string owner, int priority,
-        PrefetchSettings settings, PrefetchSource? source, CancellationToken ct)
+        PrefetchSettings settings, PrefetchSource? source, CancellationToken ct, bool prediction = false)
     {
-        if (--_remainingCandidates < 0 || !PrefetchPolicy.IsEligible(item, settings, source)) return false;
+        if (--_remainingCandidates < 0) return false;
+        if (!PrefetchPolicy.IsEligible(item, settings, source)) return RejectPreview(item, owner, "Excluded show or disabled media policy.");
         if (item.File is null)
         {
             var details = await api.GetMetadataAsync(server, item.RatingKey, ct).ConfigureAwait(false);
             item = details with { ViewOffset = item.ViewOffset, Duration = item.Duration > 0 ? item.Duration : details.Duration,
                 UserId = item.UserId, ViewedAt = item.ViewedAt, ShowRatingKey = details.ShowRatingKey ?? item.ShowRatingKey,
-                Season = details.Season ?? item.Season, Episode = details.Episode ?? item.Episode };
+                Season = details.Season ?? item.Season, Episode = details.Episode ?? item.Episode, WatchStateUserId = item.WatchStateUserId };
         }
-        if (item.File is null || PrefetchPathResolver.Map(item.File, server.PathMappings) is not { } mapped) return false;
+        if (item.File is null || PrefetchPathResolver.Map(item.File, server.PathMappings) is not { } mapped)
+            return RejectPreview(item, owner, "No exact configured path mapping for this Plex media.");
         using var scope = scopes.CreateScope();
         var database = scope.ServiceProvider.GetRequiredService<DavDatabaseClient>();
         DavItem? imported = null;
         if (mapped.DavPath is { } dav) imported = await ResolveDavAsync(database, dav, ct).ConfigureAwait(false);
         else if (mapped.LocalPath is { } local)
         {
-            if (!settings.WarmLocalFiles) return false;
+            if (!settings.WarmLocalFiles) return RejectPreview(item, owner, "Mapped local-library warming is disabled.");
             try
             {
                 var link = SymlinkAndStrmUtil.GetSymlinkOrStrmInfo(new FileInfo(local));
@@ -184,24 +235,35 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
                 };
                 if (target is { } match) imported = await database.GetFileById(match.DavItemId.ToString()).ConfigureAwait(false);
             }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException) { return false; }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+            { return RejectPreview(item, owner, "Local mapping is unavailable or does not resolve to imported media."); }
         }
         var scopedOwner = owner + ":" + item.Type + ":" + Hash(item.ShowRatingKey ?? item.RatingKey)
-            + (mapped.LocalPath is null ? "" : ":local");
-        return imported is not null && QueueImported(imported, scopedOwner, priority, item.ViewOffset, item.Duration, settings);
+            + (mapped.LocalPath is null ? "" : ":local")
+            + (prediction ? item.WatchStateUserId is null ? ":watch-unknown" : ":unwatched" : "");
+        if (imported is null) return RejectPreview(item, owner, "Mapping does not resolve to an imported media file.");
+        if (imported.FileSize is not > 0 || imported.FileSize > runtime.Settings().MaxBytesPerItem || imported.FileBlobId is null)
+            return RejectPreview(item, owner, "Imported media is unavailable or exceeds the per-file warming cap.");
+        return QueueImported(imported, scopedOwner, priority, item.ViewOffset, item.Duration, settings);
     }
 
     private bool QueueImported(DavItem item, string owner, int priority, long viewOffset, long duration, PrefetchSettings settings)
     {
         var current = runtime.Settings();
         var servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers));
+        if (_passRevision != ConfigurationRevision(current, servers))
+        {
+            LastError = "Plex policy or mappings changed during refresh. Stale candidates were skipped; another refresh is requested.";
+            RequestSync();
+            return false;
+        }
         if (item.FileSize is not > 0 || item.FileSize > current.MaxBytesPerItem || item.FileBlobId is null
             || !IsOwnerEnabled(owner, current, servers)) return false;
         if (_preview is { } preview)
         {
             foreach (var range in PrefetchPolicy.Ranges(item.FileSize.Value, viewOffset, duration, current, minimum: false))
                 if (preview.Count < 100) preview.Add(new(item.Id, item.Name, SourceLabel(owner),
-                    range.Length == 0 ? "Whole-file warming" : "Resume/start range", range.Start, range.Length, item.FileSize.Value));
+                    RangeReason(owner, range.Length), range.Start, range.Length, item.FileSize.Value));
             if (current.MinimumWarmEnabled && !current.FullFileWarming)
                 foreach (var range in PrefetchPolicy.Ranges(item.FileSize.Value, 0, 0, current, minimum: true))
                     if (preview.Count < 100) preview.Add(new(item.Id, item.Name, SourceLabel(owner), "Minimum head/tail", range.Start, range.Length, item.FileSize.Value));
@@ -253,6 +315,10 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         ["plex", _, "history", ..] => "Plex watch history",
         _ => "Background warming"
     };
+    public static string RangeReason(string owner, long length) =>
+        (owner.EndsWith(":minimum", StringComparison.Ordinal) ? "Minimum head/tail" : length == 0 ? "Whole-file warming" : "Resume/start range")
+        + (owner.Contains(":watch-unknown", StringComparison.Ordinal) ? "; watched status unknown"
+            : owner.Contains(":unwatched", StringComparison.Ordinal) ? "; next unwatched episode" : "");
     private static string Owner(string server, string kind, string key) => $"plex:{Hash(server)}:{kind}:{Hash(key)}";
     private static bool UserSelected(PrefetchSettings settings, string server, string user) => settings.Users.Length == 0
         || settings.Users.Contains(server + ":" + user, StringComparer.Ordinal);
@@ -263,9 +329,10 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         if (owner == "read") return settings.ReadActivityEnabled;
         if (owner == "read:minimum") return settings.ReadActivityEnabled && settings.MinimumWarmEnabled;
         var parts = owner.Split(':');
-        if (parts.Length is < 6 or > 8 || parts[0] != "plex") return false;
+        if (parts.Length is < 6 or > 9 || parts[0] != "plex") return false;
         foreach (var qualifier in parts.Skip(6))
-            if (qualifier == "minimum" ? !settings.MinimumWarmEnabled : qualifier != "local" || !settings.WarmLocalFiles) return false;
+            if (!(qualifier switch { "minimum" => settings.MinimumWarmEnabled, "local" => settings.WarmLocalFiles,
+                "unwatched" or "watch-unknown" => true, _ => false })) return false;
         if (parts[4] == "movie" ? !settings.MovieEnabled : !settings.TvEnabled) return false;
         var server = servers.FirstOrDefault(server => server.Enabled && Hash(server.Id) == parts[1]);
         if (server is null) return false;

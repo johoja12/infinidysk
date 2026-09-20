@@ -26,6 +26,7 @@ type QueueStatus = {
   lastError?: string | null;
 };
 type Prediction = {
+  eligible?: boolean;
   itemId: string;
   displayName: string;
   source: string;
@@ -47,6 +48,7 @@ export function PrefetchQueue() {
   const [filter, setFilter] = useState("all");
   const [predictions, setPredictions] = useState<Prediction[] | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewWarning, setPreviewWarning] = useState<string | null>(null);
   const previewRequest = useRef<AbortController | null>(null);
   useEffect(() => {
     const pending = previewRequest;
@@ -58,14 +60,18 @@ export function PrefetchQueue() {
     previewRequest.current = abort;
     setPreviewBusy(true);
     setError(null);
+    setPreviewWarning(null);
     setMessage("");
     const timeout = setTimeout(() => abort.abort(), 20000);
     try {
       const response = await fetch(withUrlBase("/api/prefetch/preview"), { signal: abort.signal });
       if (!response.ok)
         throw new Error("Policy preview unavailable. Check the saved source configuration.");
-      const result = (await response.json()) as { predictions: Prediction[] };
-      if (!abort.signal.aborted) setPredictions(result.predictions.slice(0, 100));
+      const result = (await response.json()) as { predictions: Prediction[]; warning?: string };
+      if (!abort.signal.aborted) {
+        setPredictions(result.predictions.slice(0, 100));
+        setPreviewWarning(result.warning ?? null);
+      }
     } catch (cause) {
       if (!abort.signal.aborted)
         setError(cause instanceof Error ? cause.message : "Policy preview failed.");
@@ -144,6 +150,7 @@ export function PrefetchQueue() {
       description="One bounded background queue shares existing NNTP admission. Native cache must be active with a healthy writable folder. Manual warming does not require Plex."
     >
       {error && <Alert variant="danger">{error}</Alert>}
+      {previewWarning && <Alert variant="warning">{previewWarning}</Alert>}
       {status?.initializationError && <Alert variant="warning">{status.initializationError}</Alert>}
       {status?.lastError && <Alert variant="warning">{status.lastError}</Alert>}
       <p className="text-xs">
@@ -187,11 +194,11 @@ export function PrefetchQueue() {
               <p className="text-xs">
                 {prediction.source} — {prediction.reason}
               </p>
-              <p className="text-xs">
+              {prediction.eligible === false ? <p className="text-xs">Not eligible for warming</p> : <p className="text-xs">
                 {prediction.itemId} · {prediction.length.toLocaleString()} requested bytes from{" "}
                 {prediction.start.toLocaleString()} · file {prediction.fileSize.toLocaleString()}{" "}
                 bytes
-              </p>
+              </p>}
             </div>
           ))}
         </div>

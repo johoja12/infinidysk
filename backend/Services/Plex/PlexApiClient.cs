@@ -156,6 +156,19 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
     public async Task<IReadOnlyList<PlexMediaItem>> GetNextEpisodesAsync(PlexServer server, PlexMediaItem current, int limit, CancellationToken ct = default)
     {
         var show = current.ShowRatingKey ?? current.RatingKey;
+        var scopedUser = !string.IsNullOrEmpty(current.UserId) && server.AccountId == current.UserId;
+        PlexMediaItem Project(XElement element) => ParseMedia(element) with
+            { UserId = current.UserId, WatchStateUserId = scopedUser ? current.UserId : null };
+        if (scopedUser && current.Type == "show")
+            return (await ReadPagesAsync(server,
+                $"/library/metadata/{Identifier(show)}/allLeaves?unwatched=1&sort=parentIndex%3Aasc%2Cindex%3Aasc",
+                Math.Clamp(limit, 1, 20), ["Video"], ct,
+                element =>
+                {
+                    var media = ParseMedia(element);
+                    return (Long(element, "viewCount") ?? 0) == 0 && media.Type == "episode"
+                        && media.ShowRatingKey == show && media.Season > 0 && media.Episode > 0;
+                }).ConfigureAwait(false)).Select(Project).ToArray();
         var seasons = await ReadPagesAsync(server, $"/library/metadata/{Identifier(show)}/children", 200, ["Directory"], ct).ConfigureAwait(false);
         var result = new List<PlexMediaItem>();
         var maximum = Math.Clamp(limit, 1, 20);
@@ -164,16 +177,18 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
         {
             if (Attribute(season, "ratingKey") is not { } key) continue;
             // Query the relevant seasons, not the first N episodes of the entire show.
-            // Do not apply the server token owner's watched flag to another user's signal.
-            var episodes = await ReadPagesAsync(server, $"/library/metadata/{Identifier(key)}/children?sort=index%3Aasc",
+            // Only a credential verified for the initiating user can filter watched state.
+            var watchedFilter = scopedUser ? "&unwatched=1" : "";
+            var episodes = await ReadPagesAsync(server, $"/library/metadata/{Identifier(key)}/children?sort=index%3Aasc{watchedFilter}",
                 maximum - result.Count, ["Video"], ct, element =>
                 {
                     var media = ParseMedia(element);
-                    return media.ShowRatingKey == show && media.Season > 0 && media.Episode > 0
+                    return (!scopedUser || (Long(element, "viewCount") ?? 0) == 0)
+                        && media.ShowRatingKey == show && media.Season > 0 && media.Episode > 0
                         && (current.Type == "show" || media.Season > current.Season
                             || media.Season == current.Season && media.Episode > current.Episode);
                 }).ConfigureAwait(false);
-            result.AddRange(episodes.Select(ParseMedia));
+            result.AddRange(episodes.Select(Project));
             if (result.Count >= maximum) break;
         }
         return result.DistinctBy(item => item.RatingKey).Take(maximum).ToArray();

@@ -163,6 +163,25 @@ describe("Smart Prefetch settings", () => {
     expect(saved.Users).toEqual(["server:7"]);
     expect(saved.Sources[0]?.ExcludedShows).toEqual(["42", "43"]);
   });
+  it("explains rejected preview candidates and unknown watch-state warnings", async () => {
+    const fallback = fakeApi();
+    vi.stubGlobal("fetch", (url: string, init?: RequestInit) =>
+      url.endsWith("/api/prefetch/preview")
+        ? Promise.resolve(new Response(JSON.stringify({
+            warning: "Watched status is unknown for this user.",
+            predictions: [{ itemId: "00000000-0000-0000-0000-000000000000", displayName: "Unmapped movie",
+              source: "Selected source", reason: "No exact configured path mapping", eligible: false,
+              start: 0, length: 0, fileSize: 0 }],
+          })))
+        : fallback(url, init),
+    );
+    render(<Harness />);
+    await screen.findByText(/Imported episode/);
+    await userEvent.click(screen.getByRole("button", { name: "Preview policies" }));
+    expect(await screen.findByText("Watched status is unknown for this user.")).toBeTruthy();
+    expect(screen.getByText("Not eligible for warming")).toBeTruthy();
+    expect(screen.queryByText(/0 requested bytes/)).toBeNull();
+  });
   it("uses the one bounded queue for bulk warm and retry operations", async () => {
     const fetcher = fakeApi();
     vi.stubGlobal("fetch", fetcher);

@@ -23,7 +23,10 @@ public sealed record PlexAccount(string Id, string Name, string Token)
 }
 public sealed record PlexSource(string ServerId, string? LibraryId, string Kind, string Id, string Key, string Title, string Type);
 public sealed record PlexMediaItem(string RatingKey, string Type, string Title, string? ShowRatingKey,
-    int? Season, int? Episode, string? File, long ViewOffset, long Duration, long? ViewedAt, string? UserId = null);
+    int? Season, int? Episode, string? File, long ViewOffset, long Duration, long? ViewedAt, string? UserId = null)
+{
+    public string? WatchStateUserId { get; init; }
+}
 public sealed record PlexSession(string Id, string UserId, string State, string? File, PlexMediaItem Item);
 public sealed record PlexIdentity(string MachineIdentifier, string Version);
 public sealed record PlexConnection(string Uri, bool Local, bool Relay);

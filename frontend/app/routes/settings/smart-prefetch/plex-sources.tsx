@@ -212,6 +212,7 @@ export function PlexSources({
             {snapshot.error ? ` · ${snapshot.error}` : ""}
           </p>
         ))}
+      <p className="text-xs">History users also inform show-source predictions on this server. Without a matching selection, sources use the connected server account. Connect each selected Home account to verify its unwatched episodes; otherwise predictions are chronological with unknown watch status.</p>
       <div className="flex flex-wrap gap-3">
         {users?.data.map((user) => {
           const id = `${serverId}:${user.id}`;
