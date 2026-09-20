@@ -1,13 +1,59 @@
 import { describe, expect, it } from "vitest";
 import {
+  bytesToDecimalGb,
+  decimalGbToBytes,
+  hasCustomizedPrefetchPolicy,
   numericFields,
   parsePrefetchSettings,
+  resetPrefetchPolicyDefaults,
   validatePrefetchSettings,
   hasSmartPrefetchSettingsChanged,
   isSmartPrefetchSettingsValid,
 } from "./smart-prefetch-model";
 
 describe("Smart Prefetch persisted settings", () => {
+  it("converts the daily budget between bytes and decimal GB", () => {
+    expect(bytesToDecimalGb(10_000_000_000)).toBe(10);
+    expect(decimalGbToBytes(10.5)).toBe(10_500_000_000);
+    expect(decimalGbToBytes(0)).toBe(0);
+  });
+
+  it("detects policy customization but ignores enablement, users and sources", () => {
+    const defaults = parsePrefetchSettings(undefined);
+    expect(hasCustomizedPrefetchPolicy(defaults)).toBe(false);
+    expect(hasCustomizedPrefetchPolicy({ ...defaults, Enabled: true, Users: ["server:7"] })).toBe(
+      false,
+    );
+    expect(hasCustomizedPrefetchPolicy({ ...defaults, MaxRetries: 4 })).toBe(true);
+  });
+
+  it("resets policy values while preserving enablement, users and sources", () => {
+    const source = {
+      ServerId: "server",
+      LibraryId: "2",
+      Kind: "hub",
+      Key: "/hubs/recent",
+      Title: "Recent",
+      Type: "show",
+      Enabled: true,
+      Limit: 10,
+      ExcludedShows: ["42"],
+    };
+    const reset = resetPrefetchPolicyDefaults({
+      ...parsePrefetchSettings(undefined),
+      Enabled: true,
+      MaxRetries: 9,
+      MovieEnabled: false,
+      Users: ["server:7"],
+      Sources: [source],
+    });
+    expect(reset.Enabled).toBe(true);
+    expect(reset.MaxRetries).toBe(3);
+    expect(reset.MovieEnabled).toBe(true);
+    expect(reset.Users).toEqual(["server:7"]);
+    expect(reset.Sources).toEqual([source]);
+  });
+
   it("exposes bounded queue lifetime, retries and verified-session expiry", () => {
     const defaults = parsePrefetchSettings(undefined);
     expect(defaults.QueueCapacity).toBe(256);

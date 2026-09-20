@@ -46,9 +46,40 @@ export const booleanDefaults = {
   WarmLocalFiles: false,
   PauseDuringPlayback: true,
 };
+export const DECIMAL_GB_BYTES = 1_000_000_000;
+
+export function bytesToDecimalGb(bytes: number): number {
+  return bytes / DECIMAL_GB_BYTES;
+}
+
+export function decimalGbToBytes(gigabytes: number): number {
+  return Math.round(gigabytes * DECIMAL_GB_BYTES);
+}
+
 export type PrefetchSettings = typeof numericDefaults &
   typeof booleanDefaults & { Users: string[]; Sources: PrefetchSource[] };
 export type NumericKey = keyof typeof numericDefaults;
+const customizableBooleanKeys = Object.keys(booleanDefaults).filter(
+  (key): key is keyof typeof booleanDefaults => key !== "Enabled",
+);
+const customizableNumericKeys = Object.keys(numericDefaults) as (keyof typeof numericDefaults)[];
+
+export function hasCustomizedPrefetchPolicy(settings: PrefetchSettings): boolean {
+  return (
+    customizableBooleanKeys.some((key) => settings[key] !== booleanDefaults[key]) ||
+    customizableNumericKeys.some((key) => settings[key] !== numericDefaults[key])
+  );
+}
+
+export function resetPrefetchPolicyDefaults(settings: PrefetchSettings): PrefetchSettings {
+  return {
+    ...settings,
+    ...numericDefaults,
+    ...booleanDefaults,
+    Enabled: settings.Enabled,
+  };
+}
+
 export const numericFields: {
   key: NumericKey;
   label: string;
