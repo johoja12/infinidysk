@@ -16,6 +16,14 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
     private sealed record SettingsSnapshot(string? Json, PrefetchSettings Value);
     private SettingsSnapshot? _settings;
     public string? InitializationError { get; private set; }
+    private string? _runtimeError;
+    public string? RuntimeError => Volatile.Read(ref _runtimeError) ?? _coordinator?.RuntimeError;
+    public bool Healthy => InitializationError is null && RuntimeError is null;
+    public void ReportMetadataFailure()
+    {
+        Interlocked.CompareExchange(ref _runtimeError, PrefetchCoordinator.MetadataFailureMessage, null);
+        _coordinator?.ReportMetadataFailure();
+    }
     public PrefetchJobStore? Jobs { get { Initialize(); return _jobs; } }
     public PrefetchCoordinator? Coordinator { get { Initialize(); return _coordinator; } }
 
@@ -29,7 +37,7 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
     {
         lock (_gate)
         {
-            if (_initialized || native.Store is null || native.ActiveSettings is null) return;
+            if (!Healthy || _initialized || native.Store is null || native.ActiveSettings is null) return;
             _initialized = true;
             try
             {
@@ -62,8 +70,13 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
         {
             while (!stoppingToken.IsCancellationRequested)
             {
-                if (Coordinator is { } coordinator) await coordinator.RunOnceAsync(stoppingToken).ConfigureAwait(false);
-                await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken).ConfigureAwait(false);
+                try
+                {
+                    if (Healthy && Coordinator is { } coordinator) await coordinator.RunOnceAsync(stoppingToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
+                catch (Exception exception) when (exception is not OutOfMemoryException) { ReportMetadataFailure(); }
+                await Task.Delay(TimeSpan.FromSeconds(Healthy ? 1 : 30), stoppingToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
