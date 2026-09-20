@@ -7,7 +7,36 @@ public sealed class LegacyBlobResolverTests : IDisposable
     private readonly string _root = Path.Join(Path.GetTempPath(), $"legacy-blobs-{Guid.NewGuid():N}");
 
     [Fact]
-    public async Task ReadNzbAsync_RejectsDtdAndEnforcesAggregateCeiling()
+    public async Task ReadNzbAsync_AcceptsStandardExternalNzbDoctype()
+    {
+        var id = Guid.NewGuid();
+        WriteBlob(id, """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE nzb PUBLIC "-//newzBin//DTD NZB 1.1//EN" "http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd">
+            <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb" />
+            """);
+
+        var resolved = await new LegacyBlobResolver(_root).ReadNzbAsync(id);
+
+        Assert.Empty(resolved.Document.Files);
+    }
+
+    [Theory]
+    [InlineData("<!DOCTYPE nzb SYSTEM \"https://example.invalid/not-the-nzb-dtd\">")]
+    [InlineData("<!DOCTYPE nzb [<!ENTITY unused SYSTEM \"file:///etc/passwd\">]>")]
+    [InlineData("<!DOCTYPE nzb PUBLIC \"-//newzBin//DTD NZB 1.1//EN\" \"http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd\" [<!ENTITY unused \"value\">]>")]
+    [InlineData("<!DOCTYPE nzb PUBLIC \"-//newzBin//DTD NZB 1.1//EN\" \"http://www.newzbin.com/DTD/nzb/nzb-1.1.dtd\" [ ]>")]
+    public async Task ReadNzbAsync_RejectsNonstandardAndInternalDoctypes(string doctype)
+    {
+        var id = Guid.NewGuid();
+        WriteBlob(id, $"{doctype}<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\" />");
+
+        await Assert.ThrowsAnyAsync<System.Xml.XmlException>(() =>
+            new LegacyBlobResolver(_root).ReadNzbAsync(id));
+    }
+
+    [Fact]
+    public async Task ReadNzbAsync_RejectsInternalEntityAndEnforcesAggregateCeiling()
     {
         var first = Guid.Parse("11111111-1111-1111-1111-111111111111");
         var second = Guid.Parse("22222222-2222-2222-2222-222222222222");

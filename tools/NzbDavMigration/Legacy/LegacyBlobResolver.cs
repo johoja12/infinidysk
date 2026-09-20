@@ -1,4 +1,3 @@
-using System.Xml;
 using System.Text;
 using NzbWebDAV.Models.Nzb;
 
@@ -85,16 +84,10 @@ public sealed class LegacyBlobResolver
 
     private static async Task ValidateXmlAsync(byte[] bytes, CancellationToken cancellationToken)
     {
-        var settings = new XmlReaderSettings
-        {
-            Async = true,
-            DtdProcessing = DtdProcessing.Prohibit,
-            XmlResolver = null,
-            MaxCharactersInDocument = bytes.LongLength * 4 + 1024,
-        };
         await using var stream = new MemoryStream(bytes, writable: false);
-        using var reader = XmlReader.Create(stream, settings);
-        while (await reader.ReadAsync().ConfigureAwait(false))
-            cancellationToken.ThrowIfCancellationRequested();
+        await NzbXmlSecurity.ValidateAsync(
+            stream,
+            bytes.LongLength * 4 + 1024,
+            cancellationToken).ConfigureAwait(false);
     }
 }
