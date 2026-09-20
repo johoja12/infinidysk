@@ -125,7 +125,7 @@ describe("Smart Prefetch settings", () => {
     vi.stubGlobal("fetch", fakeApi());
     render(<Harness />);
     await screen.findByRole("option", { name: "Home" });
-    const selector = screen.getByLabelText("Plex source server");
+    const selector = screen.getByLabelText<HTMLSelectElement>("Plex source server");
     await userEvent.selectOptions(selector, "server");
     expect(selector.value).toBe("server");
     act(() => publishPlexServers([]));
