@@ -1395,7 +1395,8 @@ public sealed class SupportPackService(
             }
 
             if (item.Key is not (ConfigKeys.UsenetProviders or ConfigKeys.ArrInstances
-                or ConfigKeys.IndexersInstances or ConfigKeys.ProfilesInstances))
+                or ConfigKeys.IndexersInstances or ConfigKeys.ProfilesInstances
+                or ConfigKeys.PlexAccounts or ConfigKeys.PlexServers))
                 continue;
 
             List<string>? structuredSecrets = null;
