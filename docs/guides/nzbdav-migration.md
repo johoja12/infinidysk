@@ -11,6 +11,12 @@ This is a two-stage migration with an explicit trust boundary:
 
 The feature is advanced-only. It does not change the setup wizard or its version.
 
+The legacy importer is **temporary migration tooling**. Keep it available for
+retries, resume and reconciliation until the **entire library** is migrated and
+verified, not merely until this canary passes. Imported items use the normal
+InfiniDysk queue, database and streaming paths; playback must not depend on the
+legacy reader remaining installed.
+
 ## Before you start
 
 - Back up both applications, including InfiniDysk `/config` and the legacy database/blob store.
@@ -22,6 +28,13 @@ The feature is advanced-only. It does not change the setup wizard or its version
 - Route throughput tests directly to backend port `8080` on the trusted Docker or local network. Port `3000` is functional for WebDAV, but its Node proxy handles every streamed byte and measurements through it are diagnostic only. Never publish `8080` to an untrusted network.
 
 Use a separate results directory and retain the inventory, selection, export package, downloaded plan bundle, apply journal, validation output, and performance reports together.
+
+Keep that directory private (`0700` on Unix, with files restricted to the
+operator). Inventories can contain original NZB contents and archive metadata,
+including decryption material. Do not attach raw inventories or packages to a
+public issue, pull request or ordinary support log. Grant the InfiniDysk service
+read access only to the selected package when transferring it; never make all
+migration artifacts world-readable.
 
 ## 1. Inventory the legacy library
 
@@ -38,6 +51,31 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
 ```
 
 The command walks only the supplied library root, does not follow directory symlinks, and records legacy `.ids/<guid>` links. Review every exclusion in `inventory.json`.
+
+### Legacy schema and recovery limits
+
+The reader targets the legacy schema directly. It follows `DavItems.ParentId`
+ancestry to a release directory referenced by `HistoryItems.DownloadDirId`.
+Exactly one history owner must be found. Duplicate owners, broken or cyclic
+ancestry and missing history are exclusions, not permission to match by name.
+
+The history ID identifies the retained NZB blob. If that blob is missing, retained
+`HistoryItems.NzbContents` can supply the original NZB instead. Export validates
+the XML and article identity before packaging the exact validated bytes. The
+source file size remains part of the later target-correlation check. Archive
+member paths are relative to the proven release directory, including nested
+subdirectories.
+
+There is no requirement for `DavItems.HistoryItemId`, `FileBlobId` or `NzbBlobId`
+columns. Do not add them to the legacy database to satisfy an old exporter.
+Regenerate inventories made by an older exporter before using this reader.
+
+Missing-history files and orphan NZB blobs require separate identity-backed
+reconciliation; this adapter does not automatically associate them or fabricate
+NZBs from incomplete metadata. Likewise, an ambiguous association or invalid
+source payload is not a successful migration. Preserve those exclusions until
+each has a reviewed outcome. An inventory candidate is not yet a verified import
+or a playback result.
 
 Choose 20–50 representative candidates across media types and representations. Create `selection.json` with exact path/ID pairs from the inventory:
 
@@ -186,6 +224,20 @@ Do not add `/mnt/plex2` to Plex or scale beyond the canary until all of these ar
 - direct-backend measurements are acceptable for both first and repeat passes;
 - rollback has been rehearsed or its journal has been independently checked;
 - the original NzbDav service, data, and `/mnt/plex` library remain available.
+
+## Retire the temporary importer
+
+After the canary is accepted, use a separately reviewed full-library migration
+and cutover plan that preserves the existing Plex library paths, metadata and
+watch state. Passing the canary does not authorize bulk import or replacing the
+production symlink tree.
+
+Remove the temporary exporter/import adapter and revoke its legacy database
+access only after the full library has been reconciled, unresolved records have
+reviewed dispositions, and playback works independently of legacy NzbDav.
+Retain the checksummed packages, mapping reports and journals as private audit
+and recovery evidence. Do not remove shared migration infrastructure needed by
+other import sources, or the permanent native-cache and Plex-prefetch features.
 
 ## Related
 
