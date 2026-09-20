@@ -1,0 +1,192 @@
+// @vitest-environment jsdom
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { useState } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ManagedEnvProvider } from "~/components/ui";
+import { SmartPrefetchSettings } from "./smart-prefetch";
+import { parsePrefetchSettings } from "./smart-prefetch-model";
+
+function Harness({ managed = false }: { managed?: boolean }) {
+  const [config, setConfig] = useState<Record<string, string>>({});
+  return (
+    <ManagedEnvProvider
+      value={
+        managed ? { "smart-prefetch.settings": "NZBDAV_CONFIG__SMART_PREFETCH__SETTINGS" } : {}
+      }
+    >
+      <SmartPrefetchSettings config={config} setNewConfig={setConfig} />
+      <output data-testid="config">{JSON.stringify(config)}</output>
+    </ManagedEnvProvider>
+  );
+}
+function fakeApi(collection = false) {
+  return vi
+    .fn<(url: string, init?: RequestInit) => Promise<Response>>()
+    .mockImplementation((url, init) => {
+      const op = url.split("/api/plex/")[1];
+      const snapshot = (data: unknown[]) => ({
+        data,
+        isStale: false,
+        lastSuccess: "2026-09-20T00:00:00Z",
+        error: null,
+      });
+      const body = (
+        {
+          accounts: { accounts: [] },
+          servers: { servers: [{ id: "server", name: "Home", enabled: true }] },
+          libraries: snapshot([{ id: "2", title: "TV", type: "show" }]),
+          users: snapshot([{ id: "7", name: "Owner" }]),
+          sources: snapshot([
+            {
+              serverId: "server",
+              libraryId: "2",
+              kind: collection ? "collection" : "hub",
+              id: "recent",
+              key: "/hubs/recent",
+              title: "Recent TV",
+              type: collection ? "collection" : "show",
+            },
+          ]),
+          preview: {
+            items: [
+              { ratingKey: "42", title: "Episode one", type: "episode", file: "/Plex/episode.mkv" },
+            ],
+          },
+        } as Record<string, unknown>
+      )[op ?? ""];
+      if (body) return Promise.resolve(new Response(JSON.stringify(body)));
+      if (url.endsWith("/api/prefetch/preview"))
+        return Promise.resolve(
+          new Response(
+            JSON.stringify({
+              predictions: [
+                {
+                  itemId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                  displayName: "Predicted episode",
+                  source: "History",
+                  reason: "Next unwatched episode",
+                  start: 0,
+                  length: 100,
+                  fileSize: 1000,
+                },
+              ],
+            }),
+          ),
+        );
+      if (init?.method === "POST")
+        return Promise.resolve(
+          new Response(JSON.stringify({ status: true, jobs: [], rejected: [] })),
+        );
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            available: true,
+            paused: false,
+            initializationError: null,
+            lastSuccess: "2026-09-20T00:00:00Z",
+            lastError: "History server unavailable",
+            jobs: [
+              {
+                id: "job-1",
+                itemId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                state: "failed",
+                trigger: "manual",
+                displayName: "Imported episode",
+                source: "Manual request",
+                reason: "Operator selected media",
+                fileSize: 1000,
+                committedBytes: 200,
+                length: 100,
+                priority: 50,
+                error: "Provider unavailable",
+              },
+            ],
+          }),
+        ),
+      );
+    });
+}
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+describe("Smart Prefetch settings", () => {
+  it("selects real Plex collection records using their owning library media type", async () => {
+    vi.stubGlobal("fetch", fakeApi(true));
+    render(<Harness />);
+    await waitFor(() => expect(screen.getByRole("option", { name: "Home" })).toBeTruthy());
+    await userEvent.selectOptions(screen.getByLabelText("Plex source server"), "server");
+    await screen.findByRole("option", { name: "TV (show)" });
+    await userEvent.selectOptions(screen.getByLabelText("Plex source library"), "2");
+    await userEvent.click(await screen.findByRole("button", { name: "Add source Recent TV" }));
+    const config = JSON.parse(screen.getByTestId("config").textContent) as Record<string, string>;
+    expect(parsePrefetchSettings(config["smart-prefetch.settings"]).Sources[0]).toMatchObject({
+      Kind: "collection",
+      Type: "show",
+      LibraryId: "2",
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Preview Recent TV" }));
+    expect(await screen.findByText("Episode one")).toBeTruthy();
+  });
+  it("shows policy errors and whole-file coverage, and previews without enqueueing", async () => {
+    const fetcher = fakeApi();
+    vi.stubGlobal("fetch", fetcher);
+    render(<Harness />);
+    expect(await screen.findByText("History server unavailable")).toBeTruthy();
+    expect(screen.getByText(/200 of 1,000 cached file bytes/)).toBeTruthy();
+    expect(screen.getByText(/Imported episode/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Preview policies" }));
+    expect(await screen.findByText("Predicted episode")).toBeTruthy();
+    expect(screen.getByText(/Next unwatched episode/)).toBeTruthy();
+    expect(fetcher.mock.calls.some((call) => call[0].endsWith("/operations"))).toBe(false);
+  });
+  it("edits complete typed controls and preserves scoped users and source exclusions", async () => {
+    vi.stubGlobal("fetch", fakeApi());
+    render(<Harness />);
+    await userEvent.click(screen.getByLabelText("Enable Smart Prefetch"));
+    await userEvent.clear(screen.getByLabelText("Episodes to queue ahead"));
+    await userEvent.type(screen.getByLabelText("Episodes to queue ahead"), "3");
+    await waitFor(() => expect(screen.getByRole("option", { name: "Home" })).toBeTruthy());
+    await userEvent.selectOptions(screen.getByLabelText("Plex source server"), "server");
+    await userEvent.click(await screen.findByLabelText("History user Owner"));
+    await userEvent.selectOptions(screen.getByLabelText("Plex source library"), "2");
+    await userEvent.click(await screen.findByRole("button", { name: "Add source Recent TV" }));
+    await userEvent.type(screen.getByLabelText("Excluded show IDs for Recent TV"), "42, 43");
+    await userEvent.click(screen.getByRole("button", { name: "Preview Recent TV" }));
+    expect(await screen.findByText("Episode one")).toBeTruthy();
+    const config = JSON.parse(screen.getByTestId("config").textContent) as Record<string, string>;
+    const saved = parsePrefetchSettings(config["smart-prefetch.settings"]);
+    expect(saved.Enabled).toBe(true);
+    expect(saved.MaxQueueAhead).toBe(3);
+    expect(saved.Users).toEqual(["server:7"]);
+    expect(saved.Sources[0]?.ExcludedShows).toEqual(["42", "43"]);
+  });
+  it("uses the one bounded queue for bulk warm and retry operations", async () => {
+    const fetcher = fakeApi();
+    vi.stubGlobal("fetch", fetcher);
+    render(<Harness />);
+    await screen.findByText("Provider unavailable");
+    expect(screen.getByLabelText("Priority for job-1").getAttribute("min")).toBe("-100");
+    await userEvent.click(screen.getByRole("button", { name: "Retry job-1" }));
+    expect(fetcher).toHaveBeenCalledWith(
+      expect.stringContaining("/api/prefetch/operations"),
+      expect.objectContaining({ body: JSON.stringify({ operation: "retry", jobId: "job-1" }) }),
+    );
+    await userEvent.type(
+      screen.getByLabelText("Imported media IDs (up to 32)"),
+      "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Warm selected media" }));
+    expect(fetcher).toHaveBeenCalledWith(
+      expect.stringContaining("/api/prefetch/operations"),
+      expect.objectContaining({ body: expect.stringContaining('"operation":"warm"') as unknown }),
+    );
+  });
+  it("keeps environment-owned policy controls read-only", () => {
+    vi.stubGlobal("fetch", fakeApi());
+    render(<Harness managed />);
+    expect(screen.getByLabelText("Enable Smart Prefetch").closest("fieldset")?.disabled).toBe(true);
+  });
+});

@@ -1,0 +1,98 @@
+import { describe, expect, it } from "vitest";
+import {
+  numericFields,
+  parsePrefetchSettings,
+  validatePrefetchSettings,
+  hasSmartPrefetchSettingsChanged,
+  isSmartPrefetchSettingsValid,
+} from "./smart-prefetch-model";
+
+describe("Smart Prefetch persisted settings", () => {
+  it("exposes bounded queue lifetime, retries and verified-session expiry", () => {
+    const defaults = parsePrefetchSettings(undefined);
+    expect(defaults.QueueCapacity).toBe(256);
+    expect(defaults.MaxRetries).toBe(3);
+    expect(defaults.IntentTtlHours).toBe(24);
+    expect(defaults.VerifiedSessionExpirySeconds).toBe(60);
+    expect(validatePrefetchSettings({ ...defaults, MaxRetries: 0 })).toBeNull();
+    expect(validatePrefetchSettings({ ...defaults, QueueCapacity: 257 })).not.toBeNull();
+    expect(validatePrefetchSettings({ ...defaults, IntentTtlHours: 0 })).not.toBeNull();
+    expect(
+      validatePrefetchSettings({ ...defaults, VerifiedSessionExpirySeconds: 301 }),
+    ).not.toBeNull();
+  });
+  it("supports fractional prediction confidence and bounded cooldown minutes", () => {
+    expect(parsePrefetchSettings(undefined).ConfidenceThreshold).toBe(0.5);
+    expect(parsePrefetchSettings(undefined).CooldownMinutes).toBe(15);
+    expect(
+      validatePrefetchSettings({ ...parsePrefetchSettings(undefined), ConfidenceThreshold: 0.75 }),
+    ).toBeNull();
+    expect(
+      validatePrefetchSettings({ ...parsePrefetchSettings(undefined), ConfidenceThreshold: 1.1 }),
+    ).not.toBeNull();
+    expect(
+      validatePrefetchSettings({ ...parsePrefetchSettings(undefined), CooldownMinutes: 0 }),
+    ).not.toBeNull();
+  });
+  it("matches backend case-insensitive known fields and zero-budget semantics", () => {
+    const settings = parsePrefetchSettings(
+      '{"enabled":true,"sources":[{"serverId":"server","key":"/hubs/recent","title":"Recent"}]}',
+    );
+    expect(settings.Enabled).toBe(true);
+    expect(settings.Sources[0]?.Kind).toBe("hub");
+    expect(settings.Sources[0]?.LibraryId).toBe("");
+    expect(numericFields.find((field) => field.key === "DailyByteBudget")?.label).toContain(
+      "0 means unlimited",
+    );
+    expect(() => parsePrefetchSettings('{"Sources":[{"unknown":1}]}')).toThrow();
+  });
+  it("uses complete backend defaults and preserves source/user identifiers", () => {
+    const defaults = parsePrefetchSettings(undefined);
+    expect(defaults.Enabled).toBe(false);
+    expect(defaults.RealtimeEnabled).toBe(true);
+    expect(defaults.DailyByteBudget).toBe(1_000_000_000_000);
+    const configured = {
+      ...defaults,
+      Users: ["server-a:7"],
+      Sources: [
+        {
+          ServerId: "server-a",
+          LibraryId: "2",
+          Kind: "hub",
+          Key: "/hubs/recent",
+          Title: "Recent",
+          Type: "show",
+          Enabled: false,
+          Limit: 250,
+          ExcludedShows: ["42"],
+        },
+      ],
+    };
+    expect(parsePrefetchSettings(JSON.stringify(configured))).toEqual(configured);
+    expect(validatePrefetchSettings(configured)).toBeNull();
+  });
+  it("rejects malformed shape, unknown keys and out-of-range settings", () => {
+    expect(() => parsePrefetchSettings('{"Unknown":true}')).toThrow();
+    expect(() => parsePrefetchSettings("[]")).toThrow();
+    expect(() => parsePrefetchSettings('{"Users":null}')).toThrow();
+    expect(
+      validatePrefetchSettings({ ...parsePrefetchSettings(undefined), MaxConcurrentJobs: 5 }),
+    ).not.toBeNull();
+    expect(
+      validatePrefetchSettings({ ...parsePrefetchSettings(undefined), MinimumHeadMb: -1 }),
+    ).not.toBeNull();
+    expect(isSmartPrefetchSettingsValid({ "smart-prefetch.settings": "bad json" })).toBe(false);
+  });
+  it("detects semantic changes only within its setting", () => {
+    expect(hasSmartPrefetchSettingsChanged({}, { other: "changed" })).toBe(false);
+    expect(
+      hasSmartPrefetchSettingsChanged(
+        {},
+        { "smart-prefetch.settings": JSON.stringify(parsePrefetchSettings(undefined)) },
+      ),
+    ).toBe(false);
+    expect(
+      hasSmartPrefetchSettingsChanged({}, { "smart-prefetch.settings": '{"Enabled":true}' }),
+    ).toBe(true);
+  });
+});
