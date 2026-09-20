@@ -305,6 +305,7 @@ public sealed class MigrationCanaryLink
     public string CorrelationStatus { get; set; } = "";
     public string CorrelationEvidence { get; set; } = "{}";
     public string SourcePackageDigest { get; set; } = "";
+    public long ExpectedFileSize { get; set; }
     public string ApplyStatus { get; set; } = "planned";
     public string? Error { get; set; }
     public DateTime CreatedAt { get; set; }

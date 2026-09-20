@@ -42,6 +42,7 @@ public sealed class NzbDavMigrationSchemaTests
             CorrelationStatus = "exact",
             CorrelationEvidence = "{}",
             SourcePackageDigest = new string('a', 64),
+            ExpectedFileSize = 123,
             ApplyStatus = "planned",
             CreatedAt = now,
             UpdatedAt = now,
@@ -54,7 +55,9 @@ public sealed class NzbDavMigrationSchemaTests
         Assert.Equal(MigrationSourceTypes.NzbDav, session.SourceType);
         Assert.Equal("/config/import/package", session.SourcePackageRoot);
         Assert.Equal("/mnt/plex2", session.CanaryLibraryRoot);
-        Assert.Equal("exact", (await db.CanaryLinks.SingleAsync()).CorrelationStatus);
+        var link = await db.CanaryLinks.SingleAsync();
+        Assert.Equal("exact", link.CorrelationStatus);
+        Assert.Equal(123, link.ExpectedFileSize);
     }
 
     [Fact]
