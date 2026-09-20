@@ -69,9 +69,9 @@ public sealed class LegacyNzbDavReader
         JOIN state s ON s.leaf = d."Id"
         LEFT JOIN ownership o ON o.leaf = d."Id"
         LEFT JOIN "HistoryItems" AS h ON h."Id" = o.owner_id AND o.owner_count = 1 AND NOT s.invalid
-        LEFT JOIN "DavNzbFiles" AS nf ON nf."Id" = d."Id"
-        LEFT JOIN "DavRarFiles" AS rf ON rf."Id" = d."Id"
-        LEFT JOIN "DavMultipartFiles" AS mf ON mf."Id" = d."Id"
+        LEFT JOIN "DavNzbFiles" AS nf ON nf."Id" = d."Id" AND h."Id" IS NOT NULL
+        LEFT JOIN "DavRarFiles" AS rf ON rf."Id" = d."Id" AND h."Id" IS NOT NULL
+        LEFT JOIN "DavMultipartFiles" AS mf ON mf."Id" = d."Id" AND h."Id" IS NOT NULL
         WHERE d."Id" = ANY (@ids)
         ORDER BY d."Id"
         """;

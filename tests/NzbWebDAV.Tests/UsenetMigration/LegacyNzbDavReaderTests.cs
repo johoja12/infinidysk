@@ -68,7 +68,6 @@ public sealed class LegacyNzbDavReaderTests
         var withoutHistory = Guid.NewGuid();
         var missing = Guid.NewGuid();
         var historyId = Guid.NewGuid();
-        var blobId = Guid.NewGuid();
         var releaseId = Guid.NewGuid();
         var nestedId = Guid.NewGuid();
         var roleCreated = false;
@@ -99,7 +98,7 @@ public sealed class LegacyNzbDavReaderTests
                     ('{withHistory}', '/content/release/nested/a.mkv', 123, 3, '{nestedId}'),
                     ('{withoutHistory}', '/content/b.mkv', 456, 3, NULL);
                 INSERT INTO "{schema}"."DavNzbFiles" VALUES
-                    ('{withHistory}', '[\"one@example\"]'), ('{withoutHistory}', '[\"two@example\"]');
+                    ('{withHistory}', '["one@example"]'), ('{withoutHistory}', '["two@example"]');
                 """);
             await ExecuteAsync(admin, $"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'");
             roleCreated = true;
@@ -124,31 +123,48 @@ public sealed class LegacyNzbDavReaderTests
             Assert.Null(result.Items.Single(item => item.Id == withoutHistory).HistoryItemId);
             Assert.Equal(missing, Assert.Single(result.MissingIds));
             Assert.Equal(historyId, result.Items.Single(item => item.Id == withHistory).NzbBlobId);
+            Assert.Equal("/content/release", result.Items.Single(item => item.Id == withHistory).ReleaseRootPath);
+            Assert.Equal("<nzb />", result.Items.Single(item => item.Id == withHistory).NzbContents);
+            Assert.Equal("missing-history", result.Items.Single(item => item.Id == withoutHistory).ResolutionExclusion);
+            Assert.Null(result.Items.Single(item => item.Id == withoutHistory).NzbSegmentsJson);
 
             foreach (var assignment in new[] { "\"IsCorrupted\" = true", "\"RepairStatus\" = 2",
                          "\"ZeroPadCorruptSegments\" = true", "\"HealthCheckQueueReason\" = ' Source-Validation '" })
             {
                 await ExecuteAsync(admin, $"UPDATE \"{schema}\".\"DavItems\" SET {assignment} WHERE \"Id\" = '{withHistory}'");
                 var unsafeRows = await new LegacyNzbDavReader().ReadAsync(builder.ConnectionString, [withHistory]);
-                Assert.Contains("legacy-health-excluded", System.Text.Json.JsonSerializer.Serialize(unsafeRows), StringComparison.Ordinal);
+                Assert.Equal("legacy-health-excluded", Assert.Single(unsafeRows.Items).ResolutionExclusion);
                 await ExecuteAsync(admin, $"UPDATE \"{schema}\".\"DavItems\" SET \"IsCorrupted\" = false, \"RepairStatus\" = 0, \"ZeroPadCorruptSegments\" = false, \"HealthCheckQueueReason\" = NULL");
             }
-            await ExecuteAsync(admin, $"INSERT INTO \"{schema}\".\"SourceValidationBlocks\" VALUES ('{withHistory}', 5)");
-            var blocked = await new LegacyNzbDavReader().ReadAsync(builder.ConnectionString, [withHistory]);
-            Assert.Contains("legacy-health-excluded", System.Text.Json.JsonSerializer.Serialize(blocked), StringComparison.Ordinal);
-            await ExecuteAsync(admin, $"DELETE FROM \"{schema}\".\"SourceValidationBlocks\"");
+            foreach (var status in new[] { 1, 2, 3, 5 })
+            {
+                await ExecuteAsync(admin, $"INSERT INTO \"{schema}\".\"SourceValidationBlocks\" VALUES ('{withHistory}', {status})");
+                var blocked = await new LegacyNzbDavReader().ReadAsync(builder.ConnectionString, [withHistory]);
+                Assert.Equal("legacy-health-excluded", Assert.Single(blocked.Items).ResolutionExclusion);
+                await ExecuteAsync(admin, $"DELETE FROM \"{schema}\".\"SourceValidationBlocks\"");
+            }
 
             foreach (var parent in new[] { nestedId, Guid.NewGuid() })
             {
                 await ExecuteAsync(admin, $"UPDATE \"{schema}\".\"DavItems\" SET \"ParentId\" = '{parent}' WHERE \"Id\" = '{releaseId}'");
                 var broken = await new LegacyNzbDavReader().ReadAsync(builder.ConnectionString, [withHistory]);
-                Assert.Contains("invalid-ancestry", System.Text.Json.JsonSerializer.Serialize(broken), StringComparison.Ordinal);
+                Assert.Equal("invalid-ancestry", Assert.Single(broken.Items).ResolutionExclusion);
             }
+            var chain = Enumerable.Range(0, 270).Select(_ => Guid.NewGuid()).ToArray();
+            var values = chain.Select((id, index) => $"('{id}', '/chain/{index}', 1, {(index + 1 < chain.Length ? $"'{chain[index + 1]}'::uuid" : "NULL")})");
+            await ExecuteAsync(admin, $"INSERT INTO \"{schema}\".\"DavItems\" (\"Id\", \"Path\", \"Type\", \"ParentId\") VALUES {string.Join(',', values)}");
+            await ExecuteAsync(admin, $"UPDATE \"{schema}\".\"DavItems\" SET \"ParentId\" = '{chain[0]}' WHERE \"Id\" = '{releaseId}'");
+            var bounded = await new LegacyNzbDavReader().ReadAsync(builder.ConnectionString, [withHistory]);
+            Assert.Equal("invalid-ancestry", Assert.Single(bounded.Items).ResolutionExclusion);
+            var batched = await new LegacyNzbDavReader().ReadAsync(builder.ConnectionString, chain.Append(missing));
+            Assert.Equal(chain.Length, batched.Items.Count);
+            Assert.Equal(missing, Assert.Single(batched.MissingIds));
             await ExecuteAsync(admin, $"UPDATE \"{schema}\".\"DavItems\" SET \"ParentId\" = NULL WHERE \"Id\" = '{releaseId}'");
 
             await ExecuteAsync(admin, $"INSERT INTO \"{schema}\".\"HistoryItems\" VALUES ('{Guid.NewGuid()}', 'duplicate.nzb', 'duplicate', 'tv', 1, '{releaseId}', NULL)");
             var ambiguous = await new LegacyNzbDavReader().ReadAsync(builder.ConnectionString, [withHistory]);
             Assert.Null(Assert.Single(ambiguous.Items).HistoryItemId);
+            Assert.Equal("ambiguous-history", Assert.Single(ambiguous.Items).ResolutionExclusion);
 
             await ExecuteAsync(admin, $"GRANT UPDATE ON \"{schema}\".\"DavItems\" TO \"{role}\"");
             var denied = await Assert.ThrowsAsync<InvalidOperationException>(() =>
