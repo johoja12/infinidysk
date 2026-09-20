@@ -7,4 +7,5 @@ namespace NzbWebDAV.UsenetMigration;
 public static class MigrationSourceTypes
 {
     public const string Altmount = "altmount";
+    public const string NzbDav = "nzbdav";
 }

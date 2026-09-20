@@ -1,0 +1,120 @@
+using Microsoft.EntityFrameworkCore;
+using System.Security.Cryptography;
+using NzbDavMigration.Export;
+using NzbWebDAV.Config;
+using NzbWebDAV.UsenetMigration;
+using NzbWebDAV.UsenetMigration.NzbDav;
+using NzbWebDAV.UsenetMigration.Runner;
+using NzbWebDAV.UsenetMigration.Source;
+
+namespace NzbWebDAV.Tests.UsenetMigration;
+
+public sealed class NzbDavScanRunnerTests : IDisposable
+{
+    private readonly string _root = Path.Join(Path.GetTempPath(), $"nzbdav-scan-{Guid.NewGuid():N}");
+
+    [Fact]
+    public async Task ScanAsync_PersistsPackageRowsAndPendingSubmission()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var package = await CreatePackageAsync();
+        await harness.Store.UpdateSessionAsync(session =>
+        {
+            session.Status = MigrationSessionStatus.Scanning;
+            session.SourceType = MigrationSourceTypes.NzbDav;
+            session.SourcePackageRoot = package;
+        });
+        await harness.Store.SetCategoryMappingAsync("Migration-TV", "migration-tv", "migrate");
+        var runner = new NzbDavScanRunner(harness.Store, new ConfigManager(), new NzbDavPackageReader());
+
+        var summary = await runner.ScanAsync();
+
+        Assert.NotNull(summary);
+        Assert.Equal(1, summary.GreenCount);
+        await using var db = harness.Mig();
+        var release = await db.Releases.SingleAsync();
+        var file = await db.ReleaseFiles.SingleAsync();
+        Assert.StartsWith("nzbdav:", release.StoreRef, StringComparison.Ordinal);
+        Assert.Equal("migration-tv", release.TargetCategory);
+        Assert.Equal(NzbDavArticleIdentity.DirectKind, file.ArticleIdentityKind);
+        Assert.NotNull(file.SourceFileId);
+        Assert.Equal("pending", (await db.Submissions.SingleAsync()).State);
+        Assert.Equal(MigrationSessionStatus.Scanned, (await db.SessionState.SingleAsync()).Status);
+    }
+
+    [Fact]
+    public async Task ScanAsync_PreservesExcludedLeafAsRedArtifact()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var package = await CreatePackageAsync(excluded: true);
+        await harness.Store.UpdateSessionAsync(session =>
+        {
+            session.Status = MigrationSessionStatus.Scanning;
+            session.SourceType = MigrationSourceTypes.NzbDav;
+            session.SourcePackageRoot = package;
+        });
+        await harness.Store.SetCategoryMappingAsync("Migration-TV", "migration-tv", "migrate");
+
+        var summary = await new NzbDavScanRunner(harness.Store, new ConfigManager(), new NzbDavPackageReader())
+            .ScanAsync();
+
+        Assert.Equal(1, summary!.RedCount);
+        await using var db = harness.Mig();
+        Assert.Equal("red", (await db.Releases.SingleAsync()).Verdict);
+        Assert.Empty(db.Submissions);
+        Assert.NotEmpty(db.ScanErrors);
+    }
+
+    private async Task<string> CreatePackageAsync(bool excluded = false)
+    {
+        Directory.CreateDirectory(_root);
+        var payload = Path.Join(_root, $"source-{Guid.NewGuid():N}.nzb");
+        await File.WriteAllTextAsync(payload, """
+            <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+              <file subject="sample"><segments><segment bytes="10" number="1">one@test</segment></segments></file>
+            </nzb>
+            """);
+        var package = Path.Join(_root, $"package-{Guid.NewGuid():N}");
+        var leafId = Guid.NewGuid();
+        var blobId = Guid.NewGuid();
+        await new CanaryPackageWriter(1, 50).WriteAsync(new CanaryExportRequest(
+            "scan-package",
+            package,
+            [new CanaryExportRelease("release-1", blobId, payload,
+                [new NzbDavExportLeaf(leafId, "/content/a.mkv", 10, "release-1", null, blobId,
+                    NzbDavArticleIdentity.DirectKind, new string('a', 64), "ready", null)])],
+            [new NzbDavSelectedLibraryLink("Migration-TV/a.mkv", "/legacy/.ids/a", leafId)]));
+        if (excluded)
+        {
+            var manifestPath = Path.Join(package, "manifest.json");
+            var manifest = NzbDavExportManifestJson.Deserialize(await File.ReadAllTextAsync(manifestPath));
+            var leaf = manifest.Releases[0].Leaves[0] with
+            {
+                IdentityKind = "unavailable",
+                IdentityDigest = null,
+                ExtractionStatus = "excluded",
+                ExclusionReason = "missing-identity",
+            };
+            manifest = manifest with
+            {
+                Releases = [manifest.Releases[0] with { Leaves = [leaf] }],
+            };
+            await File.WriteAllTextAsync(manifestPath, NzbDavExportManifestJson.Serialize(manifest));
+            await using var stream = File.OpenRead(manifestPath);
+            var digest = Convert.ToHexString(await SHA256.HashDataAsync(stream)).ToLowerInvariant();
+            var sumsPath = Path.Join(package, "SHA256SUMS");
+            var sums = (await File.ReadAllLinesAsync(sumsPath)).Select(line =>
+                line.EndsWith("  manifest.json", StringComparison.Ordinal)
+                    ? $"{digest}  manifest.json"
+                    : line);
+            await File.WriteAllTextAsync(sumsPath, string.Join('\n', sums) + "\n");
+        }
+        return package;
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_root))
+            Directory.Delete(_root, recursive: true);
+    }
+}

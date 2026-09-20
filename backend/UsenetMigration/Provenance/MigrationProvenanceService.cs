@@ -14,6 +14,13 @@ namespace NzbWebDAV.UsenetMigration.Provenance;
 /// </summary>
 public sealed class MigrationProvenanceService
 {
+    private readonly MigrationCorrelationDispatcher _correlationDispatcher;
+
+    public MigrationProvenanceService(MigrationCorrelationDispatcher? correlationDispatcher = null)
+    {
+        _correlationDispatcher = correlationDispatcher ?? CreateDefaultDispatcher();
+    }
+
     public async Task<int> RecordCompletedAsync(
         UsenetMigrationDbContext migrationContext,
         DavDatabaseContext davContext,
@@ -22,53 +29,47 @@ public sealed class MigrationProvenanceService
         HistoryItem history,
         CancellationToken ct = default)
     {
-        var runId = await EnsureCurrentRunAsync(migrationContext, ct).ConfigureAwait(false);
+        var session = await UsenetMigrationStore.GetOrCreateSessionAsync(migrationContext, ct).ConfigureAwait(false);
+        var sourceType = session.SourceType;
+        var runId = await EnsureCurrentRunAsync(migrationContext, sourceType, ct).ConfigureAwait(false);
         var release = await migrationContext.Releases.AsNoTracking()
             .FirstAsync(r => r.StoreRef == submission.StoreRef, ct)
             .ConfigureAwait(false);
-        var sourceFiles = await migrationContext.ReleaseFiles.AsNoTracking()
+        var sourceFiles = await migrationContext.ReleaseFiles
             .Where(f => f.StoreRef == submission.StoreRef)
             .ToListAsync(ct)
             .ConfigureAwait(false);
         var leaves = await davContext.Items.AsNoTracking()
             .Where(i => (i.NzbBlobId == nzoId || i.HistoryItemId == nzoId)
                         && i.Type == DavItem.ItemType.UsenetFile)
-            .Select(i => new ReleaseLeaf
-            {
-                DavItemId = i.Id,
-                Name = i.Name,
-                Path = i.Path,
-                FileSize = i.FileSize,
-                NzbBlobId = i.NzbBlobId,
-                IdentityMethod = i.NzbBlobId == nzoId ? "nzb-blob-id" : "history-item-id",
-            })
             .ToListAsync(ct)
             .ConfigureAwait(false);
-
-        var matches = SymlinkMatcher.Match(
-            sourceFiles.Select(f => new MatchableFile
+        var correlations = await _correlationDispatcher.Resolve(sourceType)
+            .CorrelateAsync(sourceFiles, leaves, davContext, ct).ConfigureAwait(false);
+        var exactByFileId = correlations.Where(result => result.Status == "exact" && result.DavItemId is not null)
+            .ToDictionary(result => result.ReleaseFileId);
+        if (sourceType == MigrationSourceTypes.NzbDav)
+        {
+            foreach (var sourceFile in sourceFiles)
             {
-                ReleaseFileId = f.Id,
-                NormalisedName = f.NormalisedName,
-                NormalisedRelativePath = MatchKey.ForRelativePath(f.VirtualPath),
-                FileSize = f.FileSize,
-            }).ToList(),
-            leaves);
-        var matchByFileId = matches
-            .Where(m => m.DavItemId != null && m.MatchMethod != null)
-            .ToDictionary(m => m.ReleaseFileId);
+                var result = correlations.Single(item => item.ReleaseFileId == sourceFile.Id);
+                sourceFile.FileStatus = result.Status;
+                sourceFile.Flags = result.Evidence;
+                sourceFile.NewDavItemId = result.DavItemId?.ToString();
+            }
+        }
 
         var now = DateTime.UtcNow;
         var migratedRelease = await migrationContext.MigratedReleases
             .FirstOrDefaultAsync(
-                r => r.SourceType == MigrationSourceTypes.Altmount && r.SourceReleaseId == submission.StoreRef,
+                r => r.SourceType == sourceType && r.SourceReleaseId == submission.StoreRef,
                 ct)
             .ConfigureAwait(false);
         if (migratedRelease is null)
         {
             migratedRelease = new MigratedRelease
             {
-                SourceType = MigrationSourceTypes.Altmount,
+                SourceType = sourceType,
                 SourceReleaseId = submission.StoreRef,
                 FirstRunId = runId,
                 MigratedAt = now,
@@ -83,7 +84,7 @@ public sealed class MigrationProvenanceService
         migratedRelease.JobName = history.JobName;
         migratedRelease.MountPath = $"/content/{history.Category}/{history.JobName}";
         migratedRelease.ExpectedFileCount = sourceFiles.Count;
-        migratedRelease.MappedFileCount = matchByFileId.Count;
+        migratedRelease.MappedFileCount = exactByFileId.Count;
         migratedRelease.LastVerifiedAt = now;
 
         var existingFiles = await migrationContext.MigratedFiles
@@ -92,7 +93,7 @@ public sealed class MigrationProvenanceService
             .ConfigureAwait(false);
         foreach (var sourceFile in sourceFiles)
         {
-            if (!matchByFileId.TryGetValue(sourceFile.Id, out var match))
+            if (!exactByFileId.TryGetValue(sourceFile.Id, out var match))
                 continue;
 
             if (!existingFiles.TryGetValue(sourceFile.VirtualPath, out var migratedFile))
@@ -109,12 +110,15 @@ public sealed class MigrationProvenanceService
             migratedFile.NormalisedName = sourceFile.NormalisedName;
             migratedFile.FileSize = sourceFile.FileSize;
             migratedFile.DavItemId = match.DavItemId!.Value;
-            migratedFile.NzbBlobId = nzoId;
-            migratedFile.MatchMethod = match.MatchMethod!;
+            migratedFile.NzbBlobId = match.NzbBlobId ?? nzoId;
+            migratedFile.SourceFileId = sourceFile.SourceFileId;
+            migratedFile.ArticleIdentityKind = sourceFile.ArticleIdentityKind;
+            migratedFile.ArticleIdentityDigest = sourceFile.ArticleIdentityDigest;
+            migratedFile.MatchMethod = match.MatchMethod ?? "exact";
             migratedFile.LastVerifiedAt = now;
         }
 
-        if (matchByFileId.Count == sourceFiles.Count)
+        if (exactByFileId.Count == sourceFiles.Count)
         {
             var currentPaths = sourceFiles.Select(f => f.VirtualPath).ToHashSet(StringComparer.Ordinal);
             migrationContext.MigratedFiles.RemoveRange(
@@ -124,12 +128,13 @@ public sealed class MigrationProvenanceService
         Log.Information(
             "Recorded migration provenance for {StoreRef}: Run={RunId}, ExpectedFiles={Expected}, " +
             "MappedFiles={Mapped}, NzoId={NzoId}",
-            submission.StoreRef, runId, sourceFiles.Count, matchByFileId.Count, nzoId);
-        return matchByFileId.Count;
+            submission.StoreRef, runId, sourceFiles.Count, exactByFileId.Count, nzoId);
+        return exactByFileId.Count;
     }
 
     private static async Task<long> EnsureCurrentRunAsync(
         UsenetMigrationDbContext context,
+        string sourceType,
         CancellationToken ct)
     {
         var session = await UsenetMigrationStore.GetOrCreateSessionAsync(context, ct).ConfigureAwait(false);
@@ -140,7 +145,7 @@ public sealed class MigrationProvenanceService
         var now = DateTime.UtcNow;
         var run = new MigrationRun
         {
-            SourceType = MigrationSourceTypes.Altmount,
+            SourceType = sourceType,
             Status = "running",
             StartedAt = now,
         };
@@ -151,5 +156,15 @@ public sealed class MigrationProvenanceService
         session.UpdatedAt = now;
         await context.SaveChangesAsync(ct).ConfigureAwait(false);
         return run.Id;
+    }
+
+    private static MigrationCorrelationDispatcher CreateDefaultDispatcher()
+    {
+        IMigrationCorrelationProvider[] providers =
+        [
+            new AltmountCorrelationProvider(),
+            new NzbDavCorrelationProvider(new DavItemArticleIdentityReader(BlobStore.Current)),
+        ];
+        return new MigrationCorrelationDispatcher(providers);
     }
 }

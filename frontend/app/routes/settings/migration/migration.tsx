@@ -4,8 +4,9 @@ import { Alert, Badge } from "~/components/ui/feedback";
 import { Icon } from "~/components/ui/icon";
 import { Tabs, TabPanel } from "~/components/ui/tabs";
 import { AltmountMigration } from "./altmount/altmount-migration";
+import { NzbDavMigration } from "./nzbdav/nzbdav-migration";
 
-type MigrationSourceId = "altmount";
+type MigrationSourceId = "altmount" | "nzbdav";
 
 type MigrationSource = {
   id: MigrationSourceId;
@@ -23,6 +24,14 @@ const MIGRATION_SOURCES: MigrationSource[] = [
       "Import an existing AltMount library by rebuilding NZBs and submitting them through InfiniDysk's normal queue.",
     icon: "moving",
     component: AltmountMigration,
+  },
+  {
+    id: "nzbdav",
+    label: "NzbDav",
+    description:
+      "Import a checksummed legacy NzbDav export into isolated InfiniDysk categories, then generate a host-applied parallel canary library.",
+    icon: "difference",
+    component: NzbDavMigration,
   },
 ];
 

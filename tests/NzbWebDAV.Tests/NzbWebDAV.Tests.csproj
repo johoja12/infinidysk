@@ -32,10 +32,14 @@
   <ItemGroup>
     <ProjectReference Include="..\..\backend\NzbWebDAV.csproj" />
     <ProjectReference Include="..\..\backend.Benchmarks\NzbWebDAV.Benchmarks.csproj" />
+    <ProjectReference Include="..\..\tools\NzbDavMigration\NzbDavMigration.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <None Update="TestFixtures/Par2Corpus/**/*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Fixtures/UsenetMigration/**/*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <Content Include="..\..\contracts\**\*.json">
