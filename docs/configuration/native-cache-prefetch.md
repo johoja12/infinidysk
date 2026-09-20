@@ -83,8 +83,11 @@ are masked in UI/config responses. Protect `/config`, which holds the actual tok
 Use browser sign-in to obtain a Plex PIN authorization URL, complete sign-in at Plex,
 then return to InfiniDysk. Pending requests can expire, be cancelled, or retried.
 Select an existing account, optionally switch Plex Home users with their Home PIN,
-and discover owned/shared server connection candidates. Test and save the intended
-connection. Manual server URL/token setup remains available.
+and discover owned/shared server connection candidates. Select the intended server
+card and use **Save selected server**; the success notice confirms that it is persisted
+and immediately available to Smart Prefetch. **Refresh** only repeats discovery and
+never changes saved configuration. Manual URL/token setup, path mappings, testing,
+and saved-server edits remain under **Advanced server configuration**.
 
 Multiple saved servers are independent. Account disconnect removes the local
 account and disables servers linked to it; it does not revoke authorization at Plex,
@@ -106,6 +109,12 @@ change signals, prediction thresholds, schedules, queue resources, or warming
 ranges. **Customized** means at least one policy value differs from those defaults.
 **Reset to smart defaults** restores policy behavior without disabling Smart
 Prefetch or removing selected Plex users, hubs, or collections.
+
+The normal view also shows compact Plex connection status. Library/user/source
+selection is available under **Plex libraries and sources**, and queue inspection,
+policy preview, manual warming, and retry controls are under **Prefetch activity**.
+Both sections stay collapsed until needed so the everyday setup remains limited to
+Enable, Movies, TV episodes, and the daily GB budget.
 
 Fetch libraries, users, hubs, and collections; preview a source before enabling it.
 Selections belong to stable server/library/source identities, not display names.
