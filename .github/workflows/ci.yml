@@ -539,14 +539,14 @@ jobs:
           -p:EnforceCodeStyleInBuild=false
           -p:SkipRapidYencNativeEnsure=true
 
-      - name: Test PostgreSQL migrations
+      - name: Test PostgreSQL migrations and legacy reader
         env:
           DATABASE_PROVIDER: postgres
           DATABASE_CONNECTION_STRING: Host=localhost;Port=5432;Database=nzbdav;Username=nzbdav;Password=nzbdav
         run: >
           dotnet test tests/NzbWebDAV.Tests/NzbWebDAV.Tests.csproj -c Release
           --no-build --no-restore
-          --filter "FullyQualifiedName~PostgresMigrationTests"
+          --filter "FullyQualifiedName~PostgresMigrationTests|FullyQualifiedName~LegacyNzbDavReaderTests"
 
   contracts:
     name: HTTP contracts
