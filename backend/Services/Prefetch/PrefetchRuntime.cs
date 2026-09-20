@@ -19,6 +19,12 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
     public PrefetchJobStore? Jobs { get { Initialize(); return _jobs; } }
     public PrefetchCoordinator? Coordinator { get { Initialize(); return _coordinator; } }
 
+    public async Task WaitForInitializationAsync(CancellationToken cancellationToken)
+    {
+        await native.WaitForInitializationAsync(cancellationToken).ConfigureAwait(false);
+        Initialize();
+    }
+
     private void Initialize()
     {
         lock (_gate)

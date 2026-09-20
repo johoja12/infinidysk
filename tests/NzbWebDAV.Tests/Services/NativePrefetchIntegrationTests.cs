@@ -50,6 +50,7 @@ public sealed class NativePrefetchIntegrationTests
             await context.SaveChangesAsync();
             using var repairs = new RepairPatchStore(Path.Combine(root, "repairs"), 100);
             await using var native = new NativeCacheService(config, blobs, repairs);
+            Assert.True(await native.WaitForInitializationAsync());
             using var jobs = new PrefetchJobStore(Path.Combine(root, "jobs.db"));
             var factory = new FakeFactory();
             var services = new ServiceCollection();

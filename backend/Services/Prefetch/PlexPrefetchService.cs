@@ -52,6 +52,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             var servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers));
             var revision = Hash(JsonSerializer.Serialize(settings) + JsonSerializer.Serialize(servers));
             if (preview is null && _policyRevision != revision) { _last.Clear(); _policyRevision = revision; }
+            await runtime.WaitForInitializationAsync(deadline.Token).ConfigureAwait(false);
             var jobs = runtime.Jobs;
             if (jobs is null) return;
             if (preview is null) runtime.Coordinator!.PruneOwners(owner => IsOwnerEnabled(owner, settings, servers));

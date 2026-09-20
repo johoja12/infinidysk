@@ -11,6 +11,7 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
 {
     protected override async Task<IActionResult> HandleRequest()
     {
+        await runtime.WaitForInitializationAsync(HttpContext.RequestAborted).ConfigureAwait(false);
         var jobs = runtime.Jobs?.List() ?? [];
         var items = (await database.GetItemsByIdsBatchedAsync(jobs.Select(job => job.ItemId).Distinct().ToArray(),
             ct: HttpContext.RequestAborted).ConfigureAwait(false)).ToDictionary(item => item.Id);
@@ -47,6 +48,7 @@ public sealed class PrefetchOperationController(PrefetchRuntime runtime, DavData
     public sealed record OperationRequest(string Operation, Guid[]? ItemIds, string? JobId, int? Priority, long Start = 0, long Length = 0);
     protected override async Task<IActionResult> HandleRequest()
     {
+        await runtime.WaitForInitializationAsync(HttpContext.RequestAborted).ConfigureAwait(false);
         var request = await HttpContext.Request.ReadFromJsonAsync<OperationRequest>(HttpContext.RequestAborted).ConfigureAwait(false)
             ?? throw new ArgumentException("A prefetch operation is required.");
         var jobs = runtime.Jobs ?? throw new ArgumentException("Activate Native cache and restart before warming media.");
