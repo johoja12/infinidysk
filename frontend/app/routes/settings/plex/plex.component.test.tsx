@@ -1,0 +1,223 @@
+// @vitest-environment jsdom
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ManagedEnvProvider } from "~/components/ui";
+import { PlexSettings } from "./plex";
+
+function responses(extra: Record<string, unknown> = {}) {
+  return vi
+    .fn<(url: string, init: RequestInit) => Promise<Response>>()
+    .mockImplementation((url, init) => {
+      const op = url.split("/api/plex/")[1]!;
+      const body = JSON.parse(typeof init.body === "string" ? init.body : "{}") as {
+        servers?: unknown;
+      };
+      const data =
+        extra[op] ??
+        (
+          {
+            accounts: { accounts: [] },
+            servers: { servers: [] },
+            save: { servers: body.servers },
+            "login/start": {
+              handle: "opaque",
+              url: "https://app.plex.tv/auth#pin",
+              expiresAt: new Date(Date.now() + 900000).toISOString(),
+            },
+            "login/poll": { state: "pending" },
+            "login/cancel": { status: true },
+          } as Record<string, unknown>
+        )[op] ??
+        {};
+      return Promise.resolve(new Response(JSON.stringify(data)));
+    });
+}
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+describe("Plex settings", () => {
+  it("allows readonly selection of an environment-managed account for server discovery", async () => {
+    vi.stubGlobal(
+      "fetch",
+      responses({
+        accounts: { accounts: [{ id: "account", name: "Owner", token: "masked" }] },
+        "account/select": {
+          handle: "account-handle",
+          url: "",
+          expiresAt: new Date(Date.now() + 900000).toISOString(),
+        },
+      }),
+    );
+    render(
+      <ManagedEnvProvider value={{ "plex.accounts": "NZBDAV_CONFIG__PLEX__ACCOUNTS" }}>
+        <PlexSettings />
+      </ManagedEnvProvider>,
+    );
+    const select = await screen.findByRole("button", { name: "Use account Owner" });
+    expect(select.closest("fieldset")?.disabled ?? false).toBe(false);
+    await userEvent.click(select);
+    expect(await screen.findByRole("button", { name: "Discover Plex servers" })).toBeTruthy();
+  });
+  it("does not revive a cancelled sign-in when an earlier poll completes", async () => {
+    let release!: (response: Response) => void;
+    const base = responses();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((url: string, init: RequestInit) =>
+        url.endsWith("login/poll")
+          ? new Promise<Response>((resolve) => {
+              release = resolve;
+            })
+          : base(url, init),
+      ),
+    );
+    render(<PlexSettings />);
+    await userEvent.click(await screen.findByRole("button", { name: "Sign in with Plex" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Check sign-in" }));
+    await userEvent.click(screen.getByRole("button", { name: "Cancel sign-in" }));
+    await screen.findByText("Sign-in cancelled.");
+    await act(async () => {
+      release(new Response(JSON.stringify({ state: "connected" })));
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Sign-in cancelled.")).toBeTruthy();
+    expect(screen.queryByText("Account ready for server discovery.")).toBeNull();
+  });
+  it("selects a protected Home user then discovers, tests and saves a server handle", async () => {
+    const fetcher = responses({
+      accounts: { accounts: [{ id: "account", name: "Owner", token: "masked" }] },
+      "account/select": {
+        handle: "account-handle",
+        url: "",
+        expiresAt: new Date(Date.now() + 900000).toISOString(),
+      },
+      "home/users": { users: [{ id: "kid", name: "Child", protected: true, admin: false }] },
+      "home/switch": {
+        handle: "child-handle",
+        accountId: "kid",
+        expiresAt: new Date(Date.now() + 900000).toISOString(),
+      },
+      discover: {
+        servers: [
+          {
+            handle: "server-handle",
+            id: "machine",
+            name: "Home",
+            connections: [{ uri: "http://localhost:32400", local: true, relay: false }],
+          },
+        ],
+      },
+      test: { success: true, machineIdentifier: "machine" },
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(<PlexSettings />);
+    await userEvent.click(await screen.findByRole("button", { name: "Use account Owner" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Load Plex Home users" }));
+    await userEvent.selectOptions(await screen.findByLabelText("Plex Home user"), "kid");
+    await userEvent.type(screen.getByLabelText("Plex Home PIN"), "1234");
+    await userEvent.click(screen.getByRole("button", { name: "Switch Plex Home user" }));
+    await screen.findByText("Plex Home user connected and saved.");
+    await userEvent.click(screen.getByRole("button", { name: "Discover Plex servers" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Choose Home" }));
+    await userEvent.click(screen.getByRole("button", { name: "Test server 1" }));
+    await screen.findByText("Server 1 identity and authorization verified.");
+    await userEvent.click(screen.getByRole("button", { name: "Save Plex servers" }));
+    await waitFor(() =>
+      expect(fetcher).toHaveBeenCalledWith(
+        expect.stringContaining("/api/plex/save"),
+        expect.objectContaining({
+          body: expect.stringContaining('"handle":"server-handle"') as unknown,
+        }),
+      ),
+    );
+    const switched = fetcher.mock.calls.find((call) => String(call[0]).endsWith("home/switch"));
+    expect(JSON.parse(typeof switched?.[1].body === "string" ? switched[1].body : "{}")).toEqual({
+      handle: "account-handle",
+      userId: "kid",
+      pin: "1234",
+    });
+    expect(fetcher.mock.calls.every((call) => !String(call[0]).includes("1234"))).toBe(true);
+  });
+  it("shows expired login and permits a fresh retry", async () => {
+    vi.stubGlobal(
+      "fetch",
+      responses({
+        "login/start": {
+          handle: "expired",
+          url: "https://app.plex.tv/auth",
+          expiresAt: "2000-01-01T00:00:00Z",
+        },
+      }),
+    );
+    render(<PlexSettings />);
+    await userEvent.click(await screen.findByRole("button", { name: "Sign in with Plex" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Check sign-in" }));
+    expect(await screen.findByText(/Sign-in expired/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Sign in with Plex" })).toBeTruthy();
+  });
+  it("edits and saves manual servers with exact local mapping through the dedicated API", async () => {
+    const fetcher = responses();
+    vi.stubGlobal("fetch", fetcher);
+    render(<PlexSettings />);
+    await screen.findByRole("button", { name: "Add manual server" });
+    await userEvent.click(screen.getByRole("button", { name: "Add manual server" }));
+    await userEvent.type(screen.getByLabelText("Server 1 machine ID"), "machine");
+    await userEvent.type(screen.getByLabelText("Server 1 name"), "Home");
+    await userEvent.type(screen.getByLabelText("Server 1 URL"), "http://localhost:32400");
+    await userEvent.type(screen.getByLabelText("Server 1 token"), "secret");
+    await userEvent.click(screen.getByRole("button", { name: "Add path mapping for server 1" }));
+    await userEvent.type(screen.getByLabelText("Server 1 mapping 1 Plex path"), "/Plex");
+    await userEvent.selectOptions(screen.getByLabelText("Server 1 mapping 1 target type"), "local");
+    await userEvent.type(screen.getByLabelText("Server 1 mapping 1 target path"), "/mnt/library");
+    await userEvent.click(screen.getByRole("button", { name: "Save Plex servers" }));
+    await waitFor(() =>
+      expect(fetcher).toHaveBeenCalledWith(
+        expect.stringContaining("/api/plex/save"),
+        expect.objectContaining({
+          body: expect.stringContaining('"localPath":"/mnt/library"') as unknown,
+        }),
+      ),
+    );
+    expect(fetcher.mock.calls.some((call) => String(call[0]).includes("update-config"))).toBe(
+      false,
+    );
+  });
+  it("shows browser PIN pending, cancellation and retry without exposing tokens", async () => {
+    const fetcher = responses();
+    vi.stubGlobal("fetch", fetcher);
+    render(<PlexSettings />);
+    await userEvent.click(await screen.findByRole("button", { name: "Sign in with Plex" }));
+    expect(await screen.findByRole("link", { name: "Open Plex sign-in" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Check sign-in" }));
+    expect(await screen.findByText(/Waiting for Plex authorization/)).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Cancel sign-in" }));
+    expect(await screen.findByText("Sign-in cancelled.")).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Sign in with Plex" }));
+    expect(
+      fetcher.mock.calls.filter((call) => String(call[0]).endsWith("login/start")),
+    ).toHaveLength(2);
+  });
+  it("pins environment-managed credentials", async () => {
+    vi.stubGlobal("fetch", responses());
+    render(
+      <ManagedEnvProvider
+        value={{
+          "plex.accounts": "NZBDAV_CONFIG__PLEX__ACCOUNTS",
+          "plex.servers": "NZBDAV_CONFIG__PLEX__SERVERS",
+        }}
+      >
+        <PlexSettings />
+      </ManagedEnvProvider>,
+    );
+    await screen.findByRole("button", { name: "Add manual server" });
+    expect(
+      screen.getByRole("button", { name: "Add manual server" }).closest("fieldset")?.disabled,
+    ).toBe(true);
+    expect(
+      screen.getByRole("button", { name: "Sign in with Plex" }).closest("fieldset")?.disabled,
+    ).toBe(true);
+  });
+});
