@@ -12,6 +12,19 @@ export type PlexServer = {
   pathMappings: PlexMapping[];
   handle?: string;
 };
+type PlexServersSubscriber = (servers: PlexServer[]) => void;
+const plexServersSubscribers = new Set<PlexServersSubscriber>();
+
+export function publishPlexServers(servers: PlexServer[]) {
+  for (const subscriber of plexServersSubscribers) subscriber(servers);
+}
+
+export function subscribePlexServers(subscriber: PlexServersSubscriber) {
+  plexServersSubscribers.add(subscriber);
+  return () => {
+    plexServersSubscribers.delete(subscriber);
+  };
+}
 export type PlexLogin = { handle: string; url: string; expiresAt: string };
 export type PlexCandidate = {
   handle: string;

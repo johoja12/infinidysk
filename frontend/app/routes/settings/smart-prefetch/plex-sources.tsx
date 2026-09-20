@@ -3,6 +3,7 @@ import { Alert, Button, Input, Select, Toggle } from "~/components/ui";
 import {
   loadPlexBootstrap,
   plexRequest,
+  subscribePlexServers,
   type PlexLibrary,
   type PlexMedia,
   type PlexServer,
@@ -102,6 +103,23 @@ export function PlexSources({
       alive = false;
     };
   }, []);
+  useEffect(
+    () =>
+      subscribePlexServers((nextServers) => {
+        setServers(nextServers);
+      }),
+    [],
+  );
+  useEffect(() => {
+    if (!serverId || servers.some((server) => server.id === serverId)) return;
+    setServerId("");
+    setLibraryId("");
+    setLibraries(null);
+    setUsers(null);
+    setSources(null);
+    setPreview(null);
+    generation.current++;
+  }, [serverId, servers]);
   const refresh = useCallback(
     async (forceRefresh = false) => {
       if (!serverId) return;

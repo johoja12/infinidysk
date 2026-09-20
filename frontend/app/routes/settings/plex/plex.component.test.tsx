@@ -3,6 +3,8 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ManagedEnvProvider } from "~/components/ui";
+import { PlexSources } from "../smart-prefetch/plex-sources";
+import { parsePrefetchSettings } from "../smart-prefetch/smart-prefetch-model";
 import { PlexSettings } from "./plex";
 
 function responses(extra: Record<string, unknown> = {}) {
@@ -39,6 +41,28 @@ afterEach(() => {
 });
 
 describe("Plex settings", () => {
+  it("makes a saved server available to Smart Prefetch without reloading", async () => {
+    vi.stubGlobal("fetch", responses());
+    render(
+      <>
+        <PlexSettings />
+        <PlexSources settings={parsePrefetchSettings(undefined)} onChange={vi.fn()} />
+      </>,
+    );
+    await screen.findByRole("button", { name: "Add manual server" });
+    expect(screen.queryByRole("option", { name: "Home" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Add manual server" }));
+    await userEvent.type(screen.getByLabelText("Server 1 machine ID"), "machine");
+    await userEvent.type(screen.getByLabelText("Server 1 name"), "Home");
+    await userEvent.type(screen.getByLabelText("Server 1 URL"), "http://localhost:32400");
+    await userEvent.type(screen.getByLabelText("Server 1 token"), "secret");
+    await userEvent.click(screen.getByRole("button", { name: "Add path mapping for server 1" }));
+    await userEvent.type(screen.getByLabelText("Server 1 mapping 1 Plex path"), "/Plex");
+    await userEvent.selectOptions(screen.getByLabelText("Server 1 mapping 1 target type"), "local");
+    await userEvent.type(screen.getByLabelText("Server 1 mapping 1 target path"), "/mnt/library");
+    await userEvent.click(screen.getByRole("button", { name: "Save Plex servers" }));
+    expect(await screen.findByRole("option", { name: "Home" })).toBeTruthy();
+  });
   it("allows readonly selection of an environment-managed account for server discovery", async () => {
     vi.stubGlobal(
       "fetch",

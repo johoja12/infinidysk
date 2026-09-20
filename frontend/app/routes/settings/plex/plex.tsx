@@ -3,6 +3,7 @@ import { Alert, Button, Input, ManagedSetting, Select, SettingsCard } from "~/co
 import {
   loadPlexBootstrap,
   plexRequest,
+  publishPlexServers,
   serverSaveRequest,
   validServer,
   type PlexAccount,
@@ -36,6 +37,7 @@ export function PlexSettings() {
     const result = (await plexRequest<{ servers: PlexServer[] }>("servers")).servers;
     setServers(result);
     setSavedIds(result.map((server) => server.id));
+    publishPlexServers(result);
   };
   useEffect(() => {
     let alive = true;
@@ -129,6 +131,7 @@ export function PlexSettings() {
       });
       setServers(result.servers);
       setSavedIds(result.servers.map((server) => server.id));
+      publishPlexServers(result.servers);
       setMessage("Plex servers saved. General Apply is not required.");
     });
   return (
