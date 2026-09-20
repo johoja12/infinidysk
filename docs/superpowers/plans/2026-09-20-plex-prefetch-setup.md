@@ -138,4 +138,3 @@ Inspect the diff against `origin/main`, request code review, fix Critical or Imp
 - [ ] **Step 5: Deploy and verify production**
 
 Build and deploy an immutable image from the merged main SHA using the documented nuc-1 process. Recreate only the `infinidysk` application service. Verify container health/restarts, runtime SHA, public and LAN health, the four-control default view, direct selected-server persistence across reload, immediate Smart Prefetch visibility, and no browser console errors. Close #12 only after live acceptance and set project Status to Done if project permissions permit.
-

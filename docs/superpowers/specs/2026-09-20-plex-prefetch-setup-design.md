@@ -43,4 +43,3 @@ Production already contains the four essential Smart Prefetch policy controls, b
 - Component tests must prove discovery alone cannot submit an empty save, selecting and saving sends the candidate handle, the success message is specific, and the saved server reaches Smart Prefetch immediately.
 - Component tests must prove only the four essential policy controls and Plex status are visible by default, while source and queue controls become visible only when their disclosures are opened.
 - Live verification must prove a selected production candidate persists across reload and appears in Smart Prefetch without restarting the container.
-
