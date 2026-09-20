@@ -12,6 +12,8 @@ public sealed record PrefetchJob(string Id, Guid ItemId, string Trigger, int Pri
     public long? FileSize { get; init; }
 }
 
+public sealed record PrefetchEnqueueResult(PrefetchJob Job, bool Created);
+
 public sealed class PrefetchJobStore : IDisposable
 {
     private readonly SqliteConnection _database;
@@ -65,26 +67,28 @@ public sealed class PrefetchJobStore : IDisposable
     }
 
     public PrefetchJob Enqueue(Guid itemId, string trigger, int priority, long start = 0, long length = 0)
+        => EnqueueWithOutcome(itemId, trigger, priority, start, length).Job;
+
+    public PrefetchEnqueueResult EnqueueWithOutcome(Guid itemId, string trigger, int priority, long start = 0, long length = 0)
     {
-        if (itemId == Guid.Empty || trigger.Length is 0 or > 128 || priority is < -100 or > 100
+        if (itemId == Guid.Empty || trigger is not { Length: > 0 and <= 128 } || priority is < -100 or > 100
             || start < 0 || length < 0 || start > long.MaxValue - length)
             throw new ArgumentException("Invalid prefetch item, trigger, priority, or range.");
         lock (_gate)
         return Atomic(() =>
         {
-            var existing = ReadOne("SELECT * FROM Jobs WHERE ItemId=$item AND State IN ('queued','running','paused','failed') AND ((Start=$start AND Length=$length) OR (Start=0 AND Length=0) OR ($start=0 AND $length=0 AND State='queued')) LIMIT 1",
+            // Inactive exact requests retain their retry/pause semantics. Running
+            // work is never widened; larger requests become queued successors.
+            var existing = ReadOne("SELECT * FROM Jobs WHERE ItemId=$item AND State IN ('running','paused','failed') AND ((Start=$start AND Length=$length) OR (State='running' AND Start=0 AND Length=0)) ORDER BY Created,Id LIMIT 1",
                 ("$item", itemId.ToString("N")), ("$start", start), ("$length", length));
             if (existing is not null)
             {
                 Execute("UPDATE Jobs SET Priority=MAX(Priority,$priority) WHERE Id=$id", ("$priority", priority), ("$id", existing.Id));
                 AddOwner(existing.Id, trigger);
-                if (start == 0 && length == 0 && existing.State == "queued")
-                {
-                    Execute("UPDATE Jobs SET Start=0,Length=0 WHERE Id=$id", ("$id", existing.Id));
-                    existing = existing with { Start = 0, Length = 0 };
-                }
-                return existing with { Priority = Math.Max(existing.Priority, priority) };
+                return new PrefetchEnqueueResult(existing with { Priority = Math.Max(existing.Priority, priority) }, false);
             }
+            var merged = MergeQueued(itemId, trigger, priority, start, length);
+            if (merged is not null) return new PrefetchEnqueueResult(merged, false);
             using var count = Command("SELECT COUNT(*) FROM Jobs WHERE State IN ('queued','running','paused')");
             if ((long)count.ExecuteScalar()! >= Capacity) throw new ArgumentException("Prefetch queue is full. Cancel or complete existing work first.");
             // Retain only bounded operation history; never grow a media-library-sized memory/index queue.
@@ -94,8 +98,69 @@ public sealed class PrefetchJobStore : IDisposable
             Execute("INSERT INTO Jobs(Id,ItemId,Trigger,Priority,State,Start,Length,Updated,Created) VALUES($id,$item,$trigger,$priority,'queued',$start,$length,$now,$now)",
                 ("$id", id), ("$item", itemId.ToString("N")), ("$trigger", trigger), ("$priority", priority), ("$start", start), ("$length", length), ("$now", now));
             AddOwner(id, trigger);
-            return new PrefetchJob(id, itemId, trigger, priority, "queued", start, length, null, 0, null, now);
+            return new PrefetchEnqueueResult(new PrefetchJob(id, itemId, trigger, priority, "queued", start, length, null, 0, null, now), true);
         });
+    }
+
+    private sealed record QueuedIntent(PrefetchJob Job, long Created, long Attempts, long? DeferredUntil);
+
+    private PrefetchJob? MergeQueued(Guid itemId, string owner, int priority, long start, long length)
+    {
+        var candidates = new List<QueuedIntent>();
+        using (var query = Command("""
+            SELECT j.*,COALESCE(a.Count,0) AS AttemptCount,d.Until FROM Jobs j
+            LEFT JOIN Attempts a ON a.Id=j.Id LEFT JOIN Deferred d ON d.Id=j.Id
+            WHERE j.ItemId=$item AND j.State='queued' ORDER BY j.Created,j.Id LIMIT 257
+            """, ("$item", itemId.ToString("N"))))
+        using (var reader = query.ExecuteReader())
+            while (reader.Read()) candidates.Add(new(Read(reader), reader.GetInt64(reader.GetOrdinal("Created")),
+                reader.GetInt64(reader.GetOrdinal("AttemptCount")), reader.IsDBNull(reader.GetOrdinal("Until")) ? null : reader.GetInt64(reader.GetOrdinal("Until"))));
+        if (candidates.Count > 256) throw new ArgumentException("Prefetch queue exceeds its bounded capacity. Clear excess intents first.");
+
+        // Null is an open-ended interval, including a nonzero-start tail request.
+        long? end = length == 0 ? null : start + length;
+        var selected = new HashSet<string>(StringComparer.Ordinal);
+        bool changed;
+        do
+        {
+            changed = false;
+            foreach (var candidate in candidates)
+            {
+                var job = candidate.Job;
+                long? candidateEnd = job.Length == 0 ? null : checked(job.Start + job.Length);
+                if (selected.Contains(job.Id) || (end.HasValue && job.Start > end.Value)
+                    || (candidateEnd.HasValue && start > candidateEnd.Value)) continue;
+                selected.Add(job.Id);
+                start = Math.Min(start, job.Start);
+                end = !end.HasValue || !candidateEnd.HasValue ? null : Math.Max(end.Value, candidateEnd.Value);
+                changed = true;
+            }
+        } while (changed);
+        if (selected.Count == 0) return null;
+        var merged = candidates.Where(candidate => selected.Contains(candidate.Job.Id)).ToArray();
+        var survivor = merged[0]; // Query order preserves the oldest intent and stable identity.
+        var owners = new HashSet<string>(StringComparer.Ordinal) { owner };
+        foreach (var candidate in merged)
+        {
+            using var query = Command("SELECT Owner FROM Owners WHERE Id=$id LIMIT 130", ("$id", candidate.Job.Id));
+            using var reader = query.ExecuteReader();
+            while (reader.Read()) owners.Add(reader.GetString(0));
+            if (owners.Count - (owners.Contains("manual") ? 1 : 0) > 128)
+                throw new ArgumentException("Merging these ranges would exceed the prefetch source-owner limit.");
+        }
+
+        var id = survivor.Job.Id;
+        foreach (var source in owners) Execute("INSERT OR IGNORE INTO Owners(Id,Owner) VALUES($id,$owner)", ("$id", id), ("$owner", source));
+        var attempts = merged.Max(candidate => candidate.Attempts);
+        var until = merged.Max(candidate => candidate.DeferredUntil);
+        Execute("UPDATE Jobs SET Start=$start,Length=$length,Priority=$priority,Created=$created WHERE Id=$id",
+            ("$start", start), ("$length", end.HasValue ? end.Value - start : 0),
+            ("$priority", Math.Max(priority, merged.Max(candidate => candidate.Job.Priority))), ("$created", survivor.Created), ("$id", id));
+        Execute("INSERT INTO Attempts(Id,Count) VALUES($id,$count) ON CONFLICT(Id) DO UPDATE SET Count=excluded.Count", ("$id", id), ("$count", attempts));
+        if (until.HasValue)
+            Execute("INSERT INTO Deferred(Id,Until) VALUES($id,$until) ON CONFLICT(Id) DO UPDATE SET Until=excluded.Until", ("$id", id), ("$until", until.Value));
+        foreach (var candidate in merged.Skip(1)) Execute("DELETE FROM Jobs WHERE Id=$id", ("$id", candidate.Job.Id));
+        return ReadOne("SELECT * FROM Jobs WHERE Id=$id", ("$id", id))!;
     }
 
     public bool Paused
@@ -135,8 +200,11 @@ public sealed class PrefetchJobStore : IDisposable
 
     private void AddOwner(string id, string owner)
     {
-        using var count = Command("SELECT COUNT(*) FROM Owners WHERE Id=$id", ("$id", id));
-        if ((long)count.ExecuteScalar()! >= 128 && owner != "manual") return;
+        using var existing = Command("SELECT 1 FROM Owners WHERE Id=$id AND Owner=$owner", ("$id", id), ("$owner", owner));
+        if (existing.ExecuteScalar() is not null) return;
+        using var count = Command("SELECT COUNT(*) FROM Owners WHERE Id=$id AND Owner<>'manual'", ("$id", id));
+        if ((long)count.ExecuteScalar()! >= 128 && owner != "manual")
+            throw new ArgumentException("Prefetch source-owner limit reached.");
         Execute("INSERT OR IGNORE INTO Owners(Id,Owner) VALUES($id,$owner)", ("$id", id), ("$owner", owner));
     }
 

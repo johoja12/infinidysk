@@ -8,6 +8,180 @@ public sealed class PrefetchJobStoreTests : IDisposable
     private readonly string _root = Path.Combine(Path.GetTempPath(), "prefetch-jobs-" + Guid.NewGuid().ToString("N"));
 
     [Fact]
+    public void BridgingQueuedRanges_CoalescesTransitively_WithOwnersAndPriority()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var first = jobs.Enqueue(item, "source-a", 1, 0, 10);
+        jobs.Enqueue(item, "manual", 80, 20, 10);
+        jobs.Enqueue(item, "source-c", 3, 40, 10);
+        var merged = jobs.EnqueueWithOutcome(item, "bridge", 2, 10, 30);
+        Assert.False(merged.Created);
+        Assert.Equal(first.Id, merged.Job.Id);
+        Assert.Equal(0, merged.Job.Start);
+        Assert.Equal(50, merged.Job.Length);
+        Assert.Equal(80, merged.Job.Priority);
+        Assert.Single(jobs.List());
+        jobs.PruneOwners(owner => owner == "manual");
+        Assert.Equal(first.Id, jobs.ClaimNext()!.Id);
+    }
+
+    [Fact]
+    public void ResumedLegacyRanges_AreMergedTransitivelyRegardlessOfCandidateOrder()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var paused = new List<PrefetchJob>();
+        for (var start = 0; start < 30; start += 10)
+        {
+            var job = jobs.Enqueue(item, "owner-" + start, 0, start, 10);
+            jobs.Change(job.Id, "pause");
+            paused.Add(job);
+        }
+        foreach (var job in paused) jobs.Change(job.Id, "resume");
+        var merged = jobs.Enqueue(item, "manual", 0, 30, 10);
+        Assert.Equal(0, merged.Start);
+        Assert.Equal(40, merged.Length);
+        Assert.Single(jobs.List());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void LongMaximumFiniteRange_IsDistinctFromOpenEndedTail(bool toEof)
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        jobs.Enqueue(item, "manual", 0, long.MaxValue - 20, 20);
+        var merged = jobs.Enqueue(item, "tail", 0, long.MaxValue - 10, toEof ? 0 : 10);
+        Assert.Equal(long.MaxValue - 20, merged.Start);
+        Assert.Equal(toEof ? 0 : 20, merged.Length);
+        Assert.Single(jobs.List());
+    }
+
+    [Fact]
+    public async Task EnqueueOutcomes_AreAtomicAcrossConcurrentRequests()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var outcomes = await Task.WhenAll(Enumerable.Range(0, 8)
+            .Select(index => Task.Run(() => jobs.EnqueueWithOutcome(item, "owner-" + index, 0))));
+        Assert.Single(outcomes.Where(outcome => outcome.Created));
+        Assert.Single(outcomes.Select(outcome => outcome.Job.Id).Distinct());
+        Assert.Single(jobs.List());
+    }
+
+    [Fact]
+    public void EofRangeAtNonzeroStart_MergesAllTouchingQueuedSuccessors()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var first = jobs.Enqueue(item, "manual", 0, 10, 5);
+        jobs.Enqueue(item, "source", 0, 30, 10);
+        var merged = jobs.Enqueue(item, "tail", 0, 15, 0);
+        Assert.Equal(first.Id, merged.Id);
+        Assert.Equal(10, merged.Start);
+        Assert.Equal(0, merged.Length);
+        Assert.Single(jobs.List());
+    }
+
+    [Fact]
+    public void WholeFileUpgrade_MergesEveryQueuedRange()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        jobs.Enqueue(item, "source-a", 0, 10, 5);
+        jobs.Enqueue(item, "source-b", 0, 30, 5);
+        var whole = jobs.Enqueue(item, "manual", 50);
+        Assert.Equal(0, whole.Start);
+        Assert.Equal(0, whole.Length);
+        Assert.Single(jobs.List());
+        jobs.PruneOwners(owner => owner == "source-b");
+        Assert.Equal(whole.Id, jobs.ClaimNext()!.Id);
+    }
+
+    [Fact]
+    public void OverlappingSuccessor_DoesNotExtendRunningRange()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var running = jobs.Enqueue(item, "manual", 0, 0, 10);
+        jobs.ClaimNext();
+        jobs.Enqueue(item, "tail", 0, 20, 10);
+        var successor = jobs.Enqueue(item, "bridge", 0, 10, 15);
+        Assert.Equal(10, successor.Start);
+        Assert.Equal(20, successor.Length);
+        Assert.Equal(10, jobs.List().Single(job => job.Id == running.Id).Length);
+        Assert.Null(jobs.ClaimNext());
+        jobs.Finish(running.Id, true, null);
+        Assert.Equal(successor.Id, jobs.ClaimNext()!.Id);
+    }
+
+    [Theory]
+    [InlineData("paused")]
+    [InlineData("failed")]
+    public void InactiveRanges_AreOnlyDeduplicatedExactly(string state)
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var inactive = jobs.Enqueue(item, "manual", 0, 0, 10);
+        if (state == "paused") jobs.Change(inactive.Id, "pause");
+        else { jobs.ClaimNext(); jobs.Finish(inactive.Id, false, "failed"); }
+        var overlap = jobs.EnqueueWithOutcome(item, "source", 0, 5, 10);
+        Assert.True(overlap.Created);
+        Assert.NotEqual(inactive.Id, overlap.Job.Id);
+        Assert.Equal(inactive.Id, jobs.Enqueue(item, "exact", 0, 0, 10).Id);
+        Assert.Equal(2, jobs.List().Count);
+    }
+
+    [Fact]
+    public void MergeOwnerOverflow_RejectsAtomically_AndManualDoesNotUseAutomaticSlot()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        for (var i = 0; i < 64; i++) jobs.Enqueue(item, "a-" + i, 0, 0, 10);
+        for (var i = 0; i < 65; i++) jobs.Enqueue(item, "b-" + i, 0, 20, 10);
+        Assert.Throws<ArgumentException>(() => jobs.Enqueue(item, "manual", 100, 10, 10));
+        Assert.Equal(2, jobs.List().Count);
+        Assert.All(jobs.List(), job => Assert.Equal(0, job.Priority));
+        var other = Guid.NewGuid();
+        jobs.Enqueue(other, "manual", 0);
+        for (var i = 0; i < 128; i++) jobs.Enqueue(other, "owner-" + i, 0);
+        Assert.Throws<ArgumentException>(() => jobs.Enqueue(other, "excess", 0));
+        jobs.PruneOwners(owner => owner == "owner-127");
+        Assert.Equal(other, jobs.ClaimNext()!.ItemId);
+    }
+
+    [Fact]
+    public void MergedIntent_PreservesOldestCreation_MaximumAttempts_AndLatestBackoff()
+    {
+        var path = Path.Combine(_root, "jobs.db");
+        using var jobs = new PrefetchJobStore(path);
+        var item = Guid.NewGuid();
+        var first = jobs.Enqueue(item, "manual", 0, 0, 10);
+        jobs.ClaimNext();
+        jobs.Defer(first.Id, "first", TimeSpan.FromHours(1));
+        var second = jobs.Enqueue(item, "source", 0, 20, 10);
+        jobs.ClaimNext();
+        jobs.Defer(second.Id, "second", TimeSpan.FromHours(2));
+        using var database = new SqliteConnection("Data Source=" + path);
+        database.Open();
+        using var command = database.CreateCommand();
+        command.CommandText = "UPDATE Attempts SET Count=3; UPDATE Jobs SET Created=123 WHERE Start=20; SELECT MAX(Until) FROM Deferred";
+        var until = (long)command.ExecuteScalar()!;
+        var merged = jobs.Enqueue(item, "bridge", 100, 10, 10);
+        Assert.Equal(second.Id, merged.Id);
+        command.CommandText = "SELECT Created FROM Jobs";
+        Assert.Equal(123L, (long)command.ExecuteScalar()!);
+        command.CommandText = "SELECT Count FROM Attempts";
+        Assert.Equal(3L, (long)command.ExecuteScalar()!);
+        command.CommandText = "SELECT Until FROM Deferred";
+        Assert.Equal(until, (long)command.ExecuteScalar()!);
+        Assert.Null(jobs.ClaimNext()); // Old age must not be refreshed by the bridge intent.
+        Assert.Equal("failed", jobs.List().Single().State);
+    }
+
+    [Fact]
     public void WholeFileRequestDuringPartialWarm_DoesNotRunSameMediaTwiceConcurrently()
     {
         using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
