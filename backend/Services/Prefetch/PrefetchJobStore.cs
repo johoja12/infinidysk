@@ -189,7 +189,7 @@ public sealed class PrefetchJobStore : IDisposable
             if (Paused) return null;
             Execute("UPDATE Jobs SET State='failed',Error='Intent expired; retry explicitly.' WHERE State='queued' AND Created<$cutoff",
                 ("$cutoff", DateTimeOffset.UtcNow.AddHours(-(_settings?.Invoke().IntentTtlHours ?? 24)).ToUnixTimeMilliseconds()));
-            var job = ReadOne("SELECT * FROM Jobs WHERE State='queued' AND Id NOT IN (SELECT Id FROM Deferred WHERE Until>$now) ORDER BY Priority DESC,Created,Id LIMIT 1",
+            var job = ReadOne("SELECT * FROM Jobs WHERE State='queued' AND ItemId NOT IN (SELECT ItemId FROM Jobs WHERE State='running') AND Id NOT IN (SELECT Id FROM Deferred WHERE Until>$now) ORDER BY Priority DESC,Created,Id LIMIT 1",
                 ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
             if (job is null) return null;
             Execute("UPDATE Jobs SET State='running',Error=NULL WHERE Id=$id", ("$id", job.Id));

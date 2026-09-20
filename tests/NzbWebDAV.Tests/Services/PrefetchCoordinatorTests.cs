@@ -6,6 +6,23 @@ public sealed class PrefetchCoordinatorTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "prefetch-runner-" + Guid.NewGuid().ToString("N"));
 
+    [Theory]
+    [InlineData(0, "failed")]
+    [InlineData(1, "queued")]
+    public async Task TransientSourceFailure_UsesConfiguredBoundedRetry(int retries, string expected)
+    {
+        using var store = new PrefetchJobStore(Path.Combine(_root, "jobs.db"), settings: () => new() { MaxRetries = retries });
+        store.Enqueue(Guid.NewGuid(), "manual", 0);
+        using var coordinator = new PrefetchCoordinator(store, new FailingExecutor(), () => new(), () => true);
+        await coordinator.RunOnceAsync(CancellationToken.None);
+        Assert.Equal(expected, Assert.Single(store.List()).State);
+    }
+
+    private sealed class FailingExecutor : IPrefetchExecutor
+    {
+        public Task ExecuteAsync(PrefetchJob job, CancellationToken ct) => throw new IOException("Temporary source failure");
+    }
+
     [Fact]
     public async Task Cancellation_InterruptsWorkerAndCannotBecomeCompleted()
     {

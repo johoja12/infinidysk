@@ -39,6 +39,8 @@ public sealed class PrefetchCoordinator(PrefetchJobStore store, IPrefetchExecuto
         { store.Defer(job.Id, "Interrupted; verified coverage retained.", TimeSpan.FromSeconds(30), consumeAttempt: false); }
         catch (PrefetchDeferredException exception)
         { store.Defer(job.Id, exception.Message, TimeSpan.FromMinutes(1), exception.CountsAsFailure); }
+        catch (Exception exception) when (exception is IOException or Microsoft.Data.Sqlite.SqliteException)
+        { store.Defer(job.Id, "Source or cache temporarily unavailable; verified coverage retained.", TimeSpan.FromMinutes(1), consumeAttempt: true); }
         catch (Exception exception) when (exception is not OutOfMemoryException)
         { store.Finish(job.Id, false, "Source or cache operation failed. Check source health and storage availability."); }
         finally { lock (_gate) _running.Remove(job.Id); }

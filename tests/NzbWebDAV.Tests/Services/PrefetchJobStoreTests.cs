@@ -8,6 +8,21 @@ public sealed class PrefetchJobStoreTests : IDisposable
     private readonly string _root = Path.Combine(Path.GetTempPath(), "prefetch-jobs-" + Guid.NewGuid().ToString("N"));
 
     [Fact]
+    public void WholeFileRequestDuringPartialWarm_DoesNotRunSameMediaTwiceConcurrently()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var partial = jobs.Enqueue(item, "realtime", 10, 0, 4);
+        Assert.Equal(partial.Id, jobs.ClaimNext()!.Id);
+        var whole = jobs.Enqueue(item, "manual", 100);
+        var other = jobs.Enqueue(Guid.NewGuid(), "manual", 0);
+        Assert.Equal(other.Id, jobs.ClaimNext()!.Id);
+        Assert.Null(jobs.ClaimNext());
+        jobs.Finish(partial.Id, true, null);
+        Assert.Equal(whole.Id, jobs.ClaimNext()!.Id);
+    }
+
+    [Fact]
     public void ConfiguredQueueAndRetryLimits_ApplyWithoutRestart()
     {
         var settings = new PrefetchSettings { QueueCapacity = 1, MaxRetries = 0 };
