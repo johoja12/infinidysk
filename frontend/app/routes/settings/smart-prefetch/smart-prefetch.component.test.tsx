@@ -208,4 +208,18 @@ describe("Smart Prefetch settings", () => {
     render(<Harness managed />);
     expect(screen.getByLabelText("Enable Smart Prefetch").closest("fieldset")?.disabled).toBe(true);
   });
+  it("shows per-item bulk results including deduplication and rejection reasons", async () => {
+    const fallback = fakeApi();
+    vi.stubGlobal("fetch", (url: string, init?: RequestInit) => url.endsWith("/api/prefetch/operations") && init?.method === "POST"
+      ? Promise.resolve(new Response(JSON.stringify({ outcomes: [
+          { itemId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", status: "deduplicated", jobId: "existing", start: 0, length: 0 },
+          { itemId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", status: "rejected", start: 0, length: 0, reason: "Not an available imported streamable file." },
+        ] }))) : fallback(url, init));
+    render(<Harness />);
+    await screen.findByText(/Imported episode/);
+    await userEvent.type(screen.getByLabelText("Imported media IDs (up to 32)"), "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+    await userEvent.click(screen.getByRole("button", { name: "Warm selected media" }));
+    expect(await screen.findByText(/deduplicated.*existing/)).toBeTruthy();
+    expect(screen.getByText(/Not an available imported streamable file/)).toBeTruthy();
+  });
 });

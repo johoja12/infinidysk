@@ -35,10 +35,12 @@ type Prediction = {
   length: number;
   fileSize: number;
 };
+type ItemOutcome = { itemId: string; status: string; jobId?: string; start: number; length: number; reason?: string };
 export function PrefetchQueue() {
   const [status, setStatus] = useState<QueueStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState("");
+  const [outcomes, setOutcomes] = useState<ItemOutcome[]>([]);
   const [busy, setBusy] = useState(false);
   const [ids, setIds] = useState("");
   const [start, setStart] = useState(0);
@@ -108,6 +110,7 @@ export function PrefetchQueue() {
     setBusy(true);
     setError(null);
     setMessage("");
+    setOutcomes([]);
     try {
       const response = await fetch(withUrlBase("/api/prefetch/operations"), {
         method: "POST",
@@ -118,7 +121,8 @@ export function PrefetchQueue() {
         throw new Error(
           "Warming operation rejected. Check Native cache readiness, item IDs, budgets, and job state.",
         );
-      const result = (await response.json()) as { rejected?: string[] };
+      const result = (await response.json()) as { rejected?: string[]; outcomes?: ItemOutcome[] };
+      setOutcomes(result.outcomes?.slice(0, 32) ?? []);
       setMessage(
         result.rejected?.length
           ? `${result.rejected.length} item(s) were rejected; accepted items remain in the queue.`
@@ -158,6 +162,12 @@ export function PrefetchQueue() {
         {status?.lastSuccess ? new Date(status.lastSuccess).toLocaleString() : "not yet completed"}.
       </p>
       {message && <p role="status">{message}</p>}
+      {outcomes.length > 0 && <div aria-label="Bulk warming results" className="space-y-1 text-xs">
+        {outcomes.map(outcome => <p key={outcome.itemId}>
+          {outcome.itemId} — {outcome.status}{outcome.jobId ? ` · job ${outcome.jobId}` : ""}
+          {outcome.reason ? ` · ${outcome.reason}` : ` · from ${outcome.start.toLocaleString()}, ${outcome.length === 0 ? "through end of file" : `${outcome.length.toLocaleString()} bytes`}`}
+        </p>)}
+      </div>}
       <p>
         {status?.available
           ? status.paused
