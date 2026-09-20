@@ -35,6 +35,7 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         var ok = Assert.IsType<OkObjectResult>(result);
         using var json = JsonDocument.Parse(JsonSerializer.Serialize(ok.Value));
         Assert.Equal(2, json.RootElement.GetProperty("selectionCount").GetInt32());
+        Assert.Equal(0, json.RootElement.GetProperty("exclusionCount").GetInt32());
         Assert.Equal(64, json.RootElement.GetProperty("packageDigest").GetString()!.Length);
         var session = await harness.Store.GetSessionAsync();
         Assert.Equal(MigrationSourceTypes.NzbDav, session.SourceType);

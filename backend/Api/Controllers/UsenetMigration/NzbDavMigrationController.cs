@@ -50,6 +50,8 @@ public sealed class NzbDavMigrationController(
             state = "connected",
             packageDigest = package.PackageDigest,
             selectionCount = package.Manifest.SelectedLinks.Count,
+            exclusionCount = package.Manifest.Releases.SelectMany(release => release.Leaves)
+                .Count(leaf => leaf.ExtractionStatus != "ready" || leaf.ExclusionReason is not null),
             releaseCount = package.Manifest.Releases.Count,
             categories,
             maxQueueDepth = request.MaxQueueDepth ?? 5,
