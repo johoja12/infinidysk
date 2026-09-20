@@ -15,13 +15,19 @@ namespace NzbWebDAV.Database.UsenetMigrations
         protected override void BuildModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
-            modelBuilder.HasAnnotation("ProductVersion", "10.0.10");
+            modelBuilder.HasAnnotation("ProductVersion", "10.0.11");
 
             modelBuilder.Entity("NzbWebDAV.Database.Models.UsenetMigration.MigratedFile", b =>
                 {
                     b.Property<long>("Id")
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER");
+
+                    b.Property<string>("ArticleIdentityDigest")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ArticleIdentityKind")
+                        .HasColumnType("TEXT");
 
                     b.Property<Guid>("DavItemId")
                         .HasColumnType("TEXT");
@@ -50,6 +56,9 @@ namespace NzbWebDAV.Database.UsenetMigrations
                     b.Property<Guid?>("NzbBlobId")
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("SourceFileId")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("VirtualPath")
                         .IsRequired()
                         .HasColumnType("TEXT");
@@ -59,6 +68,8 @@ namespace NzbWebDAV.Database.UsenetMigrations
                     b.HasIndex("DavItemId");
 
                     b.HasIndex("NzbBlobId");
+
+                    b.HasIndex("MigratedReleaseId", "SourceFileId");
 
                     b.HasIndex("MigratedReleaseId", "VirtualPath")
                         .IsUnique();
@@ -122,6 +133,66 @@ namespace NzbWebDAV.Database.UsenetMigrations
                     b.ToTable("MigratedReleases", (string)null);
                 });
 
+            modelBuilder.Entity("NzbWebDAV.Database.Models.UsenetMigration.MigrationCanaryLink", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ApplyStatus")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("CorrelationEvidence")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("CorrelationStatus")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Error")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("ExpectedFileSize")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("LibraryRelativePath")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("NewRelativeTarget")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("OriginalLegacyTarget")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("RunId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("SourcePackageDigest")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ApplyStatus");
+
+                    b.HasIndex("CorrelationStatus");
+
+                    b.HasIndex("RunId", "LibraryRelativePath")
+                        .IsUnique();
+
+                    b.ToTable("CanaryLinks", (string)null);
+                });
+
             modelBuilder.Entity("NzbWebDAV.Database.Models.UsenetMigration.MigrationCategoryMap", b =>
                 {
                     b.Property<string>("AltmountCategory")
@@ -169,8 +240,20 @@ namespace NzbWebDAV.Database.UsenetMigrations
                     b.Property<string>("AltmountStoreRoot")
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("CanaryLibraryRoot")
+                        .HasColumnType("TEXT");
+
                     b.Property<int>("MaxQueueDepth")
                         .HasColumnType("INTEGER");
+
+                    b.Property<string>("SourcePackageRoot")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SourceType")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("altmount");
 
                     b.Property<int>("SubmitWorkers")
                         .HasColumnType("INTEGER");
@@ -314,6 +397,12 @@ namespace NzbWebDAV.Database.UsenetMigrations
                         .ValueGeneratedOnAdd()
                         .HasColumnType("INTEGER");
 
+                    b.Property<string>("ArticleIdentityDigest")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ArticleIdentityKind")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("FileName")
                         .IsRequired()
                         .HasColumnType("TEXT");
@@ -341,6 +430,9 @@ namespace NzbWebDAV.Database.UsenetMigrations
                     b.Property<string>("NzbdavId")
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("SourceFileId")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("StoreRef")
                         .IsRequired()
                         .HasColumnType("TEXT");
@@ -354,6 +446,8 @@ namespace NzbWebDAV.Database.UsenetMigrations
                     b.HasIndex("NormalisedName");
 
                     b.HasIndex("StoreRef");
+
+                    b.HasIndex("StoreRef", "SourceFileId");
 
                     b.ToTable("ReleaseFiles", (string)null);
                 });
@@ -422,6 +516,9 @@ namespace NzbWebDAV.Database.UsenetMigrations
                     b.Property<string>("AltmountStoreRoot")
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("CanaryLibraryRoot")
+                        .HasColumnType("TEXT");
+
                     b.Property<DateTime>("CreatedAt")
                         .HasColumnType("TEXT");
 
@@ -448,6 +545,15 @@ namespace NzbWebDAV.Database.UsenetMigrations
 
                     b.Property<bool?>("ScanWindowsSafePaths")
                         .HasColumnType("INTEGER");
+
+                    b.Property<string>("SourcePackageRoot")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("SourceType")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("altmount");
 
                     b.Property<string>("Status")
                         .IsRequired()
@@ -561,6 +667,15 @@ namespace NzbWebDAV.Database.UsenetMigrations
                     b.HasOne("NzbWebDAV.Database.Models.UsenetMigration.MigratedRelease", null)
                         .WithMany()
                         .HasForeignKey("MigratedReleaseId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("NzbWebDAV.Database.Models.UsenetMigration.MigrationCanaryLink", b =>
+                {
+                    b.HasOne("NzbWebDAV.Database.Models.UsenetMigration.MigrationRun", null)
+                        .WithMany()
+                        .HasForeignKey("RunId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
                 });

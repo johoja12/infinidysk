@@ -1,5 +1,8 @@
 # Cache and Plex Prefetch Execution Contracts
 
+Implementation status: see the [testing-branch report](../../testing/native-cache-implementation-report.md),
+including the distinction between automated verification and outstanding live gates.
+
 > **For agentic workers:** Use `superpowers:executing-plans` for sequential
 > execution. This document refines the linked implementation plan; unchecked
 > items are future work, not implemented features.

@@ -44,7 +44,10 @@ public sealed class ScanSummary
 /// duplicating their naming or verdict logic.
 /// </summary>
 public sealed class AltmountScanRunner(UsenetMigrationStore store, ConfigManager configManager)
+    : IUsenetMigrationScanRunner
 {
+    public string SourceType => MigrationSourceTypes.Altmount;
+
     /// <summary>Test seam for the live NzbDAV context; production leaves it null.</summary>
     internal Func<DavDatabaseContext>? DavContextFactory { get; set; }
     internal Func<CancellationToken, Task>? BeforePersistOverride { get; set; }
@@ -151,6 +154,9 @@ public sealed class AltmountScanRunner(UsenetMigrationStore store, ConfigManager
 
         return summary;
     }
+
+    public Task<ScanSummary?> ScanAsync(CancellationToken cancellationToken = default) =>
+        RunAsync(cancellationToken);
 
     // --- release assembly --------------------------------------------------
 

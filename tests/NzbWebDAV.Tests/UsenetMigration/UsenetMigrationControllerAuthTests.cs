@@ -222,49 +222,46 @@ public sealed class UsenetMigrationControllerAuthTests
                 .AddSingleton(h.Store)
                 .BuildServiceProvider();
 
-            var controller = new UsenetMigrationController(h.Store, runner)
+            ControllerBase[] controllers =
+            [
+                new UsenetMigrationController(h.Store, runner),
+                new NzbDavMigrationController(h.Store, runner),
+            ];
+            foreach (var controller in controllers)
             {
-                ControllerContext = new ControllerContext
+                controller.ControllerContext = new ControllerContext
                 {
                     HttpContext = new DefaultHttpContext { RequestServices = services },
-                },
-            };
-
-            var actions = typeof(UsenetMigrationController)
-                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly)
-                .Where(m => m.GetCustomAttributes()
-                    .Any(a => a.GetType().Name.StartsWith("Http", StringComparison.Ordinal)
-                              && a.GetType().Name.EndsWith("Attribute", StringComparison.Ordinal)))
-                .ToList();
-
-            Assert.NotEmpty(actions);
-
-            foreach (var method in actions)
-            {
-                var args = method.GetParameters()
-                    .Select(CreateDefaultArgument)
-                    .ToArray();
-
-                var result = method.Invoke(controller, args);
-                Assert.NotNull(result);
-
-                IActionResult actionResult;
-                if (result is Task<IActionResult> task)
-                    actionResult = await task;
-                else if (result is Task taskObj)
+                };
+                var actions = controller.GetType()
+                    .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly)
+                    .Where(m => m.GetCustomAttributes()
+                        .Any(a => a.GetType().Name.StartsWith("Http", StringComparison.Ordinal)
+                                  && a.GetType().Name.EndsWith("Attribute", StringComparison.Ordinal)))
+                    .ToList();
+                Assert.NotEmpty(actions);
+                foreach (var method in actions)
                 {
-                    await taskObj;
-                    var resultProperty = taskObj.GetType().GetProperty("Result");
-                    actionResult = Assert.IsAssignableFrom<IActionResult>(resultProperty!.GetValue(taskObj));
+                    var args = method.GetParameters().Select(CreateDefaultArgument).ToArray();
+                    var result = method.Invoke(controller, args);
+                    Assert.NotNull(result);
+                    IActionResult actionResult;
+                    if (result is Task<IActionResult> task)
+                        actionResult = await task;
+                    else if (result is Task taskObj)
+                    {
+                        await taskObj;
+                        var resultProperty = taskObj.GetType().GetProperty("Result");
+                        actionResult = Assert.IsAssignableFrom<IActionResult>(resultProperty!.GetValue(taskObj));
+                    }
+                    else
+                        actionResult = Assert.IsAssignableFrom<IActionResult>(result);
+                    var unauthorized = Assert.IsType<UnauthorizedObjectResult>(actionResult);
+                    var body = Assert.IsType<BaseApiResponse>(unauthorized.Value);
+                    Assert.False(body.Status);
+                    Assert.False(string.IsNullOrWhiteSpace(body.Error),
+                        $"{controller.GetType().Name}.{method.Name} returned an empty unauthorized error.");
                 }
-                else
-                    actionResult = Assert.IsAssignableFrom<IActionResult>(result);
-
-                var unauthorized = Assert.IsType<UnauthorizedObjectResult>(actionResult);
-                var body = Assert.IsType<BaseApiResponse>(unauthorized.Value);
-                Assert.False(body.Status);
-                Assert.False(string.IsNullOrWhiteSpace(body.Error),
-                    $"{method.Name} returned an empty unauthorized error.");
             }
         }
         finally
@@ -276,30 +273,27 @@ public sealed class UsenetMigrationControllerAuthTests
     [Fact]
     public void EveryHttpAction_DelegatesThroughGuardedAsync()
     {
-        var source = File.ReadAllText(Path.Join(
-            FindRepoRoot(),
-            "backend",
-            "Api",
-            "Controllers",
-            "UsenetMigration",
-            "UsenetMigrationController.cs"));
-
-        var actions = typeof(UsenetMigrationController)
-            .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly)
-            .Where(m => m.GetCustomAttributes()
-                .Any(a => a.GetType().Name.StartsWith("Http", StringComparison.Ordinal)
-                          && a.GetType().Name.EndsWith("Attribute", StringComparison.Ordinal)))
-            .Select(m => m.Name)
-            .Distinct()
-            .ToList();
-
-        Assert.NotEmpty(actions);
-        foreach (var name in actions)
+        foreach (var controllerType in new[] { typeof(UsenetMigrationController), typeof(NzbDavMigrationController) })
         {
-            var index = source.IndexOf($" {name}(", StringComparison.Ordinal);
-            Assert.True(index >= 0, $"Could not find action {name} in controller source.");
-            var window = source.Substring(index, Math.Min(400, source.Length - index));
-            Assert.Contains("GuardedAsync", window);
+            var source = File.ReadAllText(Path.Join(
+                FindRepoRoot(), "backend", "Api", "Controllers", "UsenetMigration",
+                controllerType.Name + ".cs"));
+            var actions = controllerType
+                .GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly)
+                .Where(m => m.GetCustomAttributes()
+                    .Any(a => a.GetType().Name.StartsWith("Http", StringComparison.Ordinal)
+                              && a.GetType().Name.EndsWith("Attribute", StringComparison.Ordinal)))
+                .Select(m => m.Name)
+                .Distinct()
+                .ToList();
+            Assert.NotEmpty(actions);
+            foreach (var name in actions)
+            {
+                var index = source.IndexOf($" {name}(", StringComparison.Ordinal);
+                Assert.True(index >= 0, $"Could not find action {name} in controller source.");
+                var window = source.Substring(index, Math.Min(400, source.Length - index));
+                Assert.Contains("GuardedAsync", window);
+            }
         }
     }
 

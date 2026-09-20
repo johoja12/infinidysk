@@ -25,8 +25,12 @@ public sealed class SubmissionWorkerPool(
     UsenetMigrationStore store,
     QueueManager queueManager,
     ConfigManager configManager,
-    WebsocketManager websocketManager)
+    WebsocketManager websocketManager,
+    MigrationPayloadBuilderDispatcher? payloadBuilderDispatcher = null)
 {
+    private readonly MigrationPayloadBuilderDispatcher _payloadBuilderDispatcher =
+        payloadBuilderDispatcher ?? CreateDefaultPayloadDispatcher();
+
     /// <summary>Test seam for the live NzbDAV context; production leaves it null.</summary>
     internal Func<DavDatabaseContext>? DavContextFactory { get; set; }
 
@@ -53,6 +57,7 @@ public sealed class SubmissionWorkerPool(
         await RecoverClaimsAsync(ct).ConfigureAwait(false);
 
         var session = await store.GetSessionAsync(ct).ConfigureAwait(false);
+        var payloadBuilder = _payloadBuilderDispatcher.Resolve(session.SourceType);
         var maxDepth = Math.Max(1, session.MaxQueueDepth);
         var workerCount = Math.Clamp(session.SubmitWorkers, 1, maxDepth);
 
@@ -104,7 +109,7 @@ public sealed class SubmissionWorkerPool(
                 try
                 {
                     nzbBytes = BuildNzbOverride is null
-                        ? await BuildNzbAsync(release, session, workerContext, workerToken).ConfigureAwait(false)
+                        ? await payloadBuilder.BuildAsync(release, session, workerContext, workerToken).ConfigureAwait(false)
                         : await BuildNzbOverride(release, workerToken).ConfigureAwait(false);
                 }
                 catch (Exception e) when (e is not OperationCanceledException && e is not OutOfMemoryException)
@@ -184,7 +189,7 @@ public sealed class SubmissionWorkerPool(
         return submitted;
     }
 
-    private static async Task<byte[]> BuildNzbAsync(
+    internal static async Task<byte[]> BuildAltmountNzbAsync(
         MigrationRelease release,
         MigrationSessionState session,
         UsenetMigrationDbContext ctx,
@@ -208,6 +213,16 @@ public sealed class SubmissionWorkerPool(
         }
 
         return nzbBytes;
+    }
+
+    private static MigrationPayloadBuilderDispatcher CreateDefaultPayloadDispatcher()
+    {
+        IMigrationPayloadBuilder[] builders =
+        [
+            new AltmountPayloadBuilder(),
+            new NzbDavPayloadBuilder(new NzbDavPackageReader()),
+        ];
+        return new MigrationPayloadBuilderDispatcher(builders);
     }
 
     /// <summary>

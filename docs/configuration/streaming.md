@@ -33,7 +33,7 @@ is saturated.
 
 | Control | Config key | Default | Effect |
 |---------|------------|---------|--------|
-| Enable Segment Cache | `usenet.segment-cache.enabled` | off (new installs) | Cache decoded segments on disk; restart required |
+| Cache mode [since unreleased testing branch](https://github.com/johoja12/infinidysk/pull/4){ .nzbdav-since } | `cache.mode` | off (new installs; existing Segment setting preserved) | Off, Segment, or Native: exactly one active mode; restart required |
 | Cache path | `usenet.segment-cache.path` | `/config/segment-cache` | Segment-cache directory |
 | Maximum size (GB) | `usenet.segment-cache.max-gb` | `10` | Segment-cache size limit |
 | Cache write-behind (MiB) [since 1.3.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.3.0){ .nzbdav-since } | `usenet.segment-cache.write-behind-mb` | `0` | Advanced, restart-required RAM budget for asynchronous cache writes. `0` keeps inline writes; nonzero values are 16–1024 MiB |
@@ -77,11 +77,16 @@ path) is local SSD/NVMe or other storage that can safely absorb the extra writes
 Disable the cache for slow disks, network mounts, or flash storage with limited
 write endurance; alternatively, point **Cache path** at suitable local storage.
 
-When Segment Cache is **disabled** at startup, InfiniDysk purges any leftover cache
+On legacy installations **without an explicit `cache.mode`**, when Segment Cache is disabled at startup, InfiniDysk purges leftover cache
 files from the cache path in the background so a previously enabled cache does not
 keep occupying disk. Only files matching the cache layout are removed; unrelated
 files placed in that directory are left alone.
 [since 1.3.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.3.0){ .nzbdav-since }
+
+An explicit Off/Segment/Native selection retains inactive cache data. Changing modes
+never imports Segment entries into Native or activates both stores. See
+[Native cache and Plex Smart Prefetch](native-cache-prefetch.md) for multiple folders,
+whole-file warming, local metadata requirements, and the isolated testing workflow.
 
 ### Segment-cache write-behind
 

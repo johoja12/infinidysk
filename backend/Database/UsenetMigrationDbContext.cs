@@ -1,6 +1,7 @@
 using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Database.Interceptors;
 using NzbWebDAV.Database.Models.UsenetMigration;
+using NzbWebDAV.UsenetMigration;
 
 namespace NzbWebDAV.Database;
 
@@ -39,6 +40,7 @@ public sealed class UsenetMigrationDbContext : DbContext
     public DbSet<MigratedRelease> MigratedReleases => Set<MigratedRelease>();
     public DbSet<MigratedFile> MigratedFiles => Set<MigratedFile>();
     public DbSet<MigrationSymlinkRewrite> SymlinkRewrites => Set<MigrationSymlinkRewrite>();
+    public DbSet<MigrationCanaryLink> CanaryLinks => Set<MigrationCanaryLink>();
     public DbSet<MigrationScanError> ScanErrors => Set<MigrationScanError>();
 
     protected override void OnModelCreating(ModelBuilder b)
@@ -49,6 +51,7 @@ public sealed class UsenetMigrationDbContext : DbContext
             e.HasKey(x => x.Id);
             e.Property(x => x.Id).ValueGeneratedNever();
             e.Property(x => x.Status).IsRequired();
+            e.Property(x => x.SourceType).IsRequired().HasDefaultValue(MigrationSourceTypes.Altmount);
         });
 
         b.Entity<MigrationPreferences>(e =>
@@ -57,6 +60,7 @@ public sealed class UsenetMigrationDbContext : DbContext
                 t => t.HasCheckConstraint("CK_MigrationPreferences_Singleton", "Id = 1"));
             e.HasKey(x => x.Id);
             e.Property(x => x.Id).ValueGeneratedNever();
+            e.Property(x => x.SourceType).IsRequired().HasDefaultValue(MigrationSourceTypes.Altmount);
         });
 
         b.Entity<MigrationCategoryMap>(e =>
@@ -104,6 +108,7 @@ public sealed class UsenetMigrationDbContext : DbContext
 
             e.HasIndex(x => x.StoreRef);
             e.HasIndex(x => x.NormalisedName);
+            e.HasIndex(x => new { x.StoreRef, x.SourceFileId });
         });
 
         b.Entity<MigrationSubmission>(e =>
@@ -158,6 +163,28 @@ public sealed class UsenetMigrationDbContext : DbContext
             e.HasIndex(x => new { x.MigratedReleaseId, x.VirtualPath }).IsUnique();
             e.HasIndex(x => x.DavItemId);
             e.HasIndex(x => x.NzbBlobId);
+            e.HasIndex(x => new { x.MigratedReleaseId, x.SourceFileId });
+        });
+
+        b.Entity<MigrationCanaryLink>(e =>
+        {
+            e.ToTable("CanaryLinks");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.LibraryRelativePath).IsRequired();
+            e.Property(x => x.OriginalLegacyTarget).IsRequired();
+            e.Property(x => x.CorrelationStatus).IsRequired();
+            e.Property(x => x.CorrelationEvidence).IsRequired();
+            e.Property(x => x.SourcePackageDigest).IsRequired();
+            e.Property(x => x.ApplyStatus).IsRequired();
+
+            e.HasOne<MigrationRun>()
+                .WithMany()
+                .HasForeignKey(x => x.RunId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            e.HasIndex(x => new { x.RunId, x.LibraryRelativePath }).IsUnique();
+            e.HasIndex(x => x.ApplyStatus);
+            e.HasIndex(x => x.CorrelationStatus);
         });
 
         b.Entity<MigrationSymlinkRewrite>(e =>

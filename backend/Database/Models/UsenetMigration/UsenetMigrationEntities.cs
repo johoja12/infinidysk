@@ -17,6 +17,15 @@ public sealed class MigrationSessionState
     /// </summary>
     public string Status { get; set; } = "idle";
 
+    /// <summary>Migration source adapter selected for this session.</summary>
+    public string SourceType { get; set; } = MigrationSourceTypes.Altmount;
+
+    /// <summary>Immutable source-package root for package-backed adapters.</summary>
+    public string? SourcePackageRoot { get; set; }
+
+    /// <summary>Host-side validation library root; the backend never writes beneath it.</summary>
+    public string? CanaryLibraryRoot { get; set; }
+
     public string? AltmountMetadataRoot { get; set; }
     public string? AltmountConfigPath { get; set; }
     public string? AltmountStoreRoot { get; set; }
@@ -62,6 +71,10 @@ public sealed class MigrationPreferences
 {
     public int Id { get; set; } = 1;
 
+    public string SourceType { get; set; } = MigrationSourceTypes.Altmount;
+    public string? SourcePackageRoot { get; set; }
+    public string? CanaryLibraryRoot { get; set; }
+
     public string? AltmountMetadataRoot { get; set; }
     public string? AltmountConfigPath { get; set; }
     public string? AltmountStoreRoot { get; set; }
@@ -75,7 +88,10 @@ public sealed class MigrationPreferences
 /// <summary>Maps an Altmount category to a NzbDAV target category.</summary>
 public sealed class MigrationCategoryMap
 {
-    /// <summary>config.yaml Name; "" for uncategorised stores.</summary>
+    /// <summary>
+    /// Source-category key; the Altmount-prefixed stored name is retained for schema compatibility.
+    /// Empty string represents uncategorised stores.
+    /// </summary>
     public string AltmountCategory { get; set; } = "";
 
     public string? AltmountDir { get; set; }
@@ -184,6 +200,11 @@ public sealed class MigrationReleaseFile
     public string? FileStatus { get; set; }
     public string? NzbdavId { get; set; }
 
+    /// <summary>Stable source-specific leaf identifier; legacy column names remain unchanged.</summary>
+    public string? SourceFileId { get; set; }
+    public string? ArticleIdentityKind { get; set; }
+    public string? ArticleIdentityDigest { get; set; }
+
     /// <summary>Populated only when symlink planning matches this file to a live DavItem.</summary>
     public string? NewDavItemId { get; set; }
 
@@ -263,8 +284,32 @@ public sealed class MigratedFile
     public long? FileSize { get; set; }
     public Guid DavItemId { get; set; }
     public Guid? NzbBlobId { get; set; }
+    public string? SourceFileId { get; set; }
+    public string? ArticleIdentityKind { get; set; }
+    public string? ArticleIdentityDigest { get; set; }
     public string MatchMethod { get; set; } = "";
     public DateTime LastVerifiedAt { get; set; }
+}
+
+/// <summary>
+/// One create-only host canary link. Unlike <see cref="MigrationSymlinkRewrite"/>,
+/// this records a new parallel library entry and never authorizes mutation of an existing library.
+/// </summary>
+public sealed class MigrationCanaryLink
+{
+    public long Id { get; set; }
+    public long RunId { get; set; }
+    public string LibraryRelativePath { get; set; } = "";
+    public string OriginalLegacyTarget { get; set; } = "";
+    public string? NewRelativeTarget { get; set; }
+    public string CorrelationStatus { get; set; } = "";
+    public string CorrelationEvidence { get; set; } = "{}";
+    public string SourcePackageDigest { get; set; } = "";
+    public long ExpectedFileSize { get; set; }
+    public string ApplyStatus { get; set; } = "planned";
+    public string? Error { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
 }
 
 /// <summary>

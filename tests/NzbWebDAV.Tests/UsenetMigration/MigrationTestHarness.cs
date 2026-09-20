@@ -63,6 +63,12 @@ internal sealed class MigrationTestHarness : IAsyncDisposable
         return harness;
     }
 
+    internal static DbContextOptions<UsenetMigrationDbContext> CreateMigrationOptions(string path) =>
+        new DbContextOptionsBuilder<UsenetMigrationDbContext>()
+            .UseSqlite($"Data Source={path}")
+            .AddInterceptors(new SqliteUsenetMigrationPragmas())
+            .Options;
+
     public async ValueTask DisposeAsync()
     {
         await Task.CompletedTask;

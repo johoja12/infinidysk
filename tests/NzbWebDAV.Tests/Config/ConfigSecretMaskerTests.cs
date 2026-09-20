@@ -7,6 +7,16 @@ namespace NzbWebDAV.Tests.Config;
 public class ConfigSecretMaskerTests
 {
     [Fact]
+    public void PlexServerTokens_RoundTripWithoutBrowserDisclosure()
+    {
+        const string stored = """[{"Id":"server","Token":"private-plex-token"}]""";
+        var masker = new ConfigSecretMasker("test-signing-key");
+        var masked = masker.MaskForResponse(ConfigKeys.PlexServers, stored);
+        Assert.DoesNotContain("private-plex-token", masked);
+        Assert.Contains(ConfigSecretMasker.MaskPrefix, masked);
+        Assert.Equal(stored, masker.ResolveForUpdate(ConfigKeys.PlexServers, masked, stored));
+    }
+    [Fact]
     public void IndexerApiKeysAreMaskedAndResolvedForRoundTripUpdates()
     {
         const string configName = "indexers.instances";
