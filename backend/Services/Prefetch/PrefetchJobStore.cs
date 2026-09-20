@@ -20,6 +20,16 @@ public sealed class PrefetchJobStore : IDisposable
     private readonly Func<PrefetchSettings>? _settings;
     private int Capacity => Math.Min(_capacity, _settings?.Invoke().QueueCapacity ?? _capacity);
     private SqliteTransaction? _transaction;
+    private int _wireBudgetBlocked;
+    private readonly CancellationTokenSource _wireBudgetFailure = new();
+    public bool WireBudgetBlocked => Volatile.Read(ref _wireBudgetBlocked) != 0;
+    public CancellationToken WireBudgetFailure => _wireBudgetFailure.Token;
+    public void BlockWireBudget()
+    {
+        if (Interlocked.Exchange(ref _wireBudgetBlocked, 1) == 0)
+            try { _wireBudgetFailure.Cancel(); }
+            catch (Exception exception) when (exception is not OutOfMemoryException) { }
+    }
     public PrefetchJobStore(string path, int capacity = 256, Func<PrefetchSettings>? settings = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
@@ -150,6 +160,28 @@ public sealed class PrefetchJobStore : IDisposable
         }
     }
 
+    public long ReserveDailyCredit(long requested, long budget, string day)
+    {
+        if (WireBudgetBlocked) throw new IOException("Warming budget accounting failed; repair local metadata storage and restart.");
+        if (requested < 0 || budget < 0) throw new ArgumentOutOfRangeException(nameof(requested));
+        lock (_gate)
+        return Atomic(() =>
+        {
+            Execute("DELETE FROM DailyBudget WHERE Day<$day", ("$day", day));
+            using var lookup = Command("SELECT Bytes FROM DailyBudget WHERE Day=$day", ("$day", day));
+            var spent = lookup.ExecuteScalar() as long? ?? 0;
+            var grant = budget == 0 ? requested : Math.Min(requested, Math.Max(0, budget - spent));
+            Execute("INSERT INTO DailyBudget(Day,Bytes) VALUES($day,$bytes) ON CONFLICT(Day) DO UPDATE SET Bytes=Bytes+excluded.Bytes", ("$day", day), ("$bytes", grant));
+            return grant;
+        });
+    }
+
+    public void ReturnDailyCredit(long bytes, string day)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(bytes);
+        lock (_gate) Execute("UPDATE DailyBudget SET Bytes=MAX(0,Bytes-$bytes) WHERE Day=$day", ("$day", day), ("$bytes", bytes));
+    }
+
     public PrefetchJob? ClaimNext()
     {
         lock (_gate)
@@ -266,5 +298,10 @@ public sealed class PrefetchJobStore : IDisposable
         finally { _transaction = null; }
     }
     private void Atomic(Action mutation) => Atomic(() => { mutation(); return true; });
-    public void Dispose() { lock (_gate) _database.Dispose(); }
+    public void Dispose()
+    {
+        BlockWireBudget();
+        lock (_gate) _database.Dispose();
+        _wireBudgetFailure.Dispose();
+    }
 }

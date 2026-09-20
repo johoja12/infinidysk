@@ -13,6 +13,8 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
     private PrefetchJobStore? _jobs;
     private PrefetchCoordinator? _coordinator;
     private bool _initialized;
+    private sealed record SettingsSnapshot(string? Json, PrefetchSettings Value);
+    private SettingsSnapshot? _settings;
     public string? InitializationError { get; private set; }
     public PrefetchJobStore? Jobs { get { Initialize(); return _jobs; } }
     public PrefetchCoordinator? Coordinator { get { Initialize(); return _coordinator; } }
@@ -26,7 +28,7 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
             try
             {
                 _jobs = new PrefetchJobStore(Path.Combine(native.ActiveSettings.MetadataPath, "prefetch.db"), settings: Settings);
-                _coordinator = new PrefetchCoordinator(_jobs, new NativePrefetchExecutor(scopes, native, config, _jobs, activeReads, playback),
+                _coordinator = new PrefetchCoordinator(_jobs, new NativePrefetchExecutor(scopes, native, config, _jobs, activeReads, playback, Settings),
                     Settings, () => native.ActiveSettings.Folders.Any(folder => folder.Enabled && !folder.ReadOnly)
                         && (!Settings().PauseDuringPlayback || activeReads.Snapshot().Count == 0 && playback?.HasActivePlayback != true));
             }
@@ -38,7 +40,15 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
         }
     }
 
-    public PrefetchSettings Settings() => PrefetchSettings.Parse(config.GetEffectiveConfigValue(ConfigKeys.SmartPrefetchSettings));
+    public PrefetchSettings Settings()
+    {
+        var json = config.GetEffectiveConfigValue(ConfigKeys.SmartPrefetchSettings);
+        var snapshot = Volatile.Read(ref _settings);
+        if (snapshot is not null && string.Equals(snapshot.Json, json, StringComparison.Ordinal)) return snapshot.Value;
+        var parsed = PrefetchSettings.Parse(json);
+        Volatile.Write(ref _settings, new(json, parsed));
+        return parsed;
+    }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {

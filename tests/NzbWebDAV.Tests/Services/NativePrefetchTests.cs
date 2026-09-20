@@ -17,6 +17,32 @@ public sealed class NativePrefetchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task PartialWarm_ReservesRequestedBlocksRatherThanEntireMovie()
+    {
+        var folder = Path.Combine(_root, "small");
+        Directory.CreateDirectory(folder);
+        await using var store = new NativeCacheStore(Path.Combine(_root, "small.db"),
+            [new NativeCacheFolder { Id = "small", Path = folder, MinFreeBytes = 0, MaxBytes = 8L * 1024 * 1024 }]);
+        var identity = new NativeCacheIdentity("large-movie", "revision", 16L * 1024 * 1024);
+        await using var stream = new NativeCachedStream(store, identity,
+            _ => Task.FromResult<Stream>(new VerifiedSource(new byte[identity.Length], true)), () => true);
+        await NativePrefetchExecutor.WarmAsync(store, stream, 0, 1, _ => true, _ => { }, CancellationToken.None);
+        Assert.Equal(NativeCacheStore.BlockSize, await store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
+    public async Task FullyCachedReadOnlyWarm_RequiresNoWritableReservationOrBudget()
+    {
+        var identity = new NativeCacheIdentity("movie", "revision", 3);
+        Assert.True(await _store.WriteBlockAsync(identity, 0, new byte[] { 1, 2, 3 }));
+        await _store.DisposeAsync();
+        _store = new NativeCacheStore(Path.Combine(_root, "index", "cache.db"),
+            [new NativeCacheFolder { Id = "media", Path = Path.Combine(_root, "media"), ReadOnly = true, MinFreeBytes = 0 }]);
+        await using var stream = new NativeCachedStream(_store, identity, _ => throw new InvalidOperationException("Opened source"), () => true);
+        await NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0, (Func<long, bool>)(_ => throw new InvalidOperationException("Spent budget")), _ => { }, CancellationToken.None);
+    }
+
+    [Fact]
     public async Task WholeFileWarm_SkipsCommittedBlocksAndCompletesOnlyVerifiedCoverage()
     {
         var bytes = new byte[NativeCacheStore.BlockSize + 3];
