@@ -7,6 +7,22 @@ namespace NzbWebDAV.Tests.Plex;
 public sealed class PlexApiClientTests
 {
     [Fact]
+    public async Task NextEpisodeWindow_StartsAtCurrentSeasonWithoutOwnersWatchedFilter()
+    {
+        using var handler = new FakePlexHandler(request =>
+        {
+            Assert.DoesNotContain("unwatched", request.RequestUri!.Query);
+            return request.RequestUri.AbsolutePath.EndsWith("/show/children", StringComparison.Ordinal)
+                ? Xml("""<MediaContainer><Directory ratingKey="early" index="1"/><Directory ratingKey="current" index="20"/><Directory ratingKey="next" index="21"/></MediaContainer>""")
+                : Xml("""<MediaContainer><Video ratingKey="upcoming" type="episode" grandparentRatingKey="show" parentIndex="20" index="11"/></MediaContainer>""");
+        });
+        var api = new PlexApiClient(new HttpClient(handler), "installation");
+        var current = new PlexMediaItem("watched", "episode", "Episode", "show", 20, 10, null, 0, 0, null);
+        Assert.Equal("upcoming", Assert.Single(await api.GetNextEpisodesAsync(Server(), current, 1)).RatingKey);
+        Assert.DoesNotContain(handler.Requests, request => request.Uri.AbsolutePath.Contains("early", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task SourcePreview_HonorsConfiguredLimitsAboveTwoHundred()
     {
         var items = string.Concat(Enumerable.Range(0, 100).Select(index => $"<Video ratingKey='{index}' type='movie' title='Film'/>"));

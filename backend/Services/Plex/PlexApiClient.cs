@@ -150,8 +150,34 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
     }
 
     public async Task<IReadOnlyList<PlexMediaItem>> GetNextEpisodesAsync(PlexServer server, string showRatingKey, int limit, CancellationToken ct = default) =>
-        (await ReadPagesAsync(server, $"/library/metadata/{Identifier(showRatingKey)}/allLeaves?sort=parentIndex%3Aasc%2Cindex%3Aasc&unwatched=1",
+        (await ReadPagesAsync(server, $"/library/metadata/{Identifier(showRatingKey)}/allLeaves?sort=parentIndex%3Aasc%2Cindex%3Aasc",
             Math.Clamp(limit, 1, 200), ["Video"], ct).ConfigureAwait(false)).Select(ParseMedia).ToArray();
+
+    public async Task<IReadOnlyList<PlexMediaItem>> GetNextEpisodesAsync(PlexServer server, PlexMediaItem current, int limit, CancellationToken ct = default)
+    {
+        var show = current.ShowRatingKey ?? current.RatingKey;
+        var seasons = await ReadPagesAsync(server, $"/library/metadata/{Identifier(show)}/children", 200, ["Directory"], ct).ConfigureAwait(false);
+        var result = new List<PlexMediaItem>();
+        var maximum = Math.Clamp(limit, 1, 20);
+        foreach (var season in seasons.Where(season => Long(season, "index") is > 0
+                && Long(season, "index") >= (current.Season ?? 1)).OrderBy(season => Long(season, "index")).Take(3))
+        {
+            if (Attribute(season, "ratingKey") is not { } key) continue;
+            // Query the relevant seasons, not the first N episodes of the entire show.
+            // Do not apply the server token owner's watched flag to another user's signal.
+            var episodes = await ReadPagesAsync(server, $"/library/metadata/{Identifier(key)}/children?sort=index%3Aasc",
+                maximum - result.Count, ["Video"], ct, element =>
+                {
+                    var media = ParseMedia(element);
+                    return media.ShowRatingKey == show && media.Season > 0 && media.Episode > 0
+                        && (current.Type == "show" || media.Season > current.Season
+                            || media.Season == current.Season && media.Episode > current.Episode);
+                }).ConfigureAwait(false);
+            result.AddRange(episodes.Select(ParseMedia));
+            if (result.Count >= maximum) break;
+        }
+        return result.DistinctBy(item => item.RatingKey).Take(maximum).ToArray();
+    }
 
     public async Task<IReadOnlyList<PlexMediaItem>> GetHistoryAsync(PlexServer server, DateTimeOffset since, int limit = 1000, CancellationToken ct = default) =>
         (await ReadPagesAsync(server, $"/status/sessions/history/all?viewedAt%3E={since.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture)}",
@@ -164,14 +190,15 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
             Attribute(item.Element("User"), "id") ?? "", Attribute(item.Element("Player"), "state") ?? "",
             ParseMedia(item).File, ParseMedia(item))).ToArray();
 
-    private async Task<IReadOnlyList<XElement>> ReadPagesAsync(PlexServer server, string path, int limit, string[] elementNames, CancellationToken ct)
+    private async Task<IReadOnlyList<XElement>> ReadPagesAsync(PlexServer server, string path, int limit, string[] elementNames, CancellationToken ct,
+        Func<XElement, bool>? include = null)
     {
         var result = new List<XElement>();
         var start = 0;
         var remainingBytes = MaximumResponseBytes;
         for (var page = 0; page < MaximumPages && result.Count < limit; page++)
         {
-            var size = Math.Min(100, limit - result.Count);
+            var size = include is null ? Math.Min(100, limit - result.Count) : 100;
             var separator = path.Contains('?') ? '&' : '?';
             var document = await GetXmlAsync(server, $"{path}{separator}X-Plex-Container-Start={start}&X-Plex-Container-Size={size}", ct,
                 bytes =>
@@ -185,7 +212,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
                     .SelectMany(hub => hub.Elements().Where(item => elementNames.Contains(item.Name.LocalName))))
                 .ToArray();
             // Do not retain the document and unrelated siblings through each element's parent.
-            result.AddRange(items.Take(limit - result.Count).Select(item => new XElement(item)));
+            result.AddRange(items.Where(item => include?.Invoke(item) != false).Take(limit - result.Count).Select(item => new XElement(item)));
             if (items.Length == 0) break;
             start += items.Length;
             var total = Long(document.Root, "totalSize");
