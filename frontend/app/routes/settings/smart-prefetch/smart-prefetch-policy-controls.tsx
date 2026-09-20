@@ -1,8 +1,11 @@
-import { Input, InputGroup, Toggle } from "~/components/ui";
+import { useEffect, useRef } from "react";
+import { Badge, Button, Input, InputGroup, Toggle } from "~/components/ui";
 import {
   bytesToDecimalGb,
   decimalGbToBytes,
+  hasCustomizedPrefetchPolicy,
   numericFields,
+  resetPrefetchPolicyDefaults,
   type NumericKey,
   type PrefetchSettings,
 } from "./smart-prefetch-model";
@@ -85,11 +88,19 @@ const numericGroups: { title: string; keys: NumericKey[] }[] = [
 
 export function SmartPrefetchPolicyControls({
   settings,
+  error,
   onChange,
 }: {
   settings: PrefetchSettings;
+  error: string | null;
   onChange: (settings: PrefetchSettings) => void;
 }) {
+  const details = useRef<HTMLDetailsElement>(null);
+  const customized = hasCustomizedPrefetchPolicy(settings);
+  useEffect(() => {
+    if (error && details.current) details.current.open = true;
+  }, [error]);
+
   return (
     <div className="space-y-5">
       <div className="grid gap-3 md:grid-cols-2">
@@ -129,16 +140,31 @@ export function SmartPrefetchPolicyControls({
       </div>
 
       <div className="rounded-box border border-base-content/10 bg-base-200/40 p-4">
-        <h3 className="font-semibold">Smart defaults</h3>
+        <strong>{customized ? "Customized policy" : "Smart defaults"}</strong>
         <p className="mt-1 text-sm text-base-content/60">
           Verified playback, next episodes, whole files, pause during playback, and conservative
           concurrency.
         </p>
       </div>
 
-      <details className="collapse collapse-arrow border border-base-content/10 bg-base-200/40">
-        <summary className="collapse-title text-sm font-semibold">Advanced settings</summary>
+      <details
+        ref={details}
+        className="collapse collapse-arrow border border-base-content/10 bg-base-200/40"
+      >
+        <summary className="collapse-title flex items-center gap-2 text-sm font-semibold">
+          <span>Advanced settings</span>
+          {customized && <Badge className="badge-warning badge-soft badge-sm">Customized</Badge>}
+        </summary>
         <div className="collapse-content space-y-5">
+          <div className="flex justify-end">
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => onChange(resetPrefetchPolicyDefaults(settings))}
+            >
+              Reset to smart defaults
+            </Button>
+          </div>
           {booleanGroups.map((group) => (
             <section key={group.title} className="space-y-2">
               <h3 className="text-sm font-semibold">{group.title}</h3>

@@ -6,10 +6,22 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ManagedEnvProvider } from "~/components/ui";
 import { publishPlexServers } from "../plex/plex-api";
 import { SmartPrefetchSettings } from "./smart-prefetch";
-import { parsePrefetchSettings } from "./smart-prefetch-model";
+import {
+  PREFETCH_KEY,
+  parsePrefetchSettings,
+  type PrefetchSettings,
+} from "./smart-prefetch-model";
 
-function Harness({ managed = false }: { managed?: boolean }) {
-  const [config, setConfig] = useState<Record<string, string>>({});
+function Harness({
+  managed = false,
+  initial,
+}: {
+  managed?: boolean;
+  initial?: PrefetchSettings;
+}) {
+  const [config, setConfig] = useState<Record<string, string>>(
+    initial ? { [PREFETCH_KEY]: JSON.stringify(initial) } : {},
+  );
   return (
     <ManagedEnvProvider
       value={
@@ -134,6 +146,67 @@ describe("Smart Prefetch settings", () => {
     expect(details?.contains(screen.getByLabelText("Episodes to queue ahead"))).toBe(true);
     await userEvent.click(screen.getByText("Advanced settings"));
     expect(details?.open).toBe(true);
+  });
+
+  it("marks customized policy and resets defaults without losing identity selections", async () => {
+    vi.stubGlobal("fetch", fakeApi());
+    const initial = {
+      ...parsePrefetchSettings(undefined),
+      Enabled: true,
+      MaxRetries: 9,
+      Users: ["server:7"],
+      Sources: [
+        {
+          ServerId: "server",
+          LibraryId: "2",
+          Kind: "hub",
+          Key: "/hubs/recent",
+          Title: "Recent TV",
+          Type: "show",
+          Enabled: true,
+          Limit: 10,
+          ExcludedShows: ["42"],
+        },
+      ],
+    };
+    render(<Harness initial={initial} />);
+    expect(screen.getByText("Customized")).toBeTruthy();
+    expect(screen.getByText("Customized policy")).toBeTruthy();
+    await userEvent.click(screen.getByText("Advanced settings"));
+    await userEvent.click(screen.getByRole("button", { name: "Reset to smart defaults" }));
+    const config = JSON.parse(screen.getByTestId("config").textContent) as Record<string, string>;
+    const saved = parsePrefetchSettings(config["smart-prefetch.settings"]);
+    expect(saved.Enabled).toBe(true);
+    expect(saved.MaxRetries).toBe(3);
+    expect(saved.Users).toEqual(["server:7"]);
+    expect(saved.Sources).toEqual(initial.Sources);
+  });
+
+  it("preserves hidden custom values when editing an essential control", async () => {
+    vi.stubGlobal("fetch", fakeApi());
+    render(
+      <Harness
+        initial={{ ...parsePrefetchSettings(undefined), MaxBytesPerItem: 123_000_000_000 }}
+      />,
+    );
+    await userEvent.click(screen.getByLabelText("Warm movies"));
+    const config = JSON.parse(screen.getByTestId("config").textContent) as Record<string, string>;
+    const saved = parsePrefetchSettings(config["smart-prefetch.settings"]);
+    expect(saved.MovieEnabled).toBe(false);
+    expect(saved.MaxBytesPerItem).toBe(123_000_000_000);
+  });
+
+  it("opens Advanced settings when an advanced value is invalid", async () => {
+    vi.stubGlobal("fetch", fakeApi());
+    render(<Harness initial={{ ...parsePrefetchSettings(undefined), MaxRetries: 11 }} />);
+    expect(
+      screen.getByText(
+        "Retries after failure (0 means no retries) must be a whole number from 0 to 10.",
+      ),
+    ).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByText("Advanced settings").closest("details")?.open).toBe(true),
+    );
   });
 
   it("clears a selected source server when a refresh removes it", async () => {

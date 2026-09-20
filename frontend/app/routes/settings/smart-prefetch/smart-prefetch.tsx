@@ -37,7 +37,7 @@ export function SmartPrefetchSettings({
             title="Smart Prefetch policies"
             description="Off by default. Start with fixed, safe policy defaults; expand Advanced only when you need to tune scheduling, predictions, or provider work. Save Native cache settings and restart before enabling."
           >
-            <SmartPrefetchPolicyControls settings={settings} onChange={update} />
+            <SmartPrefetchPolicyControls settings={settings} error={error} onChange={update} />
             <p className="text-xs text-base-content/60">
               Raw read activity is not verified Plex playback. Local-library eligibility still
               requires a symlink or STRM path that resolves to an imported DAV file; regular local
