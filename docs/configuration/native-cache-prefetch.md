@@ -60,14 +60,14 @@ Foreground native I/O has a bounded wait and falls back to source reads; a stuck
 operation retains its buffer allowance until it actually finishes, so repeated NAS
 stalls cannot allocate unlimited buffers.
 
-| Configuration key | Purpose |
-| --- | --- |
-| `cache.mode` | `off`, `segment`, or `native` |
-| `cache.native.folders` | Bounded JSON array of native folder settings |
-| `cache.native.metadata-path` | Direct local path for rebuildable catalogue and warming state |
-| `cache.native.writer-mb` | Native buffering allowance in MiB; 32 by default |
-| `smart-prefetch.settings` | Validated policy settings JSON; automatic warming is off by default |
-| `plex.accounts` / `plex.servers` | Persisted Plex credentials, saved servers, and exact mappings |
+| Configuration key                | Purpose                                                             |
+| -------------------------------- | ------------------------------------------------------------------- |
+| `cache.mode`                     | `off`, `segment`, or `native`                                       |
+| `cache.native.folders`           | Bounded JSON array of native folder settings                        |
+| `cache.native.metadata-path`     | Direct local path for rebuildable catalogue and warming state       |
+| `cache.native.writer-mb`         | Native buffering allowance in MiB; 32 by default                    |
+| `smart-prefetch.settings`        | Validated policy settings JSON; automatic warming is off by default |
+| `plex.accounts` / `plex.servers` | Persisted Plex credentials, saved servers, and exact mappings       |
 
 Native folders, metadata location, buffer allowance, and cache mode require restart.
 Policy changes use Apply; queue actions and dedicated Plex Save/Disconnect actions
@@ -97,6 +97,15 @@ an exact imported DAV item. Ordinary local files are skipped: this option does n
 create another rclone warmer or an arbitrary filesystem cache.
 
 ## Select policies and inspect work
+
+The normal Smart Prefetch view contains only the master switch, movie and TV
+eligibility, and the daily provider-payload budget in decimal GB. Fixed smart
+defaults handle verified playback, next-episode prediction, whole-file warming,
+playback pausing, and conservative concurrency. Expand **Advanced settings** to
+change signals, prediction thresholds, schedules, queue resources, or warming
+ranges. **Customized** means at least one policy value differs from those defaults.
+**Reset to smart defaults** restores policy behavior without disabling Smart
+Prefetch or removing selected Plex users, hubs, or collections.
 
 Fetch libraries, users, hubs, and collections; preview a source before enabling it.
 Selections belong to stable server/library/source identities, not display names.
