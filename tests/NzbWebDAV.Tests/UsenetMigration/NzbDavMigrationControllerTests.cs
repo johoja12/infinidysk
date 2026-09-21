@@ -267,6 +267,87 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
             archive.Entries.Select(entry => entry.FullName).Order().ToArray());
     }
 
+    [Fact]
+    public async Task FullConnect_IsIdempotentAndFencesOutOfOrderOrUnacknowledgedBatches()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var masterDigest = new string('d', 64);
+        var first = await CreateFullPackageAsync("full-0", masterDigest, 0, 2);
+        var second = await CreateFullPackageAsync("full-1", masterDigest, 1, 2);
+        var controller = CreateController(harness);
+        var request0 = new NzbDavFullConnectRequest(first, masterDigest, 100, 95, 5, 1);
+
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(request0));
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(request0));
+        await using (var db = harness.Mig())
+            Assert.Single(await db.NzbDavBatches.ToListAsync());
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(
+            new NzbDavFullConnectRequest(second, masterDigest, 100, 95, 5, 1)));
+
+        await using (var db = harness.Mig())
+        {
+            var batch = await db.NzbDavBatches.SingleAsync();
+            batch.Status = "acknowledged";
+            await db.SaveChangesAsync();
+        }
+        await harness.Store.UpdateSessionAsync(session => session.Status = "connected");
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(
+            new NzbDavFullConnectRequest(second, masterDigest, 100, 95, 5, 1)));
+        var status = Assert.IsType<OkObjectResult>(await controller.GetFullStatus());
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(status.Value));
+        Assert.Equal(2, json.RootElement.GetProperty("batchCount").GetInt32());
+        Assert.Equal(95, json.RootElement.GetProperty("recoverableCount").GetInt32());
+    }
+
+    [Fact]
+    public async Task AcknowledgePlan_RequiresTerminalExactFullyAppliedBatch()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var masterDigest = new string('e', 64);
+        var packagePath = await CreateFullPackageAsync("ack", masterDigest, 0, 1);
+        var package = await new NzbDavPackageReader().ReadAsync(packagePath);
+        var selected = Assert.Single(package.Manifest.SelectedLinks);
+        var controller = CreateController(harness);
+        await controller.ConnectFull(new NzbDavFullConnectRequest(packagePath, masterDigest, 1, 1, 5, 1));
+        await harness.Store.UpdateSessionAsync(session => session.Status = "complete");
+        await using (var db = harness.Mig())
+        {
+            db.Releases.Add(new MigrationRelease
+            {
+                StoreRef = "active", StoreBasename = "active", SubmitFileName = "active.nzb",
+                QueueFileName = "active.nzb", JobName = "active", VerdictReasons = "[]", ScannedAt = DateTime.UtcNow,
+            });
+            db.Submissions.Add(new MigrationSubmission
+                { StoreRef = "active", State = "processing", UpdatedAt = DateTime.UtcNow });
+            await db.SaveChangesAsync();
+        }
+        var acknowledgement = new NzbDavBatchPlanAcknowledgementRequest(new string('f', 64), 1, 1);
+        Assert.IsType<BadRequestObjectResult>(await controller.AcknowledgePlan(0, acknowledgement));
+
+        await using (var db = harness.Mig())
+        {
+            db.Submissions.RemoveRange(db.Submissions);
+            db.Releases.Add(new MigrationRelease
+            {
+                StoreRef = "nzbdav:release-1", StoreBasename = "release-1", SubmitFileName = "release.nzb",
+                QueueFileName = "release.nzb", JobName = "release", VerdictReasons = "[]", ScannedAt = DateTime.UtcNow,
+            });
+            db.ReleaseFiles.Add(new MigrationReleaseFile
+            {
+                StoreRef = "nzbdav:release-1", MetaPath = "payload", VirtualPath = "/content/a.mkv",
+                FileName = "a.mkv", NormalisedName = "a.mkv", SourceFileId = selected.LegacyDavItemId.ToString(),
+                FileStatus = "exact", NewDavItemId = Guid.NewGuid().ToString(),
+            });
+            await db.SaveChangesAsync();
+        }
+        Assert.IsType<OkObjectResult>(await controller.AcknowledgePlan(0, acknowledgement));
+        await using var verify = harness.Mig();
+        var batch = await verify.NzbDavBatches.SingleAsync();
+        Assert.Equal("acknowledged", batch.Status);
+        Assert.Equal(1, batch.AppliedCount);
+        Assert.Equal(1, batch.ValidatedCount);
+    }
+
     private NzbDavMigrationController CreateController(MigrationTestHarness harness)
     {
         var services = new ServiceCollection()
@@ -299,6 +380,27 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         var output = Path.Join(parent, $"package-{name}-{Guid.NewGuid():N}");
         await new CanaryPackageWriter(1, 50).WriteAsync(new CanaryExportRequest(
             name, output, [new CanaryExportRelease("release-1", blob, payload, leaves)], links));
+        return output;
+    }
+
+    private async Task<string> CreateFullPackageAsync(
+        string name,
+        string masterDigest,
+        int batchIndex,
+        int batchCount)
+    {
+        var parent = Path.Join(_config, "migration-input");
+        Directory.CreateDirectory(parent);
+        var payload = Path.Join(parent, $"{name}.nzb");
+        await File.WriteAllTextAsync(payload, "<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\" />");
+        var leafId = Guid.NewGuid();
+        var leaf = new NzbDavExportLeaf(leafId, "/content/a.mkv", 10, "release-1", null, null,
+            NzbDavArticleIdentity.DirectKind, new string('a', 64), "ready", null);
+        var output = Path.Join(parent, $"package-{name}-{Guid.NewGuid():N}");
+        await new CanaryPackageWriter().WriteFullBatchAsync(new CanaryExportRequest(
+            name, output, [new CanaryExportRelease("release-1", null, payload, [leaf])],
+            [new NzbDavSelectedLibraryLink("Migration-TV/a.mkv", "/legacy/a", leafId)]),
+            masterDigest, batchIndex, batchCount);
         return output;
     }
 

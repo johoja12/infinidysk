@@ -4,6 +4,7 @@ using NzbWebDAV.Config;
 using NzbWebDAV.Database.Models.UsenetMigration;
 using NzbWebDAV.Models.Nzb;
 using NzbWebDAV.UsenetMigration.Naming;
+using NzbWebDAV.UsenetMigration.NzbDav;
 using NzbWebDAV.UsenetMigration.Provenance;
 using NzbWebDAV.UsenetMigration.Source;
 using NzbWebDAV.Utils;
@@ -96,7 +97,10 @@ public sealed class NzbDavScanRunner(
             releases.Add((release, files, errors.ToArray()));
         }
 
-        return await PersistAsync(releases, cancellationToken).ConfigureAwait(false);
+        var summary = await PersistAsync(releases, cancellationToken).ConfigureAwait(false);
+        if (summary is not null && package.Manifest.SchemaVersion == NzbDavExportManifest.CurrentSchemaVersion)
+            await store.MarkNzbDavBatchScannedAsync(package.PackageDigest, cancellationToken).ConfigureAwait(false);
+        return summary;
     }
 
     private async Task RejectArrBoundTargetsAsync(
