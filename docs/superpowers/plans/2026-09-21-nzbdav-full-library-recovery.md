@@ -816,7 +816,7 @@ Add:
 
 ```text
 coverage-report --source-root /mnt/plex --library-root /mnt/plex2 \
-  --initial-inventory FILE --master FILE --journals-dir DIR --output DIR \
+  --initial-inventory FILE --master FILE_OR_DIR --journals-dir DIR --output DIR \
   --minimum-coverage 0.90
 ```
 

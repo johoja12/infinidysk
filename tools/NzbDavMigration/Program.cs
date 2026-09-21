@@ -30,7 +30,7 @@ internal static class NzbDavMigrationProgram
             await Console.Error.WriteLineAsync("       NzbDavMigration export-batches --master FILE --blob-root PATH --output DIR [--max-releases 250] [--max-payload-bytes 4294967296]");
             await Console.Error.WriteLineAsync("       NzbDavMigration export --selection FILE --inventory FILE --blob-root PATH --output DIR --package-id ID");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
-            await Console.Error.WriteLineAsync("       NzbDavMigration coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --master FILE --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --master FILE_OR_DIR --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration rollback-links --journal FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration validate-links --journal FILE --output FILE [--ffprobe PATH] [--max-read-bytes N] [--timeout-seconds N]");
             await Console.Error.WriteLineAsync("       NzbDavMigration benchmark-links --selection FILE --plan FILE --output DIR --legacy-url URL --legacy-route KIND --infinidysk-url URL --infinidysk-route KIND [--legacy-root /mnt/plex] [--infinidysk-root /mnt/plex2] [--legacy-cache-root PATH] [--infinidysk-cache-root PATH] [--timeout-seconds N]");

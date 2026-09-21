@@ -62,9 +62,7 @@ public sealed class CanaryCoverageReporter
         var journals = CanaryPathSafety.ResolveRoot(journalsDirectory, "Journals directory");
         var initial = await ReadJsonAsync<LegacyInventoryCandidate[]>(initialInventoryPath, cancellationToken)
             .ConfigureAwait(false) ?? throw new InvalidDataException("Initial inventory is empty.");
-        var master = await ReadJsonAsync<FullRecoveryMasterManifest>(masterManifestPath, cancellationToken)
-            .ConfigureAwait(false) ?? throw new InvalidDataException("Master manifest is empty.");
-        ValidateMaster(master);
+        var masterItems = await ReadMasterItemsAsync(masterManifestPath, cancellationToken).ConfigureAwait(false);
         var initialByPath = UniqueByPath(initial.Select(item =>
             new LibraryInventoryLink(item.LibraryRelativePath, item.OriginalTarget, item.LegacyDavItemId)),
             "initial inventory");
@@ -72,7 +70,7 @@ public sealed class CanaryCoverageReporter
         var finalByPath = UniqueByPath(final, "final inventory");
         var parallel = new LibraryInventoryService().Inventory(library);
         var orphanParallelCount = parallel.Count(item => !finalByPath.ContainsKey(item.LibraryRelativePath));
-        var masterByPath = UniqueMasterByPath(master.Items);
+        var masterByPath = UniqueMasterByPath(masterItems);
         var ownership = await ReadOwnershipAsync(
             journals, source, library, statTimeout ?? TimeSpan.FromSeconds(10), cancellationToken)
             .ConfigureAwait(false);
@@ -83,13 +81,13 @@ public sealed class CanaryCoverageReporter
         {
             cancellationToken.ThrowIfCancellationRequested();
             string classification;
-            if (!initialByPath.TryGetValue(current.LibraryRelativePath, out var original))
-                classification = "added-after-initial";
-            else if (original.LegacyDavItemId != current.LegacyDavItemId
-                     || !string.Equals(original.OriginalTarget, current.OriginalTarget, StringComparison.Ordinal))
+            var existedInitially = initialByPath.TryGetValue(current.LibraryRelativePath, out var original);
+            if (existedInitially && (original!.LegacyDavItemId != current.LegacyDavItemId
+                                     || !string.Equals(original.OriginalTarget, current.OriginalTarget,
+                                         StringComparison.Ordinal)))
                 classification = "source-drift";
             else if (!masterByPath.TryGetValue(current.LibraryRelativePath, out var recovered))
-                classification = "not-in-master";
+                classification = existedInitially ? "not-in-master" : "added-after-initial";
             else if (recovered.LegacyDavItemId != current.LegacyDavItemId
                      || !string.Equals(recovered.OriginalTarget, current.OriginalTarget, StringComparison.Ordinal))
                 classification = "master-source-mismatch";
@@ -224,6 +222,42 @@ public sealed class CanaryCoverageReporter
             || master.RecoverableLinks != recoverable
             || master.RecoverableFraction != fraction)
             throw new InvalidDataException("Master manifest counts or schema are invalid.");
+    }
+
+    private static async Task<IReadOnlyList<LegacySourceRecoveryItem>> ReadMasterItemsAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var directory = new DirectoryInfo(fullPath);
+        if (directory.Exists)
+        {
+            directory.Refresh();
+            if (directory.LinkTarget is not null || directory.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                throw new InvalidDataException("Coverage master directory must not be a symbolic link.");
+            var files = directory.EnumerateFiles("*.json", SearchOption.TopDirectoryOnly)
+                .OrderBy(file => file.Name, StringComparer.Ordinal)
+                .ToArray();
+            if (files.Length == 0)
+                throw new InvalidDataException("Coverage master directory contains no JSON manifests.");
+            var items = new List<LegacySourceRecoveryItem>();
+            foreach (var file in files)
+            {
+                file.Refresh();
+                if (file.LinkTarget is not null || file.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                    throw new InvalidDataException($"Coverage master manifest must not be a symbolic link: {file.FullName}");
+                var master = await ReadJsonAsync<FullRecoveryMasterManifest>(file.FullName, cancellationToken)
+                    .ConfigureAwait(false) ?? throw new InvalidDataException($"Master manifest is empty: {file.FullName}");
+                ValidateMaster(master);
+                items.AddRange(master.Items);
+            }
+            return items;
+        }
+
+        var single = await ReadJsonAsync<FullRecoveryMasterManifest>(fullPath, cancellationToken)
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Master manifest is empty.");
+        ValidateMaster(single);
+        return single.Items;
     }
 
     private static IEnumerable<string> EnumerateJournalFilesNoFollow(DirectoryInfo directory)

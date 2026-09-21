@@ -127,6 +127,67 @@ public sealed class CanaryCoverageReporterTests : IDisposable
         Assert.Equal(3, exit);
     }
 
+    [Fact]
+    public async Task WriteAsync_CoversPostInventoryLinksProvenByADeltaMasterAndJournal()
+    {
+        var source = Directory.CreateDirectory(Path.Join(_root, "delta-source")).FullName;
+        var library = Directory.CreateDirectory(Path.Join(_root, "delta-library")).FullName;
+        var target = Directory.CreateDirectory(Path.Join(_root, "delta-target")).FullName;
+        var journals = Directory.CreateDirectory(Path.Join(_root, "delta-journals")).FullName;
+        var masters = Directory.CreateDirectory(Path.Join(_root, "delta-masters")).FullName;
+        var initial = Candidate("TV/initial.mkv", Guid.NewGuid());
+        var added = Candidate("TV/added.mkv", Guid.NewGuid());
+        var initialPath = Path.Join(_root, "delta-initial.json");
+        await File.WriteAllTextAsync(initialPath, JsonSerializer.Serialize(new[] { initial }, JsonOptions));
+        CreateLegacyLink(source, initial.LibraryRelativePath, initial.LegacyDavItemId);
+        CreateLegacyLink(source, added.LibraryRelativePath, added.LegacyDavItemId);
+
+        await WriteMasterAsync(Path.Join(masters, "initial.json"), initial);
+        await WriteMasterAsync(Path.Join(masters, "delta.json"), added);
+        var links = new[] { initial, added }.Select(item =>
+        {
+            var relativeTarget = $".ids/a/b/c/d/e/{Guid.NewGuid()}";
+            var targetPath = Path.Join(target, relativeTarget.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(targetPath)!);
+            File.WriteAllBytes(targetPath, new byte[16]);
+            return new NzbDavCanaryPlanLink(item.LibraryRelativePath, item.OriginalTarget,
+                item.LegacyDavItemId, 16, "exact", "{}", relativeTarget, "planned");
+        }).ToArray();
+        var plan = new NzbDavCanaryPlan(1, 1, new string('d', 64), DateTimeOffset.UtcNow,
+            links.Length, links.Length, true, links);
+        var planDirectory = await new NzbDavCanaryPlanWriter().WriteAsync(Path.Join(_root, "delta-plan"), plan);
+        await new CanaryLinkApplier(_ => true).ApplyAsync(
+            Path.Join(planDirectory, "plan.json"), source, library, target,
+            Path.Join(journals, "batch-1", "apply-journal.json"));
+
+        var result = await new CanaryCoverageReporter().WriteAsync(
+            source, library, initialPath, masters, journals, Path.Join(_root, "delta-report"));
+
+        Assert.Equal(2, result.Report.FinalSourceCount);
+        Assert.Equal(1, result.Report.AddedCount);
+        Assert.Equal(2, result.Report.CoveredCount);
+        Assert.Equal(1m, result.Report.CoverageFraction);
+        Assert.All(result.Report.Items, item => Assert.Equal("covered", item.Classification));
+        Assert.Equal(0, await NzbDavMigrationProgram.RunAsync(
+        [
+            "coverage-report", "--source-root", source, "--library-root", library,
+            "--initial-inventory", initialPath, "--master", masters,
+            "--journals-dir", journals, "--output", Path.Join(_root, "delta-cli-report"),
+            "--minimum-coverage", "0.90",
+        ]));
+    }
+
+    private static async Task WriteMasterAsync(string path, LegacyInventoryCandidate item)
+    {
+        var master = new FullRecoveryMasterManifest(
+            1, DateTimeOffset.UtcNow, 1, 1, 1m,
+            [new LegacySourceRecoveryItem(
+                item.LibraryRelativePath, item.OriginalTarget, item.LegacyDavItemId,
+                "/content/file.mkv", "exact-direct", null, "blob.nzb", new string('a', 64),
+                "direct-articles-v1", new string('b', 64), 16)]);
+        await File.WriteAllTextAsync(path, JsonSerializer.Serialize(master, JsonOptions));
+    }
+
     private static LegacyInventoryCandidate Candidate(string path, Guid id) =>
         new(path, $"/mnt/legacy/.ids/a/b/c/d/e/{id}", id, null, "candidate", null, null);
 

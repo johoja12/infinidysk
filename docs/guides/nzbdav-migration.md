@@ -181,8 +181,10 @@ validation has failures.
 After the first pass, freeze a fresh inventory and catalogue snapshot. Recover
 and process only links added since the initial snapshot as a delta pass. Removed
 links need no parallel entry, and changed legacy targets must be reviewed rather
-than forced. Then generate aggregate coverage against the initial snapshot and
-the live final source tree:
+than forced. Copy each unmodified initial/delta `master-manifest.json` into a
+dedicated private directory; duplicate relative paths across those masters are an
+error. Then generate aggregate coverage against the initial snapshot and the live
+final source tree:
 
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
@@ -190,13 +192,14 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --source-root /mnt/plex \
   --library-root /mnt/plex2 \
   --initial-inventory "$RUN/initial-inventory.json" \
-  --master "$RUN/recovery/master-manifest.json" \
+  --master "$RUN/coverage-masters" \
   --journals-dir "$RUN/journals" \
   --output "$RUN/coverage" \
   --minimum-coverage 0.90
 ```
 
-The final live `/mnt/plex` snapshot is the denominator. Review every `covered`,
+`--master` accepts either one manifest file or a directory of initial/delta JSON
+master manifests. The final live `/mnt/plex` snapshot is the denominator. Review every `covered`,
 `missing-parallel`, `wrong-target`, `added-after-initial`, and removed item in
 `coverage.json` and `coverage.md`; the counts must classify every final source
 link exactly once. A 90% aggregate is a recovery milestone, not permission to
