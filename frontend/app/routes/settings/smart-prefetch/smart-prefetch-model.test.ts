@@ -46,12 +46,50 @@ describe("Smart Prefetch persisted settings", () => {
       MovieEnabled: false,
       Users: ["server:7"],
       Sources: [source],
+      DisabledLibraries: [{ ServerId: "server", LibraryId: "2", Type: "show" }],
     });
     expect(reset.Enabled).toBe(true);
     expect(reset.MaxRetries).toBe(3);
     expect(reset.MovieEnabled).toBe(true);
     expect(reset.Users).toEqual(["server:7"]);
     expect(reset.Sources).toEqual([source]);
+    expect(reset.DisabledLibraries).toEqual([{ ServerId: "server", LibraryId: "2", Type: "show" }]);
+  });
+
+  it("defaults disabled libraries empty and round-trips stable identities", () => {
+    expect(parsePrefetchSettings(undefined).DisabledLibraries).toEqual([]);
+    const settings = parsePrefetchSettings(
+      '{"disabledLibraries":[{"serverId":"server","libraryId":"2","type":"show"}]}',
+    );
+    expect(settings.DisabledLibraries).toEqual([
+      { ServerId: "server", LibraryId: "2", Type: "show" },
+    ]);
+    expect(validatePrefetchSettings(settings)).toBeNull();
+  });
+
+  it("rejects invalid, duplicate, and over-limit disabled library identities", () => {
+    expect(() => parsePrefetchSettings('{"DisabledLibraries":null}')).toThrow();
+    const defaults = parsePrefetchSettings(undefined);
+    expect(
+      validatePrefetchSettings({
+        ...defaults,
+        DisabledLibraries: [{ ServerId: "server", LibraryId: "2", Type: "episode" }],
+      }),
+    ).not.toBeNull();
+    const identity = { ServerId: "server", LibraryId: "2", Type: "show" as const };
+    expect(
+      validatePrefetchSettings({ ...defaults, DisabledLibraries: [identity, identity] }),
+    ).not.toBeNull();
+    expect(
+      validatePrefetchSettings({
+        ...defaults,
+        DisabledLibraries: Array.from({ length: 129 }, (_, index) => ({
+          ServerId: "server",
+          LibraryId: String(index),
+          Type: "movie" as const,
+        })),
+      }),
+    ).not.toBeNull();
   });
 
   it("exposes bounded queue lifetime, retries and verified-session expiry", () => {
