@@ -25,7 +25,9 @@ public sealed class OrphanCatalogueScannerTests : IAsyncDisposable
         Assert.Equal(5, result.BlobCount);
         Assert.Equal(2, result.ValidBlobCount);
         Assert.Equal(3, result.FailedBlobCount);
-        Assert.Equal("valid", (await store.ReadBlobAsync("regular.nzb"))!.ParseStatus);
+        var regular = (await store.ReadBlobAsync("regular.nzb"))!;
+        Assert.Equal("valid", regular.ParseStatus);
+        Assert.Equal(1, Assert.Single(regular.Articles).SegmentOrdinal);
         Assert.Equal("invalid-xml", (await store.ReadBlobAsync("entity.nzb"))!.FailureClass);
         Assert.Equal("invalid-xml", (await store.ReadBlobAsync("malformed.nzb"))!.FailureClass);
         Assert.Equal("symlink", (await store.ReadBlobAsync("linked.nzb"))!.FailureClass);

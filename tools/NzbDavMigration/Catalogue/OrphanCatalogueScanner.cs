@@ -87,7 +87,8 @@ public sealed class OrphanCatalogueScanner(
                 var document = await NzbDocument.LoadAsync(parse, cancellationToken).ConfigureAwait(false);
                 var articles = document.Files.SelectMany((file, fileOrdinal) =>
                     file.Segments.Select((segment, segmentOrdinal) => new OrphanCatalogueArticle(
-                        NormalizeMessageId(segment.MessageId), fileOrdinal, segmentOrdinal, segment.Bytes))).ToArray();
+                        NormalizeMessageId(segment.MessageId), fileOrdinal,
+                        segment.Number ?? segmentOrdinal, segment.Bytes))).ToArray();
                 string? releaseDigest = null;
                 if (document.Files.Count > 0)
                 {
