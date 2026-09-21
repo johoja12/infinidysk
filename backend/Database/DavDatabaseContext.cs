@@ -1084,6 +1084,12 @@ public class DavDatabaseContext : DbContext
             b.Entity<HistoryItem>().Property(x => x.CreatedAt)
                 .HasColumnType("timestamp without time zone")
                 .HasConversion(PostgresWallClockDateTimeConverter);
+            b.Entity<LibraryLinkMap>().Property(x => x.LastSeenUtc)
+                .HasColumnType("timestamp without time zone")
+                .HasConversion(PostgresWallClockDateTimeConverter);
+            b.Entity<LibraryLinkMap>().Property(x => x.LastCheckedUtc)
+                .HasColumnType("timestamp without time zone")
+                .HasConversion(PostgresNullableWallClockDateTimeConverter);
         }
     }
 
