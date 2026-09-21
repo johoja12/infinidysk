@@ -1,7 +1,7 @@
 # Plex Source Accordion Design
 
 **Date:** 2026-09-21  
-**Status:** Approved visual direction; awaiting written-spec review  
+**Status:** Approved
 **Scope:** Smart Prefetch Plex source configuration only
 
 ## Problem
@@ -28,7 +28,7 @@ clearer NzbDav hierarchy: media type, library accordion, and simple on/off choic
 
 ## Non-goals
 
-- No backend Plex discovery or persistence contract changes.
+- No Plex discovery endpoint or database-schema changes.
 - No changes to prefetch scheduling, prediction, cache, or warming behavior.
 - No automatic enablement of every hub or collection.
 - No automatic rewrite of existing saved source selections.
@@ -84,8 +84,15 @@ sources are skipped without inventing synthetic catalogue entries. If no
 recommended source is available, the library opens and asks the user to choose a
 source.
 
-Turning a library off disables its selected sources while retaining their choices.
-Turning it back on restores those choices rather than reapplying defaults.
+Turning a library off adds its stable identity to `DisabledLibraries`; it does not
+change the enabled state, limit, or exclusions of any child source. Turning it back
+on removes that identity and restores those choices rather than reapplying defaults.
+
+`DisabledLibraries` is a bounded array of objects containing `ServerId`,
+`LibraryId`, and normalized `Type` (`movie` or `show`). The media type distinguishes
+movie and TV global-hub groups whose `LibraryId` is empty. Existing configurations
+default to an empty array. The prefetch scheduler skips a source when its normalized
+library identity appears in this array.
 
 ### Source switch
 
@@ -181,13 +188,21 @@ Closing the drawer keeps draft edits. Disabling a source does not erase them.
   collapsed by default, counts shorten to compact summaries, and all switches
   retain at least a 44-pixel touch target.
 
-## Existing-Configuration Compatibility
+## Configuration Contract and Compatibility
 
-- Existing `Users` and `Sources` JSON remain authoritative and load without
-  migration.
+- Existing `Users` and `Sources` JSON remain authoritative and load without a data
+  migration. The new optional `DisabledLibraries` array defaults to empty.
 - Existing enabled/disabled values, limits, and exclusions are preserved exactly.
 - Smart defaults apply only when a user turns on a library that has no prior source
   choices.
+- Library switches update only `DisabledLibraries`; they never rewrite child source
+  `Enabled` values. Source switches continue to own those values.
+- The backend validates at most 128 unique library identities, bounded string
+  lengths, and only normalized `movie`/`show` types. Duplicate or malformed entries
+  reject the settings update.
+- Scheduling filters disabled library identities after source/server matching and
+  before any Plex source request, so disabling a library causes no catalogue fetch
+  or warming work for its sources.
 - Environment-managed `smart-prefetch.settings` remains read-only through the
   existing `ManagedSetting` behavior; the redesigned controls are visibly pinned
   and Apply remains unavailable.
@@ -206,8 +221,9 @@ units:
 - A pure catalogue-grouping helper for classification, deduplication, ordering,
   and unavailable saved sources.
 
-These components consume the existing Plex API types and `PrefetchSettings`; no
-new backend endpoint is required.
+These components consume the existing Plex API types. `PrefetchSettings` gains the
+backward-compatible `DisabledLibraries` field; no new endpoint or database migration
+is required.
 
 ## Test Strategy
 
@@ -227,9 +243,19 @@ Focused frontend tests must cover:
 - Accordions and switches expose correct accessible names and expanded state.
 - The compact mobile layout retains all controls and touch targets.
 
-Backend tests are unnecessary unless implementation reveals that the existing API
-cannot supply a stable library/source identity or resolved media type. Any such
-contract change requires a separate design review before expanding scope.
+Focused backend tests must cover:
+
+- Missing `DisabledLibraries` parses as an empty array.
+- Valid library identities round-trip and malformed, duplicate, or over-limit
+  identities are rejected.
+- A disabled library makes no Plex source request and queues no warming job.
+- Re-enabling the library resumes its previously enabled sources without rewriting
+  their settings.
+
+Because this is an optional property inside the existing validated JSON setting, it
+does not require an EF migration. The setup wizard remains unchanged: Plex source
+selection is still advanced and optional, and the field defaults safely for new and
+existing installations.
 
 ## Acceptance Criteria
 
@@ -237,6 +263,7 @@ contract change requires a separate design review before expanding scope.
   Plex kinds, IDs, or repeated `Add source` actions.
 - Movies and TV are visually and semantically separate.
 - One library switch establishes the approved smart defaults.
+- Library on/off state persists independently without losing child source choices.
 - Collections are discoverable but optional and off by default.
 - Advanced controls remain available without cluttering the default layout.
 - Existing configurations round-trip without data loss or silent rewrites.
