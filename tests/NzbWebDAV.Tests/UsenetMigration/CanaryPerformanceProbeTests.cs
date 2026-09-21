@@ -99,6 +99,28 @@ public sealed class CanaryPerformanceProbeTests
     }
 
     [Fact]
+    public async Task ProbeAsync_PropagatesStructuredCacheEvidenceToEveryObservation()
+    {
+        var evidence = new CanaryCacheEvidenceResult(
+            "observed-partial", 200, 1_000, 20, "rclone-vfs-meta");
+
+        var rows = await new CanaryPerformanceProbe().ProbeAsync(
+            Selection(1_000), "infinidysk", "first-pass",
+            new CanaryRouteDescription("http://backend:8080", "direct-backend"),
+            _ => new MemoryStream(new byte[1_000], writable: false),
+            TimeSpan.FromSeconds(1), evidence);
+
+        Assert.All(rows, row =>
+        {
+            Assert.Equal("observed-partial", row.CacheLabel);
+            Assert.Equal(200, row.CacheCachedBytes);
+            Assert.Equal(1_000, row.CacheExpectedBytes);
+            Assert.Equal(20, row.CacheCoveragePercent);
+            Assert.Equal("rclone-vfs-meta", row.CacheEvidenceSource);
+        });
+    }
+
+    [Fact]
     public async Task ProbeAsync_PropagatesCallerCancellationAndKeepsSidesIndependent()
     {
         var item = Selection(100);

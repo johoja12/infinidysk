@@ -36,7 +36,7 @@ public sealed class CanaryPerformanceProbe
         CanaryRouteDescription route,
         Func<string, Stream> openStream,
         TimeSpan timeout,
-        string? provenCacheLabel = null,
+        CanaryCacheEvidenceResult? cacheEvidence = null,
         CancellationToken cancellationToken = default)
     {
         route.Validate();
@@ -100,14 +100,18 @@ public sealed class CanaryPerformanceProbe
             double? throughput = actual > 0 && elapsed.TotalSeconds > 0
                 ? actual / 1024d / 1024d / elapsed.TotalSeconds
                 : null;
-            var cache = provenCacheLabel ?? (pass == "first-pass"
+            var cache = cacheEvidence?.Label ?? (pass == "first-pass"
                 ? "cache-state-unknown-first-pass"
                 : "cache-state-unknown-repeat-pass");
             results.Add(new CanaryPerformanceObservation(
                 file.LibraryRelativePath, side, pass, operation.Name, operation.Offset,
                 operation.Requested, actual, ttfb, elapsed.TotalMilliseconds, throughput,
                 cache, route, side == "infinidysk" && route.RouteKind == "frontend-proxied",
-                timedOut, error));
+                timedOut, error,
+                cacheEvidence?.CachedBytes,
+                cacheEvidence?.ExpectedBytes,
+                cacheEvidence?.CoveragePercent,
+                cacheEvidence?.Source ?? "none"));
         }
         return results;
     }

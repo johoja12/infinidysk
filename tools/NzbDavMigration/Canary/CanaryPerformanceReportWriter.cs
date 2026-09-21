@@ -69,7 +69,7 @@ public sealed class CanaryPerformanceReportWriter
                 .Append(" | ").Append(file.Representation)
                 .Append(" | ").Append(file.ExpectedFileSize.ToString(CultureInfo.InvariantCulture))
                 .Append(" | ").Append(group.Key.Side).Append('/').Append(group.Key.Pass)
-                .Append(" | ").Append(group.First().CacheLabel)
+                .Append(" | ").Append(Cache(group.First()))
                 .Append(" | ").Append(Escape(group.First().Route.EffectiveWebDavUrl))
                 .Append(" (").Append(group.First().Route.RouteKind).Append(diagnostic).Append(')')
                 .Append(" | ").Append(Timing(rows, "seek-10"))
@@ -90,6 +90,16 @@ public sealed class CanaryPerformanceReportWriter
 
     private static string Number(double? value) =>
         value?.ToString("0.###", CultureInfo.InvariantCulture) ?? "—";
+
+    private static string Cache(CanaryPerformanceObservation row) =>
+        row.CacheCachedBytes is long cached
+        && row.CacheExpectedBytes is long expected
+        && row.CacheCoveragePercent is double percent
+            ? $"{row.CacheLabel} ({cached.ToString(CultureInfo.InvariantCulture)}/" +
+              $"{expected.ToString(CultureInfo.InvariantCulture)} bytes, " +
+              $"{percent.ToString("0.###", CultureInfo.InvariantCulture)}%, " +
+              $"{row.CacheEvidenceSource})"
+            : row.CacheLabel;
 
     private static string Escape(string value) => value.Replace("|", "\\|", StringComparison.Ordinal);
 }

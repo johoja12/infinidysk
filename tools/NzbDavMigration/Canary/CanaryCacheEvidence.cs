@@ -7,11 +7,7 @@ public sealed record CanaryCacheEvidenceResult(
     long CachedBytes,
     long ExpectedBytes,
     double CoveragePercent,
-    string Source)
-{
-    public static implicit operator string?(CanaryCacheEvidenceResult? evidence) =>
-        evidence?.Label;
-}
+    string Source);
 
 internal static class CanaryCacheEvidence
 {
