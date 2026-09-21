@@ -123,23 +123,27 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
         .Select(item => new PlexUser(Attribute(item, "id") ?? "", Attribute(item, "name") ?? Attribute(item, "title") ?? ""))
         .Where(item => item.Id.Length > 0).ToArray();
 
-    public async Task<IReadOnlyList<PlexSource>> GetSourcesAsync(PlexServer server, string? libraryId, CancellationToken ct = default)
+    public async Task<IReadOnlyList<PlexSource>> GetCollectionsAsync(PlexServer server, string libraryId,
+        CancellationToken ct = default)
     {
-        var result = new List<PlexSource>();
-        if (!string.IsNullOrEmpty(libraryId))
-        {
-            var collections = await ReadPagesAsync(server, $"/library/sections/{Identifier(libraryId)}/collections", 2000, ["Directory"], ct).ConfigureAwait(false);
-            result.AddRange(collections.Select(item => new PlexSource(server.Id, libraryId, "collection",
-                Attribute(item, "ratingKey") ?? Attribute(item, "key") ?? "",
-                Attribute(item, "key") ?? $"/library/collections/{Identifier(Attribute(item, "ratingKey") ?? "")}/children",
-                Attribute(item, "title") ?? "", Attribute(item, "type") ?? "")));
-        }
+        var collections = await ReadPagesAsync(server,
+            $"/library/sections/{Identifier(libraryId)}/collections", 2000, ["Directory"], ct).ConfigureAwait(false);
+        return collections.Select(item => new PlexSource(server.Id, libraryId, "collection",
+            Attribute(item, "ratingKey") ?? Attribute(item, "key") ?? "",
+            Attribute(item, "key") ?? $"/library/collections/{Identifier(Attribute(item, "ratingKey") ?? "")}/children",
+            Attribute(item, "title") ?? "", Attribute(item, "type") ?? ""))
+            .Where(source => source.Id.Length > 0 && IsSafeSourceKey(source.Key)).ToArray();
+    }
+
+    public async Task<IReadOnlyList<PlexSource>> GetHubsAsync(PlexServer server, string? libraryId,
+        CancellationToken ct = default)
+    {
         var path = string.IsNullOrEmpty(libraryId) ? "/hubs" : $"/hubs/sections/{Identifier(libraryId)}";
         var hubs = await ReadPagesAsync(server, path, 2000, ["Hub"], ct).ConfigureAwait(false);
-        result.AddRange(hubs.Select(item => new PlexSource(server.Id, libraryId, "hub",
+        return hubs.Select(item => new PlexSource(server.Id, libraryId, "hub",
             Attribute(item, "hubIdentifier") ?? Attribute(item, "key") ?? "", Attribute(item, "key") ?? "",
-            Attribute(item, "title") ?? "", Attribute(item, "type") ?? "")));
-        return result.Where(source => source.Id.Length > 0 && IsSafeSourceKey(source.Key)).ToArray();
+            Attribute(item, "title") ?? "", Attribute(item, "type") ?? ""))
+            .Where(source => source.Id.Length > 0 && IsSafeSourceKey(source.Key)).ToArray();
     }
 
     public async Task<IReadOnlyList<PlexMediaItem>> GetPreviewAsync(PlexServer server, string key, int limit, CancellationToken ct = default)

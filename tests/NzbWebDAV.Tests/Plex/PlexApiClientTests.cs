@@ -210,7 +210,8 @@ public sealed class PlexApiClientTests
         var api = new PlexApiClient(new HttpClient(handler), "installation");
         Assert.Equal("2", Assert.Single(await api.GetLibrariesAsync(Server())).Id);
         Assert.Equal("4", Assert.Single(await api.GetUsersAsync(Server())).Id);
-        var sources = await api.GetSourcesAsync(Server(), "2");
+        var sources = (await api.GetCollectionsAsync(Server(), "2"))
+            .Concat(await api.GetHubsAsync(Server(), "2")).ToArray();
         Assert.Equal(new[] { "collection", "hub" }, sources.Select(source => source.Kind));
         Assert.Equal("recent", sources[1].Id);
         Assert.Contains(handler.Requests, request => request.Uri.AbsolutePath == "/hubs/sections/2");

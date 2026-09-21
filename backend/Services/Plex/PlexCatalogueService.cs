@@ -20,8 +20,28 @@ public sealed class PlexCatalogueService(PlexApiClient api, TimeProvider clock)
         GetAsync(server, "libraries", forceRefresh, token => api.GetLibrariesAsync(server, token), ct);
     public Task<PlexSnapshot<PlexUser>> GetUsersAsync(PlexServer server, bool forceRefresh = false, CancellationToken ct = default) =>
         GetAsync(server, "users", forceRefresh, token => api.GetUsersAsync(server, token), ct);
-    public Task<PlexSnapshot<PlexSource>> GetSourcesAsync(PlexServer server, string? libraryId, bool forceRefresh = false, CancellationToken ct = default) =>
-        GetAsync(server, "sources:" + libraryId, forceRefresh, token => api.GetSourcesAsync(server, libraryId, token), ct);
+    public async Task<PlexSnapshot<PlexSource>> GetSourcesAsync(PlexServer server, string? libraryId,
+        bool forceRefresh = false, CancellationToken ct = default)
+    {
+        if (string.IsNullOrEmpty(libraryId))
+            return await GetAsync(server, "hubs", forceRefresh,
+                token => api.GetHubsAsync(server, null, token), ct).ConfigureAwait(false);
+
+        var collectionsTask = GetAsync(server, "collections:" + libraryId, forceRefresh,
+            token => api.GetCollectionsAsync(server, libraryId, token), ct);
+        var hubsTask = GetAsync(server, "hubs:" + libraryId, forceRefresh,
+            token => api.GetHubsAsync(server, libraryId, token), ct);
+        await Task.WhenAll(collectionsTask, hubsTask).ConfigureAwait(false);
+        var collections = await collectionsTask.ConfigureAwait(false);
+        var hubs = await hubsTask.ConfigureAwait(false);
+        var errors = new[] { collections.Error, hubs.Error }
+            .Where(error => !string.IsNullOrEmpty(error)).Distinct(StringComparer.Ordinal).ToArray();
+        return new PlexSnapshot<PlexSource>(
+            [.. collections.Data, .. hubs.Data],
+            new[] { collections.LastSuccess, hubs.LastSuccess }.Max(),
+            collections.IsStale || hubs.IsStale,
+            errors.Length == 0 ? null : string.Join(" · ", errors));
+    }
 
     private async Task<PlexSnapshot<T>> GetAsync<T>(PlexServer server, string resource, bool force,
         Func<CancellationToken, Task<IReadOnlyList<T>>> fetch, CancellationToken ct)
