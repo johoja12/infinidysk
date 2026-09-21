@@ -130,6 +130,17 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Reconcile_RejectsNonTerminalSession()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var packagePath = await CreatePackageAsync("reconcile-active", 1);
+        var controller = CreateController(harness);
+        await controller.Connect(new NzbDavConnectRequest(packagePath, 5, 1));
+
+        Assert.IsType<BadRequestObjectResult>(await controller.Reconcile());
+    }
+
+    [Fact]
     public async Task CanaryPlan_RejectsIncompleteExactCorrelationWithoutAmbiguity()
     {
         await using var harness = await MigrationTestHarness.CreateAsync();

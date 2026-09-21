@@ -33,6 +33,42 @@ public sealed class DavItemArticleIdentityReader(IBlobStore blobStore)
         }
     }
 
+    public async Task<ImportedArticleIdentity> ReadLegacyArchiveAsync(
+        DavItem item,
+        CancellationToken cancellationToken = default)
+    {
+        if (item.SubType != DavItem.ItemSubType.MultipartFile
+            || item.NzbBlobId is null
+            || item.FileBlobId is null)
+            return Missing(item);
+        await using var nzbStream = blobStore.ReadBlob(item.NzbBlobId.Value);
+        if (nzbStream is null)
+            return Missing(item);
+        var document = await NzbDocument.LoadAsync(nzbStream, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var metadata = await blobStore.ReadBlob<DavMultipartFile>(item.FileBlobId.Value)
+                .ConfigureAwait(false);
+            if (metadata?.Metadata.PathInArchive is not { Length: > 0 } pathInArchive)
+                return Missing(item);
+            var ids = metadata.Metadata.FileParts.SelectMany(part => part.SegmentIds)
+                .Concat((metadata.Metadata.PendingParts ?? []).SelectMany(part => part.SegmentIds))
+                .ToArray();
+            if (ids.Length == 0)
+                return Missing(item);
+            _ = Resolve(ids, document);
+            var releaseDigest = NzbDavArticleIdentity.ComputeRelease(
+                document.Files.Select(file => file.Segments.Select(ToSegment)));
+            return Present(item, NzbDavArticleIdentity.ArchiveMemberKind,
+                NzbDavArticleIdentity.ComputeArchiveMember(
+                    releaseDigest, pathInArchive, item.FileSize ?? -1));
+        }
+        catch (Exception exception) when (exception is InvalidDataException or KeyNotFoundException)
+        {
+            return Missing(item);
+        }
+    }
+
     private async Task<ImportedArticleIdentity> ReadDirectAsync(DavItem item, NzbDocument document)
     {
         var metadata = await blobStore.ReadBlob<DavNzbFile>(item.FileBlobId!.Value).ConfigureAwait(false);

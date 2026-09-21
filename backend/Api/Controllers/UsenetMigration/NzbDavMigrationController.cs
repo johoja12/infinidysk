@@ -6,6 +6,7 @@ using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models.UsenetMigration;
 using NzbWebDAV.UsenetMigration;
 using NzbWebDAV.UsenetMigration.Canary;
+using NzbWebDAV.UsenetMigration.Provenance;
 using NzbWebDAV.UsenetMigration.Runner;
 using NzbWebDAV.UsenetMigration.Source;
 using NzbWebDAV.UsenetMigration.Triage;
@@ -14,11 +15,14 @@ namespace NzbWebDAV.Api.Controllers.UsenetMigration;
 
 public sealed class NzbDavMigrationController(
     UsenetMigrationStore store,
-    UsenetMigrationRunner runner) : UsenetMigrationBaseController
+    UsenetMigrationRunner runner,
+    NzbDavReconciliationService? reconciliation = null) : UsenetMigrationBaseController
 {
     private readonly NzbDavPackageReader _packageReader = new();
     private readonly Action _interruptScan = () => runner?.InterruptScan();
     private readonly Action _interruptSubmissions = () => runner?.InterruptSubmissionBatch();
+    private readonly NzbDavReconciliationService _reconciliation = reconciliation
+        ?? new NzbDavReconciliationService(store, new NzbDavPackageReader(), BlobStore.Current);
 
     [HttpPost("api/migration/nzbdav/connect")]
     public Task<IActionResult> Connect([FromBody] NzbDavConnectRequest request) => GuardedAsync(async () =>
@@ -226,6 +230,28 @@ public sealed class NzbDavMigrationController(
             ambiguityCount = report.AmbiguityCount,
             exactCount = report.ExactCount,
             rows = report.Rows,
+        });
+    });
+
+    [HttpPost("api/migration/nzbdav/reconcile")]
+    public Task<IActionResult> Reconcile() => GuardedAsync(async () =>
+    {
+        var session = await RequireNzbDavSessionAsync().ConfigureAwait(false);
+        if (session.CurrentRunId is null || session.SourcePackageRoot is null)
+            throw new BadHttpRequestException("No completed NzbDav run is available to reconcile.");
+        var result = await _reconciliation.ReconcileAsync(
+            session.CurrentRunId.Value,
+            session.SourcePackageRoot,
+            HttpContext.RequestAborted).ConfigureAwait(false);
+        return Ok(new
+        {
+            status = true,
+            result.RunId,
+            result.SelectedCount,
+            result.ExactCount,
+            result.AmbiguousCount,
+            result.UnmatchedCount,
+            result.SubmittedCount,
         });
     });
 

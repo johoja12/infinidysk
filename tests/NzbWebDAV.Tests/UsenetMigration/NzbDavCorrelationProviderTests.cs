@@ -64,6 +64,30 @@ public sealed class NzbDavCorrelationProviderTests
     }
 
     [Fact]
+    public void Correlate_LegacyFallbackRequiresOneVideoInTheImportedRelease()
+    {
+        var source = Source();
+        source.ArticleIdentityKind = NzbDavArticleIdentity.ArchiveMemberKind;
+        var importedNzoId = Guid.NewGuid();
+        var exact = Target(Guid.NewGuid(), "renamed.mkv", 100, new string('b', 64)) with
+        {
+            NzbBlobId = importedNzoId,
+        };
+        var scope = new NzbDavCorrelationScope(42, "nzbdav:release", importedNzoId, true);
+
+        var matched = Assert.Single(NzbDavCorrelationProvider.Correlate([source], [exact], scope));
+        var ambiguous = Assert.Single(NzbDavCorrelationProvider.Correlate(
+            [source], [exact, exact with { DavItemId = Guid.NewGuid(), Name = "other.mkv" }], scope));
+        var crossRelease = Assert.Single(NzbDavCorrelationProvider.Correlate(
+            [source], [exact with { NzbBlobId = Guid.NewGuid() }], scope));
+
+        Assert.Equal("exact", matched.Status);
+        Assert.Equal("legacy-release-payload-size-unique", matched.MatchMethod);
+        Assert.Equal("ambiguous", ambiguous.Status);
+        Assert.Equal("unmatched-target", crossRelease.Status);
+    }
+
+    [Fact]
     public async Task IdentityReader_UsesStableRangesForEagerMultipartAndRejectsUnresolvedPendingParts()
     {
         var store = new MemoryBlobStore();
