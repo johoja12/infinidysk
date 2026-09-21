@@ -1,0 +1,9 @@
+# Media Library [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
+
+The **Media Library** page (`/library`) is a read-only catalog of your InfiniDysk media and the library symlinks that point at it.
+
+Each row is one media item (deduplicated by its stable InfiniDysk identity) with its symlink mappings nested underneath. Links that resolve to InfiniDysk `/.ids/...` targets are marked **internal** and can be opened for streaming; all other symlinks are marked **external** and are inspection-only.
+
+Use the search box to match titles, content paths, symlink paths, or targets. Filter by mapping type (internal / external / broken) and sort by name, size, or mapping count. The header shows when the library index was last refreshed; a warning appears when the scan is stale or the library directory is unavailable.
+
+This page never modifies your library: there are no repair, delete, cache, Plex, or Arr actions here. Use **Files** (`/explore`) to browse the raw virtual filesystem.

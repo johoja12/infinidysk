@@ -95,6 +95,11 @@ export const adminFrontendOperations = [
     path: "/api/watchtower-discover-catalogs",
     operationId: "post-api-watchtower-discover-catalogs",
   },
+  {
+    method: "get",
+    path: "/api/get-library-catalog",
+    operationId: "get-api-get-library-catalog",
+  },
 ] as const satisfies readonly AdminFrontendOperation[];
 
 export const adminApi = {
@@ -125,4 +130,5 @@ export const adminApi = {
   getWatchtower: "/api/get-watchtower",
   watchtowerMutate: "/api/watchtower-mutate",
   discoverStremioCatalogs: "/api/watchtower-discover-catalogs",
+  libraryCatalog: "/api/get-library-catalog",
 } as const satisfies Record<string, AdminApiPath>;
