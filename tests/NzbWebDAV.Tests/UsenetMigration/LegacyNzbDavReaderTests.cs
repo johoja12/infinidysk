@@ -17,6 +17,7 @@ public sealed class LegacyNzbDavReaderTests
         Assert.Contains("ANY", LegacyNzbDavReader.ItemQuery, StringComparison.Ordinal);
         Assert.DoesNotContain("d.\"HistoryItemId\"", LegacyNzbDavReader.ItemQuery, StringComparison.Ordinal);
         Assert.DoesNotContain("\"FileBlobId\"", LegacyNzbDavReader.ItemQuery, StringComparison.Ordinal);
+        Assert.DoesNotContain("AND h.\"Id\" IS NOT NULL", LegacyNzbDavReader.ItemQuery, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -125,8 +126,12 @@ public sealed class LegacyNzbDavReaderTests
             Assert.Equal(historyId, result.Items.Single(item => item.Id == withHistory).NzbBlobId);
             Assert.Equal("/content/release", result.Items.Single(item => item.Id == withHistory).ReleaseRootPath);
             Assert.Equal("<nzb />", result.Items.Single(item => item.Id == withHistory).NzbContents);
-            Assert.Equal("missing-history", result.Items.Single(item => item.Id == withoutHistory).ResolutionExclusion);
-            Assert.Null(result.Items.Single(item => item.Id == withoutHistory).NzbSegmentsJson);
+            var orphan = result.Items.Single(item => item.Id == withoutHistory);
+            Assert.Null(orphan.HistoryItemId);
+            Assert.Equal("[\"two@example\"]", orphan.NzbSegmentsJson);
+            Assert.Equal("missing-history", orphan.HistoryExclusion);
+            Assert.Null(orphan.SafetyExclusion);
+            Assert.Null(orphan.ResolutionExclusion);
 
             foreach (var assignment in new[] { "\"IsCorrupted\" = true", "\"RepairStatus\" = 2",
                          "\"ZeroPadCorruptSegments\" = true", "\"HealthCheckQueueReason\" = ' Source-Validation '" })
@@ -164,7 +169,8 @@ public sealed class LegacyNzbDavReaderTests
             await ExecuteAsync(admin, $"INSERT INTO \"{schema}\".\"HistoryItems\" VALUES ('{Guid.NewGuid()}', 'duplicate.nzb', 'duplicate', 'tv', 1, '{releaseId}', NULL)");
             var ambiguous = await new LegacyNzbDavReader().ReadAsync(builder.ConnectionString, [withHistory]);
             Assert.Null(Assert.Single(ambiguous.Items).HistoryItemId);
-            Assert.Equal("ambiguous-history", Assert.Single(ambiguous.Items).ResolutionExclusion);
+            Assert.Equal("ambiguous-history", Assert.Single(ambiguous.Items).HistoryExclusion);
+            Assert.Null(Assert.Single(ambiguous.Items).ResolutionExclusion);
 
             await ExecuteAsync(admin, $"GRANT UPDATE ON \"{schema}\".\"DavItems\" TO \"{role}\"");
             var denied = await Assert.ThrowsAsync<InvalidOperationException>(() =>

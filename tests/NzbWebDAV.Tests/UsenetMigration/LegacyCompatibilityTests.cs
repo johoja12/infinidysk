@@ -127,14 +127,15 @@ public sealed class LegacyCompatibilityTests : IDisposable
         {
             Id = id, Path = "/content/release/a.mkv", FileSize = 12, Type = 3,
             HistoryItemId = history, NzbBlobId = history, NzbContents = "<nzb />", HistoryDownloadStatus = 1,
+            NzbSegmentsJson = "[\"one@test\"]",
         }))!;
         var service = new LibraryInventoryService();
         var links = new[] { new LibraryInventoryLink("a.mkv", "/.ids/a", id) };
         var candidate = Assert.Single(service.Enrich(links, [row], new LegacyBlobResolver(_root)));
         Assert.Equal("candidate", candidate.Status);
         var orphan = Assert.Single(service.Enrich(links, [row with { HistoryItemId = null }], new LegacyBlobResolver(_root)));
-        Assert.Equal("excluded", orphan.Status);
-        Assert.Equal("missing-history", orphan.ExclusionReason);
+        Assert.Equal("recoverable-orphan", orphan.Status);
+        Assert.Null(orphan.ExclusionReason);
     }
 
     public void Dispose()
