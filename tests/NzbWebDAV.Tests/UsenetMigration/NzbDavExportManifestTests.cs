@@ -12,7 +12,7 @@ public sealed class NzbDavExportManifestTests
         var json = NzbDavExportManifestJson.Serialize(manifest);
         var restored = NzbDavExportManifestJson.Deserialize(json);
 
-        Assert.Equal(NzbDavExportManifest.CurrentSchemaVersion, restored.SchemaVersion);
+        Assert.Equal(1, restored.SchemaVersion);
         Assert.Equal("canary-20260920", restored.PackageId);
         Assert.Equal("release-1", Assert.Single(restored.Releases).SourceReleaseId);
         Assert.Equal(Guid.Parse("11111111-1111-1111-1111-111111111111"),
@@ -36,12 +36,12 @@ public sealed class NzbDavExportManifestTests
     public void Deserialize_RejectsUnknownMajorVersion()
     {
         var json = NzbDavExportManifestJson.Serialize(SampleManifest())
-            .Replace("\"schemaVersion\": 1", "\"schemaVersion\": 2", StringComparison.Ordinal);
+            .Replace("\"schemaVersion\": 1", "\"schemaVersion\": 3", StringComparison.Ordinal);
 
         var error = Assert.Throws<InvalidDataException>(
             () => NzbDavExportManifestJson.Deserialize(json));
 
-        Assert.Contains("schema version 2", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("schema version 3", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Theory]
@@ -65,7 +65,7 @@ public sealed class NzbDavExportManifestTests
     }
 
     private static NzbDavExportManifest SampleManifest() => new(
-        SchemaVersion: NzbDavExportManifest.CurrentSchemaVersion,
+        SchemaVersion: 1,
         PackageId: "canary-20260920",
         CreatedAt: new DateTimeOffset(2026, 9, 20, 10, 0, 0, TimeSpan.Zero),
         Source: "nzbdav",
