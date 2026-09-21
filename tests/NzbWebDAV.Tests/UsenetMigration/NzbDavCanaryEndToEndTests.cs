@@ -62,7 +62,7 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
                 Assert.Equal(2, files.Count);
                 Assert.All(files, file => Assert.Equal("exact", file.FileStatus));
                 Assert.Contains(files, file => file.ArticleIdentityKind == NzbDavArticleIdentity.DirectKind);
-                Assert.Contains(files, file => file.ArticleIdentityKind == NzbDavArticleIdentity.ArchiveMemberKind);
+                Assert.Contains(files, file => file.ArticleIdentityKind == NzbDavStableArchiveIdentity.Kind);
                 Assert.Equal(2, await migration.MigratedFiles.CountAsync());
                 var run = await migration.MigrationRuns.SingleAsync(item => item.Id == runId);
                 run.Status = "completed";
@@ -180,9 +180,11 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
                         "archive-release",
                         null,
                         archiveNzoId,
-                        NzbDavArticleIdentity.ArchiveMemberKind,
-                        NzbDavArticleIdentity.ComputeArchiveMember(
-                            archiveReleaseDigest, "Feature/Archive.mkv", 16),
+                        NzbDavStableArchiveIdentity.Kind,
+                        NzbDavStableArchiveIdentity.Compute(
+                            archiveReleaseDigest,
+                            [new NzbDavArchivePartIdentity(archiveSegments, 0, 0, 0, 0)],
+                            16),
                         "ready",
                         null)]),
             ],

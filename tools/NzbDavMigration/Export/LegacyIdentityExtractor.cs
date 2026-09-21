@@ -28,8 +28,8 @@ public sealed class LegacyIdentityExtractor
             return row.Type switch
             {
                 3 => Direct(row, document, sourceReleaseId),
-                4 => Archive(row, document, sourceReleaseId, ParseRarSegments(row.RarPartsJson)),
-                6 => Archive(row, document, sourceReleaseId, ParseMultipartSegments(row.MultipartMetadataJson)),
+                4 => Archive(row, document, sourceReleaseId, ParseRarParts(row.RarPartsJson, document)),
+                6 => Archive(row, document, sourceReleaseId, ParseMultipartParts(row.MultipartMetadataJson, document)),
                 _ => Excluded(row, sourceReleaseId, $"unsupported-legacy-type-{row.Type}"),
             };
         }
@@ -55,28 +55,59 @@ public sealed class LegacyIdentityExtractor
         LegacyDavItemRow row,
         NzbDocument document,
         string sourceReleaseId,
-        IReadOnlyList<string> contributingIds)
+        IReadOnlyList<NzbDavArchivePartIdentity> parts)
     {
-        _ = ResolveSegments(contributingIds, document);
         var releaseSegments = document.Files.Select(file => file.Segments.Select(ToIdentitySegment));
         var releaseDigest = NzbDavArticleIdentity.ComputeRelease(releaseSegments);
-        var innerPath = NormalizeArchivePath(row.Path, row.ReleaseRootPath);
-        return Ready(row, sourceReleaseId, NzbDavArticleIdentity.ArchiveMemberKind,
-            NzbDavArticleIdentity.ComputeArchiveMember(releaseDigest, innerPath, row.FileSize!.Value));
+        return Ready(row, sourceReleaseId, NzbDavStableArchiveIdentity.Kind,
+            NzbDavStableArchiveIdentity.Compute(releaseDigest, parts, row.FileSize!.Value));
     }
 
-    private static string[] ParseRarSegments(string? json)
+    private static NzbDavArchivePartIdentity[] ParseRarParts(string? json, NzbDocument document)
     {
         var parts = JsonSerializer.Deserialize<DavRarFile.RarPart[]>(json ?? "", JsonOptions)
                     ?? throw new InvalidDataException("RAR metadata is missing.");
-        return parts.SelectMany(part => part.SegmentIds).ToArray();
+        return parts.Select(part => new NzbDavArchivePartIdentity(
+            ResolveSegments(part.SegmentIds, document),
+            SegmentStart: 0,
+            SegmentLength: RarSegmentLength(part),
+            FileStart: part.Offset,
+            FileLength: part.ByteCount)).ToArray();
     }
 
-    private static string[] ParseMultipartSegments(string? json)
+    private static NzbDavArchivePartIdentity[] ParseMultipartParts(string? json, NzbDocument document)
     {
         var metadata = JsonSerializer.Deserialize<DavMultipartFile.Meta>(json ?? "", JsonOptions)
                        ?? throw new InvalidDataException("Multipart metadata is missing.");
-        return metadata.FileParts.SelectMany(part => part.SegmentIds).ToArray();
+        if ((metadata.PendingParts?.Length ?? 0) != 0)
+            throw new InvalidDataException("Multipart metadata contains unresolved pending parts.");
+        return metadata.FileParts.Select(part => MultipartPart(part, document)).ToArray();
+    }
+
+    private static NzbDavArchivePartIdentity MultipartPart(
+        DavMultipartFile.FilePart part,
+        NzbDocument document)
+    {
+        if (part.SegmentIdByteRange is null || part.FilePartByteRange is null)
+            throw new InvalidDataException("Multipart metadata contains a missing byte range.");
+        return new NzbDavArchivePartIdentity(
+            ResolveSegments(part.SegmentIds, document),
+            part.SegmentIdByteRange.StartInclusive,
+            part.SegmentIdByteRange.Count,
+            part.FilePartByteRange.StartInclusive,
+            part.FilePartByteRange.Count);
+    }
+
+    private static long RarSegmentLength(DavRarFile.RarPart part)
+    {
+        try
+        {
+            return Math.Max(part.PartSize, checked(part.Offset + part.ByteCount));
+        }
+        catch (OverflowException exception)
+        {
+            throw new InvalidDataException("RAR metadata contains an overflowing byte range.", exception);
+        }
     }
 
     private static NzbDavArticleSegment[] ResolveSegments(
@@ -101,20 +132,6 @@ public sealed class LegacyIdentityExtractor
 
     private static NzbDavArticleSegment ToIdentitySegment(NzbSegment segment) =>
         new(segment.Number, segment.Bytes, segment.MessageId);
-
-    private static string NormalizeArchivePath(string path, string? releaseRoot)
-    {
-        var normalized = path.Replace('\\', '/');
-        if (string.IsNullOrWhiteSpace(releaseRoot))
-            throw new InvalidDataException("Release directory ancestry is missing.");
-        var prefix = releaseRoot.Replace('\\', '/').TrimEnd('/') + "/";
-        if (!normalized.StartsWith(prefix, StringComparison.Ordinal))
-            throw new InvalidDataException("File is outside the proven release directory.");
-        var relative = normalized[prefix.Length..];
-        if (relative.Split('/').Any(part => part is "" or "." or ".."))
-            throw new InvalidDataException("Archive member path is invalid.");
-        return relative;
-    }
 
     private static NzbDavExportLeaf Ready(
         LegacyDavItemRow row,

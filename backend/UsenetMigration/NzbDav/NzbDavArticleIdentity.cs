@@ -42,6 +42,40 @@ public static class NzbDavArticleIdentity
         });
     }
 
+    internal static string ComputeArchiveArticles(
+        string releaseDigest,
+        IReadOnlyList<NzbDavArchivePartIdentity> parts,
+        long fileSize)
+    {
+        RequireDigest(releaseDigest);
+        if (fileSize < 0)
+            throw new InvalidDataException("An archive article identity cannot use a negative size.");
+        if (parts.Count == 0)
+            throw new InvalidDataException("An archive article identity requires at least one part.");
+
+        foreach (var part in parts)
+        {
+            ValidateRange(part.SegmentStart, part.SegmentLength, "segment");
+            ValidateRange(part.FileStart, part.FileLength, "file");
+        }
+
+        return Compute("nzbdav-archive-articles-v2", hash =>
+        {
+            AppendString(hash, releaseDigest);
+            AppendInt32(hash, parts.Count);
+            foreach (var part in parts)
+            {
+                AppendString(hash, "part");
+                AppendSegments(hash, part.Segments);
+                AppendInt64(hash, part.SegmentStart);
+                AppendInt64(hash, part.SegmentLength);
+                AppendInt64(hash, part.FileStart);
+                AppendInt64(hash, part.FileLength);
+            }
+            AppendInt64(hash, fileSize);
+        });
+    }
+
     private static void AppendSegments(IncrementalHash hash, IEnumerable<NzbDavArticleSegment> segments)
     {
         var materialized = segments.ToArray();
@@ -85,6 +119,20 @@ public static class NzbDavArticleIdentity
         if (components.Any(component => component is "" or "." or ".."))
             throw new InvalidDataException($"Unsafe archive member path '{value}'.");
         return string.Join('/', components);
+    }
+
+    private static void ValidateRange(long start, long length, string name)
+    {
+        if (start < 0 || length < 0)
+            throw new InvalidDataException($"An archive article identity cannot use a negative {name} range.");
+        try
+        {
+            _ = checked(start + length);
+        }
+        catch (OverflowException exception)
+        {
+            throw new InvalidDataException($"An archive article identity {name} range overflowed.", exception);
+        }
     }
 
     private static void RequireDigest(string value)

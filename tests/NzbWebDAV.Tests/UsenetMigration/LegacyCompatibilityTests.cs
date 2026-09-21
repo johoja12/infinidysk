@@ -73,22 +73,49 @@ public sealed class LegacyCompatibilityTests : IDisposable
     }
 
     [Fact]
-    public async Task ArchiveIdentity_UsesProvenReleaseRootAndNestedPath()
+    public async Task ArchiveIdentity_UsesArticleRangesAndSurvivesPublishedRename()
     {
         await using var stream = File.OpenRead(Path.Join(AppContext.BaseDirectory,
             "Fixtures", "UsenetMigration", "direct-sample.nzb"));
         var document = await NzbWebDAV.Models.Nzb.NzbDocument.LoadAsync(stream);
+        var metadata = JsonSerializer.Serialize(new[]
+        {
+            new NzbWebDAV.Database.Models.DavRarFile.RarPart
+            {
+                SegmentIds = ["direct-1@test", "direct-2@test"],
+                PartSize = 220,
+                Offset = 10,
+                ByteCount = 99,
+            },
+        });
         var row = JsonSerializer.Deserialize<LegacyDavItemRow>(JsonSerializer.Serialize(new
         {
             Id = Guid.NewGuid(), Path = "/content/tv/job (2)/nested/a.mkv", FileSize = 99L, Type = 4,
             NzbBlobId = Guid.NewGuid(), HistoryJobName = "job", ReleaseRootPath = "/content/tv/job (2)",
-            RarPartsJson = "[{\"SegmentIds\":[\"direct-1@test\",\"direct-2@test\"]}]",
+            RarPartsJson = metadata,
         }))!;
         var leaf = new LegacyIdentityExtractor().Extract(row, document, "release");
+        var renamed = new LegacyIdentityExtractor().Extract(row with
+        {
+            Path = "/content/tv/renamed-release/future-name.mkv",
+            ReleaseRootPath = "/content/tv/renamed-release",
+        }, document, "release");
         var releaseDigest = NzbDavArticleIdentity.ComputeRelease(document.Files.Select(file =>
             file.Segments.Select(segment => new NzbDavArticleSegment(segment.Number, segment.Bytes, segment.MessageId))));
         Assert.Equal("ready", leaf.ExtractionStatus);
-        Assert.Equal(NzbDavArticleIdentity.ComputeArchiveMember(releaseDigest, "nested/a.mkv", 99), leaf.IdentityDigest);
+        Assert.Equal(NzbDavStableArchiveIdentity.Kind, leaf.IdentityKind);
+        Assert.Equal(leaf.IdentityDigest, renamed.IdentityDigest);
+        Assert.Equal(NzbDavStableArchiveIdentity.Compute(releaseDigest,
+        [
+            new NzbDavArchivePartIdentity(
+                document.Files.SelectMany(file => file.Segments)
+                    .Select(segment => new NzbDavArticleSegment(segment.Number, segment.Bytes, segment.MessageId))
+                    .ToArray(),
+                SegmentStart: 0,
+                SegmentLength: 220,
+                FileStart: 10,
+                FileLength: 99),
+        ], 99), leaf.IdentityDigest);
     }
 
     [Fact]
