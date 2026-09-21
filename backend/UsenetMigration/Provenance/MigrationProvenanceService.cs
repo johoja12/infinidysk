@@ -54,7 +54,7 @@ public sealed class MigrationProvenanceService
             {
                 var result = correlations.Single(item => item.ReleaseFileId == sourceFile.Id);
                 sourceFile.FileStatus = result.Status;
-                sourceFile.Flags = result.Evidence;
+                sourceFile.Flags = NzbDavLedgerEvidence.WithCorrelation(sourceFile.Flags, result.Evidence);
                 sourceFile.NewDavItemId = result.DavItemId?.ToString();
             }
         }
