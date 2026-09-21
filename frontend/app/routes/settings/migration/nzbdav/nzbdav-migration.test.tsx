@@ -9,6 +9,7 @@ afterEach(cleanup);
 describe("NzbDavMigrationView", () => {
   it("shows package evidence, isolation warnings, correlation reasons, and blocks ambiguous plans", async () => {
     const generatePlan = vi.fn();
+    const reconcile = vi.fn();
     render(
       <NzbDavMigrationView
         form={{
@@ -46,6 +47,25 @@ describe("NzbDavMigrationView", () => {
             },
           ],
         }}
+        fullStatus={{
+          recoveryStatus: "active",
+          sourceLinkCount: 100,
+          recoverableCount: 95,
+          coverage: 0.95,
+          batchCount: 1,
+          selectedCount: 22,
+          appliedCount: 10,
+          validatedCount: 8,
+          batches: [
+            {
+              batchIndex: 0,
+              selectionCount: 22,
+              status: "running",
+              appliedCount: 10,
+              validatedCount: 8,
+            },
+          ],
+        }}
         digestConfirmation="d"
         countConfirmation="22"
         onDigestConfirmationChange={vi.fn()}
@@ -58,6 +78,7 @@ describe("NzbDavMigrationView", () => {
         onScan={vi.fn()}
         onRun={vi.fn()}
         onLoadCorrelation={vi.fn()}
+        onReconcile={reconcile}
         onGeneratePlan={generatePlan}
       />,
     );
@@ -69,7 +90,15 @@ describe("NzbDavMigrationView", () => {
     expect(screen.getByText(/dedicated empty InfiniDysk categories/i)).toBeTruthy();
     const row = screen.getByRole("row", { name: /episode\.mkv/i });
     expect(within(row).getByText("ambiguous")).toBeTruthy();
-    expect(within(row).getByText(/candidates/i)).toBeTruthy();
+    expect(within(row).queryByText(/candidates/i)).toBeNull();
+    expect(screen.getByText("95.0% recoverable")).toBeTruthy();
+    expect(screen.getAllByText("21 exact")).toHaveLength(2);
+    expect(screen.getByText("10 applied")).toBeTruthy();
+    expect(screen.getByText("8 validated")).toBeTruthy();
+    const reconcileButton = screen.getByRole("button", { name: /reconcile completed import/i });
+    expect((reconcileButton as HTMLButtonElement).disabled).toBe(false);
+    await userEvent.click(reconcileButton);
+    expect(reconcile).toHaveBeenCalledOnce();
     const button = screen.getByRole("button", { name: /generate canary plan/i });
     expect((button as HTMLButtonElement).disabled).toBe(true);
     await userEvent.click(button);
@@ -93,6 +122,7 @@ describe("NzbDavMigrationView", () => {
           exactCount: 6,
           rows: [],
         }}
+        fullStatus={null}
         digestConfirmation=""
         countConfirmation=""
         onDigestConfirmationChange={vi.fn()}
@@ -105,6 +135,7 @@ describe("NzbDavMigrationView", () => {
         onScan={vi.fn()}
         onRun={vi.fn()}
         onLoadCorrelation={vi.fn()}
+        onReconcile={vi.fn()}
         onGeneratePlan={vi.fn()}
       />,
     );

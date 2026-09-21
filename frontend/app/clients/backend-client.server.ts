@@ -92,8 +92,39 @@ const completeSetupWizardResponseSchema = z.object({
   restartRequired: z.boolean(),
 });
 
+const nzbDavFullBatchStatusSchema = z.object({
+  batchIndex: z.number().int().nonnegative(),
+  selectionCount: z.number().int().nonnegative(),
+  status: z.string(),
+  appliedCount: z.number().int().nonnegative(),
+  validatedCount: z.number().int().nonnegative(),
+});
+
+const nzbDavFullStatusSchema = z.object({
+  recoveryStatus: z.string(),
+  sourceLinkCount: z.number().int().nonnegative(),
+  recoverableCount: z.number().int().nonnegative(),
+  coverage: z.number().min(0).max(1),
+  batchCount: z.number().int().nonnegative(),
+  selectedCount: z.number().int().nonnegative(),
+  appliedCount: z.number().int().nonnegative(),
+  validatedCount: z.number().int().nonnegative(),
+  batches: z.array(nzbDavFullBatchStatusSchema),
+});
+
+const nzbDavReconciliationSchema = z.object({
+  runId: z.number().int(),
+  selectedCount: z.number().int().nonnegative(),
+  exactCount: z.number().int().nonnegative(),
+  ambiguousCount: z.number().int().nonnegative(),
+  unmatchedCount: z.number().int().nonnegative(),
+  submittedCount: z.number().int().nonnegative(),
+});
+
 export type SetupWizardState = z.infer<typeof setupWizardStateSchema>;
 export type CompleteSetupWizardResponse = z.infer<typeof completeSetupWizardResponseSchema>;
+export type NzbDavFullStatus = z.infer<typeof nzbDavFullStatusSchema>;
+export type NzbDavReconciliation = z.infer<typeof nzbDavReconciliationSchema>;
 export type SetupWizardStrategy = "symlinks" | "strm";
 export type SetupWizardIngestionMethod = "arrs" | "search" | "manual";
 
@@ -349,6 +380,24 @@ class BackendClient {
       z.object({ status: z.boolean() }),
     );
     return data.status;
+  }
+
+  public async getNzbDavFullStatus(): Promise<NzbDavFullStatus> {
+    return await call(
+      "/api/migration/nzbdav/full/status",
+      "Failed to fetch NzbDav full-library recovery status",
+      { method: "GET" },
+      nzbDavFullStatusSchema,
+    );
+  }
+
+  public async reconcileNzbDav(): Promise<NzbDavReconciliation> {
+    return await call(
+      "/api/migration/nzbdav/reconcile",
+      "Failed to reconcile the completed NzbDav import",
+      { method: "POST" },
+      nzbDavReconciliationSchema,
+    );
   }
 
   public async createAccount(username: string, password: string): Promise<boolean> {

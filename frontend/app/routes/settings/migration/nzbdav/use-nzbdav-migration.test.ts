@@ -1,10 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_NZBDAV_CONNECT_FORM,
+  canReconcileNzbDav,
   canGenerateCanaryPlan,
   isRunConfirmationExact,
   requestNzbDavConnect,
+  requestNzbDavFullStatus,
   requestNzbDavPlan,
+  requestNzbDavReconcile,
 } from "./use-nzbdav-migration";
 
 describe("NzbDav migration requests", () => {
@@ -54,9 +57,19 @@ describe("NzbDav migration requests", () => {
   });
 
   it("never enables plan generation while ambiguity remains", () => {
-    expect(canGenerateCanaryPlan("complete", { ambiguityCount: 0 })).toBe(true);
-    expect(canGenerateCanaryPlan("complete", { ambiguityCount: 1 })).toBe(false);
-    expect(canGenerateCanaryPlan("running", { ambiguityCount: 0 })).toBe(false);
+    const exact = { selectedCount: 6, exactCount: 6, exclusionCount: 0, ambiguityCount: 0 };
+    expect(canGenerateCanaryPlan("complete", exact)).toBe(true);
+    expect(canGenerateCanaryPlan("complete", { ...exact, exactCount: 5 })).toBe(false);
+    expect(canGenerateCanaryPlan("complete", { ...exact, exclusionCount: 1 })).toBe(false);
+    expect(canGenerateCanaryPlan("complete", { ...exact, ambiguityCount: 1 })).toBe(false);
+    expect(canGenerateCanaryPlan("running", exact)).toBe(false);
+  });
+
+  it("enables reconciliation only for terminal incomplete correlation", () => {
+    const incomplete = { selectedCount: 6, exactCount: 5 };
+    expect(canReconcileNzbDav("complete", incomplete)).toBe(true);
+    expect(canReconcileNzbDav("complete", { selectedCount: 6, exactCount: 6 })).toBe(false);
+    expect(canReconcileNzbDav("running", incomplete)).toBe(false);
   });
 
   it("uses the dedicated plan endpoint", async () => {
@@ -68,6 +81,42 @@ describe("NzbDav migration requests", () => {
     );
     await requestNzbDavPlan(fetcher);
     expect(fetcher).toHaveBeenCalledWith("/api/migration/nzbdav/canary-plan", {
+      cache: "no-store",
+      method: "POST",
+    });
+  });
+
+  it("uses count-only full status and reconciliation endpoints", async () => {
+    const statusFetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          recoveryStatus: "active",
+          sourceLinkCount: 100,
+          recoverableCount: 95,
+          coverage: 0.95,
+          batchCount: 1,
+          selectedCount: 20,
+          appliedCount: 10,
+          validatedCount: 8,
+          batches: [],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    const status = await requestNzbDavFullStatus(statusFetcher);
+    expect(status.coverage).toBe(0.95);
+    expect(statusFetcher).toHaveBeenCalledWith("/api/migration/nzbdav/full/status", {
+      cache: "no-store",
+    });
+
+    const reconcileFetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ exactCount: 6 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await requestNzbDavReconcile(reconcileFetcher);
+    expect(reconcileFetcher).toHaveBeenCalledWith("/api/migration/nzbdav/reconcile", {
       cache: "no-store",
       method: "POST",
     });
