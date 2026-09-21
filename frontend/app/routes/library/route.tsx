@@ -63,7 +63,9 @@ export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPage
   const downloadKeys: Record<string, string> = {};
   for (const item of catalog.items) {
     if (item.kind === "internal" && item.contentPath && item.davItemId) {
-      const relative = item.contentPath.startsWith("/") ? item.contentPath.slice(1) : item.contentPath;
+      const relative = item.contentPath.startsWith("/")
+        ? item.contentPath.slice(1)
+        : item.contentPath;
       downloadKeys[item.davItemId] = getDownloadKey(relative, frontendBackendApiKey);
     }
   }
@@ -88,13 +90,23 @@ export default function Library({ loaderData }: Route.ComponentProps) {
       ) : null}
       <Form method="get" className="flex flex-wrap gap-2">
         <Input name="q" defaultValue={query.q} placeholder="Search title, content path, symlink…" />
-        <select name="type" defaultValue={query.type} className="select select-bordered" aria-label="Mapping filter">
+        <select
+          name="type"
+          defaultValue={query.type}
+          className="select select-bordered"
+          aria-label="Mapping filter"
+        >
           <option value="all">All mappings</option>
           <option value="internal">Internal</option>
           <option value="external">External</option>
           <option value="broken">Broken</option>
         </select>
-        <select name="sort" defaultValue={query.sort} className="select select-bordered" aria-label="Sort">
+        <select
+          name="sort"
+          defaultValue={query.sort}
+          className="select select-bordered"
+          aria-label="Sort"
+        >
           <option value="name">Name A–Z</option>
           <option value="size">Size</option>
           <option value="mappings">Mappings</option>
@@ -118,17 +130,26 @@ export default function Library({ loaderData }: Route.ComponentProps) {
           </thead>
           <tbody>
             {catalog.items.map((item) => (
-              <CatalogRow key={item.davItemId ?? item.displayName} item={item} downloadKeys={downloadKeys} search={searchParams.toString()} />
+              <CatalogRow
+                key={item.davItemId ?? item.displayName}
+                item={item}
+                downloadKeys={downloadKeys}
+                search={searchParams.toString()}
+              />
             ))}
           </tbody>
         </table>
       </div>
       <nav className="join" aria-label="Pagination">
         {query.page > 1 ? (
-          <Link className="btn join-item" to={`?${withPage(searchParams, query.page - 1)}`}>Previous</Link>
+          <Link className="btn join-item" to={`?${withPage(searchParams, query.page - 1)}`}>
+            Previous
+          </Link>
         ) : null}
         {query.page < totalPages ? (
-          <Link className="btn join-item" to={`?${withPage(searchParams, query.page + 1)}`}>Next</Link>
+          <Link className="btn join-item" to={`?${withPage(searchParams, query.page + 1)}`}>
+            Next
+          </Link>
         ) : null}
       </nav>
     </div>
@@ -154,7 +175,9 @@ function CatalogRow({
     <>
       <tr>
         <td>{item.displayName}</td>
-        <td className="max-w-xs truncate">{item.contentPath ?? item.mappings[0]?.targetText ?? "—"}</td>
+        <td className="max-w-xs truncate">
+          {item.contentPath ?? item.mappings[0]?.targetText ?? "—"}
+        </td>
         <td>{item.size != null ? formatFileSize(item.size) : "—"}</td>
         <td>{item.mappingCount}</td>
         <td>
@@ -170,7 +193,9 @@ function CatalogRow({
                 <li key={m.linkPath} className="flex flex-wrap items-center gap-2 text-sm">
                   <Badge>{m.mappingType}</Badge>
                   <Badge>{m.status}</Badge>
-                  <code className="break-all">{m.linkPath} → {m.targetText}</code>
+                  <code className="break-all">
+                    {m.linkPath} → {m.targetText}
+                  </code>
                   {m.mappingType === "internal" && item.davItemId && item.contentPath ? (
                     <Link
                       className="link"

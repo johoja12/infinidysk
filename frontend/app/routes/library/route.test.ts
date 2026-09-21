@@ -35,7 +35,10 @@ function catalogMock() {
 
 describe("library loader", () => {
   it("passes search, filter, sort, and pagination to the catalog client", async () => {
-    await loader({ request: requestFor("/library?q=dune&type=broken&sort=size&dir=desc&page=2"), params: {} } as never);
+    await loader({
+      request: requestFor("/library?q=dune&type=broken&sort=size&dir=desc&page=2"),
+      params: {},
+    } as never);
 
     expect(catalogMock()).toHaveBeenCalledWith({
       q: "dune",
@@ -50,8 +53,6 @@ describe("library loader", () => {
   it("clamps invalid page and pageSize to defaults", async () => {
     await loader({ request: requestFor("/library?page=0&pageSize=9999"), params: {} } as never);
 
-    expect(catalogMock()).toHaveBeenCalledWith(
-      expect.objectContaining({ page: 1, pageSize: 25 }),
-    );
+    expect(catalogMock()).toHaveBeenCalledWith(expect.objectContaining({ page: 1, pageSize: 25 }));
   });
 });
