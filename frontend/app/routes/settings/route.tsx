@@ -654,7 +654,9 @@ function Body(props: BodyProps) {
             {activeTab === "streaming" && (
               <StreamingSettings
                 config={newConfig}
+                savedConfig={config}
                 setNewConfig={setNewConfig}
+                persistConfigPatch={persistConfigPatch}
                 effectiveArticleBudgetBytes={props.inFlightArticleBudgetBytes}
               />
             )}

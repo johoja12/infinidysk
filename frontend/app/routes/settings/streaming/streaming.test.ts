@@ -59,7 +59,9 @@ function StreamingHarness({
   const [config, setConfig] = useState<Record<string, string>>(initialConfig);
   return createElement(StreamingSettings, {
     config,
+    savedConfig: initialConfig,
     setNewConfig: setConfig,
+    persistConfigPatch: async () => {},
     effectiveArticleBudgetBytes: 512 * 1024 * 1024,
   });
 }

@@ -36,7 +36,9 @@ export function shouldWarnSegmentCacheReadAhead(config: Record<string, string>):
 
 type StreamingSettingsProps = {
   config: Record<string, string>;
+  savedConfig: Record<string, string>;
   setNewConfig: Dispatch<SetStateAction<Record<string, string>>>;
+  persistConfigPatch: (patch: Record<string, string>) => Promise<void>;
   effectiveArticleBudgetBytes?: number | null;
 };
 
@@ -48,7 +50,9 @@ type BandwidthLimitLiveStats = {
 
 export function StreamingSettings({
   config,
+  savedConfig,
   setNewConfig,
+  persistConfigPatch,
   effectiveArticleBudgetBytes = null,
 }: StreamingSettingsProps) {
   const [bandwidthLive, setBandwidthLive] = useState<BandwidthLimitLiveStats | null>(null);
@@ -252,7 +256,12 @@ export function StreamingSettings({
 
       <NativeCacheSettings config={config} setNewConfig={setNewConfig} />
       <PlexSettings />
-      <SmartPrefetchSettings config={config} setNewConfig={setNewConfig} />
+      <SmartPrefetchSettings
+        config={config}
+        savedConfig={savedConfig}
+        setNewConfig={setNewConfig}
+        persistConfigPatch={persistConfigPatch}
+      />
       <SettingsCard
         icon="speed"
         title="Streaming performance"

@@ -16,6 +16,8 @@ public sealed record PrefetchSource
     public string[] ExcludedShows { get; init; } = [];
 }
 
+public sealed record PrefetchLibraryIdentity(string ServerId = "", string LibraryId = "", string Type = "movie");
+
 public sealed record PrefetchSettings
 {
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -57,6 +59,11 @@ public sealed record PrefetchSettings
     public int MinimumTailMb { get; init; } = 8;
     public string[] Users { get; init; } = [];
     public PrefetchSource[] Sources { get; init; } = [];
+    public PrefetchLibraryIdentity[] DisabledLibraries { get; init; } = [];
+    public static string LibraryType(PrefetchSource source) => source.Type == "movie" ? "movie" : "show";
+    public bool IsLibraryDisabled(PrefetchSource source) => DisabledLibraries.Any(library =>
+        library.ServerId == source.ServerId && library.LibraryId == source.LibraryId
+        && library.Type == LibraryType(source));
     public static PrefetchSettings Parse(string? json)
     {
         PrefetchSettings settings;
@@ -81,8 +88,17 @@ public sealed record PrefetchSettings
             || settings.MinimumHeadMb is < 0 or > 1024 || settings.MinimumTailMb is < 0 or > 1024)
             throw new ArgumentException("Smart Prefetch concurrency, intervals, prediction limits, or byte budgets are out of range.");
         if (settings.Users is null || settings.Users.Length > 256 || settings.Users.Any(user => string.IsNullOrWhiteSpace(user) || user.Length > 256)
-            || settings.Sources is null || settings.Sources.Length > 128)
-            throw new ArgumentException("Smart Prefetch user/source selections must be bounded arrays.");
+            || settings.Sources is null || settings.Sources.Length > 128
+            || settings.DisabledLibraries is null || settings.DisabledLibraries.Length > 128)
+            throw new ArgumentException("Smart Prefetch user, source, and disabled-library selections must be bounded arrays.");
+        var libraryKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var library in settings.DisabledLibraries)
+        {
+            if (library is null || string.IsNullOrWhiteSpace(library.ServerId) || library.ServerId.Length > 128
+                || library.LibraryId is null || library.LibraryId.Length > 128 || library.Type is not ("movie" or "show")
+                || !libraryKeys.Add(library.ServerId + "\n" + library.LibraryId + "\n" + library.Type))
+                throw new ArgumentException("Smart Prefetch disabled libraries need unique server/library/media identities.");
+        }
         var keys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var source in settings.Sources)
         {

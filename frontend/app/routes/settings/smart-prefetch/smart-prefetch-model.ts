@@ -10,6 +10,11 @@ export type PrefetchSource = {
   Limit: number;
   ExcludedShows: string[];
 };
+export type DisabledPlexLibrary = {
+  ServerId: string;
+  LibraryId: string;
+  Type: "movie" | "show";
+};
 export const numericDefaults = {
   SyncIntervalMinutes: 15,
   RealtimeCheckIntervalSeconds: 30,
@@ -57,7 +62,11 @@ export function decimalGbToBytes(gigabytes: number): number {
 }
 
 export type PrefetchSettings = typeof numericDefaults &
-  typeof booleanDefaults & { Users: string[]; Sources: PrefetchSource[] };
+  typeof booleanDefaults & {
+    Users: string[];
+    Sources: PrefetchSource[];
+    DisabledLibraries: DisabledPlexLibrary[];
+  };
 export type NumericKey = keyof typeof numericDefaults;
 const customizableBooleanKeys = Object.keys(booleanDefaults).filter(
   (key): key is keyof typeof booleanDefaults => key !== "Enabled",
@@ -154,6 +163,7 @@ export function parsePrefetchSettings(json: string | undefined): PrefetchSetting
     ...booleanDefaults,
     Users: [],
     Sources: [],
+    DisabledLibraries: [],
   };
   const settings = normalizeKnownFields(parsed, defaults);
   if (Array.isArray(settings.Sources))
@@ -168,6 +178,14 @@ export function parsePrefetchSettings(json: string | undefined): PrefetchSetting
         Enabled: true,
         Limit: 10,
         ExcludedShows: [] as string[],
+      }),
+    );
+  if (Array.isArray(settings.DisabledLibraries))
+    settings.DisabledLibraries = settings.DisabledLibraries.map((library) =>
+      normalizeKnownFields(library, {
+        ServerId: "",
+        LibraryId: "",
+        Type: "movie",
       }),
     );
   if (
@@ -189,6 +207,14 @@ export function parsePrefetchSettings(json: string | undefined): PrefetchSetting
         typeof source.Limit !== "number" ||
         !Array.isArray(source.ExcludedShows) ||
         source.ExcludedShows.some((id) => typeof id !== "string"),
+    ) ||
+    !Array.isArray(settings.DisabledLibraries) ||
+    settings.DisabledLibraries.some(
+      (library) =>
+        !library ||
+        typeof library.ServerId !== "string" ||
+        typeof library.LibraryId !== "string" ||
+        typeof library.Type !== "string",
     ) ||
     Object.keys(booleanDefaults).some(
       (key) => typeof settings[key as keyof typeof booleanDefaults] !== "boolean",
@@ -233,6 +259,24 @@ export function validatePrefetchSettings(settings: PrefetchSettings): string | n
     return "Choose at most 256 valid scoped users.";
   if (!Array.isArray(settings.Sources) || settings.Sources.length > 128)
     return "Choose at most 128 sources.";
+  if (!Array.isArray(settings.DisabledLibraries) || settings.DisabledLibraries.length > 128)
+    return "Disable at most 128 Plex libraries.";
+  const libraryKeys = new Set<string>();
+  for (const library of settings.DisabledLibraries) {
+    if (
+      !library ||
+      typeof library.ServerId !== "string" ||
+      !library.ServerId.trim() ||
+      library.ServerId.length > 128 ||
+      typeof library.LibraryId !== "string" ||
+      library.LibraryId.length > 128 ||
+      !["movie", "show"].includes(library.Type)
+    )
+      return "A disabled Plex library has an invalid server, library, or media identity.";
+    const key = `${library.ServerId}\n${library.LibraryId}\n${library.Type}`;
+    if (libraryKeys.has(key)) return "Remove duplicate disabled Plex libraries.";
+    libraryKeys.add(key);
+  }
   const keys = new Set<string>();
   for (const source of settings.Sources) {
     if (
