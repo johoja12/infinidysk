@@ -116,12 +116,26 @@ policy preview, manual warming, and retry controls are under **Prefetch activity
 Both sections stay collapsed until needed so the everyday setup remains limited to
 Enable, Movies, TV episodes, and the daily GB budget.
 
-Fetch libraries, users, hubs, and collections; preview a source before enabling it.
-Selections belong to stable server/library/source identities, not display names.
-Users are scoped to the server. Configure item limits, excluded show IDs, separate
-movie/TV switches, history lookback, minimum distinct episodes, confidence threshold,
-cooldown, queue-ahead count, and episodes per show. History confidence is bounded
-distinct-episode evidence, not a claim that a viewer will watch the prediction.
+Choose a saved server and watching profile, then expand **Movies** or **TV**. Switch
+on a library to use its recommended sources: movie libraries select **Recently
+Added**, while TV libraries select **On Deck** and **Continue Watching** when Plex
+provides them. These defaults apply only the first time a library has no existing
+source choices. Expand **Collections** only when needed; collections remain off by
+default. Use **Customize** for a source's item limit, excluded TV show IDs, and
+preview. Finish with **Apply source changes**, which saves only Smart Prefetch and
+leaves unrelated Settings drafts untouched.
+
+Movie and TV section switches, and each library switch, pause that scope without
+discarding its source choices, limits, or exclusions. Turning the scope back on
+restores the same configuration. **Refresh Plex catalogue** updates available
+libraries and sources without rewriting the current draft. A saved source that Plex
+does not return remains visible under **Saved but not currently available** so it can
+be reviewed or disabled deliberately. Selections belong to stable
+server/library/source identities, not display names, and users remain scoped to the
+server. History lookback, minimum distinct episodes, confidence threshold, cooldown,
+queue-ahead count, and episodes per show remain under Advanced settings. History
+confidence is bounded distinct-episode evidence, not a claim that a viewer will watch
+the prediction.
 
 Next-unwatched filtering requires a verified credential for the initiating user.
 Connect selected Plex Home accounts so their server-specific credentials can be
@@ -170,11 +184,14 @@ one invalid item does not discard the other accepted requests.
 
 ## Setup and rollback
 
-These are advanced, opt-in controls, not new-install prerequisites. The setup wizard
-does not need a version bump; rerunning a strategy preserves an explicit Native mode
-and does not silently rewrite imported files. Review restart and environment conflicts
-before Apply. Keep the test branch separate and switch back to your prior image and
-configuration backup if needed; do not delete production cache folders as rollback.
+These are advanced, opt-in controls, not new-install prerequisites. Plex source
+accordions and their optional `DisabledLibraries` state therefore remain outside the
+setup wizard; the field defaults to empty, the setup completion allowlist is unchanged,
+and `SetupWizardService.CurrentWizardVersion` does not increase. Rerunning a strategy
+preserves an explicit Native mode and does not silently rewrite imported files. Review
+restart and environment conflicts before Apply. Keep the test branch separate and
+switch back to your prior image and configuration backup if needed; do not delete
+production cache folders as rollback.
 
 Before adopting a 50 TB deployment, run the opt-in HDD/NAS canary: cold/warm seeks,
 concurrent playback plus warming, full/readonly/offline folders, mount replacement,
