@@ -220,6 +220,7 @@ public class DavDatabaseContext : DbContext
     public DbSet<ArticleMissCacheEntry> ArticleMissCacheEntries => Set<ArticleMissCacheEntry>();
     public DbSet<Par2RepairJob> Par2RepairJobs => Set<Par2RepairJob>();
     public DbSet<SetupWizardState> SetupWizardStates => Set<SetupWizardState>();
+    public DbSet<LibraryLinkMap> LinkMaps => Set<LibraryLinkMap>();
 
     // Pending blob writes for the current unit of work (flushed in SaveChangesAsync).
     private readonly List<DavNzbFile> _blobNzbFiles = [];
@@ -1027,6 +1028,43 @@ public class DavDatabaseContext : DbContext
 
             e.HasIndex(i => i.DavItemId);
             e.HasIndex(i => new { i.State, i.NextAttemptAt });
+        });
+
+        // LibraryLinkMap
+        b.Entity<LibraryLinkMap>(e =>
+        {
+            e.ToTable("LibraryLinkMaps");
+            e.HasKey(i => i.Id);
+
+            e.Property(i => i.Id)
+                .ValueGeneratedNever();
+
+            e.Property(i => i.DavItemId)
+                .ValueGeneratedNever()
+                .IsRequired(false);
+
+            e.Property(i => i.LinkPath)
+                .IsRequired();
+
+            e.Property(i => i.TargetText)
+                .IsRequired();
+
+            e.Property(i => i.MappingType)
+                .HasConversion<int>()
+                .IsRequired();
+
+            e.Property(i => i.Status)
+                .HasConversion<int>()
+                .IsRequired();
+
+            e.Property(i => i.Size)
+                .IsRequired(false);
+
+            e.HasIndex(i => i.LinkPath)
+                .IsUnique();
+
+            e.HasIndex(i => i.DavItemId)
+                .IsUnique(false);
         });
 
         if (DatabaseProviderConfig.IsPostgres)
