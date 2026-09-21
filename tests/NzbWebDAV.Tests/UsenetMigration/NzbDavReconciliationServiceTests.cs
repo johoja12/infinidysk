@@ -92,6 +92,53 @@ public sealed class NzbDavReconciliationServiceTests : IDisposable
         Assert.Equal(conflictingTarget, persisted.DavItemId);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ReconcileAsync_RejectsMissingOrMismatchedPackageDigest(bool mismatched)
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var fixture = await SeedAsync(harness);
+        int queueCount;
+        int historyCount;
+        int itemCount;
+        await using (var before = harness.Dav())
+        {
+            queueCount = await before.QueueItems.CountAsync();
+            historyCount = await before.HistoryItems.CountAsync();
+            itemCount = await before.Items.CountAsync();
+        }
+        string?[] targetsBefore;
+        await using (var db = harness.Mig())
+        {
+            var files = await db.ReleaseFiles.OrderBy(file => file.Id).ToListAsync();
+            targetsBefore = files.Select(file => file.NewDavItemId).ToArray();
+            foreach (var file in files)
+            {
+                file.Flags = mismatched
+                    ? JsonSerializer.Serialize(new { packageSha256 = new string('f', 64) })
+                    : """{"correlation":{"match":"article-identity"}}""";
+            }
+            await db.SaveChangesAsync();
+        }
+        var service = new NzbDavReconciliationService(
+            harness.Store, new NzbDavPackageReader(), fixture.BlobStore)
+        {
+            DavContextFactory = harness.DavFactory,
+        };
+
+        await Assert.ThrowsAsync<InvalidDataException>(() =>
+            service.ReconcileAsync(fixture.RunId, fixture.PackageRoot));
+
+        await using var verifyLedger = harness.Mig();
+        Assert.Equal(targetsBefore, await verifyLedger.ReleaseFiles.OrderBy(file => file.Id)
+            .Select(file => file.NewDavItemId).ToArrayAsync());
+        await using var verifyDav = harness.Dav();
+        Assert.Equal(queueCount, await verifyDav.QueueItems.CountAsync());
+        Assert.Equal(historyCount, await verifyDav.HistoryItems.CountAsync());
+        Assert.Equal(itemCount, await verifyDav.Items.CountAsync());
+    }
+
     private async Task<Fixture> SeedAsync(MigrationTestHarness harness)
     {
         Directory.CreateDirectory(_root);
