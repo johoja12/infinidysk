@@ -81,11 +81,18 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
             Assert.All(planned.Plan.Links, link => Assert.Equal("exact", link.CorrelationStatus));
 
             var libraryRoot = Path.Join(_root, "plex2");
+            var sourceRoot = Path.Join(_root, "plex");
             var targetRoot = Path.Join(_root, "infinidysk");
             Directory.CreateDirectory(libraryRoot);
+            Directory.CreateDirectory(sourceRoot);
             Directory.CreateDirectory(targetRoot);
             foreach (var link in planned.Plan.Links)
             {
+                var source = Path.Join(
+                    sourceRoot,
+                    link.LibraryRelativePath.Replace('/', Path.DirectorySeparatorChar));
+                Directory.CreateDirectory(Path.GetDirectoryName(source)!);
+                File.CreateSymbolicLink(source, link.OriginalLegacyTarget);
                 var target = Path.Join(
                     targetRoot,
                     link.NewRelativeTarget!.Replace('/', Path.DirectorySeparatorChar));
@@ -96,6 +103,7 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
             var journalPath = Path.Join(_root, "apply-journal.json");
             var journal = await new CanaryLinkApplier(_ => true).ApplyAsync(
                 Path.Join(planned.PlanDirectory, "plan.json"),
+                sourceRoot,
                 libraryRoot,
                 targetRoot,
                 journalPath);

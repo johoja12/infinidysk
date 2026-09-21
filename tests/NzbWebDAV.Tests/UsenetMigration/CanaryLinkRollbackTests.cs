@@ -11,6 +11,7 @@ public sealed class CanaryLinkRollbackTests : IDisposable
     public async Task RollbackAsync_RemovesOnlyOwnedStillMatchingLinksAndCreatedEmptyDirectories()
     {
         var library = Directory.CreateDirectory(Path.Join(_root, "library")).FullName;
+        var source = Directory.CreateDirectory(Path.Join(_root, "source")).FullName;
         var target = Directory.CreateDirectory(Path.Join(_root, "target")).FullName;
         var targetA = await CreateTargetAsync(target, ".ids/a", 4);
         var targetB = await CreateTargetAsync(target, ".ids/b", 4);
@@ -21,9 +22,10 @@ public sealed class CanaryLinkRollbackTests : IDisposable
                 Link("TV/B/b.mkv", ".ids/b", 4),
             ]);
         var planDir = await new NzbDavCanaryPlanWriter().WriteAsync(Path.Join(_root, "plans"), plan);
+        CreateSourceLinks(source, plan);
         var journalPath = Path.Join(_root, "journal.json");
         var applier = new CanaryLinkApplier(_ => true);
-        var journal = await applier.ApplyAsync(Path.Join(planDir, "plan.json"), library, target, journalPath);
+        var journal = await applier.ApplyAsync(Path.Join(planDir, "plan.json"), source, library, target, journalPath);
         var changed = journal.Links.Single(link => link.TargetPath == targetB);
         File.Delete(changed.LinkPath);
         File.CreateSymbolicLink(changed.LinkPath, targetA);
@@ -43,6 +45,7 @@ public sealed class CanaryLinkRollbackTests : IDisposable
     public async Task RollbackAsync_RecoversLinksFromInterruptedPartialApply()
     {
         var library = Directory.CreateDirectory(Path.Join(_root, "partial-library")).FullName;
+        var source = Directory.CreateDirectory(Path.Join(_root, "partial-source")).FullName;
         var target = Directory.CreateDirectory(Path.Join(_root, "partial-target")).FullName;
         var targetA = await CreateTargetAsync(target, ".ids/c", 4);
         var targetB = await CreateTargetAsync(target, ".ids/d", 4);
@@ -50,6 +53,7 @@ public sealed class CanaryLinkRollbackTests : IDisposable
             1, 10, new string('c', 64), DateTimeOffset.UtcNow, 2, 2, true,
             [Link("TV/C/c.mkv", ".ids/c", 4), Link("TV/D/d.mkv", ".ids/d", 4)]);
         var planDir = await new NzbDavCanaryPlanWriter().WriteAsync(Path.Join(_root, "partial-plans"), plan);
+        CreateSourceLinks(source, plan);
         var journalPath = Path.Join(_root, "partial-journal.json");
         var call = 0;
         var applier = new CanaryLinkApplier(_ => true, path =>
@@ -59,7 +63,7 @@ public sealed class CanaryLinkRollbackTests : IDisposable
         });
 
         await Assert.ThrowsAsync<FileNotFoundException>(() => applier.ApplyAsync(
-            Path.Join(planDir, "plan.json"), library, target, journalPath));
+            Path.Join(planDir, "plan.json"), source, library, target, journalPath));
         Assert.True(CanaryPathSafety.PathExistsNoFollow(Path.Join(library, "TV", "C", "c.mkv")));
         Assert.False(CanaryPathSafety.PathExistsNoFollow(Path.Join(library, "TV", "D", "d.mkv")));
 
@@ -81,6 +85,16 @@ public sealed class CanaryLinkRollbackTests : IDisposable
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         await File.WriteAllBytesAsync(path, new byte[size]);
         return path;
+    }
+
+    private static void CreateSourceLinks(string root, NzbDavCanaryPlan plan)
+    {
+        foreach (var link in plan.Links)
+        {
+            var path = Path.Join(root, link.LibraryRelativePath.Replace('/', Path.DirectorySeparatorChar));
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            File.CreateSymbolicLink(path, link.OriginalLegacyTarget);
+        }
     }
 
     public void Dispose()
