@@ -22,9 +22,27 @@ public sealed class PrefetchSettingsTests
     {
         var settings = PrefetchSettings.Parse(null);
         Assert.False(settings.Enabled);
+        Assert.Empty(settings.DisabledLibraries);
         Assert.Equal(10_000_000_000, settings.DailyByteBudget);
         Assert.True(settings.FullFileWarming);
         Assert.InRange(settings.MaxConcurrentJobs, 1, 4);
+    }
+
+    [Fact]
+    public void DisabledLibraries_RoundTripStableIdentity()
+    {
+        var settings = PrefetchSettings.Parse("""{"DisabledLibraries":[{"ServerId":"plex","LibraryId":"2","Type":"show"}]}""");
+
+        Assert.Equal(new PrefetchLibraryIdentity("plex", "2", "show"), Assert.Single(settings.DisabledLibraries));
+    }
+
+    [Fact]
+    public void DisabledLibraries_AreBounded()
+    {
+        var libraries = string.Join(',', Enumerable.Range(0, 129)
+            .Select(index => $$"""{"ServerId":"plex","LibraryId":"{{index}}","Type":"movie"}"""));
+
+        Assert.Throws<ArgumentException>(() => PrefetchSettings.Parse($$"""{"DisabledLibraries":[{{libraries}}]}"""));
     }
 
     [Theory]
@@ -33,6 +51,10 @@ public sealed class PrefetchSettingsTests
     [InlineData("{\"Sources\":[{\"ServerId\":\"one\",\"Key\":\"https://other-host/steal\"}]}")]
     [InlineData("{\"Sources\":null}")]
     [InlineData("{\"Users\":null}")]
+    [InlineData("{\"DisabledLibraries\":null}")]
+    [InlineData("{\"DisabledLibraries\":[{\"ServerId\":\"\",\"LibraryId\":\"2\",\"Type\":\"show\"}]}")]
+    [InlineData("{\"DisabledLibraries\":[{\"ServerId\":\"plex\",\"LibraryId\":\"2\",\"Type\":\"episode\"}]}")]
+    [InlineData("{\"DisabledLibraries\":[{\"ServerId\":\"plex\",\"LibraryId\":\"2\",\"Type\":\"show\"},{\"ServerId\":\"plex\",\"LibraryId\":\"2\",\"Type\":\"show\"}]}")]
     [InlineData("{\"ConfidenceThreshold\":1.1}")]
     [InlineData("{\"CooldownMinutes\":0}")]
     public void UnsafeOrUnboundedPolicies_AreRejected(string json) =>
