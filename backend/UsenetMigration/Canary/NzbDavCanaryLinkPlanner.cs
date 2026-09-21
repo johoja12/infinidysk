@@ -85,8 +85,7 @@ public sealed class NzbDavCanaryLinkPlanner
             sourceById.TryGetValue(id, out var source);
             migratedById.TryGetValue(id, out var migrated);
             var exact = source?.FileStatus == "exact"
-                        && migrated is not null
-                        && migrated.MatchMethod == "article-identity";
+                        && migrated is not null;
             var status = exact
                 ? "exact"
                 : source?.FileStatus ?? "not-imported";
