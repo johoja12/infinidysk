@@ -5,6 +5,7 @@ using NzbDavMigration.Catalogue;
 using NzbDavMigration.Export;
 using NzbDavMigration.Inventory;
 using NzbDavMigration.Legacy;
+using NzbDavMigration.Recovery;
 using NzbWebDAV.UsenetMigration.NzbDav;
 
 return await NzbDavMigrationProgram.RunAsync(args);
@@ -24,6 +25,7 @@ internal static class NzbDavMigrationProgram
             await Console.Error.WriteLineAsync("Usage: NzbDavMigration inventory --library-root PATH --blob-root PATH --output FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-list --blob-root PATH --output FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-scan --blob-root PATH --inventory FILE --database FILE --summary FILE");
+            await Console.Error.WriteLineAsync("       NzbDavMigration recover-full --inventory FILE --catalogue FILE --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration export --selection FILE --inventory FILE --blob-root PATH --output DIR --package-id ID");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --library-root PATH --target-root PATH [--journal FILE]");
             await Console.Error.WriteLineAsync("       NzbDavMigration rollback-links --journal FILE");
@@ -39,6 +41,7 @@ internal static class NzbDavMigrationProgram
                 "inventory" => await InventoryAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "catalogue-list" => await CatalogueListAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "catalogue-scan" => await CatalogueScanAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "recover-full" => await RecoverFullAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "export" => await ExportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "apply-links" => await ApplyLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "rollback-links" => await RollbackLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
@@ -68,6 +71,20 @@ internal static class NzbDavMigrationProgram
         await new OrphanCatalogueScanner().ScanAsync(
             Required(options, "--blob-root"), Required(options, "--inventory"), store).ConfigureAwait(false);
         return 0;
+    }
+
+    private static async Task<int> RecoverFullAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var inventory = await ReadJsonAsync<LegacyInventoryCandidate[]>(Required(options, "--inventory"))
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Inventory file is empty.");
+        var cataloguePath = Required(options, "--catalogue");
+        await using var store = new OrphanCatalogueStore(
+            cataloguePath, cataloguePath + ".completion.json");
+        await store.OpenCompletedAsync().ConfigureAwait(false);
+        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
+        var result = await new LegacySourceRecovery().WriteAsync(
+            inventory, store, Required(options, "--output"), minimum).ConfigureAwait(false);
+        return result.MeetsMinimumCoverage ? 0 : 3;
     }
 
     private static async Task<int> ApplyLinksAsync(IReadOnlyDictionary<string, string> options)
@@ -246,6 +263,19 @@ internal static class NzbDavMigrationProgram
             return defaultValue;
         if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed <= 0)
             throw new InvalidDataException($"{name} must be a positive integer.");
+        return parsed;
+    }
+
+    private static decimal ParseCoverage(
+        IReadOnlyDictionary<string, string> options,
+        string name,
+        decimal defaultValue)
+    {
+        var value = Optional(options, name);
+        if (value is null) return defaultValue;
+        if (!decimal.TryParse(value, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var parsed)
+            || parsed is < 0 or > 1)
+            throw new InvalidDataException($"{name} must be between 0 and 1.");
         return parsed;
     }
 }

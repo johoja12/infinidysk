@@ -55,6 +55,15 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
         await ExecutePragmaAsync("PRAGMA journal_mode=WAL;", cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task OpenCompletedAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureOpenAsync(cancellationToken).ConfigureAwait(false);
+        var state = await ReadStateAsync(cancellationToken).ConfigureAwait(false);
+        if (!string.Equals(state.Status, "complete", StringComparison.Ordinal))
+            throw new InvalidOperationException("Recovery requires a sealed catalogue.");
+        _complete = true;
+    }
+
     public async Task UpsertAsync(OrphanCatalogueBlob blob, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(blob);
@@ -139,6 +148,41 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) paths.Add(reader.GetString(0));
         return paths;
+    }
+
+    public async Task<IReadOnlyList<OrphanCatalogueBlob>> FindBlobsContainingAllAsync(
+        IEnumerable<string> messageIds,
+        CancellationToken cancellationToken = default)
+    {
+        var ids = messageIds.Select(NormalizeMessageId).Distinct(StringComparer.Ordinal).ToArray();
+        if (ids.Length == 0) return [];
+        var connection = RequireConnection();
+        await using var command = connection.CreateCommand();
+        command.Transaction = _transaction;
+        var parameters = ids.Select((id, index) =>
+        {
+            var name = $"$id{index}";
+            command.Parameters.AddWithValue(name, id);
+            return name;
+        }).ToArray();
+        command.Parameters.AddWithValue("$count", ids.Length);
+        command.CommandText = $"""
+            SELECT b.RelativePath
+            FROM Blobs b JOIN Articles a ON a.BlobPath=b.RelativePath
+            WHERE b.ParseStatus='valid' AND a.MessageId IN ({string.Join(',', parameters)})
+            GROUP BY b.RelativePath
+            HAVING COUNT(DISTINCT a.MessageId)=$count
+            ORDER BY b.RelativePath
+            """;
+        var paths = new List<string>();
+        await using (var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false))
+        {
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) paths.Add(reader.GetString(0));
+        }
+        var blobs = new List<OrphanCatalogueBlob>(paths.Count);
+        foreach (var path in paths)
+            blobs.Add((await ReadBlobAsync(path, cancellationToken).ConfigureAwait(false))!);
+        return blobs;
     }
 
     public async Task<OrphanCatalogueBlob?> ReadBlobAsync(
@@ -381,6 +425,15 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
     {
         if (digest.Length != 64 || digest.Any(character => !Uri.IsHexDigit(character)))
             throw new ArgumentException("Expected a 64-character SHA-256 digest.", parameterName);
+    }
+
+    private static string NormalizeMessageId(string value)
+    {
+        var normalized = value.Trim();
+        if (normalized.StartsWith('<') && normalized.EndsWith('>') && normalized.Length >= 2)
+            normalized = normalized[1..^1].Trim();
+        if (normalized.Length == 0) throw new InvalidDataException("Article identifier is empty.");
+        return normalized;
     }
 
     public async ValueTask DisposeAsync()

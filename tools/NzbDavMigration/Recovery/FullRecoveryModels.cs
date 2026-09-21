@@ -18,3 +18,41 @@ public sealed record FullRecoveryInventory(
 {
     public const int CurrentSchemaVersion = 1;
 }
+
+public sealed record LegacySourceRecoveryItem(
+    string LibraryRelativePath,
+    string OriginalTarget,
+    Guid LegacyDavItemId,
+    string Classification,
+    string? ExclusionReason,
+    string? SourceRelativePath,
+    string? PayloadSha256,
+    string? IdentityKind,
+    string? IdentityDigest,
+    long? FileSize);
+
+public sealed record LegacySourceRecoveryReport(
+    int SchemaVersion,
+    DateTimeOffset CreatedAt,
+    int TotalLinks,
+    int RecoverableLinks,
+    decimal RecoverableFraction,
+    IReadOnlyList<LegacySourceRecoveryItem> Items)
+{
+    public const int CurrentSchemaVersion = 1;
+}
+
+public sealed record FullRecoveryMasterManifest(
+    int SchemaVersion,
+    DateTimeOffset CreatedAt,
+    int TotalLinks,
+    int RecoverableLinks,
+    decimal RecoverableFraction,
+    IReadOnlyList<LegacySourceRecoveryItem> Items)
+{
+    public const int CurrentSchemaVersion = 1;
+}
+
+public sealed record LegacyRecoveryWriteResult(
+    LegacySourceRecoveryReport Report,
+    bool MeetsMinimumCoverage);
