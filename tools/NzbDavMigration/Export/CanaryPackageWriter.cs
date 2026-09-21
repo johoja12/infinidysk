@@ -9,7 +9,7 @@ namespace NzbDavMigration.Export;
 
 public sealed record CanaryExportRelease(
     string SourceReleaseId,
-    Guid NzbBlobId,
+    Guid? NzbBlobId,
     string PayloadSourcePath,
     IReadOnlyList<NzbDavExportLeaf> Leaves,
     byte[]? PayloadBytes = null);
@@ -26,11 +26,32 @@ public sealed partial class CanaryPackageWriter(int minimumLinks = 20, int maxim
     private static partial Regex SafeReleaseIdRegex();
 
     public async Task WriteAsync(CanaryExportRequest request, CancellationToken cancellationToken = default)
+        => await WriteCoreAsync(request, schemaVersion: 1, masterManifestDigest: null,
+            batchIndex: null, batchCount: null, enforceCanaryBounds: true, cancellationToken).ConfigureAwait(false);
+
+    public async Task WriteFullBatchAsync(
+        CanaryExportRequest request,
+        string masterManifestDigest,
+        int batchIndex,
+        int batchCount,
+        CancellationToken cancellationToken = default)
+        => await WriteCoreAsync(request, NzbDavExportManifest.CurrentSchemaVersion, masterManifestDigest,
+            batchIndex, batchCount, enforceCanaryBounds: false, cancellationToken).ConfigureAwait(false);
+
+    private async Task WriteCoreAsync(
+        CanaryExportRequest request,
+        int schemaVersion,
+        string? masterManifestDigest,
+        int? batchIndex,
+        int? batchCount,
+        bool enforceCanaryBounds,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(request);
         if (Directory.Exists(request.OutputDirectory) || File.Exists(request.OutputDirectory))
             throw new IOException($"Export destination already exists: {request.OutputDirectory}");
-        if (request.SelectedLinks.Count < minimumLinks || request.SelectedLinks.Count > maximumLinks)
+        if (enforceCanaryBounds
+            && (request.SelectedLinks.Count < minimumLinks || request.SelectedLinks.Count > maximumLinks))
             throw new InvalidDataException($"Selection must contain between {minimumLinks} and {maximumLinks} links.");
         RequireUnique(request.SelectedLinks.Select(link => link.LibraryRelativePath), "library path");
         RequireUnique(request.SelectedLinks.Select(link => link.LegacyDavItemId.ToString()), "legacy DavItem ID");
@@ -75,14 +96,17 @@ public sealed partial class CanaryPackageWriter(int minimumLinks = 20, int maxim
             }
 
             var manifest = new NzbDavExportManifest(
-                NzbDavExportManifest.CurrentSchemaVersion,
+                schemaVersion,
                 request.PackageId,
                 DateTimeOffset.UtcNow,
                 MigrationSourceTypes.NzbDav,
                 manifestReleases,
                 request.SelectedLinks.OrderBy(link => link.LibraryRelativePath, StringComparer.Ordinal).ToArray(),
                 payloads,
-                checksums);
+                checksums,
+                masterManifestDigest,
+                batchIndex,
+                batchCount);
             var manifestPath = Path.Join(stage, "manifest.json");
             await WriteAndFlushAsync(manifestPath, NzbDavExportManifestJson.Serialize(manifest), cancellationToken)
                 .ConfigureAwait(false);

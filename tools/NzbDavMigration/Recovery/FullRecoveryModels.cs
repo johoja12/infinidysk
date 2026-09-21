@@ -23,6 +23,7 @@ public sealed record LegacySourceRecoveryItem(
     string LibraryRelativePath,
     string OriginalTarget,
     Guid LegacyDavItemId,
+    string? LegacyPath,
     string Classification,
     string? ExclusionReason,
     string? SourceRelativePath,

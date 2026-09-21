@@ -22,6 +22,57 @@ public sealed class NzbDavPackageReaderTests : IDisposable
         Assert.Equal(64, result.PackageDigest.Length);
     }
 
+    [Fact]
+    public void Manifest_V1RemainsCompatibleAndV2RequiresBatchAndStableArchiveProvenance()
+    {
+        var v1 = NzbDavExportManifestJson.Deserialize("""
+            {
+              "schemaVersion": 1, "packageId": "legacy", "createdAt": "2026-09-21T00:00:00Z",
+              "source": "nzbdav", "releases": [], "selectedLinks": [], "payloads": [], "checksums": []
+            }
+            """);
+        Assert.Null(v1.MasterManifestDigest);
+        Assert.Null(v1.BatchIndex);
+        Assert.Null(v1.BatchCount);
+
+        var archiveLeaf = new NzbDavExportLeaf(Guid.NewGuid(), "/content/a.mkv", 10, "release-1",
+            null, null, NzbDavStableArchiveIdentity.Kind, new string('a', 64), "ready", null);
+        var incomplete = new NzbDavExportManifest(2, "batch", DateTimeOffset.UtcNow, "nzbdav",
+            [new NzbDavExportRelease("release-1", null, "payloads/release-1.nzb", [archiveLeaf])], [],
+            [new NzbDavPayloadFile("payloads/release-1.nzb", 10, new string('b', 64))], [],
+            MasterManifestDigest: null, BatchIndex: 0, BatchCount: 1);
+        Assert.Throws<InvalidDataException>(() => NzbDavExportManifestJson.Serialize(incomplete));
+        Assert.Throws<InvalidDataException>(() => NzbDavExportManifestJson.Serialize(incomplete with
+        {
+            MasterManifestDigest = new string('c', 64),
+        }));
+
+        var complete = incomplete with
+        {
+            MasterManifestDigest = new string('c', 64),
+            Releases = [incomplete.Releases[0] with
+            {
+                Leaves = [archiveLeaf with
+                {
+                    StableIdentityKind = NzbDavStableArchiveIdentity.Kind,
+                    StableIdentityDigest = new string('a', 64),
+                }],
+            }],
+        };
+        Assert.Throws<InvalidDataException>(() => NzbDavExportManifestJson.Serialize(complete with
+        {
+            Releases = [complete.Releases[0] with
+            {
+                Leaves = [complete.Releases[0].Leaves[0] with
+                {
+                    StableIdentityDigest = new string('d', 64),
+                }],
+            }],
+        }));
+        Assert.Equal(2, NzbDavExportManifestJson.Deserialize(
+            NzbDavExportManifestJson.Serialize(complete)).SchemaVersion);
+    }
+
     [Theory]
     [InlineData("checksum")]
     [InlineData("traversal")]

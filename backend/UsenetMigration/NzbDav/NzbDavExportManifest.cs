@@ -12,18 +12,27 @@ public sealed record NzbDavExportManifest(
     IReadOnlyList<NzbDavExportRelease> Releases,
     IReadOnlyList<NzbDavSelectedLibraryLink> SelectedLinks,
     IReadOnlyList<NzbDavPayloadFile> Payloads,
-    IReadOnlyList<NzbDavChecksumEntry> Checksums)
+    IReadOnlyList<NzbDavChecksumEntry> Checksums,
+    string? MasterManifestDigest = null,
+    int? BatchIndex = null,
+    int? BatchCount = null)
 {
-    public const int CurrentSchemaVersion = 1;
+    public const int CurrentSchemaVersion = 2;
 
     public void Validate()
     {
-        if (SchemaVersion != CurrentSchemaVersion)
+        if (SchemaVersion is not (1 or CurrentSchemaVersion))
             throw new InvalidDataException($"Unsupported NzbDav export schema version {SchemaVersion}.");
         if (string.IsNullOrWhiteSpace(PackageId))
             throw new InvalidDataException("NzbDav export package id is required.");
         if (!string.Equals(Source, MigrationSourceTypes.NzbDav, StringComparison.Ordinal))
             throw new InvalidDataException($"Unsupported migration source '{Source}'.");
+        if (SchemaVersion == 2)
+        {
+            RequireSha256(MasterManifestDigest ?? string.Empty, "master manifest");
+            if (BatchIndex is null or < 0 || BatchCount is null or <= 0 || BatchIndex >= BatchCount)
+                throw new InvalidDataException("Schema-v2 packages require valid batch index and count values.");
+        }
 
         foreach (var release in Releases)
         {
@@ -34,6 +43,17 @@ public sealed record NzbDavExportManifest(
                     throw new InvalidDataException("A source leaf has an empty legacy DavItem id.");
                 if (leaf.FileSize < 0)
                     throw new InvalidDataException($"Source leaf '{leaf.LegacyDavItemId}' has a negative size.");
+                if (SchemaVersion == 2
+                    && string.Equals(leaf.IdentityKind, NzbDavStableArchiveIdentity.Kind, StringComparison.Ordinal))
+                {
+                    if (!string.Equals(leaf.StableIdentityKind, NzbDavStableArchiveIdentity.Kind,
+                            StringComparison.Ordinal))
+                        throw new InvalidDataException("Schema-v2 archive leaves require a stable identity kind.");
+                    RequireSha256(leaf.StableIdentityDigest ?? string.Empty, $"leaf {leaf.LegacyDavItemId}");
+                    if (!string.Equals(leaf.StableIdentityKind, leaf.IdentityKind, StringComparison.Ordinal)
+                        || !string.Equals(leaf.StableIdentityDigest, leaf.IdentityDigest, StringComparison.Ordinal))
+                        throw new InvalidDataException("Schema-v2 stable archive identity disagrees with correlation identity.");
+                }
             }
         }
 
@@ -96,7 +116,9 @@ public sealed record NzbDavExportLeaf(
     string IdentityKind,
     string? IdentityDigest,
     string ExtractionStatus,
-    string? ExclusionReason);
+    string? ExclusionReason,
+    string? StableIdentityKind = null,
+    string? StableIdentityDigest = null);
 
 public sealed record NzbDavSelectedLibraryLink(
     string LibraryRelativePath,

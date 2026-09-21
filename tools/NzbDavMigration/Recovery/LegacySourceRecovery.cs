@@ -112,7 +112,7 @@ public sealed class LegacySourceRecovery
         if (logical.Length > 1) return Missing(candidate, "ambiguous-payload", "multiple-distinct-payloads");
         var exact = logical[0];
         return new LegacySourceRecoveryItem(candidate.LibraryRelativePath, candidate.OriginalTarget,
-            candidate.LegacyDavItemId, row.Type == 3 ? "exact-direct" : "exact-archive", null,
+            candidate.LegacyDavItemId, row.Path, row.Type == 3 ? "exact-direct" : "exact-archive", null,
             exact.Blob.RelativePath, exact.Blob.Sha256, exact.IdentityKind, exact.IdentityDigest, row.FileSize);
     }
 
@@ -181,7 +181,7 @@ public sealed class LegacySourceRecovery
         string classification,
         string? reason) =>
         new(candidate.LibraryRelativePath, candidate.OriginalTarget, candidate.LegacyDavItemId,
-            classification, reason, null, null, null, null, candidate.Item?.FileSize);
+            candidate.Item?.Path, classification, reason, null, null, null, null, candidate.Item?.FileSize);
 
     private static string Normalize(string value) => value.Trim().TrimStart('<').TrimEnd('>').Trim();
 
