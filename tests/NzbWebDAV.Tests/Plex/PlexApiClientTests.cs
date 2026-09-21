@@ -145,7 +145,7 @@ public sealed class PlexApiClientTests
     public async Task Timeout_BoundsResponseBodyAfterHeadersHaveArrived()
     {
         using var handler = new FakePlexHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
-            { Content = new StreamContent(new WaitingBodyStream()) });
+        { Content = new StreamContent(new WaitingBodyStream()) });
         using var http = new HttpClient(handler) { Timeout = TimeSpan.FromMilliseconds(25) };
         var api = new PlexApiClient(http, "installation");
         using var cancellation = new CancellationTokenSource();

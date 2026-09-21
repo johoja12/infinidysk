@@ -162,7 +162,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
         var show = current.ShowRatingKey ?? current.RatingKey;
         var scopedUser = !string.IsNullOrEmpty(current.UserId) && server.AccountId == current.UserId;
         PlexMediaItem Project(XElement element) => ParseMedia(element) with
-            { UserId = current.UserId, WatchStateUserId = scopedUser ? current.UserId : null };
+        { UserId = current.UserId, WatchStateUserId = scopedUser ? current.UserId : null };
         if (scopedUser && current.Type == "show")
             return (await ReadPagesAsync(server,
                 $"/library/metadata/{Identifier(show)}/allLeaves?unwatched=1&sort=parentIndex%3Aasc%2Cindex%3Aasc",

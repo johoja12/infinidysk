@@ -13,7 +13,7 @@ public sealed class PlexCatalogueServiceTests
             "/library/sections/2/collections" => PlexApiClientTests.Xml(
                 """<MediaContainer><Directory ratingKey="7" key="/library/collections/7/children" title="Shows"/></MediaContainer>"""),
             "/hubs/sections/2" => new HttpResponseMessage(HttpStatusCode.NotFound)
-                { Content = new StringContent("secret upstream body") },
+            { Content = new StringContent("secret upstream body") },
             _ => PlexApiClientTests.Xml("<MediaContainer/>")
         });
         var catalogue = new PlexCatalogueService(
@@ -33,7 +33,7 @@ public sealed class PlexCatalogueServiceTests
         using var handler = new FakePlexHandler(request => request.RequestUri!.AbsolutePath switch
         {
             "/library/sections/2/collections" => new HttpResponseMessage(HttpStatusCode.Forbidden)
-                { Content = new StringContent("secret upstream body") },
+            { Content = new StringContent("secret upstream body") },
             "/hubs/sections/2" => PlexApiClientTests.Xml(
                 """<MediaContainer><Hub hubIdentifier="recent" key="/hubs/recent" title="Recent" type="show"/></MediaContainer>"""),
             _ => PlexApiClientTests.Xml("<MediaContainer/>")
