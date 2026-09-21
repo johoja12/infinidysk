@@ -30,6 +30,7 @@ internal static class NzbDavMigrationProgram
             await Console.Error.WriteLineAsync("       NzbDavMigration export-batches --master FILE --blob-root PATH --output DIR [--max-releases 250] [--max-payload-bytes 4294967296]");
             await Console.Error.WriteLineAsync("       NzbDavMigration export --selection FILE --inventory FILE --blob-root PATH --output DIR --package-id ID");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --master FILE --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration rollback-links --journal FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration validate-links --journal FILE --output FILE [--ffprobe PATH] [--max-read-bytes N] [--timeout-seconds N]");
             await Console.Error.WriteLineAsync("       NzbDavMigration benchmark-links --selection FILE --plan FILE --output DIR --legacy-url URL --legacy-route KIND --infinidysk-url URL --infinidysk-route KIND [--legacy-root /mnt/plex] [--infinidysk-root /mnt/plex2] [--legacy-cache-root PATH] [--infinidysk-cache-root PATH] [--timeout-seconds N]");
@@ -47,6 +48,7 @@ internal static class NzbDavMigrationProgram
                 "export-batches" => await ExportBatchesAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "export" => await ExportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "apply-links" => await ApplyLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "coverage-report" => await CoverageReportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "rollback-links" => await RollbackLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "validate-links" => await ValidateLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "benchmark-links" => await BenchmarkLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
@@ -189,6 +191,21 @@ internal static class NzbDavMigrationProgram
             .ConfigureAwait(false);
         await Console.Out.WriteLineAsync(JsonSerializer.Serialize(result, ReportJsonOptions));
         return 0;
+    }
+
+    private static async Task<int> CoverageReportAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var result = await new CanaryCoverageReporter().WriteAsync(
+            Required(options, "--source-root"),
+            Required(options, "--library-root"),
+            Required(options, "--initial-inventory"),
+            Required(options, "--master"),
+            Required(options, "--journals-dir"),
+            Required(options, "--output"),
+            ParseCoverage(options, "--minimum-coverage", 0.90m)).ConfigureAwait(false);
+        await Console.Out.WriteLineAsync(Path.GetFullPath(Required(options, "--output")));
+        if (result.HasOwnershipErrors) return 1;
+        return result.Report.MeetsMinimumCoverage ? 0 : 3;
     }
 
     private static async Task<int> ValidateLinksAsync(IReadOnlyDictionary<string, string> options)
