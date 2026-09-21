@@ -1,9 +1,12 @@
 using System.Text.Json;
 using System.Globalization;
+using System.Security.Cryptography;
 using NzbDavMigration.Canary;
+using NzbDavMigration.Catalogue;
 using NzbDavMigration.Export;
 using NzbDavMigration.Inventory;
 using NzbDavMigration.Legacy;
+using NzbDavMigration.Recovery;
 using NzbWebDAV.UsenetMigration.NzbDav;
 
 return await NzbDavMigrationProgram.RunAsync(args);
@@ -21,8 +24,13 @@ internal static class NzbDavMigrationProgram
         if (args.Length == 0 || args[0] is "-h" or "--help")
         {
             await Console.Error.WriteLineAsync("Usage: NzbDavMigration inventory --library-root PATH --blob-root PATH --output FILE");
+            await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-list --blob-root PATH --output FILE");
+            await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-scan --blob-root PATH --inventory FILE --database FILE --summary FILE");
+            await Console.Error.WriteLineAsync("       NzbDavMigration recover-full --inventory FILE --catalogue FILE --output DIR [--minimum-coverage 0.90]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration export-batches --master FILE --blob-root PATH --output DIR [--max-releases 250] [--max-payload-bytes 4294967296]");
             await Console.Error.WriteLineAsync("       NzbDavMigration export --selection FILE --inventory FILE --blob-root PATH --output DIR --package-id ID");
-            await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --library-root PATH --target-root PATH [--journal FILE]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --master FILE_OR_DIR --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration rollback-links --journal FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration validate-links --journal FILE --output FILE [--ffprobe PATH] [--max-read-bytes N] [--timeout-seconds N]");
             await Console.Error.WriteLineAsync("       NzbDavMigration benchmark-links --selection FILE --plan FILE --output DIR --legacy-url URL --legacy-route KIND --infinidysk-url URL --infinidysk-route KIND [--legacy-root /mnt/plex] [--infinidysk-root /mnt/plex2] [--legacy-cache-root PATH] [--infinidysk-cache-root PATH] [--timeout-seconds N]");
@@ -34,8 +42,13 @@ internal static class NzbDavMigrationProgram
             return args[0] switch
             {
                 "inventory" => await InventoryAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "catalogue-list" => await CatalogueListAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "catalogue-scan" => await CatalogueScanAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "recover-full" => await RecoverFullAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "export-batches" => await ExportBatchesAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "export" => await ExportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "apply-links" => await ApplyLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "coverage-report" => await CoverageReportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "rollback-links" => await RollbackLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "validate-links" => await ValidateLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "benchmark-links" => await BenchmarkLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
@@ -49,6 +62,114 @@ internal static class NzbDavMigrationProgram
         }
     }
 
+    private static async Task<int> CatalogueListAsync(IReadOnlyDictionary<string, string> options)
+    {
+        await OrphanCatalogueInputList.CreateAsync(
+            Required(options, "--blob-root"), Required(options, "--output")).ConfigureAwait(false);
+        return 0;
+    }
+
+    private static async Task<int> CatalogueScanAsync(IReadOnlyDictionary<string, string> options)
+    {
+        await using var store = new OrphanCatalogueStore(
+            Required(options, "--database"), Required(options, "--summary"));
+        await new OrphanCatalogueScanner().ScanAsync(
+            Required(options, "--blob-root"), Required(options, "--inventory"), store).ConfigureAwait(false);
+        return 0;
+    }
+
+    private static async Task<int> RecoverFullAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var inventory = await ReadJsonAsync<LegacyInventoryCandidate[]>(Required(options, "--inventory"))
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Inventory file is empty.");
+        var cataloguePath = Required(options, "--catalogue");
+        await using var store = new OrphanCatalogueStore(
+            cataloguePath, cataloguePath + ".completion.json");
+        await store.OpenCompletedAsync().ConfigureAwait(false);
+        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
+        var result = await new LegacySourceRecovery().WriteAsync(
+            inventory, store, Required(options, "--output"), minimum).ConfigureAwait(false);
+        return result.MeetsMinimumCoverage ? 0 : 3;
+    }
+
+    private static async Task<int> ExportBatchesAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var masterPath = Required(options, "--master");
+        var masterBytes = await File.ReadAllBytesAsync(masterPath).ConfigureAwait(false);
+        var master = JsonSerializer.Deserialize<FullRecoveryMasterManifest>(masterBytes, ReportJsonOptions)
+            ?? throw new InvalidDataException("Master recovery manifest is empty.");
+        if (master.RecoverableLinks == 0 || master.RecoverableFraction < 0.90m)
+            throw new InvalidDataException("Master recovery manifest has not passed the 90% coverage gate.");
+        var masterDigest = Convert.ToHexString(SHA256.HashData(masterBytes)).ToLowerInvariant();
+        var blobRoot = Required(options, "--blob-root");
+        var releases = new List<FullRecoveryRelease>();
+        foreach (var group in master.Items.Where(item =>
+                     item.Classification is "exact-direct" or "exact-archive")
+                 .GroupBy(item => item.PayloadSha256, StringComparer.Ordinal))
+        {
+            if (group.Key is null || group.Any(item => item.SourceRelativePath is null))
+                throw new InvalidDataException("Recoverable master rows require payload provenance.");
+            var sourceRelativePath = group.Select(item => item.SourceRelativePath!).Distinct(StringComparer.Ordinal)
+                .Order(StringComparer.Ordinal).First();
+            var sourcePath = OrphanCatalogueInputList.ResolveSafePath(blobRoot, sourceRelativePath);
+            var info = new FileInfo(sourcePath);
+            if (!info.Exists || info.LinkTarget is not null || info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                throw new InvalidDataException("A recovered payload is missing or unsafe.");
+            await using var payload = File.OpenRead(sourcePath);
+            var actualDigest = Convert.ToHexString(await SHA256.HashDataAsync(payload).ConfigureAwait(false))
+                .ToLowerInvariant();
+            if (!string.Equals(actualDigest, group.Key, StringComparison.Ordinal))
+                throw new InvalidDataException("A recovered payload changed after catalogue sealing.");
+            releases.Add(new FullRecoveryRelease(group.Key, group.Key, sourceRelativePath, info.Length,
+                group.OrderBy(item => item.LibraryRelativePath, StringComparer.Ordinal).ToArray()));
+        }
+        var batches = new BatchPackagePlanner().Partition(releases,
+            ParsePositiveInt(options, "--max-releases", 250),
+            ParsePositiveLong(options, "--max-payload-bytes", 4L * 1024 * 1024 * 1024));
+        var output = Path.GetFullPath(Required(options, "--output"));
+        if (Directory.Exists(output) || File.Exists(output))
+            throw new IOException($"Batch export destination already exists: {output}");
+        if (OperatingSystem.IsWindows()) Directory.CreateDirectory(output);
+        else Directory.CreateDirectory(output, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        try
+        {
+            foreach (var batch in batches)
+            {
+                var exportReleases = batch.Releases.Select(release => new CanaryExportRelease(
+                    release.SourceReleaseId,
+                    null,
+                    OrphanCatalogueInputList.ResolveSafePath(blobRoot, release.PayloadRelativePath),
+                    release.Items.Select(item => new NzbDavExportLeaf(
+                        item.LegacyDavItemId,
+                        item.LegacyPath ?? throw new InvalidDataException("Recovered leaf is missing its legacy path."),
+                        item.FileSize ?? throw new InvalidDataException("Recovered leaf is missing its exact size."),
+                        release.SourceReleaseId,
+                        null,
+                        null,
+                        item.IdentityKind ?? throw new InvalidDataException("Recovered leaf is missing identity kind."),
+                        item.IdentityDigest,
+                        "ready",
+                        null,
+                        item.Classification == "exact-archive" ? item.IdentityKind : null,
+                        item.Classification == "exact-archive" ? item.IdentityDigest : null)).ToArray())).ToArray();
+                var selected = batch.Releases.SelectMany(release => release.Items).Select(item =>
+                    new NzbDavSelectedLibraryLink(item.LibraryRelativePath, item.OriginalTarget,
+                        item.LegacyDavItemId)).ToArray();
+                var request = new CanaryExportRequest(
+                    $"full-{masterDigest[..12]}-{batch.BatchIndex + 1:D4}",
+                    Path.Join(output, $"batch-{batch.BatchIndex + 1:D4}"), exportReleases, selected);
+                await new CanaryPackageWriter().WriteFullBatchAsync(
+                    request, masterDigest, batch.BatchIndex, batches.Count).ConfigureAwait(false);
+            }
+            return 0;
+        }
+        catch
+        {
+            if (Directory.Exists(output)) Directory.Delete(output, recursive: true);
+            throw;
+        }
+    }
+
     private static async Task<int> ApplyLinksAsync(IReadOnlyDictionary<string, string> options)
     {
         var plan = Required(options, "--plan");
@@ -56,6 +177,7 @@ internal static class NzbDavMigrationProgram
                       ?? Path.Join(Path.GetDirectoryName(Path.GetFullPath(plan))!, "apply-journal.json");
         await new CanaryLinkApplier().ApplyAsync(
             plan,
+            Required(options, "--source-root"),
             Required(options, "--library-root"),
             Required(options, "--target-root"),
             journal).ConfigureAwait(false);
@@ -69,6 +191,21 @@ internal static class NzbDavMigrationProgram
             .ConfigureAwait(false);
         await Console.Out.WriteLineAsync(JsonSerializer.Serialize(result, ReportJsonOptions));
         return 0;
+    }
+
+    private static async Task<int> CoverageReportAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var result = await new CanaryCoverageReporter().WriteAsync(
+            Required(options, "--source-root"),
+            Required(options, "--library-root"),
+            Required(options, "--initial-inventory"),
+            Required(options, "--master"),
+            Required(options, "--journals-dir"),
+            Required(options, "--output"),
+            ParseCoverage(options, "--minimum-coverage", 0.90m)).ConfigureAwait(false);
+        await Console.Out.WriteLineAsync(Path.GetFullPath(Required(options, "--output")));
+        if (result.HasOwnershipErrors) return 1;
+        return result.Report.MeetsMinimumCoverage ? 0 : 3;
     }
 
     private static async Task<int> ValidateLinksAsync(IReadOnlyDictionary<string, string> options)
@@ -224,6 +361,31 @@ internal static class NzbDavMigrationProgram
         if (value is null)
             return defaultValue;
         if (!int.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed <= 0)
+            throw new InvalidDataException($"{name} must be a positive integer.");
+        return parsed;
+    }
+
+    private static decimal ParseCoverage(
+        IReadOnlyDictionary<string, string> options,
+        string name,
+        decimal defaultValue)
+    {
+        var value = Optional(options, name);
+        if (value is null) return defaultValue;
+        if (!decimal.TryParse(value, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var parsed)
+            || parsed is < 0 or > 1)
+            throw new InvalidDataException($"{name} must be between 0 and 1.");
+        return parsed;
+    }
+
+    private static long ParsePositiveLong(
+        IReadOnlyDictionary<string, string> options,
+        string name,
+        long defaultValue)
+    {
+        var value = Optional(options, name);
+        if (value is null) return defaultValue;
+        if (!long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out var parsed) || parsed <= 0)
             throw new InvalidDataException($"{name} must be a positive integer.");
         return parsed;
     }

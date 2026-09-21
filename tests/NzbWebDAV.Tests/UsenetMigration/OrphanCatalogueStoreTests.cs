@@ -1,0 +1,172 @@
+using System.Text.Json;
+using Microsoft.Data.Sqlite;
+using NzbDavMigration.Catalogue;
+
+namespace NzbWebDAV.Tests.UsenetMigration;
+
+public sealed class OrphanCatalogueStoreTests : IAsyncDisposable
+{
+    private readonly string _root = Path.Join(Path.GetTempPath(), $"orphan-catalogue-{Guid.NewGuid():N}");
+
+    [Fact]
+    public async Task NewStore_UpsertsAndResumesTheSameFrozenInput()
+    {
+        var (database, summary) = Paths();
+        await using (var store = new OrphanCatalogueStore(database, summary, batchSize: 2))
+        {
+            await store.BeginAsync(Digest('a'));
+            await store.UpsertAsync(Blob("one.nzb", Digest('1'), "release-a", "one@test"));
+            await store.UpsertAsync(Blob("two.nzb", Digest('2'), "release-b", "two@test"));
+        }
+
+        await using var resumed = new OrphanCatalogueStore(database, summary, batchSize: 2);
+        await resumed.BeginAsync(Digest('a'));
+        var state = await resumed.ReadStateAsync();
+        Assert.Equal("building", state.Status);
+        Assert.Equal(2, state.BlobCount);
+        Assert.Equal(2, state.ArticleCount);
+    }
+
+    [Fact]
+    public async Task Upsert_ReplacesBlobArticlesAndGroupsDuplicatePayloads()
+    {
+        var (database, summary) = Paths();
+        await using var store = new OrphanCatalogueStore(database, summary);
+        await store.BeginAsync(Digest('a'));
+        await store.UpsertAsync(Blob("one.nzb", Digest('1'), "release-a", "old@test"));
+        await store.UpsertAsync(Blob("one.nzb", Digest('1'), "release-a", "new@test"));
+        await store.UpsertAsync(Blob("copy.nzb", Digest('1'), "release-a", "new@test"));
+
+        Assert.Equal(["copy.nzb", "one.nzb"], await store.FindBlobPathsBySha256Async(Digest('1')));
+        var state = await store.ReadStateAsync();
+        Assert.Equal(2, state.BlobCount);
+        Assert.Equal(2, state.ArticleCount);
+    }
+
+    [Fact]
+    public async Task CancelledBuild_PersistsThePartialBatchForResume()
+    {
+        var (database, summary) = Paths();
+        await using (var store = new OrphanCatalogueStore(database, summary, batchSize: 100))
+        {
+            await store.BeginAsync(Digest('a'));
+            await store.UpsertAsync(Blob("partial.nzb", Digest('1'), "release-a", "one@test"));
+        }
+
+        await using var resumed = new OrphanCatalogueStore(database, summary);
+        await resumed.BeginAsync(Digest('a'));
+        var state = await resumed.ReadStateAsync();
+        Assert.Equal("building", state.Status);
+        Assert.Equal(1, state.BlobCount);
+    }
+
+    [Fact]
+    public async Task FailedBlobUpsert_RollsBackThatBlobButKeepsEarlierCompletedWork()
+    {
+        var (database, summary) = Paths();
+        await using (var store = new OrphanCatalogueStore(database, summary, batchSize: 100))
+        {
+            await store.BeginAsync(Digest('a'));
+            await store.UpsertAsync(Blob("complete.nzb", Digest('1'), "release-a", "one@test"));
+            var duplicate = new OrphanCatalogueArticle("duplicate@test", 0, 0, 123);
+            var invalid = new OrphanCatalogueBlob("partial.nzb", 123, 456, Digest('2'), "valid", null,
+                "release-b", [duplicate, duplicate]);
+            await Assert.ThrowsAsync<SqliteException>(() => store.UpsertAsync(invalid));
+        }
+
+        await using var resumed = new OrphanCatalogueStore(database, summary);
+        await resumed.BeginAsync(Digest('a'));
+        var state = await resumed.ReadStateAsync();
+        Assert.Equal(1, state.BlobCount);
+        Assert.Equal(1, state.ArticleCount);
+    }
+
+    [Fact]
+    public async Task Begin_RejectsAChangedFrozenInputDigest()
+    {
+        var (database, summary) = Paths();
+        await using var store = new OrphanCatalogueStore(database, summary);
+        await store.BeginAsync(Digest('a'));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => store.BeginAsync(Digest('b')));
+    }
+
+    [Fact]
+    public async Task Seal_CompletesStateWritesChecksummedSummaryAndCannotResumeWithDifferentInput()
+    {
+        var (database, summaryPath) = Paths();
+        var summary = new OrphanCatalogueSummary(1, 1, 0, 0, Digest('a'));
+        await using (var store = new OrphanCatalogueStore(database, summaryPath))
+        {
+            await store.BeginAsync(Digest('a'));
+            await store.UpsertAsync(Blob("one.nzb", Digest('1'), "release-a", "one@test"));
+            await store.SealAsync(summary);
+            var state = await store.ReadStateAsync();
+            Assert.Equal("complete", state.Status);
+            Assert.NotNull(state.CompletedAt);
+        }
+
+        var document = JsonSerializer.Deserialize<OrphanCatalogueCompletionDocument>(
+            await File.ReadAllTextAsync(summaryPath))!;
+        Assert.Equal(summary, document.Summary);
+        Assert.Equal(64, document.Sha256.Length);
+        Assert.Equal(OrphanCatalogueCompletionDocument.ComputeDigest(summary), document.Sha256);
+
+        await using var reopened = new OrphanCatalogueStore(database, summaryPath);
+        await reopened.BeginAsync(Digest('a'));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => reopened.BeginAsync(Digest('b')));
+        await using var observer = new SqliteConnection($"Data Source={database};Mode=ReadOnly");
+        await observer.OpenAsync();
+        await using var journalMode = observer.CreateCommand();
+        journalMode.CommandText = "PRAGMA journal_mode";
+        Assert.Equal("delete", await journalMode.ExecuteScalarAsync());
+    }
+
+    [Fact]
+    public async Task DatabaseAndSummary_ArePrivateOnLinux()
+    {
+        if (OperatingSystem.IsWindows()) return;
+        var (database, summaryPath) = Paths();
+        await using var store = new OrphanCatalogueStore(database, summaryPath);
+        await store.BeginAsync(Digest('a'));
+        await store.SealAsync(new OrphanCatalogueSummary(0, 0, 0, 0, Digest('a')));
+
+        const UnixFileMode expected = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        Assert.Equal(expected, File.GetUnixFileMode(database));
+        Assert.Equal(expected, File.GetUnixFileMode(summaryPath));
+    }
+
+    [Fact]
+    public async Task Upsert_CommitsInBoundedBatches()
+    {
+        var (database, summary) = Paths();
+        await using var store = new OrphanCatalogueStore(database, summary, batchSize: 2);
+        await store.BeginAsync(Digest('a'));
+        await store.UpsertAsync(Blob("one.nzb", Digest('1'), "release-a", "one@test"));
+        await store.UpsertAsync(Blob("two.nzb", Digest('2'), "release-b", "two@test"));
+
+        await using var observer = new SqliteConnection($"Data Source={database};Mode=ReadOnly");
+        await observer.OpenAsync();
+        await using var command = observer.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM Blobs";
+        Assert.Equal(2L, (long)(await command.ExecuteScalarAsync())!);
+    }
+
+    private (string Database, string Summary) Paths()
+    {
+        Directory.CreateDirectory(_root);
+        return (Path.Join(_root, "catalogue.sqlite"), Path.Join(_root, "catalogue-summary.json"));
+    }
+
+    private static OrphanCatalogueBlob Blob(string path, string sha256, string releaseDigest, string messageId) =>
+        new(path, 123, 456, sha256, "valid", null, releaseDigest,
+            [new OrphanCatalogueArticle(messageId, 0, 0, 123)]);
+
+    private static string Digest(char value) => new(value, 64);
+
+    public async ValueTask DisposeAsync()
+    {
+        SqliteConnection.ClearAllPools();
+        if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);
+        await ValueTask.CompletedTask;
+    }
+}

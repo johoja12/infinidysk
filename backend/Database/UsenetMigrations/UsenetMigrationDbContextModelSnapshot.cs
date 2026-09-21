@@ -226,6 +226,92 @@ namespace NzbWebDAV.Database.UsenetMigrations
                     b.ToTable("CategoryMap", (string)null);
                 });
 
+            modelBuilder.Entity("NzbWebDAV.Database.Models.UsenetMigration.MigrationNzbDavBatch", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("AppliedCount")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("BatchIndex")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<long>("MasterId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("PackageDigest")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PlanDigest")
+                        .HasColumnType("TEXT");
+
+                    b.Property<long?>("RunId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("SelectionCount")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("ValidatedCount")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("PackageDigest")
+                        .IsUnique();
+
+                    b.HasIndex("RunId");
+
+                    b.HasIndex("Status");
+
+                    b.HasIndex("MasterId", "BatchIndex")
+                        .IsUnique();
+
+                    b.ToTable("NzbDavBatches", (string)null);
+                });
+
+            modelBuilder.Entity("NzbWebDAV.Database.Models.UsenetMigration.MigrationNzbDavMaster", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ManifestDigest")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("RecoverableCount")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("SourceLinkCount")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("ManifestDigest")
+                        .IsUnique();
+
+                    b.HasIndex("Status");
+
+                    b.ToTable("NzbDavMasters", (string)null);
+                });
+
             modelBuilder.Entity("NzbWebDAV.Database.Models.UsenetMigration.MigrationPreferences", b =>
                 {
                     b.Property<int>("Id")
@@ -676,6 +762,15 @@ namespace NzbWebDAV.Database.UsenetMigrations
                     b.HasOne("NzbWebDAV.Database.Models.UsenetMigration.MigrationRun", null)
                         .WithMany()
                         .HasForeignKey("RunId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
+                });
+
+            modelBuilder.Entity("NzbWebDAV.Database.Models.UsenetMigration.MigrationNzbDavBatch", b =>
+                {
+                    b.HasOne("NzbWebDAV.Database.Models.UsenetMigration.MigrationNzbDavMaster", null)
+                        .WithMany()
+                        .HasForeignKey("MasterId")
                         .OnDelete(DeleteBehavior.Cascade)
                         .IsRequired();
                 });

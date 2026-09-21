@@ -2,9 +2,10 @@ namespace NzbDavMigration.Canary;
 
 public sealed class CanaryApplyJournal
 {
-    public int SchemaVersion { get; set; } = 1;
+    public int SchemaVersion { get; set; } = 2;
     public string PlanPath { get; set; } = "";
     public string PlanSha256 { get; set; } = "";
+    public string SourceRoot { get; set; } = "";
     public string LibraryRoot { get; set; } = "";
     public string TargetRoot { get; set; } = "";
     public List<string> CreatedDirectories { get; set; } = [];
@@ -15,6 +16,8 @@ public sealed class CanaryApplyJournal
 public sealed class CanaryApplyJournalLink
 {
     public string LibraryRelativePath { get; set; } = "";
+    public string SourceLinkPath { get; set; } = "";
+    public string ObservedSourceTarget { get; set; } = "";
     public string LinkPath { get; set; } = "";
     public string TargetPath { get; set; } = "";
     public long ExpectedFileSize { get; set; }

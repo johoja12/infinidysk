@@ -87,4 +87,49 @@ public sealed class NzbDavArticleIdentityTests
         Assert.Throws<InvalidDataException>(() =>
             NzbDavArticleIdentity.ComputeArchiveMember(releaseDigest, path, 1_000));
     }
+
+    [Fact]
+    public void StableArchiveDigest_IgnoresPublishedNameAndUsesExactRanges()
+    {
+        var releaseDigest = NzbDavArticleIdentity.ComputeRelease(
+            [[new NzbDavArticleSegment(1, 100, "archive@test")]]);
+        var parts = new[]
+        {
+            new NzbDavArchivePartIdentity(
+                [new NzbDavArticleSegment(1, 100, "archive@test")],
+                SegmentStart: 0,
+                SegmentLength: 100,
+                FileStart: 4_096,
+                FileLength: 80),
+        };
+
+        var first = NzbDavStableArchiveIdentity.Compute(releaseDigest, parts, 80);
+        var renamed = NzbDavStableArchiveIdentity.Compute(releaseDigest, parts, 80);
+        var movedRange = NzbDavStableArchiveIdentity.Compute(
+            releaseDigest,
+            [parts[0] with { FileStart = 8_192 }],
+            80);
+
+        Assert.Equal(first, renamed);
+        Assert.NotEqual(first, movedRange);
+        Assert.Matches("^[0-9a-f]{64}$", first);
+    }
+
+    [Fact]
+    public void StableArchiveDigest_RejectsMissingPartsAndInvalidRanges()
+    {
+        var releaseDigest = new string('a', 64);
+
+        Assert.Throws<InvalidDataException>(() =>
+            NzbDavStableArchiveIdentity.Compute(releaseDigest, [], 1));
+        Assert.Throws<InvalidDataException>(() =>
+            NzbDavStableArchiveIdentity.Compute(releaseDigest,
+                [new NzbDavArchivePartIdentity(
+                    [new NzbDavArticleSegment(1, 1, "one@test")],
+                    SegmentStart: -1,
+                    SegmentLength: 1,
+                    FileStart: 0,
+                    FileLength: 1)],
+                1));
+    }
 }

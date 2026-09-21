@@ -22,6 +22,23 @@ internal sealed record NzbDavMigrationConnectionValues(
     int SubmitWorkers,
     IReadOnlyList<string> SourceCategories);
 
+internal sealed record NzbDavFullConnectionValues(
+    string SourcePackageRoot,
+    string MasterManifestDigest,
+    string PackageDigest,
+    int BatchIndex,
+    int SelectionCount,
+    int SourceLinkCount,
+    int RecoverableCount,
+    int MaxQueueDepth,
+    int SubmitWorkers,
+    IReadOnlyList<string> SourceCategories);
+
+internal sealed record NzbDavFullConnectionResult(
+    MigrationNzbDavMaster Master,
+    MigrationNzbDavBatch Batch,
+    bool AlreadyRegistered);
+
 internal sealed record MigrationCategoryMappingChange(
     string AltmountCategory,
     string? TargetCategory,
@@ -315,6 +332,251 @@ public sealed class UsenetMigrationStore : IDisposable
         await transaction.CommitAsync(ct).ConfigureAwait(false);
         return transition;
     }
+
+    internal async Task<NzbDavFullConnectionResult> ApplyNzbDavFullConnectionAsync(
+        NzbDavFullConnectionValues values,
+        CancellationToken ct = default)
+    {
+        await using var ctx = ContextFactory();
+        await GetOrCreateSessionAsync(ctx, ct).ConfigureAwait(false);
+        ctx.ChangeTracker.Clear();
+        await using var transaction = await ctx.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
+
+        var master = await ctx.NzbDavMasters
+            .SingleOrDefaultAsync(item => item.ManifestDigest == values.MasterManifestDigest, ct)
+            .ConfigureAwait(false);
+        if (master is null)
+        {
+            var unfinishedOtherMaster = await ctx.NzbDavBatches.AsNoTracking()
+                .AnyAsync(item => item.Status != "acknowledged", ct).ConfigureAwait(false);
+            if (unfinishedOtherMaster)
+                throw new InvalidOperationException("Another full-library recovery still has an active batch.");
+            if (values.BatchIndex != 0)
+                throw new InvalidOperationException("A full-library recovery must begin with batch index 0.");
+            var now = DateTime.UtcNow;
+            master = new MigrationNzbDavMaster
+            {
+                ManifestDigest = values.MasterManifestDigest,
+                SourceLinkCount = values.SourceLinkCount,
+                RecoverableCount = values.RecoverableCount,
+                Status = "active",
+                CreatedAt = now,
+                UpdatedAt = now,
+            };
+            ctx.NzbDavMasters.Add(master);
+            await ctx.SaveChangesAsync(ct).ConfigureAwait(false);
+        }
+        else if (master.SourceLinkCount != values.SourceLinkCount
+                 || master.RecoverableCount != values.RecoverableCount)
+        {
+            throw new InvalidOperationException("Full-library recovery counts disagree with the registered master.");
+        }
+
+        var existing = await ctx.NzbDavBatches
+            .SingleOrDefaultAsync(item => item.MasterId == master.Id && item.BatchIndex == values.BatchIndex, ct)
+            .ConfigureAwait(false);
+        if (existing is not null)
+        {
+            if (!string.Equals(existing.PackageDigest, values.PackageDigest, StringComparison.Ordinal)
+                || existing.SelectionCount != values.SelectionCount)
+                throw new InvalidOperationException("A different package is already registered at this batch index.");
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            return new NzbDavFullConnectionResult(master, existing, AlreadyRegistered: true);
+        }
+
+        var batches = await ctx.NzbDavBatches.AsNoTracking()
+            .Where(item => item.MasterId == master.Id)
+            .OrderBy(item => item.BatchIndex)
+            .ToListAsync(ct).ConfigureAwait(false);
+        if (values.BatchIndex != batches.Count
+            || batches.Select(item => item.BatchIndex).Where((index, position) => index != position).Any())
+            throw new InvalidOperationException("Full-library batches must be connected in contiguous index order.");
+        if (batches.Any(item => item.Status != "acknowledged"))
+            throw new InvalidOperationException(
+                "The previous full-library batch must be terminal, exact, applied, validated, and acknowledged first.");
+
+        var transition = await TryTransitionSessionAsync(ctx, MigrationSessionTransition.Connect, ct)
+            .ConfigureAwait(false);
+        if (!transition.Succeeded)
+            throw new InvalidOperationException(
+                $"Cannot connect while migration operation '{transition.CurrentStatus}' is active.");
+
+        var timestamp = DateTime.UtcNow;
+        var session = await ctx.SessionState.SingleAsync(item => item.Id == SessionId, ct).ConfigureAwait(false);
+        session.SourceType = MigrationSourceTypes.NzbDav;
+        session.SourcePackageRoot = values.SourcePackageRoot;
+        session.CanaryLibraryRoot = "/mnt/plex2";
+        session.AltmountMetadataRoot = null;
+        session.AltmountConfigPath = null;
+        session.AltmountStoreRoot = null;
+        session.CurrentRunId = null;
+        session.MaxQueueDepth = ClampMaxQueueDepth(values.MaxQueueDepth);
+        session.SubmitWorkers = ClampSubmitWorkers(values.SubmitWorkers, session.MaxQueueDepth);
+        session.UpdatedAt = timestamp;
+
+        var preferences = await ctx.Preferences.FirstOrDefaultAsync(item => item.Id == SessionId, ct)
+            .ConfigureAwait(false);
+        if (preferences is null)
+        {
+            preferences = new MigrationPreferences { Id = SessionId };
+            ctx.Preferences.Add(preferences);
+        }
+        preferences.SourceType = MigrationSourceTypes.NzbDav;
+        preferences.SourcePackageRoot = values.SourcePackageRoot;
+        preferences.CanaryLibraryRoot = "/mnt/plex2";
+        preferences.MaxQueueDepth = session.MaxQueueDepth;
+        preferences.SubmitWorkers = session.SubmitWorkers;
+        preferences.UpdatedAt = timestamp;
+
+        await ctx.CategoryMap.ExecuteDeleteAsync(ct).ConfigureAwait(false);
+        ctx.CategoryMap.AddRange(values.SourceCategories
+            .Distinct(StringComparer.Ordinal)
+            .Order(StringComparer.Ordinal)
+            .Select(category => new MigrationCategoryMap
+            {
+                AltmountCategory = category,
+                AltmountDir = category,
+                AltmountSanitizedDir = category,
+                Action = "migrate",
+                DiscoveredBy = "scan",
+                UpdatedAt = timestamp,
+            }));
+        var batch = new MigrationNzbDavBatch
+        {
+            MasterId = master.Id,
+            BatchIndex = values.BatchIndex,
+            PackageDigest = values.PackageDigest,
+            SelectionCount = values.SelectionCount,
+            Status = "connected",
+        };
+        ctx.NzbDavBatches.Add(batch);
+        master.Status = "active";
+        master.UpdatedAt = timestamp;
+        await ctx.SaveChangesAsync(ct).ConfigureAwait(false);
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        return new NzbDavFullConnectionResult(master, batch, AlreadyRegistered: false);
+    }
+
+    internal async Task<NzbDavMasterStatus?> GetNzbDavFullStatusAsync(CancellationToken ct = default)
+    {
+        await using var ctx = ContextFactory();
+        var master = await ctx.NzbDavMasters.AsNoTracking()
+            .OrderByDescending(item => item.Id)
+            .FirstOrDefaultAsync(ct).ConfigureAwait(false);
+        if (master is null)
+            return null;
+        var batches = await ctx.NzbDavBatches.AsNoTracking()
+            .Where(item => item.MasterId == master.Id)
+            .OrderBy(item => item.BatchIndex)
+            .Select(item => new NzbDavBatchStatus(
+                item.Id, item.BatchIndex, item.PackageDigest, item.SelectionCount, item.Status,
+                item.RunId, item.PlanDigest, item.AppliedCount, item.ValidatedCount))
+            .ToListAsync(ct).ConfigureAwait(false);
+        return new NzbDavMasterStatus(
+            master.Id, master.ManifestDigest, master.SourceLinkCount, master.RecoverableCount,
+            master.Status, master.CreatedAt, master.UpdatedAt, batches);
+    }
+
+    internal async Task AttachNzbDavBatchRunAsync(
+        string packageDigest,
+        long runId,
+        CancellationToken ct = default)
+    {
+        await using var ctx = ContextFactory();
+        var batch = await ctx.NzbDavBatches
+            .SingleOrDefaultAsync(item => item.PackageDigest == packageDigest, ct).ConfigureAwait(false);
+        if (batch is null)
+            return;
+        batch.RunId = runId;
+        batch.Status = "running";
+        await ctx.SaveChangesAsync(ct).ConfigureAwait(false);
+    }
+
+    internal async Task MarkNzbDavBatchScannedAsync(string packageDigest, CancellationToken ct = default)
+    {
+        await using var ctx = ContextFactory();
+        await ctx.NzbDavBatches
+            .Where(item => item.PackageDigest == packageDigest && item.Status == "connected")
+            .ExecuteUpdateAsync(setters => setters.SetProperty(item => item.Status, "scanned"), ct)
+            .ConfigureAwait(false);
+    }
+
+    internal async Task<NzbDavBatchStatus> AcknowledgeNzbDavBatchAsync(
+        string masterManifestDigest,
+        int batchIndex,
+        string packageDigest,
+        IReadOnlyCollection<string> selectedSourceIds,
+        string planDigest,
+        int appliedCount,
+        int validatedCount,
+        CancellationToken ct = default)
+    {
+        await using var ctx = ContextFactory();
+        await using var transaction = await ctx.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
+        var session = await ctx.SessionState.AsNoTracking()
+            .SingleAsync(item => item.Id == SessionId, ct).ConfigureAwait(false);
+        if (session.Status != MigrationSessionStatus.Complete)
+            throw new InvalidOperationException("The active batch must reach terminal completion first.");
+        var activeSubmissions = await ctx.Submissions.AsNoTracking().AnyAsync(
+            item => item.State == "pending" || item.State == "submitting" || item.State == "submitted"
+                    || item.State == "processing", ct).ConfigureAwait(false);
+        if (activeSubmissions)
+            throw new InvalidOperationException("The active batch still has submissions in progress.");
+
+        var master = await ctx.NzbDavMasters
+            .SingleOrDefaultAsync(item => item.ManifestDigest == masterManifestDigest, ct)
+            .ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The full-library master is not registered.");
+        var batch = await ctx.NzbDavBatches
+            .SingleOrDefaultAsync(item => item.MasterId == master.Id && item.BatchIndex == batchIndex, ct)
+            .ConfigureAwait(false)
+            ?? throw new InvalidOperationException("The full-library batch is not registered.");
+        if (!string.Equals(batch.PackageDigest, packageDigest, StringComparison.Ordinal))
+            throw new InvalidOperationException("The active package does not match the registered batch.");
+        if (batch.Status == "acknowledged")
+        {
+            if (!string.Equals(batch.PlanDigest, planDigest, StringComparison.Ordinal)
+                || batch.AppliedCount != appliedCount || batch.ValidatedCount != validatedCount)
+                throw new InvalidOperationException("The persisted acknowledgement differs from this request.");
+            await transaction.CommitAsync(ct).ConfigureAwait(false);
+            return ToBatchStatus(batch);
+        }
+        if (appliedCount != batch.SelectionCount || validatedCount != batch.SelectionCount)
+            throw new InvalidOperationException("Every selected link must be applied and validated before acknowledgement.");
+        if (selectedSourceIds.Count != batch.SelectionCount)
+            throw new InvalidOperationException("The package selection count disagrees with the registered batch.");
+
+        var correlated = await ctx.ReleaseFiles.AsNoTracking()
+            .Where(item => item.SourceFileId != null && selectedSourceIds.Contains(item.SourceFileId))
+            .Select(item => new { item.SourceFileId, item.FileStatus, item.NewDavItemId })
+            .ToListAsync(ct).ConfigureAwait(false);
+        var exactIds = correlated
+            .Where(item => item.FileStatus == "exact" && item.NewDavItemId != null)
+            .GroupBy(item => item.SourceFileId!, StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Count() == 1)
+            .Select(group => group.Key)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (exactIds.Count != selectedSourceIds.Count
+            || selectedSourceIds.Any(id => !exactIds.Contains(id)))
+            throw new InvalidOperationException("Every selected link must have one exact terminal correlation.");
+
+        batch.PlanDigest = planDigest;
+        batch.AppliedCount = appliedCount;
+        batch.ValidatedCount = validatedCount;
+        batch.Status = "acknowledged";
+        if (!await ctx.NzbDavBatches.AnyAsync(
+                item => item.MasterId == master.Id && item.Id != batch.Id && item.Status != "acknowledged", ct)
+            .ConfigureAwait(false))
+            master.Status = "awaiting-next-batch";
+        master.UpdatedAt = DateTime.UtcNow;
+        await ctx.SaveChangesAsync(ct).ConfigureAwait(false);
+        await transaction.CommitAsync(ct).ConfigureAwait(false);
+        return ToBatchStatus(batch);
+    }
+
+    private static NzbDavBatchStatus ToBatchStatus(MigrationNzbDavBatch item) => new(
+        item.Id, item.BatchIndex, item.PackageDigest, item.SelectionCount, item.Status,
+        item.RunId, item.PlanDigest, item.AppliedCount, item.ValidatedCount);
 
     /// <summary>
     /// Saves Step 6 paths and claims plan generation in one transaction, so the

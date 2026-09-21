@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="fixture" date="1" subject="ambiguous.mkv">
+    <groups><group>alt.test</group></groups>
+    <segments><segment bytes="12" number="1">ambiguous@test</segment></segments>
+  </file>
+  <file poster="fixture" date="1" subject="variant-b.txt">
+    <groups><group>alt.test</group></groups>
+    <segments><segment bytes="2" number="1">variant-b@test</segment></segments>
+  </file>
+</nzb>

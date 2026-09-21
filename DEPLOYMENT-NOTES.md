@@ -214,22 +214,41 @@ key.
 
 ## Required migration approach
 
-1. Export a read-only manifest keyed by legacy DavItem ID, source article identity,
-   type, and exact size.
-2. Parse and index the full orphan NZB set. Classify exact, duplicate, ambiguous,
-   corrupt, and missing matches against live library items.
-3. Replay a bounded batch through InfiniDysk's normal import path.
-4. Match old and new leaves using segment/article identity plus size, with names as
-   supporting evidence only.
-5. Persist a legacy-ID-to-canonical-ID mapping and add a compatibility resolver for
-   the old `/.ids/...` paths. This keeps the Plex library paths and symlink targets
-   unchanged.
-6. Verify HEAD, range, seek, and representative playback through unchanged library
-   links before any consumer cutover.
-7. Enable a separate InfiniDysk segment-cache path and warm selected mapped items.
-   Do not copy old native-cache files.
+The approved implementation creates a separate local `/mnt/plex2` tree; it does
+not rewrite `/mnt/plex` and does not add a compatibility resolver to the legacy
+mount.
+
+1. Back up InfiniDysk `/config` and PostgreSQL before deploying the importer. Its
+   full-batch ledger migration is additive and auto-applies at startup.
+2. Freeze a no-follow inventory of `/mnt/plex` and a private orphan-blob input
+   list. Keep the run directory `0700` and generated evidence `0600`.
+3. Build the resumable SQLite orphan catalogue. Classify byte-identical duplicate,
+   distinct ambiguity, corrupt, missing, direct, and archive evidence without using
+   filenames as identity.
+4. Require the checksummed dry run to recover at least 90% of source links before
+   exporting. The default batch bounds are 250 releases and 4 GiB of NZB payload;
+   lower them when queue pressure requires it.
+5. Import batches in order through InfiniDysk's normal queue/history path. Pause
+   and resume the same package when needed; reconnects with the same digest are
+   idempotent. Do not advance until the current batch is terminal, reconciled,
+   exact, applied, validated, and acknowledged.
+6. Apply each exact-only plan create-only beneath `/mnt/plex2`, with `/mnt/plex` as
+   the required source-drift fence and `/mnt/remote/infinidysk` as the target root.
+   Retain the checksummed plan, apply journal, and bounded-read validation report.
+7. Run a fresh delta inventory after the initial batches, process added links, and
+   generate aggregate coverage using the live final source snapshot as denominator.
+8. Verify HEAD, range, seek, six-file first/repeat speed evidence, and representative
+   playback manually. Use direct backend port `8080` for throughput claims.
+9. Roll back only with the matching apply journal. Do not copy old native-cache
+   files or delete imported data/evidence as part of symlink rollback.
+
+Exact commands and artifact semantics are in
+`docs/guides/nzbdav-migration.md`. The setup wizard remains unchanged: this is an
+advanced migration workflow and adds no `ConfigKeys` option.
 
 No bulk import, library rewrite, Plex/*Arr switch, or native-cache copy has occurred.
+`/mnt/plex2` must remain unregistered with both Plex and every Arr application
+through the full recovery and manual end-to-end validation period.
 
 ## Operator checks
 

@@ -41,6 +41,8 @@ public sealed class UsenetMigrationDbContext : DbContext
     public DbSet<MigratedFile> MigratedFiles => Set<MigratedFile>();
     public DbSet<MigrationSymlinkRewrite> SymlinkRewrites => Set<MigrationSymlinkRewrite>();
     public DbSet<MigrationCanaryLink> CanaryLinks => Set<MigrationCanaryLink>();
+    public DbSet<MigrationNzbDavMaster> NzbDavMasters => Set<MigrationNzbDavMaster>();
+    public DbSet<MigrationNzbDavBatch> NzbDavBatches => Set<MigrationNzbDavBatch>();
     public DbSet<MigrationScanError> ScanErrors => Set<MigrationScanError>();
 
     protected override void OnModelCreating(ModelBuilder b)
@@ -185,6 +187,32 @@ public sealed class UsenetMigrationDbContext : DbContext
             e.HasIndex(x => new { x.RunId, x.LibraryRelativePath }).IsUnique();
             e.HasIndex(x => x.ApplyStatus);
             e.HasIndex(x => x.CorrelationStatus);
+        });
+
+        b.Entity<MigrationNzbDavMaster>(e =>
+        {
+            e.ToTable("NzbDavMasters");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.ManifestDigest).IsRequired();
+            e.Property(x => x.Status).IsRequired();
+            e.HasIndex(x => x.ManifestDigest).IsUnique();
+            e.HasIndex(x => x.Status);
+        });
+
+        b.Entity<MigrationNzbDavBatch>(e =>
+        {
+            e.ToTable("NzbDavBatches");
+            e.HasKey(x => x.Id);
+            e.Property(x => x.PackageDigest).IsRequired();
+            e.Property(x => x.Status).IsRequired();
+            e.HasOne<MigrationNzbDavMaster>()
+                .WithMany()
+                .HasForeignKey(x => x.MasterId)
+                .OnDelete(DeleteBehavior.Cascade);
+            e.HasIndex(x => new { x.MasterId, x.BatchIndex }).IsUnique();
+            e.HasIndex(x => x.PackageDigest).IsUnique();
+            e.HasIndex(x => x.Status);
+            e.HasIndex(x => x.RunId);
         });
 
         b.Entity<MigrationSymlinkRewrite>(e =>

@@ -52,9 +52,22 @@ public sealed class LibraryInventoryService
         if (item is null)
             return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
                 link.LegacyDavItemId, null, "excluded", "missing-database-row", null);
-        if (item.ResolutionExclusion is not null || item.HistoryItemId is null)
+        var safetyExclusion = item.SafetyExclusion ?? item.ResolutionExclusion;
+        if (safetyExclusion is not null)
             return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
-                link.LegacyDavItemId, item, "excluded", item.ResolutionExclusion ?? "missing-history", null);
+                link.LegacyDavItemId, item, "excluded", safetyExclusion, null);
+        if (item.HistoryExclusion is not null and not "missing-history")
+            return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
+                link.LegacyDavItemId, item, "excluded", item.HistoryExclusion, null);
+        if (item.FileSize is null or < 0)
+            return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
+                link.LegacyDavItemId, item, "excluded", "missing-size", null);
+        if (!HasArticleMetadata(item))
+            return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
+                link.LegacyDavItemId, item, "excluded", "missing-article-metadata", null);
+        if (item.HistoryItemId is null || item.HistoryExclusion == "missing-history")
+            return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
+                link.LegacyDavItemId, item, "recoverable-orphan", null, null);
         if (item.HistoryDownloadStatus is not null and not 1)
             return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
                 link.LegacyDavItemId, item, "excluded", "history-not-completed", null);
@@ -68,6 +81,14 @@ public sealed class LibraryInventoryService
         return new LegacyInventoryCandidate(link.LibraryRelativePath, link.OriginalTarget,
             link.LegacyDavItemId, item, "candidate", null, File.Exists(blobPath) ? blobPath : null);
     }
+
+    private static bool HasArticleMetadata(Legacy.LegacyDavItemRow item) => item.Type switch
+    {
+        3 => !string.IsNullOrWhiteSpace(item.NzbSegmentsJson),
+        4 => !string.IsNullOrWhiteSpace(item.RarPartsJson),
+        6 => !string.IsNullOrWhiteSpace(item.MultipartMetadataJson),
+        _ => false,
+    };
 
     private static void Walk(
         DirectoryInfo directory,

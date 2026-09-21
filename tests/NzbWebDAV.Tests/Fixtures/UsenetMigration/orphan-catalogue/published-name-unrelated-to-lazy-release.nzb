@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="fixture" date="1" subject="renamed.part1.rar">
+    <groups><group>alt.test</group></groups>
+    <segments><segment bytes="24" number="1">renamed-lazy-archive@test</segment></segments>
+  </file>
+</nzb>

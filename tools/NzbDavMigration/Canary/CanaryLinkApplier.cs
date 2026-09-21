@@ -19,11 +19,13 @@ public sealed class CanaryLinkApplier
 
     public async Task<CanaryApplyJournal> ApplyAsync(
         string planPath,
+        string sourceRoot,
         string libraryRoot,
         string targetRoot,
         string journalPath,
         CancellationToken cancellationToken = default)
     {
+        var source = CanaryPathSafety.ResolveRoot(sourceRoot, "Source library root");
         var library = CanaryPathSafety.ResolveRoot(libraryRoot, "Canary library root");
         var target = CanaryPathSafety.ResolveRoot(targetRoot, "InfiniDysk target root");
         if (!_isLocalMount(library))
@@ -35,11 +37,13 @@ public sealed class CanaryLinkApplier
                       {
                           PlanPath = fullPlanPath,
                           PlanSha256 = verified.PlanSha256,
+                          SourceRoot = source,
                           LibraryRoot = library,
                           TargetRoot = target,
                       };
         if (journal.PlanPath != fullPlanPath
             || journal.PlanSha256 != verified.PlanSha256
+            || journal.SourceRoot != source
             || journal.LibraryRoot != library
             || journal.TargetRoot != target)
             throw new InvalidDataException("Existing journal belongs to a different plan or root set.");
@@ -49,8 +53,11 @@ public sealed class CanaryLinkApplier
         {
             if (planned.CorrelationStatus != "exact" || planned.ApplyStatus != "planned")
                 throw new InvalidDataException($"Actionable link '{planned.LibraryRelativePath}' is not exact.");
+            var sourceLinkPath = CanaryPathSafety.ResolveBeneath(
+                source, planned.LibraryRelativePath, "source library path");
             var linkPath = CanaryPathSafety.ResolveBeneath(library, planned.LibraryRelativePath, "library path");
             var targetPath = CanaryPathSafety.ResolveBeneath(target, planned.NewRelativeTarget!, "target path");
+            VerifySourceLink(source, sourceLinkPath, planned.OriginalLegacyTarget);
             VerifyTarget(targetPath, planned.ExpectedFileSize);
             var existingJournal = journal.Links.SingleOrDefault(link =>
                 link.LibraryRelativePath == planned.LibraryRelativePath);
@@ -59,6 +66,8 @@ public sealed class CanaryLinkApplier
                 var info = new FileInfo(linkPath);
                 if (existingJournal?.Status == "applied"
                     && info.LinkTarget == targetPath
+                    && existingJournal.SourceLinkPath == sourceLinkPath
+                    && existingJournal.ObservedSourceTarget == planned.OriginalLegacyTarget
                     && existingJournal.LinkPath == linkPath
                     && existingJournal.TargetPath == targetPath)
                     continue;
@@ -73,6 +82,8 @@ public sealed class CanaryLinkApplier
             var journalLink = existingJournal ?? new CanaryApplyJournalLink
             {
                 LibraryRelativePath = planned.LibraryRelativePath,
+                SourceLinkPath = sourceLinkPath,
+                ObservedSourceTarget = planned.OriginalLegacyTarget,
                 LinkPath = linkPath,
                 TargetPath = targetPath,
                 ExpectedFileSize = planned.ExpectedFileSize,
@@ -89,10 +100,13 @@ public sealed class CanaryLinkApplier
                 || !immediate.Plan.Links.Contains(planned))
                 throw new InvalidDataException("Canary plan changed during apply.");
             if (CanaryPathSafety.ResolveRoot(library, "Canary library root") != library
+                || CanaryPathSafety.ResolveRoot(source, "Source library root") != source
                 || CanaryPathSafety.ResolveRoot(target, "InfiniDysk target root") != target)
                 throw new InvalidDataException("Canary roots changed during apply.");
+            _ = CanaryPathSafety.ResolveBeneath(source, planned.LibraryRelativePath, "source library path");
             _ = CanaryPathSafety.ResolveBeneath(library, planned.LibraryRelativePath, "library path");
             _ = CanaryPathSafety.ResolveBeneath(target, planned.NewRelativeTarget!, "target path");
+            VerifySourceLink(source, sourceLinkPath, planned.OriginalLegacyTarget);
             CanaryPathSafety.EnsureParentsExistWithoutLinks(library, linkPath);
             VerifyTarget(targetPath, planned.ExpectedFileSize);
             if (CanaryPathSafety.PathExistsNoFollow(linkPath))
@@ -103,6 +117,20 @@ public sealed class CanaryLinkApplier
         }
 
         return journal;
+    }
+
+    private static void VerifySourceLink(string sourceRoot, string sourceLinkPath, string expectedTarget)
+    {
+        CanaryPathSafety.EnsureParentsExistWithoutLinks(sourceRoot, sourceLinkPath);
+        if (!CanaryPathSafety.PathExistsNoFollow(sourceLinkPath))
+            throw new FileNotFoundException("Planned source link is missing.", sourceLinkPath);
+        var info = new FileInfo(sourceLinkPath);
+        info.Refresh();
+        if (info.LinkTarget is null || !info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+            throw new InvalidDataException($"Planned source path is no longer a symbolic link: '{sourceLinkPath}'.");
+        if (!string.Equals(info.LinkTarget, expectedTarget, StringComparison.Ordinal))
+            throw new InvalidDataException(
+                $"Planned source link changed: '{sourceLinkPath}' now targets '{info.LinkTarget}'.");
     }
 
     private static void VerifyTarget(string targetPath, long expectedSize)

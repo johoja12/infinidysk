@@ -6,6 +6,8 @@ using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models.UsenetMigration;
 using NzbWebDAV.UsenetMigration;
 using NzbWebDAV.UsenetMigration.Canary;
+using NzbWebDAV.UsenetMigration.NzbDav;
+using NzbWebDAV.UsenetMigration.Provenance;
 using NzbWebDAV.UsenetMigration.Runner;
 using NzbWebDAV.UsenetMigration.Source;
 using NzbWebDAV.UsenetMigration.Triage;
@@ -14,11 +16,14 @@ namespace NzbWebDAV.Api.Controllers.UsenetMigration;
 
 public sealed class NzbDavMigrationController(
     UsenetMigrationStore store,
-    UsenetMigrationRunner runner) : UsenetMigrationBaseController
+    UsenetMigrationRunner runner,
+    NzbDavReconciliationService? reconciliation = null) : UsenetMigrationBaseController
 {
     private readonly NzbDavPackageReader _packageReader = new();
     private readonly Action _interruptScan = () => runner?.InterruptScan();
     private readonly Action _interruptSubmissions = () => runner?.InterruptSubmissionBatch();
+    private readonly NzbDavReconciliationService _reconciliation = reconciliation
+        ?? new NzbDavReconciliationService(store, new NzbDavPackageReader(), BlobStore.Current);
 
     [HttpPost("api/migration/nzbdav/connect")]
     public Task<IActionResult> Connect([FromBody] NzbDavConnectRequest request) => GuardedAsync(async () =>
@@ -58,6 +63,145 @@ public sealed class NzbDavMigrationController(
             maxQueueDepth = request.MaxQueueDepth ?? 5,
             submitWorkers = request.SubmitWorkers ?? 1,
         });
+    });
+
+    [HttpPost("api/migration/nzbdav/full/connect")]
+    public Task<IActionResult> ConnectFull([FromBody] NzbDavFullConnectRequest request) => GuardedAsync(async () =>
+    {
+        if (request is null)
+            throw new BadHttpRequestException("Request body is required.");
+        var packagePath = RequirePackagePath(request.PackagePath);
+        var package = await ReadPackageAsync(packagePath).ConfigureAwait(false);
+        if (package.Manifest.SchemaVersion != NzbDavExportManifest.CurrentSchemaVersion
+            || package.Manifest.MasterManifestDigest is null
+            || package.Manifest.BatchIndex is null)
+            throw new BadHttpRequestException("Full-library connect requires a schema-v2 batch package.");
+        if (!string.Equals(package.Manifest.MasterManifestDigest, request.MasterManifestDigest,
+                StringComparison.Ordinal))
+            throw new BadHttpRequestException("The package master manifest digest does not match the request.");
+        if (request.SourceLinkCount <= 0
+            || request.RecoverableCount < 0
+            || request.RecoverableCount > request.SourceLinkCount)
+            throw new BadHttpRequestException("Projected source and recoverable counts are invalid.");
+        var coverage = (double)request.RecoverableCount / request.SourceLinkCount;
+        if (coverage < 0.90)
+            throw new BadHttpRequestException("Projected recoverable coverage must be at least 90%.");
+        if (package.Manifest.SelectedLinks.Count == 0
+            || package.Manifest.SelectedLinks.Count > request.RecoverableCount)
+            throw new BadHttpRequestException("The batch selection count is invalid for this recovery master.");
+
+        var categories = package.Manifest.SelectedLinks
+            .Select(link => link.LibraryRelativePath.Split('/')[0])
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        NzbDavFullConnectionResult result;
+        try
+        {
+            result = await store.ApplyNzbDavFullConnectionAsync(
+                new NzbDavFullConnectionValues(
+                    package.RootPath,
+                    request.MasterManifestDigest,
+                    package.PackageDigest,
+                    package.Manifest.BatchIndex.Value,
+                    package.Manifest.SelectedLinks.Count,
+                    request.SourceLinkCount,
+                    request.RecoverableCount,
+                    request.MaxQueueDepth ?? 5,
+                    request.SubmitWorkers ?? 1,
+                    categories),
+                HttpContext.RequestAborted).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException exception)
+        {
+            throw new BadHttpRequestException(exception.Message, exception);
+        }
+        return Ok(new
+        {
+            status = true,
+            state = result.Batch.Status,
+            batchIndex = result.Batch.BatchIndex,
+            batchCount = package.Manifest.BatchCount,
+            selectionCount = result.Batch.SelectionCount,
+            sourceLinkCount = result.Master.SourceLinkCount,
+            recoverableCount = result.Master.RecoverableCount,
+            coverage,
+            alreadyRegistered = result.AlreadyRegistered,
+        });
+    });
+
+    [HttpGet("api/migration/nzbdav/full/status")]
+    public Task<IActionResult> GetFullStatus() => GuardedAsync(async () =>
+    {
+        var master = await store.GetNzbDavFullStatusAsync(HttpContext.RequestAborted).ConfigureAwait(false)
+                     ?? throw new BadHttpRequestException("No full-library recovery is registered.");
+        return Ok(new
+        {
+            status = true,
+            recoveryStatus = master.Status,
+            sourceLinkCount = master.SourceLinkCount,
+            recoverableCount = master.RecoverableCount,
+            coverage = master.SourceLinkCount == 0
+                ? 0
+                : (double)master.RecoverableCount / master.SourceLinkCount,
+            batchCount = master.Batches.Count,
+            selectedCount = master.Batches.Sum(batch => batch.SelectionCount),
+            appliedCount = master.Batches.Sum(batch => batch.AppliedCount),
+            validatedCount = master.Batches.Sum(batch => batch.ValidatedCount),
+            batches = master.Batches.Select(batch => new
+            {
+                batchIndex = batch.BatchIndex,
+                selectionCount = batch.SelectionCount,
+                status = batch.Status,
+                appliedCount = batch.AppliedCount,
+                validatedCount = batch.ValidatedCount,
+            }),
+        });
+    });
+
+    [HttpPost("api/migration/nzbdav/full/batches/{index:int}/acknowledge-plan")]
+    public Task<IActionResult> AcknowledgePlan(
+        int index,
+        [FromBody] NzbDavBatchPlanAcknowledgementRequest request) => GuardedAsync(async () =>
+    {
+        if (request is null || !IsSha256(request.PlanDigest))
+            throw new BadHttpRequestException("A lowercase SHA-256 plan digest is required.");
+        if (request.AppliedCount < 0 || request.ValidatedCount < 0)
+            throw new BadHttpRequestException("Applied and validated counts cannot be negative.");
+        var session = await RequireNzbDavSessionAsync().ConfigureAwait(false);
+        var package = await ReadPackageAsync(session.SourcePackageRoot!).ConfigureAwait(false);
+        if (package.Manifest.SchemaVersion != NzbDavExportManifest.CurrentSchemaVersion
+            || package.Manifest.MasterManifestDigest is null
+            || package.Manifest.BatchIndex != index)
+            throw new BadHttpRequestException("The active package does not match this full-library batch.");
+        var selectedIds = package.Manifest.SelectedLinks
+            .Select(link => link.LegacyDavItemId.ToString())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        try
+        {
+            var batch = await store.AcknowledgeNzbDavBatchAsync(
+                package.Manifest.MasterManifestDigest,
+                index,
+                package.PackageDigest,
+                selectedIds,
+                request.PlanDigest!,
+                request.AppliedCount,
+                request.ValidatedCount,
+                HttpContext.RequestAborted).ConfigureAwait(false);
+            return Ok(new
+            {
+                status = true,
+                batchIndex = batch.BatchIndex,
+                state = batch.Status,
+                selectionCount = batch.SelectionCount,
+                appliedCount = batch.AppliedCount,
+                validatedCount = batch.ValidatedCount,
+            });
+        }
+        catch (InvalidOperationException exception)
+        {
+            throw new BadHttpRequestException(exception.Message, exception);
+        }
     });
 
     [HttpGet("api/migration/nzbdav/categories")]
@@ -157,7 +301,10 @@ public sealed class NzbDavMigrationController(
         if (!transition.Succeeded)
             throw new BadHttpRequestException(
                 $"Cannot start while migration operation '{transition.CurrentStatus}' is active.");
-        await store.BeginRunAsync(HttpContext.RequestAborted).ConfigureAwait(false);
+        var runId = await store.BeginRunAsync(HttpContext.RequestAborted).ConfigureAwait(false);
+        if (package.Manifest.SchemaVersion == NzbDavExportManifest.CurrentSchemaVersion)
+            await store.AttachNzbDavBatchRunAsync(package.PackageDigest, runId, HttpContext.RequestAborted)
+                .ConfigureAwait(false);
         return Ok(new { status = true, state = "running" });
     });
 
@@ -229,13 +376,39 @@ public sealed class NzbDavMigrationController(
         });
     });
 
+    [HttpPost("api/migration/nzbdav/reconcile")]
+    public Task<IActionResult> Reconcile() => GuardedAsync(async () =>
+    {
+        var session = await RequireNzbDavSessionAsync().ConfigureAwait(false);
+        if (session.CurrentRunId is null || session.SourcePackageRoot is null)
+            throw new BadHttpRequestException("No completed NzbDav run is available to reconcile.");
+        var result = await _reconciliation.ReconcileAsync(
+            session.CurrentRunId.Value,
+            session.SourcePackageRoot,
+            HttpContext.RequestAborted).ConfigureAwait(false);
+        return Ok(new
+        {
+            status = true,
+            result.RunId,
+            result.SelectedCount,
+            result.ExactCount,
+            result.AmbiguousCount,
+            result.UnmatchedCount,
+            result.SubmittedCount,
+        });
+    });
+
     [HttpPost("api/migration/nzbdav/canary-plan")]
     public Task<IActionResult> GenerateCanaryPlan() => GuardedAsync(async () =>
     {
         var report = await BuildCorrelationReportAsync().ConfigureAwait(false);
-        if (report.AmbiguityCount != 0)
+        if (report.ExactCount != report.SelectedCount
+            || report.ExclusionCount != 0
+            || report.AmbiguityCount != 0)
             throw new BadHttpRequestException(
-                $"Resolve all {report.AmbiguityCount} ambiguous or duplicate correlation(s) before generating a plan.");
+                "Canary plans require an exact correlation for every selected link "
+                + $"(selected: {report.SelectedCount}, exact: {report.ExactCount}, "
+                + $"excluded: {report.ExclusionCount}, ambiguous: {report.AmbiguityCount}).");
         var session = await RequireNzbDavSessionAsync().ConfigureAwait(false);
         if (session.CurrentRunId is null)
             throw new BadHttpRequestException("The completed import has no migration run identity.");
@@ -385,9 +558,24 @@ public sealed class NzbDavMigrationController(
         }
         return candidate;
     }
+
+    private static bool IsSha256(string? digest) =>
+        digest is { Length: 64 }
+        && digest.All(character => character is (>= '0' and <= '9') or (>= 'a' and <= 'f'));
 }
 
 public sealed record NzbDavConnectRequest(string? PackagePath, int? MaxQueueDepth, int? SubmitWorkers);
+public sealed record NzbDavFullConnectRequest(
+    string? PackagePath,
+    string MasterManifestDigest,
+    int SourceLinkCount,
+    int RecoverableCount,
+    int? MaxQueueDepth,
+    int? SubmitWorkers);
+public sealed record NzbDavBatchPlanAcknowledgementRequest(
+    string? PlanDigest,
+    int AppliedCount,
+    int ValidatedCount);
 public sealed record NzbDavRunRequest(string? PackageDigest, int? SelectionCount);
 public sealed record NzbDavCorrelationRow(
     string LibraryRelativePath,

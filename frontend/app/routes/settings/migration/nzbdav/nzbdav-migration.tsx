@@ -3,12 +3,14 @@ import { Alert } from "~/components/ui/feedback";
 import { Icon } from "~/components/ui/icon";
 import {
   canGenerateCanaryPlan,
+  canReconcileNzbDav,
   isRunConfirmationExact,
   useNzbDavMigration,
   type NzbDavCategory,
   type NzbDavConnectForm,
   type NzbDavConnection,
   type NzbDavCorrelation,
+  type NzbDavFullStatus,
 } from "./use-nzbdav-migration";
 
 export type NzbDavMigrationViewProps = {
@@ -19,6 +21,7 @@ export type NzbDavMigrationViewProps = {
   categories: NzbDavCategory[];
   onCategoryChange: (source: string, change: Partial<NzbDavCategory>) => void;
   correlation: NzbDavCorrelation | null;
+  fullStatus: NzbDavFullStatus | null;
   digestConfirmation: string;
   countConfirmation: string;
   onDigestConfirmationChange: (value: string) => void;
@@ -31,6 +34,7 @@ export type NzbDavMigrationViewProps = {
   onScan: () => void;
   onRun: () => void;
   onLoadCorrelation: () => void;
+  onReconcile: () => void;
   onGeneratePlan: () => void;
 };
 
@@ -48,6 +52,7 @@ export function NzbDavMigrationView(props: NzbDavMigrationViewProps) {
     props.countConfirmation,
   );
   const planAllowed = canGenerateCanaryPlan(props.sessionStatus, props.correlation);
+  const reconcileAllowed = canReconcileNzbDav(props.sessionStatus, props.correlation);
 
   return (
     <div className="flex w-full flex-col gap-6">
@@ -74,6 +79,49 @@ export function NzbDavMigrationView(props: NzbDavMigrationViewProps) {
       </Alert>
 
       {props.error && <div className="alert alert-error text-sm">{props.error}</div>}
+
+      {props.fullStatus && (
+        <section className="rounded-box border border-base-300 p-4 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="font-semibold">Full-library recovery progress</h3>
+            <span
+              className={`badge ${props.fullStatus.coverage >= 0.9 ? "badge-success" : "badge-error"}`}
+            >
+              {(props.fullStatus.coverage * 100).toFixed(1)}% recoverable
+            </span>
+          </div>
+          <div className="flex flex-wrap gap-2 text-xs">
+            <span className="badge">{props.fullStatus.sourceLinkCount} source links</span>
+            <span className="badge badge-success">{props.correlation?.exactCount ?? 0} exact</span>
+            <span className="badge">{props.fullStatus.appliedCount} applied</span>
+            <span className="badge">{props.fullStatus.validatedCount} validated</span>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="table table-xs">
+              <thead>
+                <tr>
+                  <th>Batch</th>
+                  <th>Status</th>
+                  <th>Selected</th>
+                  <th>Applied</th>
+                  <th>Validated</th>
+                </tr>
+              </thead>
+              <tbody>
+                {props.fullStatus.batches.map((batch) => (
+                  <tr key={batch.batchIndex}>
+                    <td>{batch.batchIndex + 1}</td>
+                    <td>{batch.status}</td>
+                    <td>{batch.selectionCount}</td>
+                    <td>{batch.appliedCount}</td>
+                    <td>{batch.validatedCount}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       <section className="rounded-box border border-base-300 p-4 space-y-3">
         <h3 className="font-semibold">1. Validate package</h3>
@@ -226,6 +274,13 @@ export function NzbDavMigrationView(props: NzbDavMigrationViewProps) {
           >
             Load correlation report
           </button>
+          <button
+            className="btn btn-sm"
+            disabled={!reconcileAllowed || props.busy !== null}
+            onClick={props.onReconcile}
+          >
+            Reconcile completed import
+          </button>
         </div>
         {props.correlation && (
           <>
@@ -246,7 +301,7 @@ export function NzbDavMigrationView(props: NzbDavMigrationViewProps) {
                     <th>File</th>
                     <th>Extraction</th>
                     <th>Correlation</th>
-                    <th>Reason / evidence</th>
+                    <th>Reason</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -255,9 +310,7 @@ export function NzbDavMigrationView(props: NzbDavMigrationViewProps) {
                       <td>{row.libraryRelativePath}</td>
                       <td>{row.extractionStatus}</td>
                       <td>{row.correlationStatus}</td>
-                      <td className="max-w-md break-all font-mono text-[10px]">
-                        {row.exclusionReason ?? row.correlationEvidence}
-                      </td>
+                      <td>{row.exclusionReason ?? "—"}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -302,6 +355,7 @@ export function NzbDavMigration() {
       categories={migration.categories}
       onCategoryChange={migration.onCategoryChange}
       correlation={migration.correlation}
+      fullStatus={migration.fullStatus}
       digestConfirmation={migration.digestConfirmation}
       countConfirmation={migration.countConfirmation}
       onDigestConfirmationChange={migration.setDigestConfirmation}
@@ -314,6 +368,7 @@ export function NzbDavMigration() {
       onScan={() => void migration.scan()}
       onRun={() => void migration.run()}
       onLoadCorrelation={() => void migration.loadCorrelation()}
+      onReconcile={() => void migration.reconcile()}
       onGeneratePlan={() => void migration.generatePlan()}
     />
   );

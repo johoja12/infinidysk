@@ -81,6 +81,88 @@ describe("BackendClient", () => {
     ]);
   });
 
+  it("gets count-only NzbDav full recovery status and reconciles a terminal run", async () => {
+    const status = {
+      recoveryStatus: "running",
+      sourceLinkCount: 100,
+      recoverableCount: 95,
+      coverage: 0.95,
+      batchCount: 2,
+      selectedCount: 50,
+      appliedCount: 25,
+      validatedCount: 25,
+      batches: [
+        {
+          batchIndex: 0,
+          selectionCount: 25,
+          status: "complete",
+          appliedCount: 25,
+          validatedCount: 25,
+        },
+      ],
+    };
+    const reconciliation = {
+      runId: 42,
+      selectedCount: 25,
+      exactCount: 25,
+      ambiguousCount: 0,
+      unmatchedCount: 0,
+      submittedCount: 0,
+    };
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(status))
+      .mockResolvedValueOnce(jsonResponse(reconciliation));
+
+    await expect(backendClient.getNzbDavFullStatus()).resolves.toEqual(status);
+    await expect(backendClient.reconcileNzbDav()).resolves.toEqual(reconciliation);
+    expect(fetchMock.mock.calls).toEqual([
+      [
+        "http://backend/api/migration/nzbdav/full/status",
+        {
+          method: "GET",
+          headers: { "x-api-key": "test-api-key" },
+        },
+      ],
+      [
+        "http://backend/api/migration/nzbdav/reconcile",
+        {
+          method: "POST",
+          headers: { "x-api-key": "test-api-key" },
+        },
+      ],
+    ]);
+  });
+
+  it("rejects unsafe NzbDav recovery counts from the backend", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse({
+          recoveryStatus: "running",
+          sourceLinkCount: 1,
+          recoverableCount: 1,
+          coverage: 1.1,
+          batchCount: 0,
+          selectedCount: 0,
+          appliedCount: 0,
+          validatedCount: 0,
+          batches: [],
+        }),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          runId: 42,
+          selectedCount: 1,
+          exactCount: -1,
+          ambiguousCount: 0,
+          unmatchedCount: 0,
+          submittedCount: 0,
+        }),
+      );
+
+    await expect(backendClient.getNzbDavFullStatus()).rejects.toBeInstanceOf(BackendContractError);
+    await expect(backendClient.reconcileNzbDav()).rejects.toBeInstanceOf(BackendContractError);
+  });
+
   it("encodes queue and history list filters", async () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse({ queue: { slots: [], noofslots: 0 } }))

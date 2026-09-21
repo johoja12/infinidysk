@@ -119,4 +119,51 @@ public sealed class NzbDavMigrationSchemaTests
                 File.Delete(path);
         }
     }
+
+    [Fact]
+    public async Task FreshSchema_PersistsOrderedNzbDavMasterBatchesWithUniqueProvenance()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        await using var db = harness.Mig();
+        var now = DateTime.UtcNow;
+        var master = new MigrationNzbDavMaster
+        {
+            ManifestDigest = new string('a', 64),
+            SourceLinkCount = 100,
+            RecoverableCount = 95,
+            Status = "planned",
+            CreatedAt = now,
+            UpdatedAt = now,
+        };
+        db.NzbDavMasters.Add(master);
+        await db.SaveChangesAsync();
+        db.NzbDavBatches.Add(new MigrationNzbDavBatch
+        {
+            MasterId = master.Id,
+            BatchIndex = 0,
+            PackageDigest = new string('b', 64),
+            SelectionCount = 95,
+            Status = "pending",
+            PlanDigest = new string('c', 64),
+            AppliedCount = 0,
+            ValidatedCount = 0,
+        });
+        await db.SaveChangesAsync();
+        db.ChangeTracker.Clear();
+
+        var stored = await db.NzbDavMasters.SingleAsync();
+        var batch = await db.NzbDavBatches.SingleAsync();
+        Assert.Equal(95, stored.RecoverableCount);
+        Assert.Equal(stored.Id, batch.MasterId);
+        Assert.Equal(95, batch.SelectionCount);
+        Assert.Equal(new string('c', 64), batch.PlanDigest);
+
+        var batchEntity = db.Model.FindEntityType(typeof(MigrationNzbDavBatch))!;
+        Assert.Contains(batchEntity.GetIndexes(), index => index.IsUnique
+            && index.Properties.Select(property => property.Name)
+                .SequenceEqual([nameof(MigrationNzbDavBatch.MasterId), nameof(MigrationNzbDavBatch.BatchIndex)]));
+        Assert.Contains(batchEntity.GetIndexes(), index => index.IsUnique
+            && index.Properties.Select(property => property.Name)
+                .SequenceEqual([nameof(MigrationNzbDavBatch.PackageDigest)]));
+    }
 }

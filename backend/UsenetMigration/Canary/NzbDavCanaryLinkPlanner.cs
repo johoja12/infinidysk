@@ -103,16 +103,26 @@ public sealed class NzbDavCanaryLinkPlanner
                 exact ? "planned" : "not-actionable"));
         }
 
+        var nonExact = links.Where(link =>
+            link.CorrelationStatus != "exact"
+            || link.NewRelativeTarget is null
+            || link.ApplyStatus != "planned").ToArray();
+        if (nonExact.Length != 0)
+            throw new InvalidDataException(
+                $"Every selected link must be exact and actionable; {nonExact.Length} row(s) are not.");
+
+        var actionable = links.Count(link => link.NewRelativeTarget is not null);
+
         var plan = new NzbDavCanaryPlan(
             NzbDavCanaryPlan.CurrentSchemaVersion,
             runId,
             package.PackageDigest,
             DateTimeOffset.UtcNow,
             links.Count,
-            links.Count(link => link.NewRelativeTarget is not null),
+            actionable,
             links.Count == package.Manifest.SelectedLinks.Count
-            && links.Where(link => link.NewRelativeTarget is not null)
-                .All(link => link.CorrelationStatus == "exact"),
+            && actionable == links.Count
+            && links.All(link => link.CorrelationStatus == "exact"),
             links);
 
         var now = DateTime.UtcNow;

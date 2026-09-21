@@ -78,6 +78,32 @@ public sealed class CanaryPackageWriterTests : IDisposable
         await Assert.ThrowsAsync<InvalidDataException>(() => new CanaryPackageWriter(20, 50).WriteAsync(request));
     }
 
+    [Fact]
+    public async Task WriteFullBatchAsync_WritesSchemaV2WithoutCanarySelectionBounds()
+    {
+        Directory.CreateDirectory(_root);
+        var payload = Path.Join(_root, "full.nzb");
+        await File.WriteAllTextAsync(payload, "<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\" />");
+        var leafId = Guid.NewGuid();
+        var output = Path.Join(_root, "full-package");
+        var leaf = new NzbDavExportLeaf(leafId, "/content/a.mkv", 10, "release-1", null, null,
+            NzbDavStableArchiveIdentity.Kind, new string('a', 64), "ready", null,
+            NzbDavStableArchiveIdentity.Kind, new string('a', 64));
+        var request = new CanaryExportRequest("full-batch", output,
+            [new CanaryExportRelease("release-1", null, payload, [leaf])],
+            [new NzbDavSelectedLibraryLink("TV/a.mkv", "/legacy/.ids/a", leafId)]);
+
+        await new CanaryPackageWriter().WriteFullBatchAsync(
+            request, new string('b', 64), batchIndex: 0, batchCount: 1);
+
+        var manifest = NzbDavExportManifestJson.Deserialize(
+            await File.ReadAllTextAsync(Path.Join(output, "manifest.json")));
+        Assert.Equal(2, manifest.SchemaVersion);
+        Assert.Equal(new string('b', 64), manifest.MasterManifestDigest);
+        Assert.Equal(0, manifest.BatchIndex);
+        Assert.Equal(1, manifest.BatchCount);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_root))

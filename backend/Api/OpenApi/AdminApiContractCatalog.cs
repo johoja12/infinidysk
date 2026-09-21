@@ -48,6 +48,8 @@ public static class AdminApiContractCatalog
         new("GET", "/api/get-watchtower", "get-api-get-watchtower"),
         new("POST", "/api/watchtower-mutate", "post-api-watchtower-mutate"),
         new("POST", "/api/watchtower-discover-catalogs", "post-api-watchtower-discover-catalogs"),
+        new("GET", "/api/migration/nzbdav/full/status", "get-api-migration-nzbdav-full-status"),
+        new("POST", "/api/migration/nzbdav/reconcile", "post-api-migration-nzbdav-reconcile"),
     ];
 
     public static IReadOnlySet<string> CanonicalMethods(string path)

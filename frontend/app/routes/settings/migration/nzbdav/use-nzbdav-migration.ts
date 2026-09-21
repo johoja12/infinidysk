@@ -42,6 +42,26 @@ export type NzbDavCorrelation = {
   rows: NzbDavCorrelationRow[];
 };
 
+export type NzbDavFullBatchStatus = {
+  batchIndex: number;
+  selectionCount: number;
+  status: string;
+  appliedCount: number;
+  validatedCount: number;
+};
+
+export type NzbDavFullStatus = {
+  recoveryStatus: string;
+  sourceLinkCount: number;
+  recoverableCount: number;
+  coverage: number;
+  batchCount: number;
+  selectedCount: number;
+  appliedCount: number;
+  validatedCount: number;
+  batches: NzbDavFullBatchStatus[];
+};
+
 async function apiJson<T>(
   url: string,
   init?: RequestInit,
@@ -82,6 +102,16 @@ export function requestNzbDavPlan(
   return apiJson("/api/migration/nzbdav/canary-plan", { method: "POST" }, fetcher);
 }
 
+export function requestNzbDavFullStatus(fetcher: typeof fetch = fetch): Promise<NzbDavFullStatus> {
+  return apiJson("/api/migration/nzbdav/full/status", undefined, fetcher);
+}
+
+export function requestNzbDavReconcile(
+  fetcher: typeof fetch = fetch,
+): Promise<{ exactCount: number; selectedCount?: number }> {
+  return apiJson("/api/migration/nzbdav/reconcile", { method: "POST" }, fetcher);
+}
+
 export function isRunConfirmationExact(
   connection: NzbDavConnection | null,
   digest: string,
@@ -96,9 +126,29 @@ export function isRunConfirmationExact(
 
 export function canGenerateCanaryPlan(
   sessionStatus: string | undefined,
-  correlation: Pick<NzbDavCorrelation, "ambiguityCount"> | null,
+  correlation: Pick<
+    NzbDavCorrelation,
+    "selectedCount" | "exactCount" | "exclusionCount" | "ambiguityCount"
+  > | null,
 ): boolean {
-  return sessionStatus === "complete" && correlation !== null && correlation.ambiguityCount === 0;
+  return (
+    sessionStatus === "complete" &&
+    correlation !== null &&
+    correlation.selectedCount === correlation.exactCount &&
+    correlation.exclusionCount === 0 &&
+    correlation.ambiguityCount === 0
+  );
+}
+
+export function canReconcileNzbDav(
+  sessionStatus: string | undefined,
+  correlation: Pick<NzbDavCorrelation, "selectedCount" | "exactCount"> | null,
+): boolean {
+  return (
+    sessionStatus === "complete" &&
+    correlation !== null &&
+    correlation.exactCount < correlation.selectedCount
+  );
 }
 
 export function useNzbDavMigration() {
@@ -107,6 +157,7 @@ export function useNzbDavMigration() {
   const [sessionStatus, setSessionStatus] = useState<string>();
   const [categories, setCategories] = useState<NzbDavCategory[]>([]);
   const [correlation, setCorrelation] = useState<NzbDavCorrelation | null>(null);
+  const [fullStatus, setFullStatus] = useState<NzbDavFullStatus | null>(null);
   const [digestConfirmation, setDigestConfirmation] = useState("");
   const [countConfirmation, setCountConfirmation] = useState("");
   const [planReady, setPlanReady] = useState(false);
@@ -128,6 +179,11 @@ export function useNzbDavMigration() {
   const refreshStatus = useCallback(async () => {
     const status = await apiJson<{ sessionStatus: string }>("/api/migration/nzbdav/status");
     setSessionStatus(status.sessionStatus);
+    try {
+      setFullStatus(await requestNzbDavFullStatus());
+    } catch {
+      setFullStatus(null);
+    }
   }, []);
 
   useEffect(() => {
@@ -199,6 +255,17 @@ export function useNzbDavMigration() {
       setCorrelation(result);
     });
 
+  const reconcile = () =>
+    mutate("reconcile", async () => {
+      await requestNzbDavReconcile();
+      setCorrelation(await apiJson<NzbDavCorrelation>("/api/migration/nzbdav/correlation"));
+      try {
+        setFullStatus(await requestNzbDavFullStatus());
+      } catch {
+        setFullStatus(null);
+      }
+    });
+
   const generatePlan = () =>
     mutate("plan", async () => {
       await requestNzbDavPlan();
@@ -220,6 +287,7 @@ export function useNzbDavMigration() {
     categories,
     onCategoryChange,
     correlation,
+    fullStatus,
     digestConfirmation,
     setDigestConfirmation,
     countConfirmation,
@@ -232,6 +300,7 @@ export function useNzbDavMigration() {
     scan,
     run,
     loadCorrelation,
+    reconcile,
     generatePlan,
   };
 }

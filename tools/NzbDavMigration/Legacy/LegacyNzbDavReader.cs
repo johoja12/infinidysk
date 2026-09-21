@@ -20,7 +20,9 @@ public sealed record LegacyDavItemRow(
     string? MultipartMetadataJson = null,
     string? NzbContents = null,
     string? ReleaseRootPath = null,
-    string? ResolutionExclusion = null);
+    string? ResolutionExclusion = null,
+    string? HistoryExclusion = null,
+    string? SafetyExclusion = null);
 
 public sealed record LegacyReadResult(
     IReadOnlyList<LegacyDavItemRow> Items,
@@ -57,9 +59,9 @@ public sealed class LegacyNzbDavReader
                h."FileName", h."JobName",
                h."Category", h."DownloadStatus", nf."SegmentIds",
                rf."RarParts", mf."Metadata", h."NzbContents", o.root_path,
+               CASE WHEN o.owner_count > 1 THEN 'ambiguous-history'
+                    WHEN h."Id" IS NULL THEN 'missing-history' END,
                CASE WHEN s.invalid THEN 'invalid-ancestry'
-                    WHEN o.owner_count > 1 THEN 'ambiguous-history'
-                    WHEN h."Id" IS NULL THEN 'missing-history'
                     WHEN d."IsCorrupted" OR d."RepairStatus" <> 0 OR d."ZeroPadCorruptSegments"
                       OR lower(trim(d."HealthCheckQueueReason")) = 'source-validation'
                       OR EXISTS (SELECT 1 FROM "SourceValidationBlocks" b
@@ -69,9 +71,9 @@ public sealed class LegacyNzbDavReader
         JOIN state s ON s.leaf = d."Id"
         LEFT JOIN ownership o ON o.leaf = d."Id"
         LEFT JOIN "HistoryItems" AS h ON h."Id" = o.owner_id AND o.owner_count = 1 AND NOT s.invalid
-        LEFT JOIN "DavNzbFiles" AS nf ON nf."Id" = d."Id" AND h."Id" IS NOT NULL
-        LEFT JOIN "DavRarFiles" AS rf ON rf."Id" = d."Id" AND h."Id" IS NOT NULL
-        LEFT JOIN "DavMultipartFiles" AS mf ON mf."Id" = d."Id" AND h."Id" IS NOT NULL
+        LEFT JOIN "DavNzbFiles" AS nf ON nf."Id" = d."Id"
+        LEFT JOIN "DavRarFiles" AS rf ON rf."Id" = d."Id"
+        LEFT JOIN "DavMultipartFiles" AS mf ON mf."Id" = d."Id"
         WHERE d."Id" = ANY (@ids)
         ORDER BY d."Id"
         """;
@@ -128,7 +130,8 @@ public sealed class LegacyNzbDavReader
                     historyIdNull ? null : reader.GetGuid(4),
                     historyIdNull ? null : reader.GetGuid(4),
                     Text(5), Text(6), Text(7), historyStatusNull ? null : reader.GetInt32(8),
-                    Text(9), Text(10), Text(11), Text(12), Text(13), Text(14)));
+                    Text(9), Text(10), Text(11), Text(12), Text(13),
+                    Text(15), Text(14), Text(15)));
             }
         }
 

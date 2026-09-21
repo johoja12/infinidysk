@@ -1,5 +1,6 @@
 using NzbDavMigration.Inventory;
 using NzbDavMigration.Legacy;
+using NzbDavMigration.Recovery;
 
 namespace NzbWebDAV.Tests.UsenetMigration;
 
@@ -60,17 +61,72 @@ public sealed class LibraryInventoryServiceTests : IDisposable
         var rows = new[]
         {
             new LegacyDavItemRow(withHistory, "/content/a.mkv", 1, 3, Guid.NewGuid(), availableBlob,
-                HistoryDownloadStatus: 1),
-            new LegacyDavItemRow(withoutHistory, "/content/b.mkv", 1, 3, null, availableBlob),
-            new LegacyDavItemRow(unresolvedBlob, "/content/d.mkv", 1, 3, Guid.NewGuid(), Guid.NewGuid()),
+                HistoryDownloadStatus: 1, NzbSegmentsJson: "[\"with-history@test\"]"),
+            new LegacyDavItemRow(withoutHistory, "/content/b.mkv", 1, 3, null, null,
+                NzbSegmentsJson: "[\"orphan@test\"]", HistoryExclusion: "missing-history"),
+            new LegacyDavItemRow(unresolvedBlob, "/content/d.mkv", 1, 3, Guid.NewGuid(), Guid.NewGuid(),
+                NzbSegmentsJson: "[\"unresolved@test\"]"),
         };
 
         var result = new LibraryInventoryService().Enrich(links, rows, new LegacyBlobResolver(blobRoot));
 
         Assert.Equal("candidate", result.Single(item => item.LegacyDavItemId == withHistory).Status);
-        Assert.Equal("missing-history", result.Single(item => item.LegacyDavItemId == withoutHistory).ExclusionReason);
+        Assert.Equal("recoverable-orphan", result.Single(item => item.LegacyDavItemId == withoutHistory).Status);
+        Assert.Null(result.Single(item => item.LegacyDavItemId == withoutHistory).ExclusionReason);
         Assert.Equal("missing-database-row", result.Single(item => item.LegacyDavItemId == missingRow).ExclusionReason);
         Assert.Equal("missing-nzb-blob", result.Single(item => item.LegacyDavItemId == unresolvedBlob).ExclusionReason);
+    }
+
+    [Fact]
+    public void Enrich_PreservesOrphanRarAndMultipartMetadataButRejectsSafetyFailures()
+    {
+        Directory.CreateDirectory(_root);
+        var direct = Guid.NewGuid();
+        var rar = Guid.NewGuid();
+        var multipart = Guid.NewGuid();
+        var unsafeItem = Guid.NewGuid();
+        var links = new[]
+        {
+            new LibraryInventoryLink("direct.mkv", "/.ids/direct", direct),
+            new LibraryInventoryLink("rar.mkv", "/.ids/rar", rar),
+            new LibraryInventoryLink("multipart.mkv", "/.ids/multipart", multipart),
+            new LibraryInventoryLink("unsafe.mkv", "/.ids/unsafe", unsafeItem),
+        };
+        var rows = new[]
+        {
+            new LegacyDavItemRow(direct, "/content/direct.mkv", 1, 3, null, null,
+                NzbSegmentsJson: "[\"direct@test\"]", HistoryExclusion: "missing-history"),
+            new LegacyDavItemRow(rar, "/content/rar.mkv", 2, 4, null, null,
+                RarPartsJson: "[{\"SegmentIds\":[\"rar@test\"]}]", HistoryExclusion: "missing-history"),
+            new LegacyDavItemRow(multipart, "/content/multipart.mkv", 3, 6, null, null,
+                MultipartMetadataJson: "{\"FileParts\":[{\"SegmentIds\":[\"multipart@test\"]}]}",
+                HistoryExclusion: "missing-history"),
+            new LegacyDavItemRow(unsafeItem, "/content/unsafe.mkv", 4, 3, null, null,
+                NzbSegmentsJson: "[\"unsafe@test\"]", HistoryExclusion: "missing-history",
+                SafetyExclusion: "invalid-ancestry", ResolutionExclusion: "invalid-ancestry"),
+        };
+
+        var result = new LibraryInventoryService().Enrich(
+            links, rows, new LegacyBlobResolver(Path.Join(_root, "blobs")));
+
+        Assert.All(result.Where(item => item.LegacyDavItemId != unsafeItem), item =>
+            Assert.Equal("recoverable-orphan", item.Status));
+        var excluded = result.Single(item => item.LegacyDavItemId == unsafeItem);
+        Assert.Equal("excluded", excluded.Status);
+        Assert.Equal("invalid-ancestry", excluded.ExclusionReason);
+    }
+
+    [Fact]
+    public void FullRecoveryInventory_RecordsVersionedSnapshotAndTerminalClasses()
+    {
+        var inventory = new FullRecoveryInventory(
+            FullRecoveryInventory.CurrentSchemaVersion,
+            new FullRecoverySnapshotDigests(new string('a', 64), new string('b', 64)),
+            DateTimeOffset.UtcNow,
+            [new FullRecoveryInventoryItem("TV/show.mkv", Guid.NewGuid(), "recoverable-orphan", null)]);
+
+        Assert.Equal(1, inventory.SchemaVersion);
+        Assert.Equal("recoverable-orphan", Assert.Single(inventory.Items).TerminalClassification);
     }
 
     private static void WriteBlob(string root, Guid id)
