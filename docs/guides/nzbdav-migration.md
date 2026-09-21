@@ -343,7 +343,13 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --infinidysk-route direct-backend
 ```
 
-If cache roots are available, add `--legacy-cache-root` and `--infinidysk-cache-root`; the report labels observed cache evidence. Otherwise the cache label explicitly records that it is unknown.
+If cache roots are available, add `--legacy-cache-root` and
+`--infinidysk-cache-root`. When a root uses rclone's standard `vfs/<remote>`
+layout, the report reads the sibling `vfsMeta/<remote>` range journal.
+`observed-warm` requires complete cached byte coverage; sparse logical file length
+is not proof. Partial entries report cached bytes and percentage. Missing or
+inconsistent metadata remains unknown. Without cache roots, the cache label
+explicitly records that its state is unknown.
 
 For each side and file the tool performs first and repeat passes, bounded reads at 10%, 50%, and 90%, plus a sequential window of up to 128 MiB. It records time to first byte, completion time, actual bytes, MiB/s, errors, timeouts, effective URL/port, route kind, and cache label in both `performance-results.json` and `performance-results.md`. Any `frontend-proxied` route is marked diagnostic and cannot support a throughput claim.
 
