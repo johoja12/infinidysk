@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="fixture" date="1" subject="retained-direct.mkv">
+    <groups><group>alt.test</group></groups>
+    <segments>
+      <segment bytes="8" number="1">retained-direct-1@test</segment>
+      <segment bytes="8" number="2">retained-direct-2@test</segment>
+    </segments>
+  </file>
+</nzb>

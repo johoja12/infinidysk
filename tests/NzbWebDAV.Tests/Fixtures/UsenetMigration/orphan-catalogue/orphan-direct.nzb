@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <file poster="fixture" date="1" subject="orphan-direct.mkv">
+    <groups><group>alt.test</group></groups>
+    <segments><segment bytes="16" number="1">orphan-direct@test</segment></segments>
+  </file>
+</nzb>

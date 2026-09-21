@@ -1,6 +1,10 @@
 using Microsoft.EntityFrameworkCore;
 using NzbDavMigration.Canary;
+using NzbDavMigration.Catalogue;
 using NzbDavMigration.Export;
+using NzbDavMigration.Inventory;
+using NzbDavMigration.Legacy;
+using NzbDavMigration.Recovery;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models;
@@ -129,6 +133,127 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
         {
             BlobStore.Use(previousBlobStore);
         }
+    }
+
+    [Fact]
+    public async Task FullRecoveryFixture_CataloguesExportsLinksAndUsesFinalCoverageSnapshot()
+    {
+        Directory.CreateDirectory(_root);
+        var sourceRoot = Directory.CreateDirectory(Path.Join(_root, "source")).FullName;
+        var libraryRoot = Directory.CreateDirectory(Path.Join(_root, "plex2")).FullName;
+        var targetRoot = Directory.CreateDirectory(Path.Join(_root, "target")).FullName;
+        var blobRoot = Path.Join(_root, "orphan-catalogue");
+        CopyFixtureDirectory(FixtureDirectory(), blobRoot);
+
+        var rows = BuildFullRecoveryRows();
+        foreach (var (path, row) in rows)
+            CreateLegacyLink(sourceRoot, path, row.Id);
+        var inventoriedLinks = new LibraryInventoryService().Inventory(sourceRoot);
+        Assert.Equal(rows.Count, inventoriedLinks.Count);
+        var candidates = inventoriedLinks.Select(link => new LegacyInventoryCandidate(
+            link.LibraryRelativePath, link.OriginalTarget, link.LegacyDavItemId,
+            rows.Single(item => item.Row.Id == link.LegacyDavItemId).Row,
+            link.LibraryRelativePath == "TV/Retained.mkv" ? "candidate" : "recoverable-orphan",
+            null, null)).ToArray();
+        var initialInventory = Path.Join(_root, "initial-inventory.json");
+        await File.WriteAllTextAsync(initialInventory, System.Text.Json.JsonSerializer.Serialize(
+            candidates, new System.Text.Json.JsonSerializerOptions
+            {
+                PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
+                WriteIndented = true,
+            }));
+
+        var frozenList = Path.Join(_root, "catalogue-input.json");
+        var catalogue = Path.Join(_root, "catalogue.sqlite");
+        var summary = Path.Join(_root, "catalogue-summary.json");
+        Assert.Equal(0, await NzbDavMigrationProgram.RunAsync(
+            ["catalogue-list", "--blob-root", blobRoot, "--output", frozenList]));
+        Assert.Equal(0, await NzbDavMigrationProgram.RunAsync(
+            ["catalogue-scan", "--blob-root", blobRoot, "--inventory", frozenList,
+                "--database", catalogue, "--summary", summary]));
+        await using (var store = new OrphanCatalogueStore(catalogue, summary))
+        {
+            await store.OpenCompletedAsync();
+            Assert.Equal("invalid-xml", (await store.ReadBlobAsync("corrupt.nzb"))!.FailureClass);
+            var original = await store.ReadBlobAsync("orphan-direct.nzb");
+            var duplicate = await store.ReadBlobAsync("orphan-direct-byte-identical-copy.nzb");
+            Assert.Equal(original!.Sha256, duplicate!.Sha256);
+        }
+
+        var recoveryRoot = Path.Join(_root, "recovery");
+        Assert.Equal(0, await NzbDavMigrationProgram.RunAsync(
+            ["recover-full", "--inventory", initialInventory, "--catalogue", catalogue,
+                "--output", recoveryRoot, "--minimum-coverage", "0.90"]));
+        var masterPath = Path.Join(recoveryRoot, "master-manifest.json");
+        var master = System.Text.Json.JsonSerializer.Deserialize<FullRecoveryMasterManifest>(
+            await File.ReadAllTextAsync(masterPath),
+            new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
+        Assert.Equal(10, master.TotalLinks);
+        Assert.Equal(9, master.RecoverableLinks);
+        Assert.Equal(0.90m, master.RecoverableFraction);
+        Assert.Equal(10, master.Items.Count);
+        Assert.Equal("ambiguous-payload",
+            master.Items.Single(item => item.LibraryRelativePath == "TV/Ambiguous.mkv").Classification);
+        Assert.Equal("exact-archive",
+            master.Items.Single(item => item.LibraryRelativePath == "TV/Renamed Lazy.mkv").Classification);
+
+        var batchesRoot = Path.Join(_root, "batches");
+        Assert.Equal(0, await NzbDavMigrationProgram.RunAsync(
+            ["export-batches", "--master", masterPath, "--blob-root", blobRoot,
+                "--output", batchesRoot, "--max-releases", "2", "--max-payload-bytes", "1048576"]));
+        var batchDirectories = Directory.GetDirectories(batchesRoot).Order(StringComparer.Ordinal).ToArray();
+        Assert.Equal(2, batchDirectories.Length);
+        foreach (var batch in batchDirectories)
+        {
+            var package = await new NzbDavPackageReader().ReadAsync(batch);
+            Assert.Equal(NzbDavExportManifest.CurrentSchemaVersion, package.Manifest.SchemaVersion);
+            Assert.Equal(2, package.Manifest.BatchCount);
+            Assert.All(package.Manifest.SelectedLinks, selected => Assert.Contains(
+                master.Items, item => item.LibraryRelativePath == selected.LibraryRelativePath &&
+                                      item.Classification is "exact-direct" or "exact-archive"));
+        }
+
+        var sourceBeforeApply = SnapshotLinks(sourceRoot);
+        var journalsRoot = Directory.CreateDirectory(Path.Join(_root, "journals")).FullName;
+        var exact = master.Items.Where(item => item.Classification is "exact-direct" or "exact-archive").ToArray();
+        foreach (var group in exact.Chunk(5).Select((items, index) => (items, index)))
+        {
+            var planLinks = group.items.Select(item =>
+            {
+                var relativeTarget = $".ids/full/{item.LegacyDavItemId}";
+                var target = Path.Join(targetRoot, relativeTarget.Replace('/', Path.DirectorySeparatorChar));
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                File.WriteAllBytes(target, new byte[checked((int)item.FileSize!.Value)]);
+                return new NzbDavCanaryPlanLink(item.LibraryRelativePath, item.OriginalTarget,
+                    item.LegacyDavItemId, item.FileSize.Value, "exact", "{}", relativeTarget, "planned");
+            }).ToArray();
+            var plan = new NzbDavCanaryPlan(1, group.index + 1, new string('a', 64),
+                DateTimeOffset.UtcNow, planLinks.Length, planLinks.Length, true, planLinks);
+            var planDirectory = await new NzbDavCanaryPlanWriter().WriteAsync(
+                Path.Join(_root, $"plans-{group.index + 1}"), plan);
+            var journal = Path.Join(journalsRoot, $"batch-{group.index + 1}", "apply-journal.json");
+            var applied = await new CanaryLinkApplier(_ => true).ApplyAsync(
+                Path.Join(planDirectory, "plan.json"), sourceRoot, libraryRoot, targetRoot, journal);
+            Assert.All(applied.Links, link => Assert.Equal("applied", link.Status));
+            Assert.All(await new CanaryValidator().ValidateAsync(
+                journal, maximumBytesPerRead: 8, timeout: TimeSpan.FromSeconds(2)),
+                result => Assert.True(result.Success, result.Error));
+        }
+        Assert.Equal(sourceBeforeApply, SnapshotLinks(sourceRoot));
+
+        File.Delete(Path.Join(sourceRoot, "TV", "Ambiguous.mkv"));
+        CreateLegacyLink(sourceRoot, "TV/Added During Delta.mkv", Guid.NewGuid());
+        var coverage = await new CanaryCoverageReporter().WriteAsync(
+            sourceRoot, libraryRoot, initialInventory, masterPath, journalsRoot,
+            Path.Join(_root, "coverage"), 0.90m, TimeSpan.FromSeconds(2));
+        Assert.False(coverage.HasOwnershipErrors);
+        Assert.True(coverage.Report.MeetsMinimumCoverage);
+        Assert.Equal(10, coverage.Report.FinalSourceCount);
+        Assert.Equal(9, coverage.Report.CoveredCount);
+        Assert.Equal(1, coverage.Report.AddedCount);
+        Assert.Equal(1, coverage.Report.RemovedCount);
+        Assert.Equal(0.90m, coverage.Report.CoverageFraction);
+        Assert.Equal(coverage.Report.FinalSourceCount, coverage.Report.Items.Count);
     }
 
     private async Task<CanaryFixture> CreatePackageAsync()
@@ -328,6 +453,76 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
             string.Concat(file.Segments.Select(segment =>
                 $"<segment bytes=\"{segment.Bytes}\" number=\"{segment.Number}\">{segment.MessageId}</segment>")) +
             "</segments></file>")) + "</nzb>";
+
+    private static string FixtureDirectory() => Path.Join(
+        AppContext.BaseDirectory, "Fixtures", "UsenetMigration", "orphan-catalogue");
+
+    private static void CopyFixtureDirectory(string source, string destination)
+    {
+        Directory.CreateDirectory(destination);
+        foreach (var file in Directory.GetFiles(source))
+            File.Copy(file, Path.Join(destination, Path.GetFileName(file)));
+    }
+
+    private static List<(string Path, LegacyDavItemRow Row)> BuildFullRecoveryRows()
+    {
+        var rows = new List<(string Path, LegacyDavItemRow Row)>
+        {
+            Direct("TV/Retained.mkv", ["retained-direct-1@test", "retained-direct-2@test"], 16),
+        };
+        rows.AddRange(Enumerable.Range(1, 6).Select(index =>
+            Direct($"TV/Orphan {index}.mkv", ["orphan-direct@test"], 16)));
+        rows.Add(Archive("TV/Eager Archive.mkv", "eager-archive@test", 20));
+        rows.Add(Archive("TV/Renamed Lazy.mkv", "renamed-lazy-archive@test", 24));
+        rows.Add(Direct("TV/Ambiguous.mkv", ["ambiguous@test"], 12));
+        return rows;
+    }
+
+    private static (string Path, LegacyDavItemRow Row) Direct(
+        string libraryPath,
+        string[] segmentIds,
+        long size)
+    {
+        var id = Guid.NewGuid();
+        return (libraryPath, new LegacyDavItemRow(
+            id, $"/content/full-recovery/{libraryPath}", size, 3, null, null,
+            NzbSegmentsJson: System.Text.Json.JsonSerializer.Serialize(segmentIds),
+            HistoryExclusion: "missing-history"));
+    }
+
+    private static (string Path, LegacyDavItemRow Row) Archive(
+        string libraryPath,
+        string segmentId,
+        long size)
+    {
+        var id = Guid.NewGuid();
+        var parts = new[]
+        {
+            new DavRarFile.RarPart
+            {
+                SegmentIds = [segmentId],
+                PartSize = size,
+                Offset = 0,
+                ByteCount = size,
+            },
+        };
+        return (libraryPath, new LegacyDavItemRow(
+            id, $"/content/full-recovery/{libraryPath}", size, 4, null, null,
+            RarPartsJson: System.Text.Json.JsonSerializer.Serialize(parts),
+            HistoryExclusion: "missing-history"));
+    }
+
+    private static void CreateLegacyLink(string root, string relativePath, Guid id)
+    {
+        var path = Path.Join(root, relativePath.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.CreateSymbolicLink(path, $"/mnt/legacy/.ids/a/b/c/d/e/{id}");
+    }
+
+    private static string[] SnapshotLinks(string root) => new LibraryInventoryService().Inventory(root)
+        .Select(link => $"{link.LibraryRelativePath}\0{link.OriginalTarget}")
+        .Order(StringComparer.Ordinal)
+        .ToArray();
 
     public void Dispose()
     {

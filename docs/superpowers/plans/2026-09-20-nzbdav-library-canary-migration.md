@@ -530,7 +530,7 @@ This phase is a separate, explicitly approved production operation after the imp
 
 ### Task 17: Build and validate `/mnt/plex2`
 
-- [ ] Run `apply-links` on nuc-1 with exact roots `/mnt/plex2` and `/mnt/remote/infinidysk`. Preserve the apply journal and checksum it.
+- [ ] Run `apply-links` on nuc-1 with source root `/mnt/plex` and exact roots `/mnt/plex2` and `/mnt/remote/infinidysk`. Preserve the apply journal and checksum it.
 - [ ] Confirm link count equals the reviewed plan count, all links remain beneath `/mnt/plex2`, and no inode/mtime beneath `/mnt/plex` changed during the window.
 - [ ] Run bounded automated validation for every leaf: `lstat`, target existence, exact size, beginning/middle/end reads, WebDAV HEAD/range probes, and supported `ffprobe`.
 - [ ] Record the effective routes before benchmarking: legacy NzbDav's WebDAV
@@ -564,6 +564,16 @@ This phase is a separate, explicitly approved production operation after the imp
 - [ ] On success, leave `/mnt/plex2` unregistered and retain the immutable package, plan, journal, reports, and before/after snapshots for the production-cutover design.
 - [ ] Revoke the temporary legacy database role after export work is complete.
 - [ ] Stop. Full library import, Plex registration, legacy-ID aliasing, production symlink rewriting, and rclone cutover require a new approved design.
+
+### Superseding full-library recovery plan
+
+The approved follow-on implementation is specified in
+`2026-09-21-nzbdav-full-library-recovery.md`. It replaces the proposed legacy-ID
+compatibility resolver with exact-only, create-only links in `/mnt/plex2`, adds a
+resumable orphan catalogue and bounded batches, and uses the live final source
+snapshot for aggregate coverage. This canary plan remains the prerequisite and
+production safety baseline; it does not authorize registering `/mnt/plex2` with
+Plex or Arr.
 
 ## Evidence required before declaring the canary successful
 

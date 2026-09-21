@@ -900,7 +900,7 @@ git commit -m "feat(ui): show full NzbDav recovery progress"
 - Modify: `DEPLOYMENT-NOTES.md`
 - Modify: `docs/superpowers/plans/2026-09-20-nzbdav-library-canary-migration.md`
 
-- [ ] **Step 1: Add a failing end-to-end full-recovery fixture**
+- [x] **Step 1: Add a failing end-to-end full-recovery fixture**
 
 The fixture must include retained direct, orphan direct, eager archive, renamed
 lazy archive, byte-identical duplicate payload, distinct ambiguity, corrupt NZB,
@@ -910,11 +910,11 @@ scan/submission stub → reconcile → plan → apply → validate → coverage.
 Assert every source is classified, exact rows alone link, no source changes, and
 coverage math uses the final snapshot.
 
-- [ ] **Step 2: Run the end-to-end test**
+- [x] **Step 2: Run the end-to-end test**
 
 Expected: it fails at the first missing full-recovery integration.
 
-- [ ] **Step 3: Wire the completed units and document exact operations**
+- [x] **Step 3: Wire the completed units and document exact operations**
 
 Document commands, private artifact permissions, backup warning, 90% preflight,
 batch limits, pause/resume, plan/apply journals, delta pass, coverage report,
@@ -922,7 +922,7 @@ validation, rollback, and the prohibition on registering `/mnt/plex2` with Plex
 or Arr. State that the setup wizard is unchanged because this is an advanced
 migration workflow with no `ConfigKeys` addition.
 
-- [ ] **Step 4: Run focused end-to-end and documentation checks not covered locally by CI**
+- [x] **Step 4: Run focused end-to-end and documentation checks not covered locally by CI**
 
 Run the end-to-end test. Do not duplicate CI's full standard lanes locally; rely
 on PR CI for backend/library/frontend/architecture/docs lanes unless a failure
