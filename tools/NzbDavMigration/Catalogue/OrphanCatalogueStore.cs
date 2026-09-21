@@ -141,6 +141,86 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
         return paths;
     }
 
+    public async Task<OrphanCatalogueBlob?> ReadBlobAsync(
+        string relativePath,
+        CancellationToken cancellationToken = default)
+    {
+        var connection = RequireConnection();
+        await using var command = connection.CreateCommand();
+        command.Transaction = _transaction;
+        command.CommandText = """
+            SELECT RelativePath,Length,MtimeTicks,Sha256,ParseStatus,FailureClass,ReleaseDigest
+            FROM Blobs WHERE RelativePath=$path
+            """;
+        command.Parameters.AddWithValue("$path", relativePath);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)) return null;
+        var blob = new
+        {
+            Path = reader.GetString(0),
+            Length = reader.GetInt64(1),
+            Mtime = reader.GetInt64(2),
+            Sha = await reader.IsDBNullAsync(3, cancellationToken).ConfigureAwait(false) ? null : reader.GetString(3),
+            Status = reader.GetString(4),
+            Failure = await reader.IsDBNullAsync(5, cancellationToken).ConfigureAwait(false) ? null : reader.GetString(5),
+            Release = await reader.IsDBNullAsync(6, cancellationToken).ConfigureAwait(false) ? null : reader.GetString(6),
+        };
+        await reader.DisposeAsync().ConfigureAwait(false);
+
+        await using var articlesCommand = connection.CreateCommand();
+        articlesCommand.Transaction = _transaction;
+        articlesCommand.CommandText = """
+            SELECT MessageId,FileOrdinal,SegmentOrdinal,SegmentBytes
+            FROM Articles WHERE BlobPath=$path ORDER BY FileOrdinal,SegmentOrdinal,MessageId
+            """;
+        articlesCommand.Parameters.AddWithValue("$path", relativePath);
+        var articles = new List<OrphanCatalogueArticle>();
+        await using var articlesReader = await articlesCommand.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await articlesReader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            articles.Add(new OrphanCatalogueArticle(articlesReader.GetString(0), articlesReader.GetInt32(1),
+                articlesReader.GetInt32(2), articlesReader.GetInt64(3)));
+        return new OrphanCatalogueBlob(blob.Path, blob.Length, blob.Mtime, blob.Sha, blob.Status,
+            blob.Failure, blob.Release, articles);
+    }
+
+    public async Task<bool> ContainsSnapshotAsync(
+        OrphanCatalogueInputItem input,
+        CancellationToken cancellationToken = default)
+    {
+        var connection = RequireConnection();
+        await using var command = connection.CreateCommand();
+        command.Transaction = _transaction;
+        command.CommandText = """
+            SELECT EXISTS(
+              SELECT 1 FROM Blobs WHERE RelativePath=$path AND Length=$length AND MtimeTicks=$mtime)
+            """;
+        command.Parameters.AddWithValue("$path", input.RelativePath);
+        command.Parameters.AddWithValue("$length", input.Length);
+        command.Parameters.AddWithValue("$mtime", input.MtimeTicks);
+        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false)) == 1;
+    }
+
+    public async Task<OrphanCatalogueSummary> BuildSummaryAsync(
+        string inputDigest,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateDigest(inputDigest, nameof(inputDigest));
+        var connection = RequireConnection();
+        await using var command = connection.CreateCommand();
+        command.Transaction = _transaction;
+        command.CommandText = """
+            SELECT COUNT(*),
+                   COALESCE(SUM(CASE WHEN ParseStatus='valid' THEN 1 ELSE 0 END),0),
+                   COALESCE(SUM(CASE WHEN ParseStatus='valid' THEN 0 ELSE 1 END),0),
+                   (SELECT COUNT(*) FROM Articles)
+            FROM Blobs
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        await reader.ReadAsync(cancellationToken).ConfigureAwait(false);
+        return new OrphanCatalogueSummary(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2),
+            reader.GetInt64(3), inputDigest);
+    }
+
     public async Task<OrphanCatalogueState> ReadStateAsync(CancellationToken cancellationToken = default)
     {
         var connection = RequireConnection();

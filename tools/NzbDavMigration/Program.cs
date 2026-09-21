@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Globalization;
 using NzbDavMigration.Canary;
+using NzbDavMigration.Catalogue;
 using NzbDavMigration.Export;
 using NzbDavMigration.Inventory;
 using NzbDavMigration.Legacy;
@@ -21,6 +22,8 @@ internal static class NzbDavMigrationProgram
         if (args.Length == 0 || args[0] is "-h" or "--help")
         {
             await Console.Error.WriteLineAsync("Usage: NzbDavMigration inventory --library-root PATH --blob-root PATH --output FILE");
+            await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-list --blob-root PATH --output FILE");
+            await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-scan --blob-root PATH --inventory FILE --database FILE --summary FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration export --selection FILE --inventory FILE --blob-root PATH --output DIR --package-id ID");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --library-root PATH --target-root PATH [--journal FILE]");
             await Console.Error.WriteLineAsync("       NzbDavMigration rollback-links --journal FILE");
@@ -34,6 +37,8 @@ internal static class NzbDavMigrationProgram
             return args[0] switch
             {
                 "inventory" => await InventoryAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "catalogue-list" => await CatalogueListAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "catalogue-scan" => await CatalogueScanAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "export" => await ExportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "apply-links" => await ApplyLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "rollback-links" => await RollbackLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
@@ -47,6 +52,22 @@ internal static class NzbDavMigrationProgram
             await Console.Error.WriteLineAsync(exception.Message);
             return 1;
         }
+    }
+
+    private static async Task<int> CatalogueListAsync(IReadOnlyDictionary<string, string> options)
+    {
+        await OrphanCatalogueInputList.CreateAsync(
+            Required(options, "--blob-root"), Required(options, "--output")).ConfigureAwait(false);
+        return 0;
+    }
+
+    private static async Task<int> CatalogueScanAsync(IReadOnlyDictionary<string, string> options)
+    {
+        await using var store = new OrphanCatalogueStore(
+            Required(options, "--database"), Required(options, "--summary"));
+        await new OrphanCatalogueScanner().ScanAsync(
+            Required(options, "--blob-root"), Required(options, "--inventory"), store).ConfigureAwait(false);
+        return 0;
     }
 
     private static async Task<int> ApplyLinksAsync(IReadOnlyDictionary<string, string> options)

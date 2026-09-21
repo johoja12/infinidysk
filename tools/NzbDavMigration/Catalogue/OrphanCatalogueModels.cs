@@ -20,6 +20,18 @@ public sealed record OrphanCatalogueBlob(
     string? ReleaseDigest,
     IReadOnlyList<OrphanCatalogueArticle> Articles);
 
+public sealed record OrphanCatalogueInputItem(
+    string RelativePath,
+    long Length,
+    long MtimeTicks);
+
+public sealed record OrphanCatalogueInputDocument(
+    int SchemaVersion,
+    IReadOnlyList<OrphanCatalogueInputItem> Items)
+{
+    public const int CurrentSchemaVersion = 1;
+}
+
 public sealed record OrphanCatalogueState(
     string InputDigest,
     string Status,
