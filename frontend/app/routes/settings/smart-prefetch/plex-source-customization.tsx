@@ -33,6 +33,7 @@ export function PlexSourceCustomization({
       <label className="grid gap-1 text-sm">
         Item limit
         <Input
+          autoFocus
           aria-label={`Item limit for ${source.Title}`}
           type="number"
           min={1}

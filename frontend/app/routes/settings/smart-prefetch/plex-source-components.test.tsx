@@ -114,6 +114,24 @@ describe("Plex source presentation", () => {
     expect(onCustomize).toHaveBeenCalledWith(settings.Sources[0]);
   });
 
+  it("explains when an expanded library has no compatible Plex sources", async () => {
+    const user = userEvent.setup();
+    render(
+      <PlexMediaSection
+        type="show"
+        title="TV shows"
+        enabled
+        libraries={[{ ...library(), hubs: [], collections: [] }]}
+        settings={parsePrefetchSettings(undefined)}
+        onChange={vi.fn()}
+        onCustomize={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "Show TV sources" }));
+    expect(screen.getByText("No compatible hubs or collections returned by Plex.")).toBeTruthy();
+  });
+
   it("renders source limits, TV exclusions, preview, and mapping feedback", async () => {
     const user = userEvent.setup();
     const configured = {
@@ -150,6 +168,7 @@ describe("Plex source presentation", () => {
     );
 
     expect(screen.getByLabelText("Item limit for On Deck")).toBeTruthy();
+    expect(document.activeElement).toBe(screen.getByLabelText("Item limit for On Deck"));
     expect(screen.getByLabelText("Excluded shows for On Deck")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Preview On Deck" }));
     expect(onPreview).toHaveBeenCalledOnce();

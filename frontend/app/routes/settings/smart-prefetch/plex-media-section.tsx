@@ -42,7 +42,14 @@ export function PlexMediaSection({
   const [manualChoice, setManualChoice] = useState<string | null>(null);
   const enabledSources = settings.Sources.filter(
     (source) =>
-      source.Enabled && (type === "movie" ? source.Type === "movie" : source.Type !== "movie"),
+      source.Enabled &&
+      (type === "movie" ? source.Type === "movie" : source.Type !== "movie") &&
+      libraries.some(
+        (library) =>
+          library.enabled &&
+          library.identity.serverId === source.ServerId &&
+          library.identity.libraryId === source.LibraryId,
+      ),
   ).length;
   const toggleOpen = (current: Set<string>, update: (value: Set<string>) => void, key: string) => {
     const next = new Set(current);
@@ -114,6 +121,13 @@ export function PlexMediaSection({
                       No recommended source is available. Choose a source below.
                     </p>
                   )}
+                  {library.hubs.length === 0 &&
+                    library.collections.length === 0 &&
+                    library.unavailable.length === 0 && (
+                      <p className="text-sm text-base-content/60">
+                        No compatible hubs or collections returned by Plex.
+                      </p>
+                    )}
                   {library.hubs.map((source) => {
                     const persisted = settings.Sources.find(
                       (item) =>

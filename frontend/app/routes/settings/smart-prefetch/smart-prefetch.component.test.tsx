@@ -44,7 +44,7 @@ function Harness({
     </ManagedEnvProvider>
   );
 }
-function fakeApi(collection = false) {
+function fakeApi(collection = false, serverEnabled = true) {
   return vi
     .fn<(url: string, init?: RequestInit) => Promise<Response>>()
     .mockImplementation((url, init) => {
@@ -61,7 +61,7 @@ function fakeApi(collection = false) {
       const body = (
         {
           accounts: { accounts: [] },
-          servers: { servers: [{ id: "server", name: "Home", enabled: true }] },
+          servers: { servers: [{ id: "server", name: "Home", enabled: serverEnabled }] },
           libraries: snapshot([{ id: "2", title: "TV", type: "show" }]),
           users: snapshot([{ id: "7", name: "Owner" }]),
           sources: snapshot(
@@ -151,6 +151,14 @@ afterEach(() => {
 });
 
 describe("Smart Prefetch settings", () => {
+  it("does not offer disabled Plex servers as source targets", async () => {
+    vi.stubGlobal("fetch", fakeApi(false, false));
+    render(<Harness />);
+
+    expect(await screen.findByText(/Connect a Plex server first/)).toBeTruthy();
+    expect(screen.queryByRole("option", { name: /Home/ })).toBeNull();
+  });
+
   it("applies only the Smart Prefetch draft and clears its dirty state", async () => {
     vi.stubGlobal("fetch", fakeApi());
     const persist = vi.fn<(patch: Record<string, string>) => Promise<void>>(async () => {});

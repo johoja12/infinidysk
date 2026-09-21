@@ -50,6 +50,7 @@ export function PlexSources({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const generation = useRef(0);
+  const enabledServers = useMemo(() => servers.filter((server) => server.enabled), [servers]);
 
   useEffect(() => {
     let alive = true;
@@ -68,7 +69,7 @@ export function PlexSources({
   useEffect(() => subscribePlexServers(setServers), []);
 
   useEffect(() => {
-    if (!serverId || servers.some((server) => server.id === serverId)) return;
+    if (!serverId || enabledServers.some((server) => server.id === serverId)) return;
     generation.current++;
     setServerId("");
     setLibraries(null);
@@ -76,7 +77,7 @@ export function PlexSources({
     setSources(null);
     setPreview(null);
     setCustomizing(null);
-  }, [serverId, servers]);
+  }, [serverId, enabledServers]);
 
   const refresh = useCallback(
     async (forceRefresh = false) => {
@@ -215,7 +216,7 @@ export function PlexSources({
     <div className="space-y-4">
       {error && <Alert variant="danger">{error}</Alert>}
       <PlexSourceToolbar
-        servers={servers}
+        servers={enabledServers}
         serverId={serverId}
         users={users?.data ?? []}
         selectedUsers={settings.Users}
