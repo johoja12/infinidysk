@@ -138,7 +138,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             }
             catch (PlexRequestException) { LastError = "Plex history could not be refreshed; other source policies remain available."; }
         }
-        foreach (var source in settings.Sources.Where(source => source.Enabled && source.ServerId == server.Id))
+        foreach (var source in settings.Sources.Where(source => source.Enabled && source.ServerId == server.Id
+            && !settings.IsLibraryDisabled(source)))
         {
             if (_remainingCandidates <= 0) break;
             ct.ThrowIfCancellationRequested();

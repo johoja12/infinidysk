@@ -181,6 +181,42 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
         Assert.Empty(_runtime.Jobs!.List());
     }
 
+    [Fact]
+    public async Task DisabledLibrary_SkipsSourceUntilReenabledWithoutRewritingIt()
+    {
+        var itemId = await AddItem("movie.mkv");
+        PrefetchSource source = new()
+        {
+            ServerId = "machine", LibraryId = "2", Key = "/hubs/source", Title = "Recent Movies", Type = "movie",
+            Limit = 7, ExcludedShows = ["retained"]
+        };
+        Set(ConfigKeys.SmartPrefetchSettings, JsonSerializer.Serialize(new PrefetchSettings
+        {
+            Enabled = true, RealtimeEnabled = false, Sources = [source],
+            DisabledLibraries = [new("machine", "2", "movie")]
+        }));
+        using var handler = new FakePlexHandler(_ => PlexApiClientTests.Xml(
+            """<MediaContainer><Video ratingKey="movie" type="movie" title="Movie"><Media><Part file="/plex/movie.mkv"/></Media></Video></MediaContainer>"""));
+        using var policy = Policy(handler);
+
+        await policy.SyncAsync(true, CancellationToken.None);
+
+        Assert.Empty(handler.Requests);
+        Assert.Empty(_runtime.Jobs!.List());
+
+        Set(ConfigKeys.SmartPrefetchSettings, JsonSerializer.Serialize(new PrefetchSettings
+        {
+            Enabled = true, RealtimeEnabled = false, Sources = [source], DisabledLibraries = []
+        }));
+        await policy.SyncAsync(true, CancellationToken.None);
+
+        Assert.Contains(handler.Requests, request => request.Uri.AbsolutePath == "/hubs/source");
+        Assert.Equal(itemId, Assert.Single(_runtime.Jobs!.List()).ItemId);
+        var saved = Assert.Single(_runtime.Settings().Sources);
+        Assert.Equal(7, saved.Limit);
+        Assert.Equal(["retained"], saved.ExcludedShows);
+    }
+
     private PlexPrefetchService Policy(FakePlexHandler handler) => new(_config, new PlexApiClient(new HttpClient(handler), "policy-test"),
         _runtime, _services.GetRequiredService<IServiceScopeFactory>(), new ActiveReadRegistry());
     private void SetPolicy(string type, string[] users) => Set(ConfigKeys.SmartPrefetchSettings, JsonSerializer.Serialize(new PrefetchSettings

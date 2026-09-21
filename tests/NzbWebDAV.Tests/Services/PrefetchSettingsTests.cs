@@ -46,6 +46,14 @@ public sealed class PrefetchSettingsTests
     }
 
     [Theory]
+    [InlineData("movie", "movie")]
+    [InlineData("show", "show")]
+    [InlineData("episode", "show")]
+    [InlineData("clip", "show")]
+    public void SourceLibraryType_NormalizesSchedulerIdentity(string sourceType, string expected) =>
+        Assert.Equal(expected, PrefetchSettings.LibraryType(new PrefetchSource { Type = sourceType }));
+
+    [Theory]
     [InlineData("{\"MaxConcurrentJobs\":100}")]
     [InlineData("{\"RealtimeCheckIntervalSeconds\":0}")]
     [InlineData("{\"Sources\":[{\"ServerId\":\"one\",\"Key\":\"https://other-host/steal\"}]}")]

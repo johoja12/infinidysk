@@ -60,6 +60,10 @@ public sealed record PrefetchSettings
     public string[] Users { get; init; } = [];
     public PrefetchSource[] Sources { get; init; } = [];
     public PrefetchLibraryIdentity[] DisabledLibraries { get; init; } = [];
+    public static string LibraryType(PrefetchSource source) => source.Type == "movie" ? "movie" : "show";
+    public bool IsLibraryDisabled(PrefetchSource source) => DisabledLibraries.Any(library =>
+        library.ServerId == source.ServerId && library.LibraryId == source.LibraryId
+        && library.Type == LibraryType(source));
     public static PrefetchSettings Parse(string? json)
     {
         PrefetchSettings settings;
