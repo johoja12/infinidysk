@@ -15,7 +15,7 @@ public sealed class NzbDavCanaryLinkPlannerTests : IDisposable
     private readonly string _root = Path.Join(Path.GetTempPath(), $"nzbdav-canary-plan-{Guid.NewGuid():N}");
 
     [Fact]
-    public async Task GenerateAsync_AccountsForEverySelectionAndOnlyMakesExactRowsActionable()
+    public async Task GenerateAsync_RejectsAnyNonExactSelectionWithoutPersistingRowsOrPlan()
     {
         var exactSource = Guid.NewGuid();
         var unmatchedSource = Guid.NewGuid();
@@ -27,34 +27,13 @@ public sealed class NzbDavCanaryLinkPlannerTests : IDisposable
         await SeedAsync(harness, exactSource, unmatchedSource, exactTarget);
 
         await using var db = harness.Mig();
-        var result = await new NzbDavCanaryLinkPlanner().GenerateAsync(
-            db, package, 42, Path.Join(_root, "output"));
+        var output = Path.Join(_root, "output");
+        var error = await Assert.ThrowsAsync<InvalidDataException>(() =>
+            new NzbDavCanaryLinkPlanner().GenerateAsync(db, package, 42, output));
 
-        Assert.True(result.Plan.IsValid);
-        Assert.Equal(2, result.Plan.SelectedCount);
-        Assert.Equal(1, result.Plan.ActionableCount);
-        var exact = Assert.Single(result.Plan.Links, link => link.LibraryRelativePath.EndsWith("exact.mkv"));
-        Assert.Equal("exact", exact.CorrelationStatus);
-        Assert.Equal($".ids/{string.Join('/', exactTarget.ToString().Take(5))}/{exactTarget}", exact.NewRelativeTarget);
-        Assert.False(Path.IsPathRooted(exact.NewRelativeTarget));
-        Assert.Equal(10, exact.ExpectedFileSize);
-        var unmatched = Assert.Single(result.Plan.Links, link => link.LibraryRelativePath.EndsWith("unmatched.mkv"));
-        Assert.Equal("unmatched-target", unmatched.CorrelationStatus);
-        Assert.Null(unmatched.NewRelativeTarget);
-
-        db.ChangeTracker.Clear();
-        var persisted = await db.CanaryLinks.OrderBy(link => link.LibraryRelativePath).ToListAsync();
-        Assert.Equal(2, persisted.Count);
-        Assert.All(persisted, row => Assert.Equal(result.Plan.SourcePackageDigest, row.SourcePackageDigest));
-        Assert.Equal([10, 20], persisted.Select(row => row.ExpectedFileSize));
-
-        Assert.True(File.Exists(Path.Join(result.PlanDirectory, "plan.json")));
-        Assert.True(File.Exists(Path.Join(result.PlanDirectory, "SHA256SUMS")));
-        var json = await File.ReadAllTextAsync(Path.Join(result.PlanDirectory, "plan.json"));
-        Assert.DoesNotContain("/mnt/plex2", json, StringComparison.Ordinal);
-        Assert.DoesNotContain("/content/", json, StringComparison.Ordinal);
-        using var parsed = JsonDocument.Parse(json);
-        Assert.Equal(2, parsed.RootElement.GetProperty("links").GetArrayLength());
+        Assert.Contains("every selected", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(await db.CanaryLinks.ToListAsync());
+        Assert.False(Directory.Exists(output));
     }
 
     [Fact]

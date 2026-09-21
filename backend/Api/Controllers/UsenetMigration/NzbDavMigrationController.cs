@@ -233,9 +233,13 @@ public sealed class NzbDavMigrationController(
     public Task<IActionResult> GenerateCanaryPlan() => GuardedAsync(async () =>
     {
         var report = await BuildCorrelationReportAsync().ConfigureAwait(false);
-        if (report.AmbiguityCount != 0)
+        if (report.ExactCount != report.SelectedCount
+            || report.ExclusionCount != 0
+            || report.AmbiguityCount != 0)
             throw new BadHttpRequestException(
-                $"Resolve all {report.AmbiguityCount} ambiguous or duplicate correlation(s) before generating a plan.");
+                "Canary plans require an exact correlation for every selected link "
+                + $"(selected: {report.SelectedCount}, exact: {report.ExactCount}, "
+                + $"excluded: {report.ExclusionCount}, ambiguous: {report.AmbiguityCount}).");
         var session = await RequireNzbDavSessionAsync().ConfigureAwait(false);
         if (session.CurrentRunId is null)
             throw new BadHttpRequestException("The completed import has no migration run identity.");

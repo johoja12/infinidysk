@@ -130,6 +130,65 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task CanaryPlan_RejectsIncompleteExactCorrelationWithoutAmbiguity()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var packagePath = await CreatePackageAsync("incomplete-plan", 2);
+        var package = await new NzbDavPackageReader().ReadAsync(packagePath);
+        var selected = package.Manifest.SelectedLinks[0];
+        var leaf = package.Manifest.Releases.SelectMany(release => release.Leaves).First();
+        var targetId = Guid.NewGuid();
+        var controller = CreateController(harness);
+        await controller.Connect(new NzbDavConnectRequest(packagePath, 5, 1));
+        await using (var db = harness.Mig())
+        {
+            var now = DateTime.UtcNow;
+            var run = new MigrationRun
+            {
+                SourceType = MigrationSourceTypes.NzbDav, Status = "complete", StartedAt = now, CompletedAt = now,
+            };
+            db.MigrationRuns.Add(run);
+            db.Releases.Add(new MigrationRelease
+            {
+                StoreRef = "release-1", StoreBasename = "release-1", SubmitFileName = "release.nzb",
+                QueueFileName = "release.nzb", JobName = "release", VerdictReasons = "[]", ScannedAt = now,
+            });
+            db.ReleaseFiles.Add(new MigrationReleaseFile
+            {
+                StoreRef = "release-1", MetaPath = "package", VirtualPath = leaf.LegacyPath,
+                FileName = "0.mkv", NormalisedName = "0.mkv", FileSize = leaf.FileSize,
+                SourceFileId = selected.LegacyDavItemId.ToString(), FileStatus = "exact",
+                Flags = "{\"match\":\"article-identity\"}", NewDavItemId = targetId.ToString(),
+            });
+            var migratedRelease = new MigratedRelease
+            {
+                SourceType = MigrationSourceTypes.NzbDav, SourceReleaseId = "release-1",
+                FirstRunId = 0, LastRunId = 0, ExpectedFileCount = 2, MappedFileCount = 1,
+                MigratedAt = now, LastVerifiedAt = now,
+            };
+            db.MigratedReleases.Add(migratedRelease);
+            await db.SaveChangesAsync();
+            migratedRelease.FirstRunId = run.Id;
+            migratedRelease.LastRunId = run.Id;
+            db.MigratedFiles.Add(new MigratedFile
+            {
+                MigratedReleaseId = migratedRelease.Id, VirtualPath = leaf.LegacyPath,
+                NormalisedRelativePath = "0.mkv", NormalisedName = "0.mkv", FileSize = leaf.FileSize,
+                DavItemId = targetId, SourceFileId = selected.LegacyDavItemId.ToString(),
+                MatchMethod = "article-identity", LastVerifiedAt = now,
+            });
+            await db.SaveChangesAsync();
+            await harness.Store.UpdateSessionAsync(session =>
+            {
+                session.Status = "complete";
+                session.CurrentRunId = run.Id;
+            });
+        }
+
+        Assert.IsType<BadRequestObjectResult>(await controller.GenerateCanaryPlan());
+    }
+
+    [Fact]
     public async Task CanaryPlan_GeneratesAndDownloadsOnlyForExactTerminalCorrelation()
     {
         await using var harness = await MigrationTestHarness.CreateAsync();
