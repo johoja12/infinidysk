@@ -134,7 +134,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
                 Attribute(item, "key") ?? $"/library/collections/{Identifier(Attribute(item, "ratingKey") ?? "")}/children",
                 Attribute(item, "title") ?? "", Attribute(item, "type") ?? "")));
         }
-        var path = string.IsNullOrEmpty(libraryId) ? "/hubs" : $"/library/sections/{Identifier(libraryId)}/hubs";
+        var path = string.IsNullOrEmpty(libraryId) ? "/hubs" : $"/hubs/sections/{Identifier(libraryId)}";
         var hubs = await ReadPagesAsync(server, path, 2000, ["Hub"], ct).ConfigureAwait(false);
         result.AddRange(hubs.Select(item => new PlexSource(server.Id, libraryId, "hub",
             Attribute(item, "hubIdentifier") ?? Attribute(item, "key") ?? "", Attribute(item, "key") ?? "",
