@@ -74,6 +74,10 @@ is never rendered as an unexplained `mixed` entry.
 
 ### Library switch
 
+A library switch is on when the library has at least one persisted source choice and
+its identity is not in `DisabledLibraries`. A library with no persisted source choice
+is off, including on existing configurations where `DisabledLibraries` is absent.
+
 Turning on a library with no prior source choices selects these defaults:
 
 - **Movie library:** `Recently Added`.
@@ -82,7 +86,7 @@ Turning on a library with no prior source choices selects these defaults:
 Only matching sources actually returned by Plex are enabled. Missing recommended
 sources are skipped without inventing synthetic catalogue entries. If no
 recommended source is available, the library opens and asks the user to choose a
-source.
+source; the switch remains off until that choice creates the first persisted source.
 
 Turning a library off adds its stable identity to `DisabledLibraries`; it does not
 change the enabled state, limit, or exclusions of any child source. Turning it back
@@ -97,6 +101,8 @@ library identity appears in this array.
 ### Source switch
 
 - On adds or enables the corresponding persisted `PrefetchSource` draft.
+- Enabling the first source in a disabled library also removes that library identity
+  from `DisabledLibraries`.
 - Off disables the source but preserves its limit and exclusions so they return if
   re-enabled.
 - There is no separate Add or Remove button in the normal flow.
