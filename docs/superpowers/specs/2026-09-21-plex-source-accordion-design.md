@@ -1,6 +1,6 @@
 # Plex Source Accordion Design
 
-**Date:** 2026-09-21  
+**Date:** 2026-09-21
 **Status:** Approved
 **Scope:** Smart Prefetch Plex source configuration only
 
