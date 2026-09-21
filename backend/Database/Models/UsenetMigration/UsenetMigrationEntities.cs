@@ -312,6 +312,33 @@ public sealed class MigrationCanaryLink
     public DateTime UpdatedAt { get; set; }
 }
 
+/// <summary>Aggregate provenance for one checksummed NzbDav full-library recovery manifest.</summary>
+public sealed class MigrationNzbDavMaster
+{
+    public long Id { get; set; }
+    public string ManifestDigest { get; set; } = "";
+    public int SourceLinkCount { get; set; }
+    public int RecoverableCount { get; set; }
+    public string Status { get; set; } = "planned";
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+}
+
+/// <summary>Ordered immutable package and execution state within a full-library recovery.</summary>
+public sealed class MigrationNzbDavBatch
+{
+    public long Id { get; set; }
+    public long MasterId { get; set; }
+    public int BatchIndex { get; set; }
+    public string PackageDigest { get; set; } = "";
+    public int SelectionCount { get; set; }
+    public string Status { get; set; } = "pending";
+    public long? RunId { get; set; }
+    public string? PlanDigest { get; set; }
+    public int AppliedCount { get; set; }
+    public int ValidatedCount { get; set; }
+}
+
 /// <summary>
 /// One planned or applied symlink rewrite for Step 6.
 /// The plan is built dry-run (Status in rewrite|already-nzbdav|not-altmount|orphan),
