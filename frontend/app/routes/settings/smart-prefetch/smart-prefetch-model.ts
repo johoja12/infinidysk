@@ -185,7 +185,7 @@ export function parsePrefetchSettings(json: string | undefined): PrefetchSetting
       normalizeKnownFields(library, {
         ServerId: "",
         LibraryId: "",
-        Type: "movie" as "movie" | "show",
+        Type: "movie",
       }),
     );
   if (

@@ -166,7 +166,8 @@ describe("Smart Prefetch settings", () => {
     await waitFor(() => expect(persist).toHaveBeenCalledTimes(1));
     const patch = persist.mock.calls[0]?.[0];
     expect(Object.keys(patch ?? {})).toEqual([PREFETCH_KEY]);
-    expect(JSON.parse(screen.getByTestId("config").textContent).unrelated).toBe("draft value");
+    const draft = JSON.parse(screen.getByTestId("config").textContent) as Record<string, unknown>;
+    expect(draft["unrelated"]).toBe("draft value");
     expect(await screen.findByText("Source changes applied.")).toBeTruthy();
     await waitFor(() => expect(apply.hasAttribute("disabled")).toBe(true));
   });

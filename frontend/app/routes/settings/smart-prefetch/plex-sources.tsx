@@ -153,9 +153,10 @@ export function PlexSources({
 
   useEffect(() => {
     if (!serverId) return;
+    const requestGeneration = generation;
     void refresh();
     return () => {
-      generation.current++;
+      requestGeneration.current++;
     };
     // `refresh` also reads retained source snapshots; server changes alone start automatic loads.
     // eslint-disable-next-line react-hooks/exhaustive-deps
