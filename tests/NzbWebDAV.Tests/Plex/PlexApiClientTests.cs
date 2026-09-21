@@ -145,7 +145,7 @@ public sealed class PlexApiClientTests
     public async Task Timeout_BoundsResponseBodyAfterHeadersHaveArrived()
     {
         using var handler = new FakePlexHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
-            { Content = new StreamContent(new WaitingBodyStream()) });
+        { Content = new StreamContent(new WaitingBodyStream()) });
         using var http = new HttpClient(handler) { Timeout = TimeSpan.FromMilliseconds(25) };
         var api = new PlexApiClient(http, "installation");
         using var cancellation = new CancellationTokenSource();
@@ -204,15 +204,18 @@ public sealed class PlexApiClientTests
             "/library/sections" => """<MediaContainer><Directory key="2" title="TV" type="show"/></MediaContainer>""",
             "/accounts" => """<MediaContainer><Account id="4" name="viewer"/></MediaContainer>""",
             "/library/sections/2/collections" => """<MediaContainer><Directory ratingKey="7" key="/library/collections/7/children" title="Shows"/></MediaContainer>""",
-            "/library/sections/2/hubs" => """<MediaContainer><Hub hubIdentifier="recent" key="/hubs/recent" title="Recent" type="show"/></MediaContainer>""",
+            "/hubs/sections/2" => """<MediaContainer><Hub hubIdentifier="recent" key="/hubs/recent" title="Recent" type="show"/></MediaContainer>""",
             _ => """<MediaContainer><Video ratingKey="9" grandparentRatingKey="8" parentIndex="3" index="1" type="episode" title="Next"/></MediaContainer>"""
         }));
         var api = new PlexApiClient(new HttpClient(handler), "installation");
         Assert.Equal("2", Assert.Single(await api.GetLibrariesAsync(Server())).Id);
         Assert.Equal("4", Assert.Single(await api.GetUsersAsync(Server())).Id);
-        var sources = await api.GetSourcesAsync(Server(), "2");
+        var sources = (await api.GetCollectionsAsync(Server(), "2"))
+            .Concat(await api.GetHubsAsync(Server(), "2")).ToArray();
         Assert.Equal(new[] { "collection", "hub" }, sources.Select(source => source.Kind));
         Assert.Equal("recent", sources[1].Id);
+        Assert.Contains(handler.Requests, request => request.Uri.AbsolutePath == "/hubs/sections/2");
+        Assert.DoesNotContain(handler.Requests, request => request.Uri.AbsolutePath == "/library/sections/2/hubs");
         Assert.Equal(3, Assert.Single(await api.GetNextEpisodesAsync(Server(), "8", 2)).Season);
         Assert.DoesNotContain(handler.Requests, request => request.Uri.ToString().Contains("secret", StringComparison.Ordinal));
     }
