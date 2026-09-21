@@ -28,6 +28,9 @@ function fakeApi(collection = false) {
     .fn<(url: string, init?: RequestInit) => Promise<Response>>()
     .mockImplementation((url, init) => {
       const op = url.split("/api/plex/")[1];
+      const request = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as {
+        libraryId?: string | null;
+      };
       const snapshot = (data: unknown[]) => ({
         data,
         isStale: false,
@@ -40,17 +43,21 @@ function fakeApi(collection = false) {
           servers: { servers: [{ id: "server", name: "Home", enabled: true }] },
           libraries: snapshot([{ id: "2", title: "TV", type: "show" }]),
           users: snapshot([{ id: "7", name: "Owner" }]),
-          sources: snapshot([
-            {
-              serverId: "server",
-              libraryId: "2",
-              kind: collection ? "collection" : "hub",
-              id: "recent",
-              key: "/hubs/recent",
-              title: "Recent TV",
-              type: collection ? "collection" : "show",
-            },
-          ]),
+          sources: snapshot(
+            request.libraryId === "2"
+              ? [
+                  {
+                    serverId: "server",
+                    libraryId: "2",
+                    kind: collection ? "collection" : "hub",
+                    id: collection ? "collection-42" : "home.onDeck",
+                    key: collection ? "/library/collections/42/children" : "/hubs/on-deck",
+                    title: collection ? "Anime" : "On Deck",
+                    type: collection ? "collection" : "show",
+                  },
+                ]
+              : [],
+          ),
           preview: {
             items: [
               {
@@ -221,25 +228,82 @@ describe("Smart Prefetch settings", () => {
     expect(selector.value).toBe("server");
     act(() => publishPlexServers([]));
     await waitFor(() => expect(selector.value).toBe(""));
-    expect(screen.getByLabelText("Plex source library").hasAttribute("disabled")).toBe(true);
+    expect(
+      screen.getByRole("button", { name: "Refresh Plex catalogue" }).hasAttribute("disabled"),
+    ).toBe(true);
   });
   it("selects real Plex collection records using their owning library media type", async () => {
     vi.stubGlobal("fetch", fakeApi(true));
     render(<Harness />);
     await waitFor(() => expect(screen.getByRole("option", { name: "Home" })).toBeTruthy());
     await userEvent.selectOptions(screen.getByLabelText("Plex source server"), "server");
-    await screen.findByRole("option", { name: "TV (show)" });
-    await userEvent.selectOptions(screen.getByLabelText("Plex source library"), "2");
-    await userEvent.click(await screen.findByRole("button", { name: "Add source Recent TV" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Show TV sources" }));
+    await userEvent.click(screen.getByRole("button", { name: "Show TV collections" }));
+    await userEvent.click(await screen.findByLabelText("Enable TV collection Anime"));
     const config = JSON.parse(screen.getByTestId("config").textContent) as Record<string, string>;
     expect(parsePrefetchSettings(config["smart-prefetch.settings"]).Sources[0]).toMatchObject({
       Kind: "collection",
       Type: "show",
       LibraryId: "2",
     });
-    await userEvent.click(screen.getByRole("button", { name: "Preview Recent TV" }));
+    await userEvent.click(screen.getByRole("button", { name: "Customize Anime" }));
+    await userEvent.click(screen.getByRole("button", { name: "Preview Anime" }));
     expect(await screen.findByText("Episode one")).toBeTruthy();
     expect(screen.getByText(/unmapped.*No exact configured path mapping/)).toBeTruthy();
+  });
+  it("keeps draft sources and the previous catalogue when a forced refresh partially fails", async () => {
+    const base = fakeApi();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+        const request = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as {
+          forceRefresh?: boolean;
+          libraryId?: string | null;
+        };
+        if (url.endsWith("/api/plex/sources") && request.forceRefresh && request.libraryId === "2")
+          return Promise.resolve(new Response("", { status: 503 }));
+        return base(url, init);
+      }),
+    );
+    render(<Harness />);
+    await userEvent.selectOptions(await screen.findByLabelText("Plex source server"), "server");
+    await userEvent.click(await screen.findByRole("button", { name: "Show TV sources" }));
+    await userEvent.click(await screen.findByLabelText("Enable TV source On Deck"));
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh Plex catalogue" }));
+
+    expect(await screen.findByText(/Catalogue is stale/)).toBeTruthy();
+    expect(screen.getByLabelText("Enable TV source On Deck")).toBeTruthy();
+    const config = JSON.parse(screen.getByTestId("config").textContent) as Record<string, string>;
+    expect(parsePrefetchSettings(config[PREFETCH_KEY]).Sources[0]?.Key).toBe("/hubs/on-deck");
+  });
+  it("shows saved sources that are absent from the refreshed catalogue", async () => {
+    vi.stubGlobal("fetch", fakeApi());
+    render(
+      <Harness
+        initial={{
+          ...parsePrefetchSettings(undefined),
+          Sources: [
+            {
+              ServerId: "server",
+              LibraryId: "2",
+              Kind: "hub",
+              Key: "/hubs/missing",
+              Title: "Missing hub",
+              Type: "show",
+              Enabled: false,
+              Limit: 25,
+              ExcludedShows: [],
+            },
+          ],
+        }}
+      />,
+    );
+    await userEvent.selectOptions(await screen.findByLabelText("Plex source server"), "server");
+    await userEvent.click(await screen.findByRole("button", { name: "Show TV sources" }));
+
+    expect(screen.getByText("Saved but not currently available")).toBeTruthy();
+    expect(screen.getByLabelText("Enable TV unavailable source Missing hub")).toBeTruthy();
   });
   it("shows policy errors and whole-file coverage, and previews without enqueueing", async () => {
     const fetcher = fakeApi();
@@ -262,11 +326,12 @@ describe("Smart Prefetch settings", () => {
     await userEvent.type(screen.getByLabelText("Episodes to queue ahead"), "3");
     await waitFor(() => expect(screen.getByRole("option", { name: "Home" })).toBeTruthy());
     await userEvent.selectOptions(screen.getByLabelText("Plex source server"), "server");
-    await userEvent.click(await screen.findByLabelText("History user Owner"));
-    await userEvent.selectOptions(screen.getByLabelText("Plex source library"), "2");
-    await userEvent.click(await screen.findByRole("button", { name: "Add source Recent TV" }));
-    await userEvent.type(screen.getByLabelText("Excluded show IDs for Recent TV"), "42, 43");
-    await userEvent.click(screen.getByRole("button", { name: "Preview Recent TV" }));
+    await userEvent.selectOptions(screen.getByLabelText("Watching profile"), "server:7");
+    await userEvent.click(await screen.findByRole("button", { name: "Show TV sources" }));
+    await userEvent.click(await screen.findByLabelText("Enable TV source On Deck"));
+    await userEvent.click(screen.getByRole("button", { name: "Customize On Deck" }));
+    await userEvent.type(screen.getByLabelText("Excluded shows for On Deck"), "42, 43");
+    await userEvent.click(screen.getByRole("button", { name: "Preview On Deck" }));
     expect(await screen.findByText("Episode one")).toBeTruthy();
     const config = JSON.parse(screen.getByTestId("config").textContent) as Record<string, string>;
     const saved = parsePrefetchSettings(config["smart-prefetch.settings"]);

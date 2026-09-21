@@ -169,22 +169,31 @@ export function PlexMediaSection({
                                 persistedSourceKey(source.serverId, source.kind, source.key),
                             );
                             return (
-                              <Toggle
-                                className="min-h-11"
+                              <div
                                 key={source.key}
-                                label={`Enable ${library.title} collection ${source.title}`}
-                                checked={persisted?.Enabled ?? false}
-                                onChange={(event) => {
-                                  const result = setSourceEnabled(
-                                    settings,
-                                    library,
-                                    source,
-                                    event.target.checked,
-                                  );
-                                  onError?.(result.error);
-                                  if (!result.error) onChange(result.settings);
-                                }}
-                              />
+                                className="flex min-h-11 flex-wrap items-center gap-2"
+                              >
+                                <Toggle
+                                  className="min-h-11 flex-1"
+                                  label={`Enable ${library.title} collection ${source.title}`}
+                                  checked={persisted?.Enabled ?? false}
+                                  onChange={(event) => {
+                                    const result = setSourceEnabled(
+                                      settings,
+                                      library,
+                                      source,
+                                      event.target.checked,
+                                    );
+                                    onError?.(result.error);
+                                    if (!result.error) onChange(result.settings);
+                                  }}
+                                />
+                                {persisted?.Enabled && (
+                                  <Button type="button" onClick={() => onCustomize(persisted)}>
+                                    Customize {source.title}
+                                  </Button>
+                                )}
+                              </div>
                             );
                           })}
                         </div>

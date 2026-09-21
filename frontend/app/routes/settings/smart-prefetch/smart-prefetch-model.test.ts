@@ -10,6 +10,7 @@ import {
   hasSmartPrefetchSettingsChanged,
   isSmartPrefetchSettingsValid,
 } from "./smart-prefetch-model";
+import type { DisabledPlexLibrary } from "./smart-prefetch-model";
 
 describe("Smart Prefetch persisted settings", () => {
   it("converts the daily budget between bytes and decimal GB", () => {
@@ -73,7 +74,9 @@ describe("Smart Prefetch persisted settings", () => {
     expect(
       validatePrefetchSettings({
         ...defaults,
-        DisabledLibraries: [{ ServerId: "server", LibraryId: "2", Type: "episode" }],
+        DisabledLibraries: [
+          { ServerId: "server", LibraryId: "2", Type: "episode" } as unknown as DisabledPlexLibrary,
+        ],
       }),
     ).not.toBeNull();
     const identity = { ServerId: "server", LibraryId: "2", Type: "show" as const };
