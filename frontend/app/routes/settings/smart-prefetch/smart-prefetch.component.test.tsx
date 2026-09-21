@@ -8,18 +8,39 @@ import { publishPlexServers } from "../plex/plex-api";
 import { SmartPrefetchSettings } from "./smart-prefetch";
 import { PREFETCH_KEY, parsePrefetchSettings, type PrefetchSettings } from "./smart-prefetch-model";
 
-function Harness({ managed = false, initial }: { managed?: boolean; initial?: PrefetchSettings }) {
-  const [config, setConfig] = useState<Record<string, string>>(
-    initial ? { [PREFETCH_KEY]: JSON.stringify(initial) } : {},
-  );
+function Harness({
+  managed = false,
+  initial,
+  persist = vi.fn(async () => {}),
+}: {
+  managed?: boolean;
+  initial?: PrefetchSettings;
+  persist?: (patch: Record<string, string>) => Promise<void>;
+}) {
+  const initialConfig = initial ? { [PREFETCH_KEY]: JSON.stringify(initial) } : {};
+  const [savedConfig, setSavedConfig] = useState<Record<string, string>>(initialConfig);
+  const [config, setConfig] = useState<Record<string, string>>({
+    ...initialConfig,
+    unrelated: "draft value",
+  });
+  const persistConfigPatch = async (patch: Record<string, string>) => {
+    await persist(patch);
+    setSavedConfig((current) => ({ ...current, ...patch }));
+  };
   return (
     <ManagedEnvProvider
       value={
         managed ? { "smart-prefetch.settings": "NZBDAV_CONFIG__SMART_PREFETCH__SETTINGS" } : {}
       }
     >
-      <SmartPrefetchSettings config={config} setNewConfig={setConfig} />
+      <SmartPrefetchSettings
+        config={config}
+        savedConfig={savedConfig}
+        setNewConfig={setConfig}
+        persistConfigPatch={persistConfigPatch}
+      />
       <output data-testid="config">{JSON.stringify(config)}</output>
+      <output data-testid="saved-config">{JSON.stringify(savedConfig)}</output>
     </ManagedEnvProvider>
   );
 }
@@ -130,6 +151,47 @@ afterEach(() => {
 });
 
 describe("Smart Prefetch settings", () => {
+  it("applies only the Smart Prefetch draft and clears its dirty state", async () => {
+    vi.stubGlobal("fetch", fakeApi());
+    const persist = vi.fn<(patch: Record<string, string>) => Promise<void>>(async () => {});
+    render(<Harness persist={persist} />);
+    const apply = screen.getByRole("button", { name: "Apply source changes" });
+    expect(apply.hasAttribute("disabled")).toBe(true);
+
+    await userEvent.click(screen.getByLabelText("Movies"));
+    expect(screen.getByText("Source changes not applied")).toBeTruthy();
+    expect(apply.hasAttribute("disabled")).toBe(false);
+    await userEvent.click(apply);
+
+    await waitFor(() => expect(persist).toHaveBeenCalledTimes(1));
+    const patch = persist.mock.calls[0]?.[0];
+    expect(Object.keys(patch ?? {})).toEqual([PREFETCH_KEY]);
+    expect(JSON.parse(screen.getByTestId("config").textContent).unrelated).toBe("draft value");
+    expect(await screen.findByText("Source changes applied.")).toBeTruthy();
+    await waitFor(() => expect(apply.hasAttribute("disabled")).toBe(true));
+  });
+
+  it("keeps source changes dirty and reports a scoped Apply failure", async () => {
+    vi.stubGlobal("fetch", fakeApi());
+    render(<Harness persist={vi.fn(async () => Promise.reject(new Error("offline")))} />);
+    await userEvent.click(screen.getByLabelText("TV episodes"));
+    await userEvent.click(screen.getByRole("button", { name: "Apply source changes" }));
+
+    expect(await screen.findByText("Could not apply source changes. Try again.")).toBeTruthy();
+    expect(screen.getByText("Source changes not applied")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Apply source changes" }).hasAttribute("disabled"),
+    ).toBe(false);
+  });
+
+  it("makes scoped Apply unavailable when Smart Prefetch is environment-managed", () => {
+    vi.stubGlobal("fetch", fakeApi());
+    render(<Harness managed />);
+    expect(
+      screen.getByRole("button", { name: "Apply source changes" }).hasAttribute("disabled"),
+    ).toBe(true);
+  });
+
   it("shows essential policy choices and keeps expert controls in a collapsed disclosure", async () => {
     vi.stubGlobal("fetch", fakeApi());
     render(<Harness />);
