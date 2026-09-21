@@ -454,6 +454,8 @@ public sealed partial class Program
                 .AddSingleton<IndexerConfigWriteLock>()
                 .AddSingleton<SearchExcludeSyncService>()
                 .AddHostedService(sp => sp.GetRequiredService<SearchExcludeSyncService>())
+                .AddSingleton<NzbWebDAV.Services.Library.LibraryCatalogScanner>()
+                .AddHostedService(sp => sp.GetRequiredService<NzbWebDAV.Services.Library.LibraryCatalogScanner>())
                 .AddSingleton<ProwlarrSyncService>()
                 .AddHostedService(sp => sp.GetRequiredService<ProwlarrSyncService>())
                 .AddSingleton<PlaybackFastVerifier>()
