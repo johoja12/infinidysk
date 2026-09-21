@@ -528,6 +528,22 @@ class BackendClient {
     }
   }
 
+  public async getLibraryCatalog(query: LibraryCatalogQuery = {}): Promise<LibraryCatalogResponse> {
+    const qs = new URLSearchParams();
+    if (query.q) qs.set("q", query.q);
+    qs.set("type", query.type ?? "all");
+    qs.set("sort", query.sort ?? "name");
+    qs.set("dir", query.dir ?? "asc");
+    qs.set("page", String(query.page ?? 1));
+    qs.set("pageSize", String(query.pageSize ?? 25));
+    return await call<LibraryCatalogResponse>(
+      `${adminApi.libraryCatalog}?${qs.toString()}`,
+      "Failed to get library catalog",
+      { method: "GET" },
+      libraryCatalogResponseSchema,
+    );
+  }
+
   public async getConfig(keys: string[], signal?: AbortSignal): Promise<ConfigItem[]> {
     const data = await call<{ configItems?: ConfigItem[] }>(
       adminApi.getConfig,
@@ -876,6 +892,46 @@ export type DirectoryItem = {
   isDirectory: boolean;
   size: number | null | undefined;
   nzbBlobId?: string;
+};
+
+const libraryCatalogMappingSchema = z.object({
+  linkPath: z.string(),
+  targetText: z.string(),
+  mappingType: z.enum(["internal", "external"]),
+  status: z.enum(["valid", "broken", "unchecked", "stale"]),
+});
+
+const libraryCatalogItemSchema = z.object({
+  kind: z.enum(["internal", "external"]),
+  davItemId: z.string().nullable().optional(),
+  displayName: z.string(),
+  contentPath: z.string().nullable().optional(),
+  size: z.number().nullable().optional(),
+  mappingCount: z.number().int(),
+  health: z.string(),
+  mappings: z.array(libraryCatalogMappingSchema),
+});
+
+const libraryCatalogResponseSchema = z.object({
+  items: z.array(libraryCatalogItemSchema),
+  totalCount: z.number().int(),
+  page: z.number().int(),
+  pageSize: z.number().int(),
+  indexScannedAt: z.string().nullable().optional(),
+  indexWarning: z.string().nullable().optional(),
+});
+
+export type LibraryCatalogMapping = z.infer<typeof libraryCatalogMappingSchema>;
+export type LibraryCatalogItem = z.infer<typeof libraryCatalogItemSchema>;
+export type LibraryCatalogResponse = z.infer<typeof libraryCatalogResponseSchema>;
+
+export type LibraryCatalogQuery = {
+  q?: string;
+  type?: "all" | "internal" | "external" | "broken";
+  sort?: "name" | "size" | "mappings";
+  dir?: "asc" | "desc";
+  page?: number;
+  pageSize?: number;
 };
 
 export type ConfigItem = {
