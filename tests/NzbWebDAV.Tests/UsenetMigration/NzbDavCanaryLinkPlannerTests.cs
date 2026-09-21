@@ -7,6 +7,7 @@ using NzbWebDAV.Database.Models.UsenetMigration;
 using NzbWebDAV.UsenetMigration;
 using NzbWebDAV.UsenetMigration.Canary;
 using NzbWebDAV.UsenetMigration.NzbDav;
+using NzbWebDAV.WebDav;
 
 namespace NzbWebDAV.Tests.UsenetMigration;
 
@@ -83,6 +84,29 @@ public sealed class NzbDavCanaryLinkPlannerTests : IDisposable
             new NzbDavCanaryLinkPlanner().GenerateAsync(retry, package, 42, output));
     }
 
+    [Theory]
+    [InlineData("legacy-release-payload-size-unique")]
+    [InlineData("archive-path-in-archive-v1")]
+    public async Task GenerateAsync_AcceptsReconciledExactTargetsFromSupportedCorrelationMethods(
+        string matchMethod)
+    {
+        var source = Guid.NewGuid();
+        var target = Guid.NewGuid();
+        var package = await CreatePackageAsync(
+            new NzbDavSelectedLibraryLink("TV/Show/exact.mkv", "/legacy/.ids/exact", source));
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        await SeedAsync(harness, source, null, target, matchMethod);
+
+        await using var db = harness.Mig();
+        var result = await new NzbDavCanaryLinkPlanner().GenerateAsync(
+            db, package, 42, Path.Join(_root, "output"));
+
+        var link = Assert.Single(result.Plan.Links);
+        Assert.Equal("exact", link.CorrelationStatus);
+        Assert.Equal("planned", link.ApplyStatus);
+        Assert.Equal(DatabaseStoreSymlinkFile.GetTargetPath(target, '/'), link.NewRelativeTarget);
+    }
+
     private async Task<string> CreatePackageAsync(params NzbDavSelectedLibraryLink[] links)
     {
         Directory.CreateDirectory(_root);
@@ -113,7 +137,8 @@ public sealed class NzbDavCanaryLinkPlannerTests : IDisposable
         MigrationTestHarness harness,
         Guid exactSource,
         Guid? unmatchedSource,
-        Guid exactTarget)
+        Guid exactTarget,
+        string matchMethod = "article-identity")
     {
         await using var db = harness.Mig();
         var now = DateTime.UtcNow;
@@ -186,7 +211,7 @@ public sealed class NzbDavCanaryLinkPlannerTests : IDisposable
             FileSize = 10,
             DavItemId = exactTarget,
             SourceFileId = exactSource.ToString(),
-            MatchMethod = "article-identity",
+            MatchMethod = matchMethod,
             LastVerifiedAt = now,
         });
         await db.SaveChangesAsync();
