@@ -7,7 +7,11 @@ vi.mock("~/clients/backend-client.server", async (importOriginal) => {
   const actual = await importOriginal<typeof import("~/clients/backend-client.server")>();
   return {
     ...actual,
-    backendClient: { ...actual.backendClient, getLibraryCatalog: vi.fn() },
+    backendClient: {
+      ...actual.backendClient,
+      getLibraryCatalog: vi.fn(),
+      getNativeCacheStatus: vi.fn(),
+    },
   };
 });
 
@@ -20,6 +24,8 @@ beforeEach(() => {
     page: 1,
     pageSize: 25,
   });
+  nativeCacheMock().mockReset();
+  nativeCacheMock().mockResolvedValue({ activeMode: "native" });
 });
 
 function requestFor(path: string): Request {
@@ -31,6 +37,11 @@ function requestFor(path: string): Request {
 function catalogMock() {
   // eslint-disable-next-line @typescript-eslint/unbound-method
   return vi.mocked(backendClient.getLibraryCatalog);
+}
+
+function nativeCacheMock() {
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  return vi.mocked(backendClient.getNativeCacheStatus);
 }
 
 describe("library loader", () => {
@@ -54,5 +65,32 @@ describe("library loader", () => {
     await loader({ request: requestFor("/library?page=0&pageSize=9999"), params: {} } as never);
 
     expect(catalogMock()).toHaveBeenCalledWith(expect.objectContaining({ page: 1, pageSize: 25 }));
+  });
+
+  it("builds signed preview urls for internal rows", async () => {
+    catalogMock().mockResolvedValue({
+      items: [
+        {
+          kind: "internal",
+          davItemId: "11111111-1111-1111-1111-111111111111",
+          displayName: "film.mkv",
+          contentPath: "/content/film.mkv",
+          size: 100,
+          mappingCount: 1,
+          health: "healthy",
+          mappings: [],
+        },
+      ],
+      totalCount: 1,
+      page: 1,
+      pageSize: 25,
+    });
+
+    const data = await loader({ request: requestFor("/library"), params: {} } as never);
+
+    expect(data.previewUrls["11111111-1111-1111-1111-111111111111"]).toMatch(
+      /^\/view\/content\/film\.mkv\?downloadKey=.+/,
+    );
+    expect(data.nativeCacheActive).toBe(true);
   });
 });

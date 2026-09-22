@@ -667,4 +667,62 @@ describe("BackendClient", () => {
       message: "Failed to fetch onboarding status: The operation was aborted.",
     });
   });
+
+  it("gets library file details by dav item id", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        davItemId: "11111111-1111-1111-1111-111111111111",
+        name: "detail-film.mkv",
+        contentPath: "/content/detail-film.mkv",
+        mappings: [],
+      }),
+    );
+
+    await backendClient.getLibraryFileDetails("11111111-1111-1111-1111-111111111111");
+
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe(
+      "http://backend/api/get-library-file-details?davItemId=11111111-1111-1111-1111-111111111111",
+    );
+    expect(init?.method).toBe("GET");
+    expect(init?.headers).toEqual({ "x-api-key": "test-api-key" });
+  });
+
+  it("passes davItemId through to health history", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ stats: [], items: [], totalCount: 0 }));
+
+    await backendClient.getHealthCheckHistory({
+      davItemId: "11111111-1111-1111-1111-111111111111",
+      pageSize: 5,
+    });
+
+    const [url] = fetchMock.mock.calls[0]!;
+    expect(url).toContain("davItemId=11111111-1111-1111-1111-111111111111");
+  });
+
+  it("requeues a single item by dav item id", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ requeuedCount: 1 }));
+
+    await backendClient.requeueActionNeededHealthChecks("11111111-1111-1111-1111-111111111111");
+
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe(
+      "http://backend/api/requeue-action-needed-health-checks?davItemId=11111111-1111-1111-1111-111111111111",
+    );
+    expect(init?.method).toBe("POST");
+  });
+
+  it("warms prefetch items by id", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ status: true }));
+
+    await backendClient.warmPrefetch(["11111111-1111-1111-1111-111111111111"]);
+
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(url).toBe("http://backend/api/prefetch/operations");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toMatchObject({
+      Operation: "warm",
+      ItemIds: ["11111111-1111-1111-1111-111111111111"],
+    });
+  });
 });

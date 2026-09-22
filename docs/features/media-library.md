@@ -6,4 +6,15 @@ Each row is one media item (deduplicated by its stable InfiniDysk identity) with
 
 Use the search box to match titles, content paths, symlink paths, or targets. Filter by mapping type (internal / external / broken) and sort by name, size, or mapping count. The header shows when the library index was last refreshed; a warning appears when the scan is stale or the library directory is unavailable.
 
-This page never modifies your library: there are no repair, delete, cache, Plex, or Arr actions here. Use **Files** (`/explore`) to browse the raw virtual filesystem.
+## File details modal [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
+
+Selecting a row opens a details modal without leaving the page. External items show their mappings only; internal items also offer actions:
+
+- **Preview** plays the file in the built-in player; **Download** saves it directly.
+- **Run health check** queues all due health checks — not just this file.
+- **Requeue repair** re-queues this file when its latest result needs action.
+- **Prewarm** warms this file into the Native cache (hidden with an explanation when Native cache is inactive).
+
+The modal also lists every symlink mapping for the item and its latest health-check result, with a link to **Health** (`/health`) for full history.
+
+The catalog and mapping list are read-only: the modal never edits or deletes library files or symlinks. Health checks, repair requeues, and prewarming schedule backend work without changing the catalog's mappings. Use **Files** (`/explore`) to browse the raw virtual filesystem.

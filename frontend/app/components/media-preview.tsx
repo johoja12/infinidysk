@@ -2,10 +2,10 @@ import { useMemo, useState } from "react";
 import { Alert, Button, Icon, Modal } from "~/components/ui";
 import { formatFileSize } from "~/utils/file-size";
 import { generateUuid } from "~/utils/uuid";
-import { isVideoFile } from "../file-kind/file-kind";
-import { MediaDiagnostics } from "./media-diagnostics";
-import { appendQueryParam, buildMediaSrc, formatClock } from "./media-utils";
-import { useMediaPlayer } from "./use-media-player";
+import { isVideoFile } from "~/components/file-kind";
+import { MediaDiagnostics } from "~/components/media-diagnostics";
+import { appendQueryParam, buildMediaSrc, formatClock } from "~/components/media-utils";
+import { useMediaPlayer } from "~/components/use-media-player";
 
 export type MediaPreviewProps = {
   fileName: string;
