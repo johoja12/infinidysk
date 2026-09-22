@@ -7,7 +7,7 @@ namespace NzbWebDAV.Api.OpenApi;
 /// </summary>
 public static class AdminApiContractCatalog
 {
-    public const string ContractVersion = "2.2.0";
+    public const string ContractVersion = "2.3.0";
     public const string RelativeContractPath = "contracts/openapi/admin-v1.json";
 
     public sealed record Operation(string Method, string Path, string OperationId);
@@ -51,6 +51,7 @@ public static class AdminApiContractCatalog
         new("GET", "/api/migration/nzbdav/full/status", "get-api-migration-nzbdav-full-status"),
         new("POST", "/api/migration/nzbdav/reconcile", "post-api-migration-nzbdav-reconcile"),
         new("GET", "/api/get-library-catalog", "get-api-get-library-catalog"),
+        new("GET", "/api/get-library-file-details", "get-api-get-library-file-details"),
     ];
 
     public static IReadOnlySet<string> CanonicalMethods(string path)
