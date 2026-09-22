@@ -78,6 +78,9 @@ public sealed class NzbDavScanRunnerTests : IDisposable
         var release = await db.Releases.SingleAsync();
         var file = await db.ReleaseFiles.SingleAsync();
         Assert.StartsWith("nzbdav:", release.StoreRef, StringComparison.Ordinal);
+        Assert.Equal("release-1.nzb", release.SubmitFileName);
+        Assert.Equal("release-1.nzb", release.QueueFileName);
+        Assert.Equal("release-1", release.JobName);
         Assert.Equal("migration-tv", release.TargetCategory);
         Assert.Equal(NzbDavArticleIdentity.DirectKind, file.ArticleIdentityKind);
         Assert.NotNull(file.SourceFileId);
@@ -108,7 +111,39 @@ public sealed class NzbDavScanRunnerTests : IDisposable
         Assert.NotEmpty(db.ScanErrors);
     }
 
-    private async Task<string> CreatePackageAsync(bool excluded = false, string? doctype = null)
+    [Fact]
+    public async Task ScanAsync_UsesSourceNamesInsteadOfUuidPayloadName()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var sourceReleaseId = Guid.NewGuid().ToString();
+        var package = await CreatePackageAsync(
+            sourceReleaseId: sourceReleaseId,
+            sourceFileName: "Outlander.Blood.of.My.Blood.S02E01.nzb",
+            sourceJobName: "Outlander.Blood.of.My.Blood.S02E01");
+        await harness.Store.UpdateSessionAsync(session =>
+        {
+            session.Status = MigrationSessionStatus.Scanning;
+            session.SourceType = MigrationSourceTypes.NzbDav;
+            session.SourcePackageRoot = package;
+        });
+        await harness.Store.SetCategoryMappingAsync("Migration-TV", "migration-tv", "migrate");
+
+        await new NzbDavScanRunner(harness.Store, new ConfigManager(), new NzbDavPackageReader())
+            .ScanAsync();
+
+        await using var db = harness.Mig();
+        var release = await db.Releases.SingleAsync();
+        Assert.Equal("Outlander.Blood.of.My.Blood.S02E01.nzb", release.SubmitFileName);
+        Assert.Equal("Outlander.Blood.of.My.Blood.S02E01.nzb", release.QueueFileName);
+        Assert.Equal("Outlander.Blood.of.My.Blood.S02E01", release.JobName);
+    }
+
+    private async Task<string> CreatePackageAsync(
+        bool excluded = false,
+        string? doctype = null,
+        string sourceReleaseId = "release-1",
+        string? sourceFileName = null,
+        string? sourceJobName = null)
     {
         Directory.CreateDirectory(_root);
         var payload = Path.Join(_root, $"source-{Guid.NewGuid():N}.nzb");
@@ -125,9 +160,11 @@ public sealed class NzbDavScanRunnerTests : IDisposable
         await new CanaryPackageWriter(1, 50).WriteAsync(new CanaryExportRequest(
             "scan-package",
             package,
-            [new CanaryExportRelease("release-1", blobId, payload,
-                [new NzbDavExportLeaf(leafId, "/content/a.mkv", 10, "release-1", null, blobId,
-                    NzbDavArticleIdentity.DirectKind, new string('a', 64), "ready", null)])],
+            [new CanaryExportRelease(sourceReleaseId, blobId, payload,
+                [new NzbDavExportLeaf(leafId, "/content/a.mkv", 10, sourceReleaseId, null, blobId,
+                    NzbDavArticleIdentity.DirectKind, new string('a', 64), "ready", null)],
+                SourceFileName: sourceFileName,
+                SourceJobName: sourceJobName)],
             [new NzbDavSelectedLibraryLink("Migration-TV/a.mkv", "/legacy/.ids/a", leafId)]));
         if (excluded)
         {

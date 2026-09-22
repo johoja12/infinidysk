@@ -57,9 +57,12 @@ public sealed class NzbDavScanRunner(
             var payload = package.Manifest.Payloads.Single(item => item.RelativePath == source.PayloadPath);
             var document = await LoadNzbSecurelyAsync(
                 package.PayloadPaths[source.PayloadPath], cancellationToken).ConfigureAwait(false);
-            var submitName = Path.GetFileName(source.PayloadPath);
+            var submitName = source.SourceFileName ?? Path.GetFileName(source.PayloadPath);
             var queueName = NzbDavNaming.QueueFileName(submitName);
             var jobName = NzbDavNaming.JobName(submitName);
+            if (source.SourceJobName is not null
+                && !string.Equals(jobName, source.SourceJobName, StringComparison.Ordinal))
+                throw new InvalidDataException("NzbDav source name metadata changed after package validation.");
             var storeRef = $"nzbdav:{source.SourceReleaseId}";
             var release = new MigrationRelease
             {
