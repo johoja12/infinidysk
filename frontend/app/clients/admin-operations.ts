@@ -102,6 +102,11 @@ export const adminFrontendOperations = [
   },
   {
     method: "get",
+    path: "/api/get-library-browse",
+    operationId: "get-api-get-library-browse",
+  },
+  {
+    method: "get",
     path: "/api/get-library-file-details",
     operationId: "get-api-get-library-file-details",
   },
@@ -137,6 +142,7 @@ export const adminApi = {
   watchtowerMutate: "/api/watchtower-mutate",
   discoverStremioCatalogs: "/api/watchtower-discover-catalogs",
   libraryCatalog: "/api/get-library-catalog",
+  libraryBrowse: "/api/get-library-browse",
   libraryFileDetails: "/api/get-library-file-details",
   nativeCache: "/api/native-cache",
   prefetchOperations: "/api/prefetch/operations",

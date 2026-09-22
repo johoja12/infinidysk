@@ -553,7 +553,7 @@ class BackendClient {
     qs.set("page", String(query.page ?? 1));
     qs.set("groupPage", String(query.groupPage ?? 1));
     return await call<LibraryBrowseResponse>(
-      `/api/get-library-browse?${qs.toString()}`,
+      `${adminApi.libraryBrowse}?${qs.toString()}`,
       "Failed to browse media library",
       { method: "GET" },
       libraryBrowseResponseSchema,
