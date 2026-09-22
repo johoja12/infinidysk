@@ -216,6 +216,21 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
 Rollback removes only unchanged links owned by that journal. It does not delete
 imported InfiniDysk releases, source links, packages, or evidence.
 
+### Replacing a failed canary import
+
+Keep replacement work inside the dedicated canary boundary. Only history entries
+whose reconciled migration ledger IDs resolve to the dedicated `migration-*`
+categories, and links owned by the matching `/mnt/plex2` apply journal, are eligible.
+Freshly reconcile the IDs and counts immediately before deleting anything. Stop on
+any ownership or count mismatch.
+
+Do not delete or modify the legacy NzbDav deployment, `/mnt/plex`, Plex libraries,
+Sonarr or Radarr configuration, unrelated InfiniDysk history, or shared migration
+tooling. Delete imported content through the supported SAB history API with completed
+files enabled, remove only verified canary links, reset and forget the matching
+migration session through its supported APIs, then generate a new checksummed package
+instead of reusing or editing the defective package.
+
 For the success canary, exclude corrupted, zero-padded, quarantined and repaired
 or repairing files. A previously repaired file may rely on local patches that
 the original NZB does not contain. Repeated normalized article IDs within an NZB
@@ -248,7 +263,21 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --package-id nuc-1-canary-2026-09-20
 ```
 
-The tool writes the package through a staging directory, requires strong identity for every selected leaf, and refuses duplicates or excluded candidates. Copy the completed directory without editing it, then mount it beneath InfiniDysk's input boundary:
+The tool writes the package through a staging directory, requires strong identity
+for every selected leaf, and refuses duplicates or excluded candidates. Each release
+records an authoritative `sourceFileName` and `sourceJobName`; its `payloadPath` is
+only the private checksummed location inside the package and may intentionally use an
+opaque release ID. InfiniDysk submits the authoritative filename through its normal
+queue path, which preserves the legacy job name and gives media deobfuscation a
+human-readable fallback.
+
+Older packages without the two source-name fields remain readable for compatibility,
+but they fall back to the payload basename. Regenerate them with the upgraded export
+tool before any name-preserving import or replacement run. Do not edit a manifest in
+place because doing so invalidates the package checksums.
+
+Copy the completed directory without editing it, then mount it beneath InfiniDysk's
+input boundary:
 
 ```yaml
 services:

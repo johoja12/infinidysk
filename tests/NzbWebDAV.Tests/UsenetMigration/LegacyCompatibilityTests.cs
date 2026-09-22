@@ -30,6 +30,7 @@ public sealed class LegacyCompatibilityTests : IDisposable
             {
                 Id = candidate.LegacyDavItemId, Path = "/content/release/Canary.Direct.mkv",
                 FileSize = 999L, Type = 3, HistoryItemId = history, NzbBlobId = history,
+                HistoryFileName = "Canary.Direct.nzb", HistoryJobName = "Canary.Direct",
                 HistoryDownloadStatus = 1, NzbSegmentsJson = "[\"direct-1@test\",\"direct-2@test\"]",
                 NzbContents = nzb, ReleaseRootPath = "/content/release",
             },
@@ -49,6 +50,9 @@ public sealed class LegacyCompatibilityTests : IDisposable
         Assert.Equal(0, result);
         Assert.Equal(nzb, await File.ReadAllTextAsync(Path.Join(output, "payloads", $"{history}.nzb")));
         var manifest = NzbDavExportManifestJson.Deserialize(await File.ReadAllTextAsync(Path.Join(output, "manifest.json")));
+        var release = Assert.Single(manifest.Releases);
+        Assert.Equal("Canary.Direct.nzb", release.SourceFileName);
+        Assert.Equal("Canary.Direct", release.SourceJobName);
         Assert.All(manifest.Releases.SelectMany(r => r.Leaves), leaf => Assert.Equal(999, leaf.FileSize));
     }
 

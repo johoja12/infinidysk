@@ -9,6 +9,7 @@ using NzbWebDAV.Config;
 using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models;
 using NzbWebDAV.Database.Models.UsenetMigration;
+using NzbWebDAV.Queue.FileAggregators;
 using NzbWebDAV.Tests.Database;
 using NzbWebDAV.UsenetMigration;
 using NzbWebDAV.UsenetMigration.Canary;
@@ -21,6 +22,10 @@ namespace NzbWebDAV.Tests.UsenetMigration;
 [Collection(nameof(ConfigPathCollection))]
 public sealed class NzbDavCanaryEndToEndTests : IDisposable
 {
+    private const string DirectSourceReleaseId = "6f16ecdb-db31-418b-a7e4-2077eccaeeb3";
+    private const string ArchiveSourceReleaseId = "ad7f4510-a108-4ddd-9880-e696cbd9dc72";
+    private const string DirectSourceJobName = "Outlander.Blood.of.My.Blood.S02E01";
+    private const string ArchiveSourceJobName = "Archive.Feature.2026";
     private readonly string _root = Path.Join(Path.GetTempPath(), $"nzbdav-e2e-{Guid.NewGuid():N}");
 
     [Fact]
@@ -47,6 +52,21 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
                 .ScanAsync();
 
             Assert.Equal(2, scan!.GreenCount);
+            await using (var migration = harness.Mig())
+            {
+                var directRelease = await migration.Releases.SingleAsync(
+                    release => release.StoreRef == $"nzbdav:{DirectSourceReleaseId}");
+                Assert.Equal($"{DirectSourceJobName}.nzb", directRelease.SubmitFileName);
+                Assert.Equal($"{DirectSourceJobName}.nzb", directRelease.QueueFileName);
+                Assert.Equal(DirectSourceJobName, directRelease.JobName);
+                Assert.Equal(
+                    $"{DirectSourceJobName}.mkv",
+                    ImportableVideoNamer.Normalize(
+                        "b082fa0beaa644d3aa01045d5b8d0b36.xyz",
+                        ".mkv",
+                        directRelease.JobName,
+                        allowBaseRename: true));
+            }
             await StubSubmissionsAsync(harness, fixture);
             await SeedCompletedImportsAsync(harness, fixture, blobStore);
 
@@ -288,29 +308,31 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
             package,
             [
                 new CanaryExportRelease(
-                    "direct-release",
+                    DirectSourceReleaseId,
                     directNzoId,
                     directPayload,
                     [new NzbDavExportLeaf(
                         directLeafId,
                         "/content/Migration-TV/direct-release/Direct.mkv",
                         220,
-                        "direct-release",
+                        DirectSourceReleaseId,
                         null,
                         directNzoId,
                         NzbDavArticleIdentity.DirectKind,
                         NzbDavArticleIdentity.ComputeDirect(directSegments),
                         "ready",
-                        null)]),
+                        null)],
+                    SourceFileName: $"{DirectSourceJobName}.nzb",
+                    SourceJobName: DirectSourceJobName),
                 new CanaryExportRelease(
-                    "archive-release",
+                    ArchiveSourceReleaseId,
                     archiveNzoId,
                     archivePayload,
                     [new NzbDavExportLeaf(
                         archiveLeafId,
                         "/content/Migration-TV/archive-release/Feature/Archive.mkv",
                         16,
-                        "archive-release",
+                        ArchiveSourceReleaseId,
                         null,
                         archiveNzoId,
                         NzbDavStableArchiveIdentity.Kind,
@@ -319,7 +341,9 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
                             [new NzbDavArchivePartIdentity(archiveSegments, 0, 0, 0, 0)],
                             16),
                         "ready",
-                        null)]),
+                        null)],
+                    SourceFileName: $"{ArchiveSourceJobName}.nzb",
+                    SourceJobName: ArchiveSourceJobName),
             ],
             [
                 new NzbDavSelectedLibraryLink(
@@ -341,8 +365,8 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
     {
         var expected = new Dictionary<string, (Guid NzoId, string PayloadPath)>(StringComparer.Ordinal)
         {
-            ["nzbdav:direct-release"] = (fixture.DirectNzoId, fixture.DirectPayloadPath),
-            ["nzbdav:archive-release"] = (fixture.ArchiveNzoId, fixture.ArchivePayloadPath),
+            [$"nzbdav:{DirectSourceReleaseId}"] = (fixture.DirectNzoId, fixture.DirectPayloadPath),
+            [$"nzbdav:{ArchiveSourceReleaseId}"] = (fixture.ArchiveNzoId, fixture.ArchivePayloadPath),
         };
         var session = await harness.Store.GetSessionAsync();
         await using var migration = harness.Mig();
@@ -391,8 +415,8 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
 
         await using var dav = harness.Dav();
         var category = Folder(Guid.NewGuid(), DavItem.ContentFolder, "migration-canary");
-        var directRelease = Folder(Guid.NewGuid(), category, "direct-release");
-        var archiveRelease = Folder(Guid.NewGuid(), category, "archive-release");
+        var directRelease = Folder(Guid.NewGuid(), category, DirectSourceJobName);
+        var archiveRelease = Folder(Guid.NewGuid(), category, ArchiveSourceJobName);
         var archiveFeature = Folder(Guid.NewGuid(), archiveRelease, "Feature");
         dav.Items.AddRange(category, directRelease, archiveRelease, archiveFeature);
         dav.Items.Add(DavItem.New(
@@ -420,8 +444,8 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
             archiveFileBlobId,
             fixture.ArchiveNzoId));
         dav.HistoryItems.AddRange(
-            Completed(fixture.DirectNzoId, "direct-release"),
-            Completed(fixture.ArchiveNzoId, "archive-release"));
+            Completed(fixture.DirectNzoId, DirectSourceJobName),
+            Completed(fixture.ArchiveNzoId, ArchiveSourceJobName));
         await dav.SaveChangesAsync();
     }
 

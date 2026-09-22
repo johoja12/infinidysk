@@ -21,7 +21,9 @@ public sealed class CanaryPackageWriterTests : IDisposable
             output,
             [new CanaryExportRelease("release-1", blobId, payload,
                 [new NzbDavExportLeaf(leafId, "/content/tv/episode.mkv", 123, "release-1", null,
-                    blobId, NzbDavArticleIdentity.DirectKind, new string('a', 64), "ready", null)])],
+                    blobId, NzbDavArticleIdentity.DirectKind, new string('a', 64), "ready", null)],
+                SourceFileName: "Outlander.S02E01.nzb",
+                SourceJobName: "Outlander.S02E01")],
             [new NzbDavSelectedLibraryLink("TV/episode.mkv", "/mnt/nzbdav/.ids/x", leafId)]);
         var originalBytes = await File.ReadAllBytesAsync(payload);
         var source = request.Releases[0];
@@ -29,6 +31,7 @@ public sealed class CanaryPackageWriterTests : IDisposable
             System.Text.Json.JsonSerializer.Serialize(new
             {
                 source.SourceReleaseId, source.NzbBlobId, source.PayloadSourcePath, source.Leaves,
+                source.SourceFileName, source.SourceJobName,
                 PayloadBytes = originalBytes,
             }))!;
         request = request with { Releases = [frozenSource] };
@@ -49,6 +52,9 @@ public sealed class CanaryPackageWriterTests : IDisposable
         var manifest = NzbDavExportManifestJson.Deserialize(
             await File.ReadAllTextAsync(Path.Join(output, "manifest.json")));
         Assert.Equal("canary-test", manifest.PackageId);
+        var release = Assert.Single(manifest.Releases);
+        Assert.Equal("Outlander.S02E01.nzb", release.SourceFileName);
+        Assert.Equal("Outlander.S02E01", release.SourceJobName);
         Assert.DoesNotContain("password", await File.ReadAllTextAsync(Path.Join(output, "manifest.json")),
             StringComparison.OrdinalIgnoreCase);
         Assert.Contains("manifest.json", await File.ReadAllTextAsync(Path.Join(output, "SHA256SUMS")),

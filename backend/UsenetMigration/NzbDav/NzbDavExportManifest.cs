@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using NzbWebDAV.UsenetMigration.Naming;
 
 namespace NzbWebDAV.UsenetMigration.NzbDav;
 
@@ -37,6 +38,20 @@ public sealed record NzbDavExportManifest(
         foreach (var release in Releases)
         {
             RequirePackagePath(release.PayloadPath, "release payload");
+            if ((release.SourceFileName is null) != (release.SourceJobName is null))
+                throw new InvalidDataException("NzbDav source filename and job name must be supplied together.");
+            if (release.SourceFileName is not null)
+            {
+                if (string.IsNullOrWhiteSpace(release.SourceFileName)
+                    || release.SourceFileName is "." or ".."
+                    || release.SourceFileName.IndexOfAny(['/', '\\']) >= 0)
+                    throw new InvalidDataException($"Unsafe NzbDav source filename '{release.SourceFileName}'.");
+                if (string.IsNullOrWhiteSpace(release.SourceJobName))
+                    throw new InvalidDataException("NzbDav source job name is required.");
+                var expectedJobName = NzbDavNaming.JobName(release.SourceFileName);
+                if (!string.Equals(expectedJobName, release.SourceJobName, StringComparison.Ordinal))
+                    throw new InvalidDataException("NzbDav source filename and job name disagree.");
+            }
             foreach (var leaf in release.Leaves)
             {
                 if (leaf.LegacyDavItemId == Guid.Empty)
@@ -104,7 +119,9 @@ public sealed record NzbDavExportRelease(
     string SourceReleaseId,
     Guid? NzbBlobId,
     string PayloadPath,
-    IReadOnlyList<NzbDavExportLeaf> Leaves);
+    IReadOnlyList<NzbDavExportLeaf> Leaves,
+    string? SourceFileName = null,
+    string? SourceJobName = null);
 
 public sealed record NzbDavExportLeaf(
     Guid LegacyDavItemId,

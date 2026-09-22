@@ -11,18 +11,18 @@ PostgreSQL database, separate application data, separate WebDAV identity, separa
 rclone container, and separate mount. Plex and the *Arr applications have not been
 connected to InfiniDysk.
 
-| Resource | Existing NzbDav | Parallel InfiniDysk |
-| --- | --- | --- |
-| Host | `192.168.20.65` | `192.168.20.65` |
-| Frontend | port `3003` | port `3004` |
-| Application container | `nzbdav` | `infinidysk` |
-| PostgreSQL container | `nzbdav-postgres` | `infinidysk-postgres` |
-| Application data | `/opt/nzbdav/config` | `/opt/infinidysk/config` |
-| PostgreSQL data | existing production path | `/opt/infinidysk/postgres` |
-| rclone container | `rclone-nzbdav` | `rclone-infinidysk` |
-| Mount | `/mnt/remote/nzbdav` | `/mnt/remote/infinidysk` |
-| rclone RC | `5573` | `5574` |
-| VFS cache | production cache | isolated 10 GiB maximum |
+| Resource              | Existing NzbDav          | Parallel InfiniDysk        |
+| --------------------- | ------------------------ | -------------------------- |
+| Host                  | `192.168.20.65`          | `192.168.20.65`            |
+| Frontend              | port `3003`              | port `3004`                |
+| Application container | `nzbdav`                 | `infinidysk`               |
+| PostgreSQL container  | `nzbdav-postgres`        | `infinidysk-postgres`      |
+| Application data      | `/opt/nzbdav/config`     | `/opt/infinidysk/config`   |
+| PostgreSQL data       | existing production path | `/opt/infinidysk/postgres` |
+| rclone container      | `rclone-nzbdav`          | `rclone-infinidysk`        |
+| Mount                 | `/mnt/remote/nzbdav`     | `/mnt/remote/infinidysk`   |
+| rclone RC             | `5573`                   | `5574`                     |
+| VFS cache             | production cache         | isolated 10 GiB maximum    |
 
 The installed image is pinned to:
 
@@ -51,35 +51,34 @@ credentials must not be copied into issues, logs, commits, or support packs.
 
 ## Current deployed configuration
 
-The following is the sanitized configuration observed on nuc-1 on September 20,
-2026. Values marked as secrets live only on the host and are intentionally not
+The following is the sanitized configuration observed on nuc-1 on September 20, 2026. Values marked as secrets live only on the host and are intentionally not
 reproduced here.
 
 ### Application Compose project
 
 The Compose project in `/opt/docker/infinidysk` contains two services:
 
-| Setting | `infinidysk` | `infinidysk-postgres` |
-| --- | --- | --- |
-| Image | pinned InfiniDysk digest above | `postgres:17-alpine` |
-| Container name | `infinidysk` | `infinidysk-postgres` |
-| Restart policy | `unless-stopped` | `unless-stopped` |
-| Published ports | host `3004` to container `3000`; `192.168.20.65:8080` to container `8080` | none |
-| Persistent bind | `/opt/infinidysk/config:/config` | `/opt/infinidysk/postgres:/var/lib/postgresql/data` |
-| Health check | `curl -fsSL http://localhost:3000/healthz` | `pg_isready -U infinidysk -d infinidysk` |
-| Dependency | waits for PostgreSQL health | none |
+| Setting         | `infinidysk`                                                              | `infinidysk-postgres`                               |
+| --------------- | ------------------------------------------------------------------------- | --------------------------------------------------- |
+| Image           | pinned InfiniDysk digest above                                            | `postgres:17-alpine`                                |
+| Container name  | `infinidysk`                                                              | `infinidysk-postgres`                               |
+| Restart policy  | `unless-stopped`                                                          | `unless-stopped`                                    |
+| Published ports | host `3004` to container `3000`; `192.168.20.65:8080` to container `8080` | none                                                |
+| Persistent bind | `/opt/infinidysk/config:/config`                                          | `/opt/infinidysk/postgres:/var/lib/postgresql/data` |
+| Health check    | `curl -fsSL http://localhost:3000/healthz`                                | `pg_isready -U infinidysk -d infinidysk`            |
+| Dependency      | waits for PostgreSQL health                                               | none                                                |
 
 The application loads `secrets/app.env`, `secrets/webdav.env`, and
 `secrets/providers.env`; PostgreSQL loads `secrets/postgres.env`. The deployed
 files and their variable names are:
 
-| File | Variables (values are not committed) |
-| --- | --- |
-| `app.env` | `INFINIDYSK_IMAGE`, `DATABASE_PROVIDER`, `DATABASE_CONNECTION_STRING`, `PUID`, `PGID`, `TZ`, `NZBDAV_CONFIG__USENET__SEGMENT_CACHE__ENABLED` |
-| `postgres.env` | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` |
-| `webdav.env` | `WEBDAV_USER`, `WEBDAV_PASSWORD` |
-| `providers.env` | `NZBDAV_CONFIG__USENET__PROVIDERS`, `NZBDAV_CONFIG__API__CATEGORIES` |
-| `admin.env` | `ADMIN_USERNAME`, `ADMIN_PASSWORD`; operator record only, not loaded by Compose |
+| File            | Variables (values are not committed)                                                                                                         |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `app.env`       | `INFINIDYSK_IMAGE`, `DATABASE_PROVIDER`, `DATABASE_CONNECTION_STRING`, `PUID`, `PGID`, `TZ`, `NZBDAV_CONFIG__USENET__SEGMENT_CACHE__ENABLED` |
+| `postgres.env`  | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`                                                                                          |
+| `webdav.env`    | `WEBDAV_USER`, `WEBDAV_PASSWORD`                                                                                                             |
+| `providers.env` | `NZBDAV_CONFIG__USENET__PROVIDERS`, `NZBDAV_CONFIG__API__CATEGORIES`                                                                         |
+| `admin.env`     | `ADMIN_USERNAME`, `ADMIN_PASSWORD`; operator record only, not loaded by Compose                                                              |
 
 The secrets directory is mode `0700` and each `.env` file is mode `0600`, owned
 by `root:root`. Always include the protected environment file when operating the
@@ -108,18 +107,18 @@ recreate from the base Compose file immediately afterward.
 configuration is read-only at `/config`; cache and logs are isolated beneath
 `/opt/docker/rclone-infinidysk`. The mount bind uses `rshared` propagation.
 
-| Setting | Deployed value |
-| --- | --- |
-| Container | `rclone-infinidysk` |
-| Image | `sakhter86/rclone:latest` |
-| Compose file | `/opt/docker/rclone-infinidysk/docker-compose.yml` |
-| rclone remote | `infinidysk:` (`webdav`, vendor `other`) |
-| WebDAV target | `http://192.168.20.65:8080` (trusted LAN backend) |
-| Credentials | protected in `/opt/docker/rclone-infinidysk/config/rclone.conf` |
-| Host mount | `/mnt/remote/infinidysk` |
-| VFS cache | `/opt/docker/rclone-infinidysk/cache`, maximum `10G` |
-| Logs | `/opt/docker/rclone-infinidysk/logs/rclone.log` |
-| RC endpoint | `127.0.0.1:5574`, unauthenticated but loopback-only |
+| Setting       | Deployed value                                                  |
+| ------------- | --------------------------------------------------------------- |
+| Container     | `rclone-infinidysk`                                             |
+| Image         | `sakhter86/rclone:latest`                                       |
+| Compose file  | `/opt/docker/rclone-infinidysk/docker-compose.yml`              |
+| rclone remote | `infinidysk:` (`webdav`, vendor `other`)                        |
+| WebDAV target | `http://192.168.20.65:8080` (trusted LAN backend)               |
+| Credentials   | protected in `/opt/docker/rclone-infinidysk/config/rclone.conf` |
+| Host mount    | `/mnt/remote/infinidysk`                                        |
+| VFS cache     | `/opt/docker/rclone-infinidysk/cache`, maximum `10G`            |
+| Logs          | `/opt/docker/rclone-infinidysk/logs/rclone.log`                 |
+| RC endpoint   | `127.0.0.1:5574`, unauthenticated but loopback-only             |
 
 The sanitized remote definition is:
 
@@ -155,15 +154,15 @@ restart sidecar, or dependency on Plex, Arr, or the production NzbDav mount.
 Nginx Proxy Manager proxy host ID `61` currently has this non-secret
 configuration:
 
-| Setting | Value |
-| --- | --- |
-| Domain | `infin.sakhter.org` |
-| Upstream | `http://192.168.20.65:3004` |
-| Certificate | ID `7` |
-| Force SSL / HTTP2 / WebSockets | enabled |
-| Block common exploits | enabled |
-| Asset caching | disabled |
-| Access list | public (`0`) |
+| Setting                        | Value                       |
+| ------------------------------ | --------------------------- |
+| Domain                         | `infin.sakhter.org`         |
+| Upstream                       | `http://192.168.20.65:3004` |
+| Certificate                    | ID `7`                      |
+| Force SSL / HTTP2 / WebSockets | enabled                     |
+| Block common exploits          | enabled                     |
+| Asset caching                  | disabled                    |
+| Access list                    | public (`0`)                |
 
 ## Configuration decisions
 
@@ -232,6 +231,11 @@ mount.
    and resume the same package when needed; reconnects with the same digest are
    idempotent. Do not advance until the current batch is terminal, reconciled,
    exact, applied, validated, and acknowledged.
+   The package `PayloadPath` is an internal checksummed locator, not a release name.
+   New exports carry authoritative `SourceFileName` and `SourceJobName` values from
+   legacy history, or a deterministic name derived from the legacy content path for
+   recovered orphans. Compatible older packages remain readable but must be
+   regenerated before a name-preserving import.
 6. Apply each exact-only plan create-only beneath `/mnt/plex2`, with `/mnt/plex` as
    the required source-drift fence and `/mnt/remote/infinidysk` as the target root.
    Retain the checksummed plan, apply journal, and bounded-read validation report.
@@ -249,6 +253,12 @@ advanced migration workflow and adds no `ConfigKeys` option.
 No bulk import, library rewrite, Plex/*Arr switch, or native-cache copy has occurred.
 `/mnt/plex2` must remain unregistered with both Plex and every Arr application
 through the full recovery and manual end-to-end validation period.
+
+Any Phase B replacement is restricted to the exact migration-ledger IDs in the
+dedicated `migration-*` categories and the links owned beneath `/mnt/plex2`. The
+legacy NzbDav deployment, `/mnt/plex`, Plex, Arr, unrelated InfiniDysk history, and
+the reusable migration tool installation are outside the deletion boundary. Recheck
+the live IDs, row/file counts, and symlink ownership immediately before cleanup.
 
 ## Operator checks
 

@@ -135,11 +135,12 @@ internal static class NzbDavMigrationProgram
         {
             foreach (var batch in batches)
             {
-                var exportReleases = batch.Releases.Select(release => new CanaryExportRelease(
-                    release.SourceReleaseId,
-                    null,
-                    OrphanCatalogueInputList.ResolveSafePath(blobRoot, release.PayloadRelativePath),
-                    release.Items.Select(item => new NzbDavExportLeaf(
+                var exportReleases = batch.Releases.Select(release =>
+                {
+                    var sourceNames = NzbDavSourceNameResolver.FromLegacyPaths(release.Items.Select(item =>
+                        item.LegacyPath ?? throw new InvalidDataException(
+                            "Recovered leaf is missing its legacy path.")));
+                    var leaves = release.Items.Select(item => new NzbDavExportLeaf(
                         item.LegacyDavItemId,
                         item.LegacyPath ?? throw new InvalidDataException("Recovered leaf is missing its legacy path."),
                         item.FileSize ?? throw new InvalidDataException("Recovered leaf is missing its exact size."),
@@ -151,7 +152,15 @@ internal static class NzbDavMigrationProgram
                         "ready",
                         null,
                         item.Classification == "exact-archive" ? item.IdentityKind : null,
-                        item.Classification == "exact-archive" ? item.IdentityDigest : null)).ToArray())).ToArray();
+                        item.Classification == "exact-archive" ? item.IdentityDigest : null)).ToArray();
+                    return new CanaryExportRelease(
+                        release.SourceReleaseId,
+                        null,
+                        OrphanCatalogueInputList.ResolveSafePath(blobRoot, release.PayloadRelativePath),
+                        leaves,
+                        SourceFileName: sourceNames.FileName,
+                        SourceJobName: sourceNames.JobName);
+                }).ToArray();
                 var selected = batch.Releases.SelectMany(release => release.Items).Select(item =>
                     new NzbDavSelectedLibraryLink(item.LibraryRelativePath, item.OriginalTarget,
                         item.LegacyDavItemId)).ToArray();
@@ -303,7 +312,21 @@ internal static class NzbDavMigrationProgram
                 .ToArray();
             if (leaves.Any(leaf => !string.Equals(leaf.ExtractionStatus, "ready", StringComparison.Ordinal)))
                 throw new InvalidDataException($"Release {sourceReleaseId} contains selected leaves without strong identity.");
-            releases.Add(new CanaryExportRelease(sourceReleaseId, group.Key, nzb.Path, leaves, nzb.Bytes));
+            var historyFileNames = group.Select(candidate => candidate.Item!.HistoryFileName)
+                .Distinct(StringComparer.Ordinal).ToArray();
+            var historyJobNames = group.Select(candidate => candidate.Item!.HistoryJobName)
+                .Distinct(StringComparer.Ordinal).ToArray();
+            if (historyFileNames.Length != 1 || historyJobNames.Length != 1)
+                throw new InvalidDataException($"Release {sourceReleaseId} has inconsistent legacy history names.");
+            var sourceNames = NzbDavSourceNameResolver.FromHistory(historyFileNames[0], historyJobNames[0]);
+            releases.Add(new CanaryExportRelease(
+                sourceReleaseId,
+                group.Key,
+                nzb.Path,
+                leaves,
+                nzb.Bytes,
+                sourceNames.FileName,
+                sourceNames.JobName));
         }
 
         var selectedLinks = selected.Select(candidate => new NzbDavSelectedLibraryLink(
