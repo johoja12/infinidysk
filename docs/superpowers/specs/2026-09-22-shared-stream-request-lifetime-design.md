@@ -1,6 +1,6 @@
 # Shared-stream request lifetime fix
 
-**Issue:** [#23](https://github.com/johoja12/infinidysk/issues/23)  
+**Issue:** [#23](https://github.com/johoja12/infinidysk/issues/23)
 **Date:** 2026-09-22
 
 ## Problem
