@@ -105,6 +105,7 @@ export const adminFrontendOperations = [
     path: "/api/get-library-file-details",
     operationId: "get-api-get-library-file-details",
   },
+  { method: "get", path: "/api/native-cache", operationId: "get-api-native-cache" },
 ] as const satisfies readonly AdminFrontendOperation[];
 
 export const adminApi = {
@@ -137,5 +138,6 @@ export const adminApi = {
   discoverStremioCatalogs: "/api/watchtower-discover-catalogs",
   libraryCatalog: "/api/get-library-catalog",
   libraryFileDetails: "/api/get-library-file-details",
+  nativeCache: "/api/native-cache",
   prefetchOperations: "/api/prefetch/operations",
 } as const satisfies Record<string, AdminApiPath>;

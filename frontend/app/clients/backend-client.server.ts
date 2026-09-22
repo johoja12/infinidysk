@@ -553,6 +553,15 @@ class BackendClient {
     );
   }
 
+  public async getNativeCacheStatus(): Promise<{ activeMode: string }> {
+    const data = await call<{ activeMode?: string }>(
+      adminApi.nativeCache,
+      "Failed to get native cache status",
+      { method: "GET" },
+    );
+    return { activeMode: data.activeMode ?? "" };
+  }
+
   public async warmPrefetch(itemIds: string[]): Promise<void> {
     await call(
       adminApi.prefetchOperations,

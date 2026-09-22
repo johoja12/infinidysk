@@ -19,7 +19,7 @@ vi.mock("~/components/ui", async (importOriginal) => {
   };
 });
 
-vi.mock("~/routes/explore/media-preview/media-preview", () => ({
+vi.mock("~/components/media-preview", () => ({
   MediaPreview: ({ fileName, onClose }: { fileName: string; onClose: () => void }) => (
     <div>
       <span>preview:{fileName}</span>
