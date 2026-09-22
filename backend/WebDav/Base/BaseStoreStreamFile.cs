@@ -17,9 +17,6 @@ public abstract class BaseStoreStreamFile(HttpContext context, ConfigManager con
     public virtual DavItem? DavItem => null;
     public virtual SharedContentIdentity ContentIdentity =>
         new(UniqueKey, DavItem?.FileBlobId, FileSize);
-    // Derived stream files must use these properties instead of capturing
-    // the primary-constructor parameters (CS9107 double-capture).
-    protected HttpContext Context => context;
     protected ConfigManager Config => configManager;
 
     protected abstract Task<Stream> GetStreamAsync(CancellationToken cancellationToken);
@@ -53,7 +50,7 @@ public abstract class BaseStoreStreamFile(HttpContext context, ConfigManager con
             {
                 Stream = stream,
                 Ownership = ownership,
-                DavItem = Context.Items["DavItem"] as DavItem,
+                DavItem = DavItem,
                 ContentIdentity = ContentIdentity,
             };
         }
@@ -69,8 +66,8 @@ public abstract class BaseStoreStreamFile(HttpContext context, ConfigManager con
         if (DavItem is not { } item) return GetStreamAsync(cancellationToken);
         // Publish attribution before opening: a native hit deliberately never opens
         // the source and must still participate in read/session accounting.
-        Context.Items["DavItem"] = item;
-        var native = Context.RequestServices?.GetService<NativeCacheService>();
+        context.Items["DavItem"] = item;
+        var native = context.RequestServices?.GetService<NativeCacheService>();
         return native is null ? GetStreamAsync(cancellationToken)
             : native.WrapAsync(item, GetStreamAsync, cancellationToken);
     }
@@ -81,7 +78,7 @@ public abstract class BaseStoreStreamFile(HttpContext context, ConfigManager con
     /// the entry-owned path never share disposables.
     /// </summary>
     private IAsyncDisposable CreateStreamingScope(CancellationToken token) =>
-        BeginReadScope(configManager, Context.RequestServices, SemaphorePriority.High, null, token);
+        BeginReadScope(configManager, context.RequestServices, SemaphorePriority.High, null, token);
 
     /// <summary>Shared ownership for response, detached playback, and bounded low-priority warming.</summary>
     public static IAsyncDisposable BeginReadScope(ConfigManager configManager, IServiceProvider services,

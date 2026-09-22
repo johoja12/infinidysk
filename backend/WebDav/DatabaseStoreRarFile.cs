@@ -26,12 +26,7 @@ public class DatabaseStoreRarFile(
     public override DateTime CreatedAt => davRarFile.CreatedAt;
     public override Guid? NzbBlobId => davRarFile.NzbBlobId;
 
-    protected override Task<Stream> GetStreamAsync(CancellationToken ct)
-    {
-        // store the DavItem being accessed in the http context
-        Context.Items["DavItem"] = davRarFile;
-
-        return DavContentStreamFactory.OpenRarAsync(davRarFile, dbClient, usenetClient, Config,
+    protected override Task<Stream> GetStreamAsync(CancellationToken ct) =>
+        DavContentStreamFactory.OpenRarAsync(davRarFile, dbClient, usenetClient, Config,
             inFlightArticleBudget, ct);
-    }
 }

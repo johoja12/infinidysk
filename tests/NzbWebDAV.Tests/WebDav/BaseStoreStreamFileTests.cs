@@ -170,12 +170,8 @@ public class BaseStoreStreamFileTests
         public override long FileSize => payload.Length;
         public override DateTime CreatedAt => DateTime.UnixEpoch;
 
-        protected override Task<Stream> GetStreamAsync(CancellationToken cancellationToken)
-        {
-            if (davItem is not null)
-                Context.Items["DavItem"] = davItem;
-            return Task.FromResult(TestStreams.Create(payload));
-        }
+        protected override Task<Stream> GetStreamAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(TestStreams.Create(payload));
     }
 
     private sealed class ThrowingStoreFile(HttpContext context, ConfigManager config)
