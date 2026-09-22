@@ -15,6 +15,10 @@ public sealed class NzbDavExportManifestTests
         Assert.Equal(1, restored.SchemaVersion);
         Assert.Equal("canary-20260920", restored.PackageId);
         Assert.Equal("release-1", Assert.Single(restored.Releases).SourceReleaseId);
+        Assert.Equal("Outlander.Blood.of.My.Blood.S02E01.nzb",
+            Assert.Single(restored.Releases).SourceFileName);
+        Assert.Equal("Outlander.Blood.of.My.Blood.S02E01",
+            Assert.Single(restored.Releases).SourceJobName);
         Assert.Equal(Guid.Parse("11111111-1111-1111-1111-111111111111"),
             Assert.Single(restored.Releases[0].Leaves).LegacyDavItemId);
         Assert.Equal("payloads/release-1.nzb", Assert.Single(restored.Payloads).RelativePath);
@@ -64,6 +68,30 @@ public sealed class NzbDavExportManifestTests
         Assert.Throws<InvalidDataException>(() => manifest.Validate());
     }
 
+    [Theory]
+    [InlineData("Outlander.S02E01.nzb", null)]
+    [InlineData(null, "Outlander.S02E01")]
+    [InlineData("../Outlander.S02E01.nzb", "Outlander.S02E01")]
+    [InlineData("Outlander.S02E01.nzb", " ")]
+    [InlineData("Outlander.S02E01.nzb", "Different.Release")]
+    public void Validate_RejectsInvalidSourceNamingMetadata(string? sourceFileName, string? sourceJobName)
+    {
+        var sourceRelease = Assert.Single(SampleManifest().Releases);
+        var manifest = SampleManifest() with
+        {
+            Releases =
+            [
+                sourceRelease with
+                {
+                    SourceFileName = sourceFileName,
+                    SourceJobName = sourceJobName,
+                },
+            ],
+        };
+
+        Assert.Throws<InvalidDataException>(() => manifest.Validate());
+    }
+
     private static NzbDavExportManifest SampleManifest() => new(
         SchemaVersion: 1,
         PackageId: "canary-20260920",
@@ -88,7 +116,9 @@ public sealed class NzbDavExportManifestTests
                         IdentityDigest: new string('b', 64),
                         ExtractionStatus: "ready",
                         ExclusionReason: null),
-                ]),
+                ],
+                SourceFileName: "Outlander.Blood.of.My.Blood.S02E01.nzb",
+                SourceJobName: "Outlander.Blood.of.My.Blood.S02E01"),
         ],
         SelectedLinks:
         [
