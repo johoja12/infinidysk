@@ -59,6 +59,24 @@ public class BaseStoreStreamFileTests
     }
 
     [Fact]
+    public async Task DetachedLease_DoesNotReadRequestItemsAfterSourceOpen()
+    {
+        var (context, _) = NewContext();
+        var item = new DavItem { Id = Guid.NewGuid(), Name = "movie.mkv" };
+        var file = new DeferredStoreFile(context, new ConfigManager(), item);
+
+        var pending = file.GetDetachedReadableStreamAsync(CancellationToken.None);
+        await file.Entered.Task;
+        context.Uninitialize();
+        file.Release.SetResult(TestStreams.Create([1]));
+
+        var lease = await pending;
+        Assert.Same(item, lease.DavItem);
+        await lease.Ownership.DisposeAsync();
+        await lease.Stream.DisposeAsync();
+    }
+
+    [Fact]
     public async Task DetachedAndResponsePaths_UseFreshDisposables()
     {
         var (context, response) = NewContext();
@@ -152,12 +170,8 @@ public class BaseStoreStreamFileTests
         public override long FileSize => payload.Length;
         public override DateTime CreatedAt => DateTime.UnixEpoch;
 
-        protected override Task<Stream> GetStreamAsync(CancellationToken cancellationToken)
-        {
-            if (davItem is not null)
-                Context.Items["DavItem"] = davItem;
-            return Task.FromResult(TestStreams.Create(payload));
-        }
+        protected override Task<Stream> GetStreamAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(TestStreams.Create(payload));
     }
 
     private sealed class ThrowingStoreFile(HttpContext context, ConfigManager config)
@@ -170,5 +184,28 @@ public class BaseStoreStreamFileTests
 
         protected override Task<Stream> GetStreamAsync(CancellationToken cancellationToken) =>
             throw new IOException("open failed");
+    }
+
+    private sealed class DeferredStoreFile(
+        HttpContext context,
+        ConfigManager config,
+        DavItem davItem) : BaseStoreStreamFile(context, config)
+    {
+        public TaskCompletionSource Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<Stream> Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public override DavItem DavItem => davItem;
+        public override string Name => davItem.Name;
+        public override string UniqueKey => davItem.Id.ToString();
+        public override long FileSize => 1;
+        public override DateTime CreatedAt => DateTime.UnixEpoch;
+
+        protected override async Task<Stream> GetStreamAsync(CancellationToken cancellationToken)
+        {
+            Entered.SetResult();
+            return await Release.Task.WaitAsync(cancellationToken);
+        }
     }
 }

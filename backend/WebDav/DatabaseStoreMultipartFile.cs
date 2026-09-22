@@ -28,12 +28,7 @@ public class DatabaseStoreMultipartFile(
     public override DateTime CreatedAt => davMultipartFile.CreatedAt;
     public override Guid? NzbBlobId => davMultipartFile.NzbBlobId;
 
-    protected override Task<Stream> GetStreamAsync(CancellationToken ct)
-    {
-        // store the DavItem being accessed in the http context
-        Context.Items["DavItem"] = davMultipartFile;
-
-        return DavContentStreamFactory.OpenMultipartAsync(davMultipartFile, dbClient, usenetClient, Config,
+    protected override Task<Stream> GetStreamAsync(CancellationToken ct) =>
+        DavContentStreamFactory.OpenMultipartAsync(davMultipartFile, dbClient, usenetClient, Config,
             lazyRarResolver, inFlightArticleBudget, ct);
-    }
 }

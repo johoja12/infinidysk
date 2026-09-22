@@ -25,12 +25,7 @@ public class DatabaseStoreNzbFile(
     public override DateTime CreatedAt => davNzbFile.CreatedAt;
     public override Guid? NzbBlobId => davNzbFile.NzbBlobId;
 
-    protected override Task<Stream> GetStreamAsync(CancellationToken cancellationToken)
-    {
-        // store the DavItem being accessed in the http context
-        Context.Items["DavItem"] = davNzbFile;
-
-        return DavContentStreamFactory.OpenNzbAsync(davNzbFile, dbClient, usenetClient, Config,
+    protected override Task<Stream> GetStreamAsync(CancellationToken cancellationToken) =>
+        DavContentStreamFactory.OpenNzbAsync(davNzbFile, dbClient, usenetClient, Config,
             inFlightArticleBudget, cancellationToken);
-    }
 }
