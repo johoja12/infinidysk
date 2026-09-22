@@ -22,36 +22,41 @@ public sealed class LibraryCatalogService(DavDatabaseContext context)
         var search = query.Search?.Trim();
         var descending = string.Equals(query.Direction, "desc", StringComparison.OrdinalIgnoreCase);
 
-        var maps = context.LinkMaps.AsNoTracking().AsQueryable();
-        if (!string.IsNullOrEmpty(search))
-        {
-            maps = maps.Where(m =>
-                m.LinkPath.Contains(search) || m.TargetText.Contains(search));
-        }
+        var dtos = await LoadAllAsync(ct, search).ConfigureAwait(false);
+        dtos = dtos.Where(d => PassesTypeFilter(d, query.TypeFilter)).ToList();
+        dtos = SortDtos(dtos, query.Sort, descending);
+        var total = dtos.Count;
+        var pageItems = dtos.Skip((page - 1) * pageSize).Take(pageSize).ToList();
+        return new LibraryCatalogResult(
+            pageItems, total, page, pageSize,
+            scanner?.LastSuccessfulScanAt, scanner?.LastScanWarning);
+    }
+
+    internal async Task<List<LibraryCatalogItemDto>> LoadAllAsync(
+        CancellationToken ct, string? search = null)
+    {
+        var maps = await context.LinkMaps.AsNoTracking().ToListAsync(ct).ConfigureAwait(false);
 
         var items = context.Items.AsNoTracking()
             .Where(i => i.Type == DavItem.ItemType.UsenetFile
                 && i.Path.StartsWith("/content/"));
         if (!string.IsNullOrEmpty(search))
         {
-            var matchingIds = maps
-                .Where(m => m.DavItemId != null)
-                .Select(m => m.DavItemId!.Value)
-                .Distinct();
+            var matchedIds = context.LinkMaps.AsNoTracking()
+                .Where(m => m.DavItemId != null
+                    && (m.LinkPath.Contains(search) || m.TargetText.Contains(search)))
+                .Select(m => m.DavItemId!.Value);
             items = items.Where(i =>
-                i.Name.Contains(search) || i.Path.Contains(search) || matchingIds.Contains(i.Id));
+                i.Name.Contains(search) || i.Path.Contains(search) || matchedIds.Contains(i.Id));
         }
-
         var internalRows = await items
             .Select(i => new { Item = i })
             .ToListAsync(ct)
             .ConfigureAwait(false);
 
-        var internalIds = internalRows.Select(r => r.Item.Id).ToList();
-        var mappingsByItem = (await maps
-                .Where(m => m.DavItemId != null && internalIds.Contains(m.DavItemId.Value))
-                .ToListAsync(ct)
-                .ConfigureAwait(false))
+        var internalIds = internalRows.Select(r => r.Item.Id).ToHashSet();
+        var mappingsByItem = maps
+            .Where(m => m.DavItemId != null && internalIds.Contains(m.DavItemId.Value))
             .GroupBy(m => m.DavItemId!.Value)
             .ToDictionary(g => g.Key, g => (IReadOnlyList<LibraryLinkMap>)g.ToList());
 
@@ -61,28 +66,27 @@ public sealed class LibraryCatalogService(DavDatabaseContext context)
             mappingsByItem.TryGetValue(row.Item.Id, out var mappings);
             mappings ??= [];
             var dto = ToInternalDto(row.Item, mappings);
-            if (PassesTypeFilter(dto, query.TypeFilter))
-                dtos.Add(dto);
+            dtos.Add(dto);
         }
 
-        var externalMaps = await maps
-            .Where(m => m.DavItemId == null)
-            .ToListAsync(ct)
-            .ConfigureAwait(false);
+        var externalMaps = maps.Where(m => m.DavItemId == null
+            && (string.IsNullOrEmpty(search)
+                || m.LinkPath.Contains(search, StringComparison.OrdinalIgnoreCase)
+                || m.TargetText.Contains(search, StringComparison.OrdinalIgnoreCase)));
         foreach (var group in externalMaps.GroupBy(m => m.LinkPath, StringComparer.Ordinal))
         {
             var dto = ToExternalDto(group.ToList());
-            if (PassesTypeFilter(dto, query.TypeFilter))
-                dtos.Add(dto);
+            dtos.Add(dto);
         }
-
-        dtos = SortDtos(dtos, query.Sort, descending);
-        var total = dtos.Count;
-        var pageItems = dtos.Skip((page - 1) * pageSize).Take(pageSize).ToList();
-        return new LibraryCatalogResult(
-            pageItems, total, page, pageSize,
-            scanner?.LastSuccessfulScanAt, scanner?.LastScanWarning);
+        return dtos;
     }
+
+    internal static bool MatchesSearch(LibraryCatalogItemDto dto, string search) =>
+        dto.DisplayName.Contains(search, StringComparison.OrdinalIgnoreCase)
+        || (dto.ContentPath?.Contains(search, StringComparison.OrdinalIgnoreCase) ?? false)
+        || dto.Mappings.Any(m =>
+            m.LinkPath.Contains(search, StringComparison.OrdinalIgnoreCase)
+            || m.TargetText.Contains(search, StringComparison.OrdinalIgnoreCase));
 
     private static LibraryCatalogItemDto ToInternalDto(DavItem item, IReadOnlyList<LibraryLinkMap> mappings) =>
         new("internal", item.Id, item.Name, item.Path, item.FileSize, mappings.Count,
