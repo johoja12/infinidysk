@@ -3,8 +3,8 @@ import { useCallback, useState } from "react";
 import { Form, Link, useFetcher, useSearchParams } from "react-router";
 import {
   backendClient,
+  type LibraryBrowseResponse,
   type LibraryCatalogItem,
-  type LibraryCatalogResponse,
   type LibraryFileDetails,
 } from "~/clients/backend-client.server";
 import { getDownloadKey } from "~/auth/downloads.server";
@@ -15,78 +15,73 @@ import { Alert, Badge, Button, Input, PageHeader } from "~/components/ui";
 import { LibraryFileModal, type LibraryModalFeedback } from "./file-modal";
 import { MediaPreview } from "~/components/media-preview";
 
-const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
-const DEFAULT_PAGE_SIZE = 25;
+type Category = "shows" | "movies" | "unmatched";
+type MappingFilter = "all" | "internal" | "external" | "broken";
 
 export type LibraryPageData = {
-  query: { q: string; type: string; sort: string; dir: string; page: number; pageSize: number };
-  catalog: LibraryCatalogResponse;
-  downloadKeys: Record<string, string>;
+  query: {
+    q: string;
+    category: Category;
+    type: MappingFilter;
+    page: number;
+    group: string | null;
+    groupPage: number;
+  };
+  browse: LibraryBrowseResponse;
   previewUrls: Record<string, string>;
   nativeCacheActive: boolean;
 };
 
-function parseType(value: string | null) {
+function parseCategory(value: string | null): Category {
+  return value === "movies" || value === "unmatched" ? value : "shows";
+}
+
+function parseType(value: string | null): MappingFilter {
   return value === "internal" || value === "external" || value === "broken" ? value : "all";
 }
 
-function parseSort(value: string | null) {
-  return value === "size" || value === "mappings" ? value : "name";
-}
-
-function parseDir(value: string | null) {
-  return value === "desc" ? "desc" : "asc";
-}
-
 function parsePage(value: string | null): number {
-  const page = parseInt(value ?? "1", 10);
-  return Number.isFinite(page) && page > 0 ? page : 1;
-}
-
-function parsePageSize(value: string | null): number {
-  const size = parseInt(value ?? String(DEFAULT_PAGE_SIZE), 10);
-  return (PAGE_SIZE_OPTIONS as readonly number[]).includes(size) ? size : DEFAULT_PAGE_SIZE;
+  const page = Number(value);
+  return Number.isSafeInteger(page) && page > 0 ? page : 1;
 }
 
 export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPageData> {
   const url = new URL(request.url);
   const query = {
     q: url.searchParams.get("q")?.trim() ?? "",
+    category: parseCategory(url.searchParams.get("category")),
     type: parseType(url.searchParams.get("type")),
-    sort: parseSort(url.searchParams.get("sort")),
-    dir: parseDir(url.searchParams.get("dir")),
     page: parsePage(url.searchParams.get("page")),
-    pageSize: parsePageSize(url.searchParams.get("pageSize")),
+    group: url.searchParams.get("group"),
+    groupPage: parsePage(url.searchParams.get("groupPage")),
   };
-  const catalog = await backendClient.getLibraryCatalog({
+  const browse = await backendClient.getLibraryBrowse({
     ...(query.q ? { q: query.q } : {}),
-    type: query.type as "all" | "internal" | "external" | "broken",
-    sort: query.sort as "name" | "size" | "mappings",
-    dir: query.dir as "asc" | "desc",
+    category: query.category,
+    type: query.type,
     page: query.page,
-    pageSize: query.pageSize,
+    ...(query.group ? { group: query.group } : {}),
+    groupPage: query.groupPage,
   });
   const { frontendBackendApiKey } = getFrontendRuntimeConfig();
-  const downloadKeys: Record<string, string> = {};
   const previewUrls: Record<string, string> = {};
-  for (const item of catalog.items) {
+  for (const { item } of browse.expandedGroup?.items ?? []) {
     if (item.kind === "internal" && item.contentPath && item.davItemId) {
       const relative = item.contentPath.startsWith("/")
         ? item.contentPath.slice(1)
         : item.contentPath;
       const key = getDownloadKey(relative, frontendBackendApiKey);
-      downloadKeys[item.davItemId] = key;
       previewUrls[item.davItemId] = `/view${item.contentPath}?downloadKey=${key}`;
     }
   }
-  let nativeCacheActive: boolean;
+  let nativeCacheActive = false;
   try {
     const status = await backendClient.getNativeCacheStatus();
     nativeCacheActive = status.activeMode === "native";
   } catch {
-    nativeCacheActive = false;
+    // The catalog remains usable if the optional cache status cannot be loaded.
   }
-  return { query, catalog, downloadKeys, previewUrls, nativeCacheActive };
+  return { query, browse, previewUrls, nativeCacheActive };
 }
 
 export async function action({ request }: Route.ActionArgs) {
@@ -105,11 +100,33 @@ export async function action({ request }: Route.ActionArgs) {
   return Response.json({ status: false, error: "Unknown library action." }, { status: 400 });
 }
 
+function withParams(params: URLSearchParams, changes: Record<string, string | null>): string {
+  const next = new URLSearchParams(params);
+  for (const [key, value] of Object.entries(changes)) {
+    if (value === null) next.delete(key);
+    else next.set(key, value);
+  }
+  return `?${next.toString()}`;
+}
+
+function indexAge(value: string | null | undefined): string {
+  if (!value) return "Index scan pending";
+  const time = new Date(value);
+  return Number.isNaN(time.valueOf())
+    ? "Index time unavailable"
+    : `Scanned ${time.toLocaleString()}`;
+}
+
+const categories: { value: Category; label: string }[] = [
+  { value: "shows", label: "TV shows" },
+  { value: "movies", label: "Movies" },
+  { value: "unmatched", label: "Unmatched" },
+];
+
 export default function Library({ loaderData }: Route.ComponentProps) {
   const [searchParams] = useSearchParams();
   const fetcher = useFetcher<{ status: boolean; error?: string }>();
-  const { query, catalog, downloadKeys, previewUrls, nativeCacheActive } = loaderData;
-  const totalPages = Math.max(1, Math.ceil(catalog.totalCount / catalog.pageSize));
+  const { query, browse, previewUrls, nativeCacheActive } = loaderData;
   const [selected, setSelected] = useState<LibraryCatalogItem | null>(null);
   const [details, setDetails] = useState<LibraryFileDetails | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
@@ -125,19 +142,18 @@ export default function Library({ loaderData }: Route.ComponentProps) {
     setShowPreview(false);
     setFeedback(null);
     if (item.kind === "internal" && item.davItemId) {
-      const id = item.davItemId;
       setDetailsLoading(true);
-      void fetch(withUrlBase(`/api/get-library-file-details?davItemId=${encodeURIComponent(id)}`))
+      void fetch(
+        withUrlBase(
+          `/api/get-library-file-details?davItemId=${encodeURIComponent(item.davItemId)}`,
+        ),
+      )
         .then(async (response) => {
           if (!response.ok) throw new Error("Could not load file details.");
           setDetails((await response.json()) as LibraryFileDetails);
         })
-        .catch(() => {
-          setDetailsError("Could not load file details.");
-        })
-        .finally(() => {
-          setDetailsLoading(false);
-        });
+        .catch(() => setDetailsError("Could not load file details."))
+        .finally(() => setDetailsLoading(false));
     }
   }, []);
 
@@ -154,8 +170,7 @@ export default function Library({ loaderData }: Route.ComponentProps) {
     setFeedback(null);
     try {
       const result = await fn();
-      setFeedback(result.ok ? { variant: "success", message: result.message } : null);
-      if (!result.ok) setFeedback({ variant: "danger", message: result.message });
+      setFeedback({ variant: result.ok ? "success" : "danger", message: result.message });
     } catch (error) {
       setFeedback({
         variant: "danger",
@@ -188,126 +203,273 @@ export default function Library({ loaderData }: Route.ComponentProps) {
       );
       if (!response.ok) {
         const body = (await response.json().catch(() => null)) as { error?: string } | null;
-        return {
-          ok: false,
-          message: body?.error || "Could not queue action-needed items for re-check.",
-        };
+        return { ok: false, message: body?.error || "Could not queue this file for re-check." };
       }
       const body = (await response.json()) as { requeuedCount?: number };
       const count = body.requeuedCount ?? 0;
       return {
         ok: true,
-        message:
-          count === 0
-            ? "No current action-needed items to re-check."
-            : `Queued ${count.toLocaleString()} item${count === 1 ? "" : "s"} for re-check.`,
+        message: count === 0 ? "No action-needed result to re-check." : "File queued for re-check.",
       };
     });
   }, [runAction, selected]);
 
   const onPrewarm = useCallback(() => {
-    const id = selected?.davItemId;
-    if (!id) return;
+    if (!selected?.davItemId) return;
     const form = new FormData();
     form.set("operation", "prewarm");
-    form.set("davItemId", id);
+    form.set("davItemId", selected.davItemId);
     void fetcher.submit(form, { method: "post" });
   }, [fetcher, selected]);
 
   const selectedPreviewUrl =
     selected?.davItemId != null ? (previewUrls[selected.davItemId] ?? null) : null;
-  const selectedItem = selected;
-  const previewItem = showPreview && selectedItem ? selectedItem : null;
+  const totalPages = Math.max(1, Math.ceil(browse.totalGroups / browse.pageSize));
 
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 py-8 md:px-6">
+    <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 py-8 md:px-6">
       <PageHeader
         title="Media Library"
-        subtitle="Read-only catalog of InfiniDysk media and its library symlinks."
+        subtitle="Browse your indexed shows and movies, with every mapped file in one place."
+        actions={
+          <span className="rounded-lg border border-base-content/10 bg-base-200 px-3 py-2 text-xs text-base-content/65">
+            {indexAge(browse.indexScannedAt)}
+          </span>
+        }
       />
-      {catalog.indexWarning ? (
-        <div className="alert alert-warning">
-          <span>Library index may be stale: {catalog.indexWarning}</span>
-        </div>
+      {browse.indexWarning ? (
+        <Alert variant="warning" role="alert">
+          Library index may be stale: {browse.indexWarning}
+        </Alert>
       ) : null}
-      <Form method="get" className="flex flex-wrap gap-2">
-        <Input name="q" defaultValue={query.q} placeholder="Search title, content path, symlink…" />
-        <select
-          name="type"
-          defaultValue={query.type}
-          className="select select-bordered"
-          aria-label="Mapping filter"
-        >
-          <option value="all">All mappings</option>
-          <option value="internal">Internal</option>
-          <option value="external">External</option>
-          <option value="broken">Broken</option>
-        </select>
-        <select
-          name="sort"
-          defaultValue={query.sort}
-          className="select select-bordered"
-          aria-label="Sort"
-        >
-          <option value="name">Name A–Z</option>
-          <option value="size">Size</option>
-          <option value="mappings">Mappings</option>
-        </select>
-        <Button type="submit">Search</Button>
-      </Form>
-      <p className="text-sm text-base-content/60">
-        {catalog.totalCount} items · page {catalog.page} of {totalPages}
-        {catalog.indexScannedAt ? ` · index fresh as of ${catalog.indexScannedAt}` : null}
-      </p>
-      <div className="overflow-x-auto">
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Location</th>
-              <th>Size</th>
-              <th>Mappings</th>
-              <th>State</th>
-            </tr>
-          </thead>
-          <tbody>
-            {catalog.items.map((item) => (
-              <CatalogRow
-                key={item.davItemId ?? item.displayName}
-                item={item}
-                downloadKeys={downloadKeys}
-                search={searchParams.toString()}
-                onOpen={() => openModal(item)}
-              />
-            ))}
-          </tbody>
-        </table>
+
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+        <Metric label="Indexed files" value={browse.totalItems} hint="Matching current filters" />
+        <Metric
+          label="Valid mappings"
+          value={browse.healthyItems}
+          hint="Internal files"
+          tone="success"
+        />
+        <Metric
+          label="Need attention"
+          value={browse.attentionItems}
+          hint="Unmapped or broken"
+          tone="warning"
+        />
+        <Metric
+          label="Unmatched"
+          value={browse.unmatchedItems}
+          hint="Review their paths"
+          tone="info"
+        />
       </div>
-      <nav className="join" aria-label="Pagination">
-        {query.page > 1 ? (
-          <Link className="btn join-item" to={`?${withPage(searchParams, query.page - 1)}`}>
-            Previous
+
+      <Form
+        method="get"
+        className="flex flex-wrap items-end gap-3 rounded-xl border border-base-content/10 bg-base-200 p-4"
+      >
+        <input type="hidden" name="category" value={query.category} />
+        <label className="min-w-48 flex-1 text-xs font-semibold text-base-content/70">
+          Search media and paths
+          <Input
+            name="q"
+            defaultValue={query.q}
+            placeholder="Show, movie, file, or link path…"
+            className="mt-1 w-full"
+          />
+        </label>
+        <label className="text-xs font-semibold text-base-content/70">
+          Mapping
+          <select
+            name="type"
+            defaultValue={query.type}
+            className="select mt-1 block select-bordered"
+          >
+            <option value="all">All mappings</option>
+            <option value="internal">Internal</option>
+            <option value="external">External</option>
+            <option value="broken">Broken links</option>
+          </select>
+        </label>
+        <Button type="submit">Apply filters</Button>
+      </Form>
+
+      <nav className="flex gap-1 border-b border-base-content/15" aria-label="Media type">
+        {categories.map(({ value, label }) => (
+          <Link
+            key={value}
+            to={withParams(searchParams, {
+              category: value,
+              page: null,
+              group: null,
+              groupPage: null,
+            })}
+            aria-current={query.category === value ? "page" : undefined}
+            className={`border-b-2 px-4 py-3 text-sm font-semibold transition-colors ${
+              query.category === value
+                ? "border-primary text-primary"
+                : "border-transparent text-base-content/60 hover:text-base-content"
+            }`}
+          >
+            {label}
+            {value === "unmatched" ? ` (${browse.unmatchedItems})` : ""}
           </Link>
-        ) : null}
-        {query.page < totalPages ? (
-          <Link className="btn join-item" to={`?${withPage(searchParams, query.page + 1)}`}>
-            Next
-          </Link>
-        ) : null}
+        ))}
       </nav>
-      {fetcher.data && fetcher.data.status === false ? (
+
+      <div className="flex items-center justify-between gap-4">
+        <h2 className="text-lg font-semibold">
+          {categories.find((category) => category.value === query.category)?.label}
+        </h2>
+        <span className="text-xs text-base-content/55">
+          {browse.totalGroups.toLocaleString()} groups · page {browse.page} of {totalPages}
+        </span>
+      </div>
+      {browse.groups.length === 0 ? (
+        <div className="rounded-xl border border-dashed border-base-content/20 bg-base-200 p-10 text-center">
+          <p className="font-semibold">No media matches these filters.</p>
+          <p className="mt-1 text-sm text-base-content/60">
+            Try a different search or mapping filter.
+          </p>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {browse.groups.map((group) => {
+            const open = browse.expandedGroup?.key === group.key;
+            return (
+              <section
+                key={group.key}
+                className="overflow-hidden rounded-xl border border-base-content/10 bg-base-200"
+              >
+                <Link
+                  to={withParams(searchParams, {
+                    group: open ? null : group.key,
+                    groupPage: null,
+                  })}
+                  aria-expanded={open}
+                  className="flex items-center gap-4 p-4 hover:bg-base-content/5"
+                >
+                  <span className="flex h-14 w-12 shrink-0 items-center justify-center rounded-lg bg-primary/15 text-xl font-bold text-primary">
+                    {group.category === "shows" ? "TV" : group.category === "movies" ? "▶" : "?"}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <strong className="block truncate text-base">{group.title}</strong>
+                    <span className="mt-1 block text-xs text-base-content/60">
+                      {group.itemCount.toLocaleString()} {group.itemCount === 1 ? "file" : "files"}
+                    </span>
+                  </span>
+                  <span className="hidden items-center gap-2 text-xs sm:flex">
+                    {group.healthyCount > 0 && <Badge>{group.healthyCount} valid</Badge>}
+                    {group.attentionCount > 0 && (
+                      <Badge>{group.attentionCount} need attention</Badge>
+                    )}
+                  </span>
+                  <span className="text-xl text-base-content/50" aria-hidden="true">
+                    {open ? "⌄" : "›"}
+                  </span>
+                </Link>
+                {open && browse.expandedGroup ? (
+                  <div className="border-t border-base-content/10 bg-base-300/45 px-4 py-2">
+                    {browse.expandedGroup.items.map(({ item, season, episode }) => (
+                      <div
+                        key={item.davItemId ?? item.mappings[0]?.linkPath ?? item.displayName}
+                        className="border-b border-base-content/10 py-3 last:border-b-0"
+                      >
+                        <div className="flex flex-wrap items-center gap-3">
+                          {episode ? (
+                            <span className="w-16 shrink-0 font-mono text-xs font-bold text-primary">
+                              {episode}
+                            </span>
+                          ) : null}
+                          <div className="min-w-48 flex-1">
+                            <button
+                              type="button"
+                              className="link text-left font-semibold"
+                              onClick={() => openModal(item)}
+                            >
+                              {item.displayName}
+                            </button>
+                            <p className="truncate text-xs text-base-content/50">
+                              {season ? `${season} · ` : ""}
+                              {item.contentPath ?? item.mappings[0]?.linkPath ?? "External link"}
+                            </p>
+                          </div>
+                          <span className="text-xs text-base-content/70">
+                            {item.size != null ? formatFileSize(item.size) : "—"}
+                          </span>
+                          <Badge>{item.health}</Badge>
+                          <button
+                            type="button"
+                            className="btn btn-sm btn-outline"
+                            onClick={() => openModal(item)}
+                          >
+                            Details
+                          </button>
+                        </div>
+                        <details className="mt-2 text-xs text-base-content/65">
+                          <summary className="cursor-pointer">
+                            {item.mappingCount} {item.mappingCount === 1 ? "mapping" : "mappings"}
+                          </summary>
+                          <ul className="mt-2 space-y-1 pl-4">
+                            {item.mappings.map((mapping) => (
+                              <li key={mapping.linkPath} className="break-all">
+                                <Badge>{mapping.status}</Badge> {mapping.linkPath} →{" "}
+                                {mapping.targetText}
+                              </li>
+                            ))}
+                          </ul>
+                        </details>
+                      </div>
+                    ))}
+                    {browse.expandedGroup.totalItems > browse.expandedGroup.pageSize ? (
+                      <Pagination
+                        page={browse.expandedGroup.page}
+                        total={Math.ceil(
+                          browse.expandedGroup.totalItems / browse.expandedGroup.pageSize,
+                        )}
+                        previous={withParams(searchParams, {
+                          groupPage: String(browse.expandedGroup.page - 1),
+                        })}
+                        next={withParams(searchParams, {
+                          groupPage: String(browse.expandedGroup.page + 1),
+                        })}
+                        label="Group files"
+                      />
+                    ) : null}
+                  </div>
+                ) : null}
+              </section>
+            );
+          })}
+        </div>
+      )}
+      {browse.totalGroups > browse.pageSize ? (
+        <Pagination
+          page={browse.page}
+          total={totalPages}
+          previous={withParams(searchParams, {
+            page: String(browse.page - 1),
+            group: null,
+            groupPage: null,
+          })}
+          next={withParams(searchParams, {
+            page: String(browse.page + 1),
+            group: null,
+            groupPage: null,
+          })}
+          label="Groups"
+        />
+      ) : null}
+
+      {fetcher.data?.status === false ? (
         <Alert variant="danger" role="alert">
           {fetcher.data.error ?? "Could not prewarm this file."}
         </Alert>
       ) : null}
-      {fetcher.data && fetcher.data.status === true && selected ? (
-        <span className="sr-only" role="status">
-          Prewarm requested.
-        </span>
-      ) : null}
-      {selectedItem ? (
+      {selected ? (
         <LibraryFileModal
-          item={selectedItem}
+          item={selected}
           details={details}
           detailsLoading={detailsLoading}
           detailsError={detailsError}
@@ -315,7 +477,7 @@ export default function Library({ loaderData }: Route.ComponentProps) {
           canPrewarm={nativeCacheActive}
           actionState={actionPending || fetcher.state !== "idle" ? "pending" : "idle"}
           feedback={
-            fetcher.data && fetcher.data.status === true
+            fetcher.data?.status === true
               ? { variant: "success", message: "Prewarm requested." }
               : feedback
           }
@@ -326,17 +488,80 @@ export default function Library({ loaderData }: Route.ComponentProps) {
           onPrewarm={onPrewarm}
         />
       ) : null}
-      {previewItem && selectedPreviewUrl ? (
+      {showPreview && selected && selectedPreviewUrl ? (
         <MediaPreview
-          fileName={previewItem.displayName}
-          filePath={previewItem.contentPath ?? previewItem.displayName}
-          mimeType={mimeTypeFor(previewItem.displayName)}
-          sizeBytes={previewItem.size ?? null}
+          fileName={selected.displayName}
+          filePath={selected.contentPath ?? selected.displayName}
+          mimeType={mimeTypeFor(selected.displayName)}
+          sizeBytes={selected.size ?? null}
           previewUrl={selectedPreviewUrl}
           onClose={() => setShowPreview(false)}
         />
       ) : null}
     </div>
+  );
+}
+
+function Metric({
+  label,
+  value,
+  hint,
+  tone = "default",
+}: {
+  label: string;
+  value: number;
+  hint: string;
+  tone?: "default" | "success" | "warning" | "info";
+}) {
+  const color = {
+    default: "text-base-content",
+    success: "text-success",
+    warning: "text-warning",
+    info: "text-info",
+  }[tone];
+  return (
+    <div className="rounded-xl border border-base-content/10 bg-base-200 p-4">
+      <p className="text-xs font-semibold text-base-content/65">{label}</p>
+      <p className={`mt-2 text-3xl font-bold tracking-tight ${color}`}>{value.toLocaleString()}</p>
+      <p className="mt-1 text-xs text-base-content/50">{hint}</p>
+    </div>
+  );
+}
+
+function Pagination({
+  page,
+  total,
+  previous,
+  next,
+  label,
+}: {
+  page: number;
+  total: number;
+  previous: string;
+  next: string;
+  label: string;
+}) {
+  return (
+    <nav
+      className="mt-4 flex items-center justify-between gap-3 text-xs"
+      aria-label={`${label} pagination`}
+    >
+      <span className="text-base-content/60">
+        {label} page {page} of {total}
+      </span>
+      <div className="join">
+        {page > 1 ? (
+          <Link className="btn btn-sm join-item" to={previous}>
+            Previous
+          </Link>
+        ) : null}
+        {page < total ? (
+          <Link className="btn btn-sm join-item" to={next}>
+            Next
+          </Link>
+        ) : null}
+      </div>
+    </nav>
   );
 }
 
@@ -353,70 +578,4 @@ function mimeTypeFor(name: string): string {
   if (lower.endsWith(".m4a")) return "audio/mp4";
   if (lower.endsWith(".wav")) return "audio/wav";
   return "application/octet-stream";
-}
-
-function withPage(params: URLSearchParams, page: number): string {
-  const next = new URLSearchParams(params);
-  next.set("page", String(page));
-  return next.toString();
-}
-
-function CatalogRow({
-  item,
-  downloadKeys,
-  search,
-  onOpen,
-}: {
-  item: LibraryCatalogItem;
-  downloadKeys: Record<string, string>;
-  search: string;
-  onOpen: () => void;
-}) {
-  return (
-    <>
-      <tr>
-        <td>
-          <button type="button" className="link text-left" aria-haspopup="dialog" onClick={onOpen}>
-            {item.displayName}
-          </button>
-        </td>
-        <td className="max-w-xs truncate">
-          {item.contentPath ?? item.mappings[0]?.targetText ?? "—"}
-        </td>
-        <td>{item.size != null ? formatFileSize(item.size) : "—"}</td>
-        <td>{item.mappingCount}</td>
-        <td>
-          <Badge>{item.health}</Badge>
-        </td>
-      </tr>
-      <tr>
-        <td colSpan={5}>
-          <details>
-            <summary>{item.mappingCount} mapping(s) — expand to inspect</summary>
-            <ul className="mt-2 flex flex-col gap-1">
-              {item.mappings.map((m) => (
-                <li key={m.linkPath} className="flex flex-wrap items-center gap-2 text-sm">
-                  <Badge>{m.mappingType}</Badge>
-                  <Badge>{m.status}</Badge>
-                  <code className="break-all">
-                    {m.linkPath} → {m.targetText}
-                  </code>
-                  {m.mappingType === "internal" && item.davItemId && item.contentPath ? (
-                    <Link
-                      className="link"
-                      to={`/view${item.contentPath}?downloadKey=${downloadKeys[item.davItemId] ?? ""}&${search}`}
-                    >
-                      Open
-                    </Link>
-                  ) : (
-                    <span className="text-base-content/50">inspection only</span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          </details>
-        </td>
-      </tr>
-    </>
-  );
 }

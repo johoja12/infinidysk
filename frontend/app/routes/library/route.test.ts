@@ -9,7 +9,7 @@ vi.mock("~/clients/backend-client.server", async (importOriginal) => {
     ...actual,
     backendClient: {
       ...actual.backendClient,
-      getLibraryCatalog: vi.fn(),
+      getLibraryBrowse: vi.fn(),
       getNativeCacheStatus: vi.fn(),
     },
   };
@@ -17,26 +17,25 @@ vi.mock("~/clients/backend-client.server", async (importOriginal) => {
 
 beforeEach(() => {
   installFrontendRuntimeConfig({ frontendBackendApiKey: "test-api-key" });
-  catalogMock().mockReset();
-  catalogMock().mockResolvedValue({
-    items: [],
-    totalCount: 0,
+  browseMock().mockReset();
+  browseMock().mockResolvedValue({
+    groups: [],
+    totalGroups: 0,
     page: 1,
-    pageSize: 25,
+    pageSize: 12,
+    totalItems: 0,
+    healthyItems: 0,
+    attentionItems: 0,
+    unmatchedItems: 0,
+    expandedGroup: null,
   });
   nativeCacheMock().mockReset();
   nativeCacheMock().mockResolvedValue({ activeMode: "native" });
 });
 
-function requestFor(path: string): Request {
-  return new Request(`http://localhost${path}`);
-}
-
-// Wraps the unbound-method lint (vi.mocked unwraps the method from its object).
-// Fine here: the mock carries no `this` state.
-function catalogMock() {
+function browseMock() {
   // eslint-disable-next-line @typescript-eslint/unbound-method
-  return vi.mocked(backendClient.getLibraryCatalog);
+  return vi.mocked(backendClient.getLibraryBrowse);
 }
 
 function nativeCacheMock() {
@@ -44,49 +43,90 @@ function nativeCacheMock() {
   return vi.mocked(backendClient.getNativeCacheStatus);
 }
 
-describe("library loader", () => {
-  it("passes search, filter, sort, and pagination to the catalog client", async () => {
+function requestFor(path: string): Request {
+  return new Request(`http://localhost${path}`);
+}
+
+describe("library browse loader", () => {
+  it("passes category, search, mapping filter, and group paging", async () => {
     await loader({
-      request: requestFor("/library?q=dune&type=broken&sort=size&dir=desc&page=2"),
+      request: requestFor(
+        "/library?category=movies&q=dune&type=broken&page=2&group=movies%2FDune&groupPage=3",
+      ),
       params: {},
     } as never);
 
-    expect(catalogMock()).toHaveBeenCalledWith({
+    expect(browseMock()).toHaveBeenCalledWith({
       q: "dune",
+      category: "movies",
       type: "broken",
-      sort: "size",
-      dir: "desc",
       page: 2,
-      pageSize: 25,
+      group: "movies/Dune",
+      groupPage: 3,
     });
   });
 
-  it("clamps invalid page and pageSize to defaults", async () => {
-    await loader({ request: requestFor("/library?page=0&pageSize=9999"), params: {} } as never);
+  it("clamps invalid category and page inputs to safe defaults", async () => {
+    await loader({
+      request: requestFor("/library?category=invalid&type=invalid&page=-1&groupPage=0"),
+      params: {},
+    } as never);
 
-    expect(catalogMock()).toHaveBeenCalledWith(expect.objectContaining({ page: 1, pageSize: 25 }));
+    expect(browseMock()).toHaveBeenCalledWith({
+      category: "shows",
+      type: "all",
+      page: 1,
+      groupPage: 1,
+    });
   });
 
-  it("builds signed preview urls for internal rows", async () => {
-    catalogMock().mockResolvedValue({
-      items: [
+  it("signs preview URLs for files in the expanded group", async () => {
+    browseMock().mockResolvedValue({
+      groups: [
         {
-          kind: "internal",
-          davItemId: "11111111-1111-1111-1111-111111111111",
-          displayName: "film.mkv",
-          contentPath: "/content/film.mkv",
-          size: 100,
-          mappingCount: 1,
-          health: "healthy",
-          mappings: [],
+          key: "movies/Film",
+          title: "Film",
+          category: "movies",
+          itemCount: 1,
+          healthyCount: 1,
+          attentionCount: 0,
         },
       ],
-      totalCount: 1,
+      totalGroups: 1,
       page: 1,
-      pageSize: 25,
+      pageSize: 12,
+      totalItems: 1,
+      healthyItems: 1,
+      attentionItems: 0,
+      unmatchedItems: 0,
+      expandedGroup: {
+        key: "movies/Film",
+        page: 1,
+        pageSize: 50,
+        totalItems: 1,
+        items: [
+          {
+            item: {
+              kind: "internal",
+              davItemId: "11111111-1111-1111-1111-111111111111",
+              displayName: "film.mkv",
+              contentPath: "/content/film.mkv",
+              size: 100,
+              mappingCount: 1,
+              health: "healthy",
+              mappings: [],
+            },
+            season: null,
+            episode: null,
+          },
+        ],
+      },
     });
 
-    const data = await loader({ request: requestFor("/library"), params: {} } as never);
+    const data = await loader({
+      request: requestFor("/library?group=movies%2FFilm"),
+      params: {},
+    } as never);
 
     expect(data.previewUrls["11111111-1111-1111-1111-111111111111"]).toMatch(
       /^\/view\/content\/film\.mkv\?downloadKey=.+/,

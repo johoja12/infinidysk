@@ -544,6 +544,22 @@ class BackendClient {
     );
   }
 
+  public async getLibraryBrowse(query: LibraryBrowseQuery = {}): Promise<LibraryBrowseResponse> {
+    const qs = new URLSearchParams();
+    if (query.q) qs.set("q", query.q);
+    if (query.group) qs.set("group", query.group);
+    qs.set("category", query.category ?? "shows");
+    qs.set("type", query.type ?? "all");
+    qs.set("page", String(query.page ?? 1));
+    qs.set("groupPage", String(query.groupPage ?? 1));
+    return await call<LibraryBrowseResponse>(
+      `/api/get-library-browse?${qs.toString()}`,
+      "Failed to browse media library",
+      { method: "GET" },
+      libraryBrowseResponseSchema,
+    );
+  }
+
   public async getLibraryFileDetails(davItemId: string): Promise<LibraryFileDetails> {
     return await call<LibraryFileDetails>(
       `${adminApi.libraryFileDetails}?davItemId=${encodeURIComponent(davItemId)}`,
@@ -954,6 +970,54 @@ const libraryCatalogResponseSchema = z.object({
 export type LibraryCatalogMapping = z.infer<typeof libraryCatalogMappingSchema>;
 export type LibraryCatalogItem = z.infer<typeof libraryCatalogItemSchema>;
 export type LibraryCatalogResponse = z.infer<typeof libraryCatalogResponseSchema>;
+
+const libraryBrowseGroupSchema = z.object({
+  key: z.string(),
+  title: z.string(),
+  category: z.enum(["shows", "movies", "unmatched"]),
+  itemCount: z.number().int(),
+  healthyCount: z.number().int(),
+  attentionCount: z.number().int(),
+});
+
+const libraryBrowseExpandedGroupSchema = z.object({
+  key: z.string(),
+  page: z.number().int(),
+  pageSize: z.number().int(),
+  totalItems: z.number().int(),
+  items: z.array(
+    z.object({
+      item: libraryCatalogItemSchema,
+      season: z.string().nullable(),
+      episode: z.string().nullable(),
+    }),
+  ),
+});
+
+const libraryBrowseResponseSchema = z.object({
+  groups: z.array(libraryBrowseGroupSchema),
+  totalGroups: z.number().int(),
+  page: z.number().int(),
+  pageSize: z.number().int(),
+  totalItems: z.number().int(),
+  healthyItems: z.number().int(),
+  attentionItems: z.number().int(),
+  unmatchedItems: z.number().int(),
+  expandedGroup: libraryBrowseExpandedGroupSchema.nullable().optional(),
+  indexScannedAt: z.string().nullable().optional(),
+  indexWarning: z.string().nullable().optional(),
+});
+
+export type LibraryBrowseResponse = z.infer<typeof libraryBrowseResponseSchema>;
+
+export type LibraryBrowseQuery = {
+  q?: string;
+  category?: "shows" | "movies" | "unmatched";
+  type?: "all" | "internal" | "external" | "broken";
+  page?: number;
+  group?: string;
+  groupPage?: number;
+};
 
 const libraryFileDetailsHealthSchema = z.object({
   result: z.string(),
