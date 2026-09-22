@@ -12,7 +12,9 @@ public sealed record CanaryExportRelease(
     Guid? NzbBlobId,
     string PayloadSourcePath,
     IReadOnlyList<NzbDavExportLeaf> Leaves,
-    byte[]? PayloadBytes = null);
+    byte[]? PayloadBytes = null,
+    string? SourceFileName = null,
+    string? SourceJobName = null);
 
 public sealed record CanaryExportRequest(
     string PackageId,
@@ -92,7 +94,8 @@ public sealed partial class CanaryPackageWriter(int minimumLinks = 20, int maxim
                 payloads.Add(new NzbDavPayloadFile(relativePath, info.Length, digest));
                 checksums.Add(new NzbDavChecksumEntry(relativePath, digest));
                 manifestReleases.Add(new NzbDavExportRelease(
-                    release.SourceReleaseId, release.NzbBlobId, relativePath, release.Leaves));
+                    release.SourceReleaseId, release.NzbBlobId, relativePath, release.Leaves,
+                    release.SourceFileName, release.SourceJobName));
             }
 
             var manifest = new NzbDavExportManifest(
