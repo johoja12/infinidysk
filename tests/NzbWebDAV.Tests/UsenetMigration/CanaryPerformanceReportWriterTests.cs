@@ -19,7 +19,11 @@ public sealed class CanaryPerformanceReportWriterTests : IDisposable
             new CanaryPerformanceObservation(
                 file.LibraryRelativePath, "legacy", "first-pass", "seek-10", 102, 512, 512,
                 1.25, 4.5, 0.11, "cache-state-unknown-first-pass", metadata.LegacyRoute,
-                false, false, null),
+                false, false, null,
+                CacheCachedBytes: 200,
+                CacheExpectedBytes: 1_000,
+                CacheCoveragePercent: 20,
+                CacheEvidenceSource: "rclone-vfs-meta"),
             new CanaryPerformanceObservation(
                 file.LibraryRelativePath, "infinidysk", "first-pass", "seek-10", 102, 512, 0,
                 null, 2000, null, "cache-state-unknown-first-pass", metadata.InfiniDyskRoute,
@@ -36,6 +40,10 @@ public sealed class CanaryPerformanceReportWriterTests : IDisposable
         Assert.Contains("1.25", markdown, StringComparison.Ordinal);
         Assert.Contains("frontend-proxied", markdown, StringComparison.Ordinal);
         Assert.Contains("diagnostic", markdown, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("\"cacheCoveragePercent\": 20", json, StringComparison.Ordinal);
+        Assert.Contains(
+            "cache-state-unknown-first-pass (200/1000 bytes, 20%, rclone-vfs-meta)",
+            markdown, StringComparison.Ordinal);
     }
 
     public void Dispose()

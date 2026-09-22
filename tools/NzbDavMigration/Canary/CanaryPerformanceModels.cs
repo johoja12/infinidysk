@@ -88,7 +88,11 @@ public sealed record CanaryPerformanceObservation(
     CanaryRouteDescription Route,
     bool DiagnosticOnly,
     bool TimedOut,
-    string? Error);
+    string? Error,
+    long? CacheCachedBytes = null,
+    long? CacheExpectedBytes = null,
+    double? CacheCoveragePercent = null,
+    string CacheEvidenceSource = "none");
 
 public sealed record CanaryPerformanceResults(
     DateTimeOffset CreatedAt,
