@@ -563,15 +563,11 @@ class BackendClient {
   }
 
   public async warmPrefetch(itemIds: string[]): Promise<void> {
-    await call(
-      adminApi.prefetchOperations,
-      "Failed to warm prefetch items",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ Operation: "warm", ItemIds: itemIds }),
-      },
-    );
+    await call(adminApi.prefetchOperations, "Failed to warm prefetch items", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ Operation: "warm", ItemIds: itemIds }),
+    });
   }
 
   public async getConfig(keys: string[], signal?: AbortSignal): Promise<ConfigItem[]> {
@@ -622,7 +618,9 @@ class BackendClient {
     );
   }
 
-  public async requeueActionNeededHealthChecks(davItemId?: string): Promise<{ requeuedCount: number }> {
+  public async requeueActionNeededHealthChecks(
+    davItemId?: string,
+  ): Promise<{ requeuedCount: number }> {
     const query = davItemId ? `?davItemId=${encodeURIComponent(davItemId)}` : "";
     return await call<{ requeuedCount: number }>(
       `${adminApi.requeueActionNeededHealthChecks}${query}`,

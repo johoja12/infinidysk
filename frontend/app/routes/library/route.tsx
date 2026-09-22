@@ -149,25 +149,22 @@ export default function Library({ loaderData }: Route.ComponentProps) {
     setFeedback(null);
   }, []);
 
-  const runAction = useCallback(
-    async (fn: () => Promise<{ ok: boolean; message: string }>) => {
-      setActionPending(true);
-      setFeedback(null);
-      try {
-        const result = await fn();
-        setFeedback(result.ok ? { variant: "success", message: result.message } : null);
-        if (!result.ok) setFeedback({ variant: "danger", message: result.message });
-      } catch (error) {
-        setFeedback({
-          variant: "danger",
-          message: error instanceof Error ? error.message : "Action failed.",
-        });
-      } finally {
-        setActionPending(false);
-      }
-    },
-    [],
-  );
+  const runAction = useCallback(async (fn: () => Promise<{ ok: boolean; message: string }>) => {
+    setActionPending(true);
+    setFeedback(null);
+    try {
+      const result = await fn();
+      setFeedback(result.ok ? { variant: "success", message: result.message } : null);
+      if (!result.ok) setFeedback({ variant: "danger", message: result.message });
+    } catch (error) {
+      setFeedback({
+        variant: "danger",
+        message: error instanceof Error ? error.message : "Action failed.",
+      });
+    } finally {
+      setActionPending(false);
+    }
+  }, []);
 
   const onRunHealthCheck = useCallback(() => {
     void runAction(async () => {
@@ -379,12 +376,7 @@ function CatalogRow({
     <>
       <tr>
         <td>
-          <button
-            type="button"
-            className="link text-left"
-            aria-haspopup="dialog"
-            onClick={onOpen}
-          >
+          <button type="button" className="link text-left" aria-haspopup="dialog" onClick={onOpen}>
             {item.displayName}
           </button>
         </td>
