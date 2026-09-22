@@ -119,6 +119,7 @@ public sealed class GetHealthCheckHistoryControllerTests : IAsyncLifetime
     [Theory]
     [InlineData("?repairStatus=unknown")]
     [InlineData("?currentActionNeeded=invalid")]
+    [InlineData("?davItemId=not-a-guid")]
     [InlineData("?page=0")]
     [InlineData("?pageSize=0")]
     [InlineData("?pageSize=251")]
@@ -127,6 +128,20 @@ public sealed class GetHealthCheckHistoryControllerTests : IAsyncLifetime
         var result = await InvokeActionAsync(query);
 
         Assert.IsType<BadRequestObjectResult>(result);
+    }
+
+    [Fact]
+    public async Task GetAsync_DavItemIdFilterReturnsOnlyMatchingRows()
+    {
+        var wanted = Guid.NewGuid();
+        var wantedResult = NewResult(DateTimeOffset.UtcNow, HealthCheckResult.RepairAction.None, wanted);
+        var otherResult = NewResult(DateTimeOffset.UtcNow, HealthCheckResult.RepairAction.None);
+        _context.HealthCheckResults.AddRange(wantedResult, otherResult);
+        await _context.SaveChangesAsync();
+
+        var response = await InvokeAsync($"?davItemId={wanted:D}");
+
+        Assert.Equal([wantedResult.Id], response.Items.Select(item => item.Id));
     }
 
     [Fact]

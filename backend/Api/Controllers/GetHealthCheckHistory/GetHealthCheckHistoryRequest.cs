@@ -12,6 +12,7 @@ public class GetHealthCheckHistoryRequest
     public bool CurrentActionNeeded { get; init; }
     public IReadOnlySet<HealthCheckResult.RepairAction>? RepairStatuses { get; init; }
     public IReadOnlySet<HealthCheckResult.HealthResult>? Results { get; init; }
+    public Guid? DavItemId { get; init; }
     public CancellationToken CancellationToken { get; init; }
 
     public GetHealthCheckHistoryRequest(HttpContext context)
@@ -101,6 +102,15 @@ public class GetHealthCheckHistoryRequest
             }
             // Same convention as repairStatus: an empty or comma-only value means "no filter".
             Results = results.Count > 0 ? results : null;
+        }
+
+        var davItemIdParam = context.GetQueryParam("davItemId");
+        if (davItemIdParam is not null)
+        {
+            if (!Guid.TryParse(davItemIdParam, out var davItemId))
+                errors.Add("davItemId", "Invalid davItemId parameter (use a UUID).");
+            else
+                DavItemId = davItemId;
         }
 
         errors.ThrowIfAny();
