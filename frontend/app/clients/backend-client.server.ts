@@ -544,6 +544,27 @@ class BackendClient {
     );
   }
 
+  public async getLibraryFileDetails(davItemId: string): Promise<LibraryFileDetails> {
+    return await call<LibraryFileDetails>(
+      `${adminApi.libraryFileDetails}?davItemId=${encodeURIComponent(davItemId)}`,
+      "Failed to get library file details",
+      { method: "GET" },
+      libraryFileDetailsResponseSchema,
+    );
+  }
+
+  public async warmPrefetch(itemIds: string[]): Promise<void> {
+    await call(
+      adminApi.prefetchOperations,
+      "Failed to warm prefetch items",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ Operation: "warm", ItemIds: itemIds }),
+      },
+    );
+  }
+
   public async getConfig(keys: string[], signal?: AbortSignal): Promise<ConfigItem[]> {
     const data = await call<{ configItems?: ConfigItem[] }>(
       adminApi.getConfig,
@@ -592,9 +613,10 @@ class BackendClient {
     );
   }
 
-  public async requeueActionNeededHealthChecks(): Promise<{ requeuedCount: number }> {
+  public async requeueActionNeededHealthChecks(davItemId?: string): Promise<{ requeuedCount: number }> {
+    const query = davItemId ? `?davItemId=${encodeURIComponent(davItemId)}` : "";
     return await call<{ requeuedCount: number }>(
-      adminApi.requeueActionNeededHealthChecks,
+      `${adminApi.requeueActionNeededHealthChecks}${query}`,
       "Failed to requeue action-needed health checks",
       {
         method: "POST",
@@ -684,6 +706,7 @@ class BackendClient {
     if (params.repairStatus) qs.set("repairStatus", params.repairStatus);
     if (params.result) qs.set("result", params.result);
     if (params.currentActionNeeded) qs.set("currentActionNeeded", "true");
+    if (params.davItemId) qs.set("davItemId", params.davItemId);
     const query = qs.toString();
     return await call<HealthCheckHistoryResponse>(
       `${adminApi.getHealthCheckHistory}${query ? `?${query}` : ""}`,
@@ -925,6 +948,29 @@ export type LibraryCatalogMapping = z.infer<typeof libraryCatalogMappingSchema>;
 export type LibraryCatalogItem = z.infer<typeof libraryCatalogItemSchema>;
 export type LibraryCatalogResponse = z.infer<typeof libraryCatalogResponseSchema>;
 
+const libraryFileDetailsHealthSchema = z.object({
+  result: z.string(),
+  repairStatus: z.string(),
+  message: z.string().nullable().optional(),
+  createdAt: z.string(),
+});
+
+const libraryFileDetailsResponseSchema = z.object({
+  davItemId: z.string(),
+  name: z.string(),
+  contentPath: z.string(),
+  size: z.number().nullable().optional(),
+  releaseDate: z.string().nullable().optional(),
+  lastHealthCheck: z.string().nullable().optional(),
+  nextHealthCheck: z.string().nullable().optional(),
+  healthRepairPending: z.boolean().optional(),
+  historyItemId: z.string().nullable().optional(),
+  latestHealth: libraryFileDetailsHealthSchema.nullable().optional(),
+  mappings: z.array(libraryCatalogMappingSchema),
+});
+
+export type LibraryFileDetails = z.infer<typeof libraryFileDetailsResponseSchema>;
+
 export type LibraryCatalogQuery = {
   q?: string;
   type?: "all" | "internal" | "external" | "broken";
@@ -1095,6 +1141,7 @@ export type GetHealthCheckHistoryParams = {
   repairStatus?: string;
   result?: string;
   currentActionNeeded?: boolean;
+  davItemId?: string;
 };
 
 export type HealthCheckStats = {
