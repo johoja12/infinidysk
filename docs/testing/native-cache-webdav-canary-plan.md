@@ -34,28 +34,55 @@ production canary only after the intended image is deployed.
    exclude request headers and tokens from captured logs. Confirm the request
    reaches backend directly, with no rclone container or mount in the path.
 4. For each item, list `/api/native-cache/entries?folderId=...` and identify its
-   exact key. Queue `POST /api/native-cache/operations` with `operation: "evict"`,
-   `folderId`, `cacheKey`, and matching `confirmCacheKey`. Poll the job to a
-   completed result of one, then confirm the exact entry and its verified ranges
-   are gone. Unpin first if necessary. Stop playback and retry if the entry has
-   an active reader. Do not clear a shared folder to simulate file eviction.
+   exact key. Run the file eviction checks below before the first cold read. Do
+   not clear a shared folder to simulate file eviction.
 5. Record a baseline for the selected item's cache coverage, hit/miss counters,
    provider bytes, and any concurrent warm jobs. If spontaneous warming changes
    the baseline, isolate the item and restart that phase.
+
+## Per-file eviction checks
+
+Use the authenticated cache catalogue's **Evict file** action and the equivalent
+`POST /api/native-cache/operations` request with `operation: "evict"`, `folderId`,
+`cacheKey`, and matching `confirmCacheKey`. The response queues a job; it does
+not prove deletion. Poll `/api/native-cache` until that job completes with
+`result: 1`, then refresh the catalogue and assert that the chosen key has no
+entry or verified ranges. Record the selected item's source WebDAV path before
+eviction and confirm that a subsequent cold GET can still open it.
+
+On a disposable cache instance, run these negative cases before the read matrix:
+
+| Case | Expected outcome |
+| --- | --- |
+| Missing or mismatched `confirmCacheKey`, malformed key, or wrong folder | Request is rejected or job fails; selected and neighboring entries remain intact. |
+| Pinned selected entry | Eviction job fails; unpin, retry, and confirm only that key is removed. |
+| Active playback/read lease on selected entry | Eviction job fails; playback continues, then eviction succeeds after the reader closes. |
+| Read-only/offline folder | No deletion; job reports failure and catalogue/bytes remain recoverable. |
+| Repeat an already completed eviction | No other key is removed; the old key stays absent. |
+
+Seed at least one neighboring file in the same folder and compare its key,
+verified ranges, cached bytes, and readability before and after every targeted
+eviction. Test the confirmation dialog and disabled pinned/read-only action in
+the UI. Check the job's final state and error text; a queued or running state is
+not a pass. Run fault cases only on disposable storage. For the production
+canary, use only the confirmed successful path and inspect the neighboring
+entry without injecting storage faults.
 
 ## Read matrix
 
 Native Cache stores complete 4 MiB integrity blocks. For partial reads, compare
 coverage against block-aligned expectations, allowing only documented read-ahead
-or other measured requests. Capture `206`, `Content-Range`, `Content-Length`,
+or other measured requests. Capture HTTP status (`200` for a full GET, `206` for
+a satisfiable range), `Content-Range` for range requests, `Content-Length`,
 received bytes, elapsed time, and a SHA-256 of every sampled response. A `HEAD`
-request may establish length but must not count as a cache fill.
+request may establish length but must not count as a cache fill. Wait for
+in-flight cache writes to finish before judging final coverage.
 
 | File | Cold direct-WebDAV requests | Expected coverage before playback | Seek and replay checks |
 | --- | --- | --- | --- |
 | A: full | One complete `GET` to EOF | 100% verified for the current key/revision | Replay beginning, middle, end; compare hashes and cache-hit/provider counters. |
-| B: half | `Range: bytes=0-N` ending at a 4 MiB boundary near half the file | Only fetched blocks verified; the remaining half stays missing | Play from start, seek within cached half, then seek into the cold half and verify new blocks appear. |
-| C: gap | Separate bounded range GETs for head and tail, leaving several intact blocks between them | Two separated verified regions; middle gap remains absent | Play head, seek into middle gap, then seek to cached tail and back across the boundary. |
+| B: half | `Range: bytes=0-N`, where `N = 4 MiB × floor(size / (8 MiB)) - 1` | Only fetched blocks verified; the remaining half stays missing | Play from start, seek within cached half, then seek into the cold half and verify new blocks appear. |
+| C: gap | Separate head and tail range GETs, each at least 4 MiB, leaving at least two complete 4 MiB blocks untouched in the middle | Two separated verified regions; middle gap remains absent | Play head, seek into middle gap, then seek to cached tail and back across the boundary. |
 
 For B and C, fetch a small crossing range around each cached/missing boundary.
 Compare its bytes with repeat reads after the gap fills. Full and partial responses
@@ -81,6 +108,8 @@ isolate that cause.
 - Targeted eviction affects only the chosen key; a second cached item's entry,
   ranges, and bytes remain intact. Pinned/active entries are retained with a
   clear job failure, and wrong-folder or invalid keys cannot delete anything.
+  The source WebDAV file remains available after eviction and can be cached
+  again under its current revision.
 - Full GET reaches 100% verified coverage. Half and gap reads publish only
   verified fetched blocks; the planned gap is still missing before the cold
   seek. Coverage updates after cold seeks and persists after stream close.
@@ -90,7 +119,8 @@ isolate that cause.
 - All three player sessions decode and seek without persistent stalls, HTTP
   failures, truncation, incorrect bytes, or cache-induced playback errors.
 
-Save one evidence bundle per file: build/config identifiers, redacted request
+Save one evidence bundle per file: build/config identifiers, redacted eviction
+request and final job state, target/neighbor catalogue snapshots, WebDAV request
 log, range hashes, coverage snapshots, provider/cache counter deltas, player
 log, and deviations. Mark each matrix row pass/fail and record any retry. Stop
 on an unexpected deletion, source-revision change, quota/free-space issue, or
