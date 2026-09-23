@@ -54,6 +54,8 @@ InfiniDysk deployment test.
 invalidation. It is not a payload-purge API. Do not substitute remote delete/purge
 operations, which operate on source files. The correction publishes a changed
 source fingerprint through modification time, using ordinary client revalidation.
+First observation on upgrade or catalogue rebuild uses a fresh modification time
+so legacy creation-time fingerprints revalidate; this can refill client caches once.
 Refresh every affected mount's metadata, then reopen playback. An unavailable RC
 endpoint delays refresh until normal expiry or a manual retry; source repair does
 not depend on RC being available. Native disk-only corruption never admits bad
