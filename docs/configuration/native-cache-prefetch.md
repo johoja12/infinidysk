@@ -173,6 +173,13 @@ Cache hits spend no provider credit. If accounting storage fails, warming stops
 across jobs until local metadata is repaired and the service restarts; ordinary
 playback is not charged to this budget and remains available.
 
+Before reporting warming complete, InfiniDysk reads and verifies the existing
+cached blocks in the requested range. Missing or damaged blocks are fetched again
+under the normal warming budget; unavailable storage defers completion. This also
+means a repeated whole-file warm reads the cached file from disk, even when it
+requires no Usenet traffic. The [historical regression audit](../testing/native-cache-regression-audit.md)
+documents the protections and remaining storage/client-cache limitations.
+
 Disabling a source/trigger removes its ownership of pending work. Another enabled
 source or a manual request can retain the same job. Removing its last owner cancels
 active work. On restart, manual interrupted jobs restore paused; speculative work is
