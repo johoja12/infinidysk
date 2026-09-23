@@ -15,6 +15,34 @@ public sealed class NativeCacheConcurrencyTests : IDisposable
     }
 
     [Fact]
+    public async Task RetiredCleanup_DoesNotBypassTheHealthyReplacement()
+    {
+        var first = Folder() with { MaxBytes = NativeCacheStore.BlockSize + 200000, Priority = 10 };
+        var path = Path.Combine(_root, "second");
+        Directory.CreateDirectory(path);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var store = new NativeCacheStore(Path.Combine(_root, "index.db"),
+            [first, new() { Id = "second", Path = path, MinFreeBytes = 0 }])
+        {
+            BeforeRetiredDeleteAsync = async _ => { entered.TrySetResult(); await release.Task; }
+        };
+        var identity = new NativeCacheIdentity("cleanup-hit", "v1", NativeCacheStore.BlockSize * 2L);
+        var block = new byte[NativeCacheStore.BlockSize];
+        Assert.True(await store.WriteBlockAsync(identity, 0, block));
+        Assert.True(await store.RestartPartialWarmAsync(identity, block.Length, CancellationToken.None));
+        Assert.True(await store.WriteBlockAsync(identity, 0, block));
+        Assert.True(await store.WriteBlockAsync(identity, block.Length, block));
+        var cleanup = store.ReclaimRetiredAsync(first.Id);
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.Equal(block.Length, await store.ReadBlockAsync(identity, 0, block).WaitAsync(TimeSpan.FromSeconds(2)));
+        }
+        finally { release.TrySetResult(); await cleanup; }
+    }
+
+    [Fact]
     public async Task RetiredPlacement_SurvivesRestart_AndCannotBeImportedFromOldRoot()
     {
         var first = Folder() with { MaxBytes = NativeCacheStore.BlockSize + 200000, Priority = 10 };
