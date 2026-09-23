@@ -1,6 +1,8 @@
 # Native Cache direct-WebDAV canary plan
 
-Status: planned; no eviction, streaming, or playback results are claimed here.
+Status: isolated first pass started on 2026-09-23. See
+[the run results](native-cache-webdav-canary-results-2026-09-23.md) for passed
+checks, deviations, and remaining gates. No production canary has run.
 
 ## Goal and scope
 
