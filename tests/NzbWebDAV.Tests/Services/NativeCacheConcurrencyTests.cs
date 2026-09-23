@@ -21,7 +21,7 @@ public sealed class NativeCacheConcurrencyTests : IDisposable
         var path = Path.Combine(_root, "second");
         Directory.CreateDirectory(path);
         var second = new NativeCacheFolder { Id = "second", Path = path, MinFreeBytes = 0 };
-        var identity = new NativeCacheIdentity("restart-move", "generation", NativeCacheStore.BlockSize + 3L);
+        var identity = new NativeCacheIdentity("restart-move", "generation", NativeCacheStore.BlockSize * 2L);
         var catalogue = Path.Combine(_root, "index.db");
         long available = long.MaxValue;
         await using (var store = new NativeCacheStore(catalogue, [first, second]) { AvailableBytesOverride = _ => available })
@@ -36,7 +36,7 @@ public sealed class NativeCacheConcurrencyTests : IDisposable
         await using var reopened = new NativeCacheStore(catalogue, [first, second]);
         Assert.Equal(0, await reopened.ScanAsync(first.Id));
         Assert.True((await reopened.GetStatusAsync()).Single(status => status.Id == first.Id).CommittedBytes > 0);
-        Assert.True(await reopened.WriteBlockAsync(identity, NativeCacheStore.BlockSize, new byte[] { 1, 2, 3 }));
+        Assert.True(await reopened.WriteBlockAsync(identity, NativeCacheStore.BlockSize, new byte[NativeCacheStore.BlockSize]));
         Assert.Equal("second", Assert.Single(await reopened.ListEntriesAsync(second.Id, null, 10)).FolderId);
         Assert.Equal(1, await reopened.ReclaimRetiredAsync(first.Id, clear: true));
         Assert.Equal(0, (await reopened.GetStatusAsync()).Single(status => status.Id == first.Id).CommittedBytes);
