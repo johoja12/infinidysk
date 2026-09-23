@@ -125,6 +125,8 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog)
                     {
                         "tv" or "shows" or "tv shows" or "series" or "television" => "shows",
                         "movies" or "films" => "movies",
+                        _ when root.Length > 3 && root.StartsWith("tv-", StringComparison.Ordinal) => "shows",
+                        _ when root.Length > 7 && root.StartsWith("movies-", StringComparison.Ordinal) => "movies",
                         _ => null,
                     };
                     if (category is null) continue;
