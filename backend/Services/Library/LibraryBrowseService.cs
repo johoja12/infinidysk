@@ -1,4 +1,7 @@
 using NzbWebDAV.Services.Plex;
+using NzbWebDAV.Services.NativeCache;
+using Microsoft.Data.Sqlite;
+using System.Text.RegularExpressions;
 
 namespace NzbWebDAV.Services.Library;
 
@@ -6,7 +9,8 @@ namespace NzbWebDAV.Services.Library;
 /// Classifies indexed files by their Plex filename match, then groups matched
 /// files using the recognized link directories.
 /// </summary>
-public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLibraryMetadataIndex plexMetadata)
+public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLibraryMetadataIndex plexMetadata,
+    NativeCacheService? nativeCache = null)
 {
     private const int GroupFilePageSize = 50;
     public async Task<LibraryBrowseResult> QueryAsync(
@@ -15,6 +19,17 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
         CancellationToken ct = default)
     {
         var all = await catalog.LoadAllAsync(ct).ConfigureAwait(false);
+        IReadOnlyDictionary<string, int>? storedCoverage = null;
+        if (nativeCache?.InitializationPending == true)
+            await nativeCache.WaitForInitializationAsync(ct).ConfigureAwait(false);
+        if (nativeCache?.Store is { } store)
+        {
+            try { storedCoverage = await store.GetStoredCoverageByItemAsync(ct).ConfigureAwait(false); }
+            catch (Exception error) when (error is IOException or SqliteException or ObjectDisposedException)
+            {
+                // Cache information is optional; a catalogue problem must not hide the library.
+            }
+        }
         var matched = all
             .Where(i => string.IsNullOrWhiteSpace(query.Search)
                 || LibraryCatalogService.MatchesSearch(i, query.Search.Trim()))
@@ -25,10 +40,22 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
                 "broken" => i.Mappings.Any(m => m.Status is "broken" or "stale"),
                 _ => true,
             })
+            .Where(i => query.Quality == "all" ||
+                string.Equals(QualityFromName(i.DisplayName), query.Quality, StringComparison.OrdinalIgnoreCase))
             .Select(i =>
             {
                 var plex = Match(i, plexMetadata);
-                return new ClassifiedItem(i, Classify(i, plex), plex);
+                int? cachePercentage = i.DavItemId is { } id && storedCoverage is not null
+                    ? storedCoverage.GetValueOrDefault(id.ToString("N"), 0) : null;
+                return new ClassifiedItem(i, Classify(i, plex), plex, cachePercentage);
+            })
+            .Where(i => query.Cache switch
+            {
+                "any" => i.CachePercentage > 0,
+                "complete" => i.CachePercentage == 100,
+                "empty" => i.CachePercentage == 0,
+                "unavailable" => i.CachePercentage is null,
+                _ => true,
             })
             .ToList();
 
@@ -46,7 +73,9 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
         var page = Math.Clamp(query.Page, 1, Math.Max(1, (groups.Count + pageSize - 1) / pageSize));
         var pageGroups = groups.Skip((page - 1) * pageSize).Take(pageSize)
             .Select(g => new LibraryBrowseGroupDto(g.Key, g.Title, g.Category,
-                g.Items.Count, g.Items.Count(i => IsHealthy(i.Item)), g.Items.Count(i => NeedsAttention(i.Item))))
+                g.Items.Count, g.Items.Count(i => IsHealthy(i.Item)), g.Items.Count(i => NeedsAttention(i.Item)),
+                g.Items.Count == 1 ? QualityFromName(g.Items[0].Item.DisplayName) : null,
+                g.Items.Count == 1 ? g.Items[0].CachePercentage : null))
             .ToList();
 
         LibraryBrowseExpandedGroupDto? expanded = null;
@@ -68,7 +97,8 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
                     var episode = i.PlexMatch?.Episode;
                     return new LibraryBrowseFileDto(i.Item,
                         season.HasValue ? $"Season {season}" : null,
-                        season.HasValue && episode.HasValue ? $"S{season:00}E{episode:00}" : null);
+                        season.HasValue && episode.HasValue ? $"S{season:00}E{episode:00}" : null,
+                        QualityFromName(i.Item.DisplayName), i.CachePercentage);
                 })
                 .ToList();
             expanded = new LibraryBrowseExpandedGroupDto(expandedGroup.Key,
@@ -87,6 +117,15 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
 
     private static bool NeedsAttention(LibraryCatalogItemDto item) =>
         item.Health is "attention" or "unmapped";
+
+    internal static string QualityFromName(string name)
+    {
+        if (Regex.IsMatch(name, @"(?i)(?:^|[^a-z0-9])(?:2160p|4k|uhd)(?:[^a-z0-9]|$)")) return "4k";
+        if (Regex.IsMatch(name, @"(?i)(?:^|[^a-z0-9])1080[pi]?(?:[^a-z0-9]|$)")) return "1080p";
+        if (Regex.IsMatch(name, @"(?i)(?:^|[^a-z0-9])720[pi]?(?:[^a-z0-9]|$)")) return "720p";
+        if (Regex.IsMatch(name, @"(?i)(?:^|[^a-z0-9])(?:480[pi]?|576[pi]?|sd)(?:[^a-z0-9]|$)")) return "sd";
+        return "unknown";
+    }
 
     private static string? PrimaryLinkPath(LibraryCatalogItemDto item) =>
         item.Mappings.OrderBy(m => m.LinkPath, StringComparer.OrdinalIgnoreCase)
@@ -149,7 +188,7 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
 
     private sealed record GroupIdentity(string Category, string Key, string Title);
     private sealed record ClassifiedItem(LibraryCatalogItemDto Item, GroupIdentity Identity,
-        PlexLibraryMedia? PlexMatch);
+        PlexLibraryMedia? PlexMatch, int? CachePercentage);
     private sealed record Group(string Key, string Title, string Category,
         IReadOnlyList<ClassifiedItem> Items);
 }

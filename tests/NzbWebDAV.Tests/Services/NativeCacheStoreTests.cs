@@ -9,6 +9,22 @@ public sealed class NativeCacheStoreTests : IDisposable
     public NativeCacheStoreTests() => Directory.CreateDirectory(_root);
 
     [Fact]
+    public async Task StoredCoverage_UsesVerifiedBytesPerItem_WithoutRoundingPartialFilesToComplete()
+    {
+        var folder = CreateFolder();
+        await using var store = new NativeCacheStore(Path.Combine(_root, "catalogue.db"), [folder]);
+        var partial = new NativeCacheIdentity("partial-item", "v1", NativeCacheStore.BlockSize * 2L + 3);
+        var complete = new NativeCacheIdentity("complete-item", "v1", 3);
+        Assert.True(await store.WriteBlockAsync(partial, 0, new byte[NativeCacheStore.BlockSize]));
+        Assert.True(await store.WriteBlockAsync(complete, 0, new byte[3]));
+
+        var coverage = await store.GetStoredCoverageByItemAsync();
+        Assert.Equal(49, coverage["partial-item"]);
+        Assert.Equal(100, coverage["complete-item"]);
+        Assert.False(coverage.ContainsKey("absent-item"));
+    }
+
+    [Fact]
     public async Task EntryGeneration_SurvivesReopen_AndExplicitCatalogueRecovery()
     {
         var folder = CreateFolder();

@@ -52,7 +52,7 @@ describe("library browse loader", () => {
   it("passes category, search, mapping filter, and group paging", async () => {
     await loader({
       request: requestFor(
-        "/library?category=movies&q=dune&type=broken&page=2&group=movies%2FDune&groupPage=3",
+        "/library?category=movies&q=dune&type=broken&quality=4k&cache=any&page=2&group=movies%2FDune&groupPage=3",
       ),
       params: {},
     } as never);
@@ -61,6 +61,8 @@ describe("library browse loader", () => {
       q: "dune",
       category: "movies",
       type: "broken",
+      quality: "4k",
+      cache: "any",
       page: 2,
       group: "movies/Dune",
       groupPage: 3,
@@ -76,6 +78,8 @@ describe("library browse loader", () => {
     expect(browseMock()).toHaveBeenCalledWith({
       category: "shows",
       type: "all",
+      quality: "all",
+      cache: "all",
       page: 1,
       groupPage: 1,
     });
@@ -91,6 +95,8 @@ describe("library browse loader", () => {
           itemCount: 1,
           healthyCount: 1,
           attentionCount: 0,
+          quality: "1080p",
+          cachePercentage: 75,
         },
       ],
       totalGroups: 1,
@@ -126,6 +132,8 @@ describe("library browse loader", () => {
             },
             season: null,
             episode: null,
+            quality: "1080p",
+            cachePercentage: 75,
           },
         ],
       },

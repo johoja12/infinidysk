@@ -48,6 +48,8 @@ const item: LibraryCatalogItem = {
 
 const baseProps = {
   item,
+  quality: "1080p" as const,
+  cachePercentage: 75,
   details: null,
   detailsLoading: false,
   detailsError: null,
@@ -68,6 +70,7 @@ describe("LibraryFileModal", () => {
     render(<LibraryFileModal {...baseProps} />);
     expect(screen.getByRole("dialog", { name: "detail-film.mkv" })).toBeTruthy();
     expect(screen.getByText(/movies\/detail-film\.mkv/)).toBeTruthy();
+    expect(screen.getByText("75%")).toBeTruthy();
     expect(screen.getByText(/no health checks recorded/i)).toBeTruthy();
   });
 
