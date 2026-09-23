@@ -59,6 +59,115 @@ public sealed class NativePrefetchTests : IAsyncLifetime
     }
 
     [Theory]
+    [InlineData("missing")]
+    [InlineData("truncated")]
+    [InlineData("corrupt")]
+    public async Task Warm_RechecksCachedDataBeforeDeclaringCompletion(string damage)
+    {
+        var identity = new NativeCacheIdentity("damaged-movie", "revision", 3);
+        byte[] expected = [1, 2, 3];
+        Assert.True(await _store.WriteBlockAsync(identity, 0, expected));
+        var path = Path.Combine(_root, "media", "v1", identity.Key[..2], identity.Key, "content.data");
+        if (damage == "missing") File.Delete(path);
+        else await File.WriteAllBytesAsync(path, damage == "truncated" ? [1] : [9, 9, 9]);
+
+        var source = new VerifiedSource(expected, true);
+        await using var stream = new NativeCachedStream(_store, identity, _ => Task.FromResult<Stream>(source), () => true);
+        var charged = 0L;
+        await NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0,
+            count => { charged += count; return true; }, _ => { }, CancellationToken.None);
+
+        Assert.Equal(3, source.ReadBytes);
+        Assert.Equal(3, charged);
+        var actual = new byte[3];
+        Assert.Equal(3, await _store.ReadBlockAsync(identity, 0, actual));
+        Assert.Equal(expected, actual);
+    }
+
+    [Fact]
+    public async Task Warm_OfflineCachedVolumeCannotReportCompletion()
+    {
+        var identity = new NativeCacheIdentity("offline-movie", "revision", 3);
+        Assert.True(await _store.WriteBlockAsync(identity, 0, new byte[] { 1, 2, 3 }));
+        Directory.Move(Path.Combine(_root, "media"), Path.Combine(_root, "offline-media"));
+        await using var stream = new NativeCachedStream(_store, identity,
+            _ => throw new InvalidOperationException("Offline cache opened source"), () => true);
+
+        await Assert.ThrowsAsync<PrefetchDeferredException>(() => NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0,
+            (Func<long, bool>)(_ => throw new InvalidOperationException("Offline cache spent budget")), _ => { }, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Warm_RepairsCorruptMiddleWithoutDownloadingValidHeadAndTail()
+    {
+        var block = NativeCacheStore.BlockSize;
+        var bytes = new byte[block * 2 + 3];
+        new Random(826).NextBytes(bytes);
+        var identity = new NativeCacheIdentity("middle-damage", "revision", bytes.Length);
+        Assert.True(await _store.WriteBlockAsync(identity, 0, bytes.AsMemory(0, block)));
+        Assert.True(await _store.WriteBlockAsync(identity, block, bytes.AsMemory(block, block)));
+        Assert.True(await _store.WriteBlockAsync(identity, block * 2L, bytes.AsMemory(block * 2)));
+        var path = Path.Combine(_root, "media", "v1", identity.Key[..2], identity.Key, "content.data");
+        await using (var file = File.OpenWrite(path))
+        {
+            file.Position = block;
+            await file.WriteAsync(new byte[block]);
+        }
+
+        var source = new VerifiedSource(bytes, true);
+        await using var stream = new NativeCachedStream(_store, identity, _ => Task.FromResult<Stream>(source), () => true);
+        var charged = 0L;
+        await NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0,
+            count => { charged += count; return true; }, _ => { }, CancellationToken.None);
+        Assert.Equal(block, source.ReadBytes);
+        Assert.Equal(block, charged);
+        var actual = new byte[block];
+        Assert.Equal(block, await _store.ReadBlockAsync(identity, block, actual));
+        Assert.Equal(bytes.AsSpan(block, block).ToArray(), actual);
+    }
+
+    [Fact]
+    public async Task Warm_DamagedCacheCannotBypassSourceBudget()
+    {
+        var identity = new NativeCacheIdentity("budget", "revision", 3);
+        Assert.True(await _store.WriteBlockAsync(identity, 0, new byte[] { 1, 2, 3 }));
+        File.Delete(Path.Combine(_root, "media", "v1", identity.Key[..2], identity.Key, "content.data"));
+        await using var stream = new NativeCachedStream(_store, identity,
+            _ => throw new InvalidOperationException("Opened source without budget"), () => true);
+        await Assert.ThrowsAsync<PrefetchDeferredException>(() => NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0,
+            _ => false, _ => { }, CancellationToken.None));
+        Assert.Equal(0, await _store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
+    public async Task PartialWarm_DoesNotVerifyOrFetchOutsideRequestedBlocks()
+    {
+        var block = NativeCacheStore.BlockSize;
+        var identity = new NativeCacheIdentity("partial", "revision", block + 3L);
+        Assert.True(await _store.WriteBlockAsync(identity, 0, new byte[block]));
+        Assert.True(await _store.WriteBlockAsync(identity, block, new byte[] { 1, 2, 3 }));
+        var path = Path.Combine(_root, "media", "v1", identity.Key[..2], identity.Key, "content.data");
+        await using (var file = File.OpenWrite(path)) await file.WriteAsync(new byte[] { 9 });
+        await using var stream = new NativeCachedStream(_store, identity,
+            _ => throw new InvalidOperationException("Opened source outside requested range"), () => true);
+        await NativePrefetchExecutor.WarmAsync(_store, stream, block + 1L, 1,
+            (Func<long, bool>)(_ => throw new InvalidOperationException("Spent budget for cached tail")), _ => { }, CancellationToken.None);
+        Assert.Equal(identity.Length, await _store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
+    public async Task Warm_CachedVerificationYieldsToForegroundWithoutSpendingProviderBudget()
+    {
+        var identity = new NativeCacheIdentity("paused", "revision", 3);
+        Assert.True(await _store.WriteBlockAsync(identity, 0, new byte[] { 1, 2, 3 }));
+        await using var stream = new NativeCachedStream(_store, identity,
+            _ => throw new InvalidOperationException("Opened source while paused"), () => true);
+        await Assert.ThrowsAsync<PrefetchDeferredException>(() => NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0,
+            (Func<long, ValueTask<bool>>)(_ => throw new InvalidOperationException("Spent budget while paused")), _ => { },
+            CancellationToken.None, canContinue: () => false));
+    }
+
+    [Theory]
     [InlineData(false, true)]
     [InlineData(true, false)]
     public async Task UnverifiedOrOverBudgetWork_DoesNotComplete(bool verified, bool budget)

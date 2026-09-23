@@ -41,14 +41,16 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         catch (InvalidOperationException) { throw new PrefetchDeferredException("Native cache buffers or metadata are unavailable."); }
         await using var stream = admitted;
         var cached = (NativeCachedStream)stream;
-        await WarmAsync(native.Store, cached, job.Start, job.Length, async _ =>
+        bool CanContinue()
         {
             var current = Settings();
             return !jobs.Paused && jobs.IsRunning(job.Id)
                 && item.FileSize <= current.MaxBytesPerItem
-                && (!current.PauseDuringPlayback || activeReads.Snapshot().Count == 0 && playback?.HasActivePlayback != true)
-                && await wireBudget.PrepareReadAsync(ct).ConfigureAwait(false);
-        }, bytes => jobs.Progress(job.Id, cached.Identity.Generation, bytes), wireBudget.Token).ConfigureAwait(false);
+                && (!current.PauseDuringPlayback || activeReads.Snapshot().Count == 0 && playback?.HasActivePlayback != true);
+        }
+        await WarmAsync(native.Store, cached, job.Start, job.Length,
+            async _ => CanContinue() && await wireBudget.PrepareReadAsync(ct).ConfigureAwait(false),
+            bytes => jobs.Progress(job.Id, cached.Identity.Generation, bytes), wireBudget.Token, CanContinue).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is not OutOfMemoryException && (wireBudget.Exceeded || jobs.WireBudgetBlocked) && !ct.IsCancellationRequested)
         {
@@ -62,7 +64,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         => WarmAsync(store, stream, start, length, bytes => new ValueTask<bool>(spend(bytes)), progress, ct);
 
     public static async Task WarmAsync(NativeCacheStore store, NativeCachedStream stream, long start, long length,
-        Func<long, ValueTask<bool>> spend, Action<long> progress, CancellationToken ct)
+        Func<long, ValueTask<bool>> spend, Action<long> progress, CancellationToken ct, Func<bool>? canContinue = null)
     {
         if (start < 0 || start >= stream.Length || length < 0 || length > stream.Length - start)
             throw new ArgumentException("The warm range is outside the media file.");
@@ -70,6 +72,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         var position = start / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize;
         var alignedEnd = end % NativeCacheStore.BlockSize == 0 ? end
             : end + Math.Min(NativeCacheStore.BlockSize - end % NativeCacheStore.BlockSize, stream.Length - end);
+        await VerifyExistingRangesAsync(store, stream, position, alignedEnd, canContinue, ct).ConfigureAwait(false);
         var missing = await store.GetMissingRangeBytesAsync(stream.Identity, position, alignedEnd, ct).ConfigureAwait(false);
         if (missing == 0)
         {
@@ -97,5 +100,37 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         }
         if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed before completion.");
         progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
+    }
+
+    private static async Task VerifyExistingRangesAsync(NativeCacheStore store, NativeCachedStream stream,
+        long start, long end, Func<bool>? canContinue, CancellationToken ct)
+    {
+        // Catalogue coverage is a snapshot. It cannot prove the mounted data still
+        // exists or matches its committed hash. Validate only this job's blocks,
+        // with bounded catalogue pages and the stream's existing buffer admission.
+        var after = start - 1;
+        while (true)
+        {
+            var ranges = await store.ListVerifiedRangesAsync(stream.Identity.Key, after, 100, ct).ConfigureAwait(false);
+            if (ranges.Count == 0) return;
+            foreach (var range in ranges)
+            {
+                if (range.Offset >= end) return;
+                ct.ThrowIfCancellationRequested();
+                if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed before cache verification.");
+                if (canContinue?.Invoke() == false)
+                    throw new PrefetchDeferredException("Warming is paused or foreground playback has priority.");
+                if (!await stream.VerifyCachedBlockAsync(range.Offset, ct).ConfigureAwait(false))
+                {
+                    // Missing/truncated/corrupt data invalidates the indexed block
+                    // and is filled by the ordinary budgeted path below. An offline
+                    // or inaccessible volume leaves coverage intact; defer it.
+                    if (!stream.IsSourceCurrent || await store.FindNextMissingOffsetAsync(stream.Identity,
+                        range.Offset, range.Offset + range.Count, ct).ConfigureAwait(false) != range.Offset)
+                        throw new PrefetchDeferredException("Cached storage is unavailable; completion could not be verified.");
+                }
+                after = range.Offset;
+            }
+        }
     }
 }
