@@ -48,6 +48,8 @@ export function selectedPlexServerIds(value: string, servers: PlexServer[]): Set
 
 export function LibrarySettings({ config, savedConfig, setNewConfig }: Props) {
   const enabled = config["media.library-enabled"] !== "false";
+  const savedEnabled = savedConfig["media.library-enabled"];
+  const savedSourceIds = savedConfig["media.library-plex-server-ids"];
   const [servers, setServers] = useState<PlexServer[]>([]);
   const [status, setStatus] = useState<PlexStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -70,7 +72,7 @@ export function LibrarySettings({ config, savedConfig, setNewConfig }: Props) {
     return () => {
       active = false;
     };
-  }, []);
+  }, [savedEnabled, savedSourceIds]);
   useEffect(() => {
     if (!status?.syncing) return;
     let active = true;
