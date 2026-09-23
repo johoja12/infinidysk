@@ -84,7 +84,7 @@ public class ActiveReadRegistry
     {
         if (_entries.TryGetValue(id, out var entry))
         {
-            lock (entry)
+            lock (entry.ActivityGate)
             {
                 if (bytesRead > 0 && currentOffset is { } end && end >= bytesRead)
                 {
@@ -208,12 +208,13 @@ public class ActiveReadRegistry
         /// transferred bytes (which over-counts on seek/rewind).
         /// </summary>
         public long CurrentOffset;
+        internal Lock ActivityGate { get; } = new();
         internal DateTimeOffset SequentialStartedAt;
         internal long SequentialBytes;
 
         public bool QualifiesForWarming(DateTimeOffset now)
         {
-            lock (this) return SequentialBytes >= 64L * 1024 * 1024
+            lock (ActivityGate) return SequentialBytes >= 64L * 1024 * 1024
                 && now - SequentialStartedAt >= TimeSpan.FromSeconds(30)
                 && now - LastActivityAt <= ActivityWindow;
         }
