@@ -6,11 +6,11 @@ Each file is one media item (deduplicated by its stable InfiniDysk identity) wit
 
 ## Grouped browsing [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
 
-The **TV shows** and **Movies** tabs group files by recognized library symlink folders. Expand a group to see its files and their mappings; large groups have their own file pages, so episodes stay under the same show even when the full library spans many pages. The **Unmatched** tab keeps files without a reliable show or movie folder, including external-only links, visible without assigning a guessed title.
+The **TV shows** and **Movies** tabs classify files by matching their symlink filename against metadata from enabled Plex servers. A Plex episode match goes under TV shows; a Plex movie match goes under Movies. Recognized library folders, including `TV-*` and `Movies-*`, organize matched files into groups. If the folder does not match the Plex media type, the Plex show or movie title supplies the group. Expand a group to see its files and their mappings; large groups have their own file pages. The **Unmatched** tab lists files with no unambiguous Plex filename match, including external-only links when Plex does not recognize their filenames.
 
 Search matches file names, content paths, symlink paths, and targets across the full indexed catalog. The mapping filter includes internal, external, and broken links. Summary cards count indexed files, internal files with valid mappings, files needing attention, and unmatched files for the current search and mapping filter. The scan timestamp and any stale-index warning appear above the groups.
 
-These groups use library paths, not Plex metadata. The page does not claim Plex sync, missing-episode detection, analysis results, or cache coverage.
+The Plex index syncs shortly after startup and every six hours. **Sync Plex now** refreshes it on demand. The page shows the last successful sync, the number of indexed Plex items, and any sync warning. A failed or incomplete Plex request keeps the last complete index; before the first successful sync, the page leaves categories pending rather than treating every file as unmatched. The index is saved in `/config/plex-library-metadata.json`. Plex matching uses filenames, so files renamed differently from their Plex versions may remain unmatched. The page does not provide missing-episode detection or language analysis.
 
 ## File details modal [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
 
