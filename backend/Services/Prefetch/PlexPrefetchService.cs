@@ -89,7 +89,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
                 // Raw reads are low-confidence hints only. They never enter the verified Plex registry.
                 using var scope = scopes.CreateScope();
                 var database = scope.ServiceProvider.GetRequiredService<DavDatabaseClient>();
-                foreach (var read in reads.Snapshot().Take(32))
+                foreach (var read in reads.Snapshot().Where(read => read.QualifiesForWarming(DateTimeOffset.UtcNow)).Take(32))
                 {
                     var item = await ResolveDavAsync(database, read.Path, deadline.Token).ConfigureAwait(false);
                     if (item is not null) QueueImported(item, "read", 5, 0, 0, settings);
