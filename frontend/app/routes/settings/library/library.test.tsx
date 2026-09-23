@@ -58,17 +58,21 @@ describe("Media Library settings", () => {
   });
 
   it("saves an explicit empty Plex selection and waits for Save before syncing", async () => {
-    plexRequest.mockImplementation((operation: string) => Promise.resolve(
-      operation === "servers"
-        ? { servers: [{ id: "home", name: "Home Plex", enabled: true }] }
-        : { ready: true, syncedAt: null, entryCount: 12, warning: null, syncing: false },
-    ));
+    plexRequest.mockImplementation((operation: string) =>
+      Promise.resolve(
+        operation === "servers"
+          ? { servers: [{ id: "home", name: "Home Plex", enabled: true }] }
+          : { ready: true, syncedAt: null, entryCount: 12, warning: null, syncing: false },
+      ),
+    );
     const user = userEvent.setup();
     render(<Harness />);
     const source = await screen.findByRole("checkbox", { name: "Home Plex" });
     expect(source).toHaveProperty("checked", true);
     await user.click(source);
-    expect(screen.getByTestId("config").textContent).toContain('"media.library-plex-server-ids":"[]"');
+    expect(screen.getByTestId("config").textContent).toContain(
+      '"media.library-plex-server-ids":"[]"',
+    );
     expect(screen.getByRole("button", { name: "Sync Plex now" }).matches(":disabled")).toBe(true);
   });
 });
