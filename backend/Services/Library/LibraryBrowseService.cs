@@ -19,15 +19,29 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
         CancellationToken ct = default)
     {
         var all = await catalog.LoadAllAsync(ct).ConfigureAwait(false);
-        IReadOnlyDictionary<string, int>? storedCoverage = null;
+        Dictionary<string, int?>? currentCoverage = null;
         if (nativeCache?.InitializationPending == true)
             await nativeCache.WaitForInitializationAsync(ct).ConfigureAwait(false);
         if (nativeCache?.Store is { } store)
         {
-            try { storedCoverage = await store.GetStoredCoverageByItemAsync(ct).ConfigureAwait(false); }
-            catch (Exception error) when (error is IOException or SqliteException or ObjectDisposedException)
+            try
+            {
+                currentCoverage = new Dictionary<string, int?>(StringComparer.OrdinalIgnoreCase);
+                var cachedIds = await store.GetCachedItemIdsAsync(ct).ConfigureAwait(false);
+                var ids = all.Where(item => item.DavItemId is { } id && cachedIds.Contains(id.ToString("N")))
+                    .Select(item => item.DavItemId!.Value).ToArray();
+                foreach (var item in await catalog.LoadItemsByIdsAsync(ids, ct).ConfigureAwait(false))
+                {
+                    try { currentCoverage[item.Id.ToString("N")] = await nativeCache.GetCurrentCoverageAsync(item, ct).ConfigureAwait(false); }
+                    catch (Exception error) when (error is IOException or UnauthorizedAccessException or SqliteException
+                        or NzbWebDAV.Exceptions.CorruptedBlobPayloadException or ObjectDisposedException)
+                    { currentCoverage[item.Id.ToString("N")] = null; }
+                }
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or SqliteException or ObjectDisposedException)
             {
                 // Cache information is optional; a catalogue problem must not hide the library.
+                currentCoverage = null;
             }
         }
         var matched = all
@@ -45,8 +59,8 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
             .Select(i =>
             {
                 var plex = Match(i, plexMetadata);
-                int? cachePercentage = i.DavItemId is { } id && storedCoverage is not null
-                    ? storedCoverage.GetValueOrDefault(id.ToString("N"), 0) : null;
+                int? cachePercentage = i.DavItemId is { } id && currentCoverage is not null
+                    ? currentCoverage.GetValueOrDefault(id.ToString("N"), 0) : null;
                 return new ClassifiedItem(i, Classify(i, plex), plex, cachePercentage);
             })
             .Where(i => query.Cache switch

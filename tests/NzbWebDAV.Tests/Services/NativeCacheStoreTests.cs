@@ -9,7 +9,7 @@ public sealed class NativeCacheStoreTests : IDisposable
     public NativeCacheStoreTests() => Directory.CreateDirectory(_root);
 
     [Fact]
-    public async Task StoredCoverage_UsesVerifiedBytesPerItem_WithoutRoundingPartialFilesToComplete()
+    public async Task CachedItemIds_IncludeOnlyItemsWithVerifiedBytes()
     {
         var folder = CreateFolder();
         await using var store = new NativeCacheStore(Path.Combine(_root, "catalogue.db"), [folder]);
@@ -18,10 +18,10 @@ public sealed class NativeCacheStoreTests : IDisposable
         Assert.True(await store.WriteBlockAsync(partial, 0, new byte[NativeCacheStore.BlockSize]));
         Assert.True(await store.WriteBlockAsync(complete, 0, new byte[3]));
 
-        var coverage = await store.GetStoredCoverageByItemAsync();
-        Assert.Equal(49, coverage["partial-item"]);
-        Assert.Equal(100, coverage["complete-item"]);
-        Assert.False(coverage.ContainsKey("absent-item"));
+        var ids = await store.GetCachedItemIdsAsync();
+        Assert.Contains("partial-item", ids);
+        Assert.Contains("complete-item", ids);
+        Assert.DoesNotContain("absent-item", ids);
     }
 
     [Fact]

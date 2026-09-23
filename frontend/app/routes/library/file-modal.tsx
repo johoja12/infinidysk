@@ -68,7 +68,7 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
           />
           <Fact label="Quality" value={qualityLabel} />
           <Fact
-            label="Stored cache"
+            label="Native Cache"
             value={props.cachePercentage == null ? "Unavailable" : `${props.cachePercentage}%`}
           />
           <Fact label="Mappings" value={String(item.mappingCount)} />

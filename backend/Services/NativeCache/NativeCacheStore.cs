@@ -405,19 +405,17 @@ public sealed class NativeCacheStore : IAsyncDisposable
         finally { _gate.Release(); }
     }
 
-    /// <summary>Stored verified coverage by item ID. This is a storage view and may
-    /// include an older content generation; callers must not treat it as a cache hit.</summary>
     [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
-    public async Task<IReadOnlyDictionary<string, int>> GetStoredCoverageByItemAsync(CancellationToken cancellationToken = default)
+    public async Task<IReadOnlySet<string>> GetCachedItemIdsAsync(CancellationToken cancellationToken = default)
     {
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            using var command = Command("SELECT ItemId, MAX(MIN(100.0, VerifiedBytes * 100.0 / Length)) FROM Entries WHERE ItemId <> '' AND Length > 0 GROUP BY ItemId");
+            using var command = Command("SELECT DISTINCT ItemId FROM Entries WHERE ItemId <> '' AND VerifiedBytes > 0");
             using var reader = command.ExecuteReader();
-            var result = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            while (reader.Read()) result[reader.GetString(0)] = (int)Math.Floor(reader.GetDouble(1));
-            return result;
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (reader.Read()) ids.Add(reader.GetString(0));
+            return ids;
         }
         finally { _gate.Release(); }
     }

@@ -413,7 +413,7 @@ export default function Library({ loaderData }: Route.ComponentProps) {
           </select>
         </label>
         <label className="text-xs font-semibold text-base-content/70">
-          Stored cache
+          Native Cache
           <select
             name="cache"
             defaultValue={query.cache}
@@ -429,8 +429,8 @@ export default function Library({ loaderData }: Route.ComponentProps) {
         <Button type="submit">Apply filters</Button>
       </Form>
       <p className="-mt-3 text-xs text-base-content/55">
-        Quality is inferred from the filename. Stored cache reflects Native Cache data and may
-        include an older file revision{nativeCacheActive ? "." : "; Native Cache is inactive."}
+        Quality is inferred from the filename. Native Cache shows verified coverage for the current
+        file revision{nativeCacheActive ? "." : "; Native Cache is inactive."}
       </p>
 
       <nav className="flex gap-1 border-b border-base-content/15" aria-label="Media type">
