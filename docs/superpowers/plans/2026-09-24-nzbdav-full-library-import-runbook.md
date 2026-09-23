@@ -15,9 +15,10 @@ This is the operator sequence for the [approved recovery design](../specs/2026-0
 | Parallel canary | `/mnt/plex2` contains 30 symlinks; the retained apply journal has 30 links and the retained validation result reports 30/30 success | Revalidate the journal, current targets, sizes, and representative reads. Review source-name remediation before bulk import. |
 | Full run | No full master manifest or aggregate coverage report was found under `/opt/infinidysk-migration/full` | Create a new run ID and immutable input snapshots; do not reuse the old canary run directory. |
 | Legacy source | Prior checked snapshot contained 41,306 NzbDav links; orphan blob tree is currently about 47 GiB | Treat the old link count as historical. Recount from a fresh checksummed inventory and freeze a blob list. |
-| Capacity | The filesystem holding `/opt/infinidysk-migration/full` has about 14 GiB free | **Block package export and bulk import.** Provide a private artifact volume and separate backup capacity first. |
+| Capacity | The root filesystem holding `/opt/infinidysk-migration/full` had about 96 GiB free and was 90% used at the latest check | **Block package export and bulk import.** Provide a private artifact volume with calculated headroom; the root filesystem is not the planned artifact volume. Recheck free space on run day. |
+| Backup destination | `/mnt/docker/infinidysk-migration-backups` is a mounted Synology NFS share with ample space; existing local backup copies were moved there under `local-root-backups-20260924` and checksum-verified | Create a fresh full-run backup on this share. Verify it is mounted as NFS before writing, validate checksums by reading it back, and restore-test it. Do not write to the local mountpoint if the NAS is unavailable. |
 
-The orphan scan and batch export may need a full extra copy of recoverable NZB payloads, plus one active batch, catalogue, journals, and backups. Provision a private run volume with **at least 80 GiB free initially** and a separate verified backup destination; recalculate the requirement from the frozen blob inventory before export. Keep at least 20% headroom and enough space for the largest batch and rollback evidence. Do not solve this by deleting the legacy blobs, current canary, or existing backups.
+The orphan scan and batch export may need a full extra copy of recoverable NZB payloads, plus one active batch, catalogue, and journals. Provision a private run volume with **at least 80 GiB free initially** and use the separate NAS backup destination above; recalculate the artifact requirement from the frozen blob inventory before export. Keep at least 20% headroom and enough space for the largest batch and rollback evidence. Do not solve this by deleting the legacy blobs, current canary, or existing backups.
 
 ## Boundaries and evidence
 
@@ -35,7 +36,7 @@ The orphan scan and batch export may need a full extra copy of recoverable NZB p
 2. Freeze an operator record of the current 30-link canary, including its journal and validation result. Re-run `validate-links` and check the existing source-name remediation. Stop on a mismatched target, failed read, or unowned link; do not silently replace it.
 3. Pin one self-contained `NzbDavMigration` executable under `tools/<commit>` and record its digest. Its `inventory`, `catalogue-list`, `catalogue-scan`, `recover-full`, `export-batches`, `apply-links`, `validate-links`, `coverage-report`, and `rollback-links` commands must match the selected backend. The current `acb6f0ce` binary is the starting candidate, not an assumed final pin.
 
-**Hold:** Do not start the full scan until backups, revision compatibility, canary validation, and artifact/backup storage have passed. The current 14 GiB free on the root filesystem fails this hold point.
+**Hold:** Do not start the full scan until backups, revision compatibility, canary validation, and artifact/backup storage have passed. The root filesystem remains about 90% used and is not the dedicated artifact volume required by this plan.
 
 ### 2. Inventory and recover without importing
 
