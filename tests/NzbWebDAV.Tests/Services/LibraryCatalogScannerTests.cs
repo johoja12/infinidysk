@@ -60,4 +60,25 @@ public sealed class LibraryCatalogScannerTests : IAsyncLifetime
         Assert.Equal(LibraryMappingType.External, row.MappingType);
         Assert.Null(row.DavItemId);
     }
+
+    [Fact]
+    public async Task DisabledLibrary_DoesNotScanOrMarkExistingMappingsStale()
+    {
+        var target = Path.Join(_libraryRoot, "real.mkv");
+        await File.WriteAllTextAsync(target, "x");
+        var link = Path.Join(_libraryRoot, "linked.mkv");
+        File.CreateSymbolicLink(link, target);
+        var config = new ConfigManager();
+        config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryDir, ConfigValue = _libraryRoot }]);
+        var factory = _provider.GetRequiredService<IDbContextFactory<DavDatabaseContext>>();
+        var scanner = new LibraryCatalogScanner(config, factory);
+        await scanner.ReconcileOnceAsync(CancellationToken.None);
+
+        File.Delete(link);
+        config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryEnabled, ConfigValue = "false" }]);
+        await scanner.ReconcileOnceAsync(CancellationToken.None);
+
+        await using var context = factory.CreateDbContext();
+        Assert.Equal(LibraryLinkStatus.Valid, (await context.LinkMaps.SingleAsync()).Status);
+    }
 }

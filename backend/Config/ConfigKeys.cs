@@ -107,6 +107,9 @@ public static class ConfigKeys
 
     // media / repair / arr
     public const string MediaLibraryDir = "media.library-dir";
+    public const string MediaLibraryEnabled = "media.library-enabled";
+    public const string MediaLibraryScanIntervalMinutes = "media.library-scan-interval-minutes";
+    public const string MediaLibraryPlexServerIds = "media.library-plex-server-ids";
     public const string RepairEnable = "repair.enable";
     public const string RepairHealthcheckConcurrency = "repair.healthcheck-concurrency";
     public const string RepairHealthcheckWorkers = "repair.healthcheck-workers";

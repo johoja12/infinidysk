@@ -482,6 +482,19 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 CacheModeResolver.Parse(item.ConfigValue);
                 continue;
             }
+            if (item.ConfigName == ConfigKeys.MediaLibraryPlexServerIds)
+            {
+                _ = MediaLibraryOptions.ParsePlexServerIds(item.ConfigValue);
+                continue;
+            }
+            if (item.ConfigName == ConfigKeys.MediaLibraryScanIntervalMinutes)
+            {
+                if (!string.IsNullOrWhiteSpace(item.ConfigValue) &&
+                    (!int.TryParse(item.ConfigValue, out var interval) ||
+                     !MediaLibraryOptions.ScanIntervalsMinutes.Contains(interval)))
+                    throw new ArgumentException("Media Library scan interval must be 5, 15, 30, 60, or 360 minutes.");
+                continue;
+            }
             var value = StringUtil.EmptyToNull(item.ConfigValue);
             if (value == null) continue;
 
@@ -660,6 +673,7 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 case ConfigKeys.WardenHideDead:
                 case ConfigKeys.WardenBackboneScope:
                 case ConfigKeys.RepairEnable:
+                case ConfigKeys.MediaLibraryEnabled:
                 case ConfigKeys.RepairPar2Enabled:
                 case ConfigKeys.RepairPar2PreferredOverArr:
                 case ConfigKeys.RepairHealthcheckAging:
@@ -1023,6 +1037,15 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
     {
         return StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.MediaLibraryDir));
     }
+
+    public bool IsMediaLibraryEnabled() =>
+        !bool.TryParse(GetConfigValue(ConfigKeys.MediaLibraryEnabled), out var enabled) || enabled;
+
+    public TimeSpan GetMediaLibraryScanInterval() => TimeSpan.FromMinutes(
+        MediaLibraryOptions.ParseScanInterval(GetConfigValue(ConfigKeys.MediaLibraryScanIntervalMinutes)));
+
+    public IReadOnlySet<string>? GetMediaLibraryPlexServerIds() =>
+        MediaLibraryOptions.ParsePlexServerIds(GetConfigValue(ConfigKeys.MediaLibraryPlexServerIds));
 
     // The total connection budget used for webdav streaming. "0" or empty means
     // "auto": use the combined connection limit of the primary Pool providers

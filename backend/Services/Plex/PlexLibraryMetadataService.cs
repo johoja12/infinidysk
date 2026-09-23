@@ -30,10 +30,12 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
     private readonly ConfigManager _config;
     private readonly PlexApiClient _api;
     private readonly ILogger<PlexLibraryMetadataService> _logger;
+    private readonly IDisposable _configSubscription;
     private readonly string _path;
     private readonly SemaphoreSlim _syncGate = new(1, 1);
     private readonly SemaphoreSlim _syncSignal = new(0, 1);
     private volatile Index _index = Index.Empty;
+    private HashSet<string> _allowedServerIds;
     private volatile bool _syncing;
     private string? _warning;
 
@@ -44,6 +46,7 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
         _api = api;
         _logger = logger;
         _path = Path.Combine(DavDatabaseContext.ConfigPath, "plex-library-metadata.json");
+        _allowedServerIds = AllowedServerIds();
         try
         {
             if (File.Exists(_path))
@@ -58,6 +61,16 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
             _warning = "Saved Plex library metadata could not be loaded. Sync Plex again.";
             LogLoadFailure(_logger, error);
         }
+        _configSubscription = _config.Subscribe((_, args) =>
+        {
+            if (args.ChangedConfig.ContainsKey(ConfigKeys.MediaLibraryEnabled) ||
+                args.ChangedConfig.ContainsKey(ConfigKeys.MediaLibraryPlexServerIds) ||
+                args.ChangedConfig.ContainsKey(PlexSettings.ServersKey))
+            {
+                Volatile.Write(ref _allowedServerIds, AllowedServerIds());
+                RequestSync();
+            }
+        });
     }
 
     public PlexLibraryMetadataStatus Status => new(_index.SyncedAt.HasValue,
@@ -68,16 +81,21 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
 
     public PlexLibraryMetadataStatus RequestSync()
     {
+        if (!_config.IsMediaLibraryEnabled()) return Status;
         try { _syncSignal.Release(); }
         catch (SemaphoreFullException) { /* An existing request is already queued. */ }
+        catch (ObjectDisposedException) { /* Shutdown raced a settings change. */ }
         return Status;
     }
 
     public PlexLibraryMedia? Match(string? fileName)
     {
-        if (string.IsNullOrWhiteSpace(fileName)) return null;
+        if (!_config.IsMediaLibraryEnabled() || string.IsNullOrWhiteSpace(fileName)) return null;
         var name = Path.GetFileName(fileName.Replace('\\', '/'));
-        if (!_index.ByFileName.TryGetValue(name, out var candidates)) return null;
+        if (!_index.ByFileName.TryGetValue(name, out var indexed)) return null;
+        var allowed = Volatile.Read(ref _allowedServerIds);
+        var candidates = indexed.Where(candidate => allowed.Contains(candidate.ServerId)).ToArray();
+        if (candidates.Length == 0) return null;
         var first = candidates[0];
         // A filename reused for unrelated Plex media has no trustworthy match.
         return candidates.All(candidate => candidate.MediaType == first.MediaType &&
@@ -87,16 +105,33 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
             candidate.Year == first.Year) ? first : null;
     }
 
+    private HashSet<string> AllowedServerIds()
+    {
+        try
+        {
+            var selected = _config.GetMediaLibraryPlexServerIds();
+            return PlexSettings.ParseServers(_config.GetEffectiveConfigValue(PlexSettings.ServersKey))
+                .Where(server => server.Enabled && (selected is null || selected.Contains(server.Id)))
+                .Select(server => server.Id).ToHashSet(StringComparer.Ordinal);
+        }
+        catch (ArgumentException) { return []; }
+    }
+
     public async Task<PlexLibraryMetadataStatus> SyncAsync(CancellationToken ct = default)
     {
         await _syncGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (!_config.IsMediaLibraryEnabled()) return Status;
+            var selectedServerIds = _config.GetMediaLibraryPlexServerIds();
             var servers = PlexSettings.ParseServers(_config.GetEffectiveConfigValue(PlexSettings.ServersKey))
-                .Where(server => server.Enabled).ToArray();
+                .Where(server => server.Enabled &&
+                    (selectedServerIds is null || selectedServerIds.Contains(server.Id))).ToArray();
             if (servers.Length == 0)
             {
-                _warning = "Configure and enable a Plex server to match the Media Library.";
+                _warning = selectedServerIds is { Count: 0 }
+                    ? "Select a Plex server for Media Library matching."
+                    : "Configure and enable a selected Plex server to match the Media Library.";
                 return Status;
             }
             var entries = new List<PlexLibraryMedia>();
@@ -139,12 +174,26 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
         try
         {
             await Task.Delay(TimeSpan.FromSeconds(15), stoppingToken).ConfigureAwait(false);
+            DateTimeOffset? lastSyncFinishedAt = null;
             while (!stoppingToken.IsCancellationRequested)
             {
-                _syncing = true;
-                try { await SyncAsync(stoppingToken).ConfigureAwait(false); }
-                finally { _syncing = false; }
-                await _syncSignal.WaitAsync(TimeSpan.FromHours(6), stoppingToken).ConfigureAwait(false);
+                if (!_config.IsMediaLibraryEnabled())
+                {
+                    lastSyncFinishedAt = null;
+                    _ = _syncSignal.Wait(0);
+                    await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken).ConfigureAwait(false);
+                    continue;
+                }
+                if (lastSyncFinishedAt is null ||
+                    DateTimeOffset.UtcNow - lastSyncFinishedAt.Value >= TimeSpan.FromHours(6))
+                {
+                    _syncing = true;
+                    try { await SyncAsync(stoppingToken).ConfigureAwait(false); }
+                    finally { _syncing = false; }
+                    lastSyncFinishedAt = DateTimeOffset.UtcNow;
+                }
+                if (await _syncSignal.WaitAsync(TimeSpan.FromSeconds(30), stoppingToken).ConfigureAwait(false))
+                    lastSyncFinishedAt = null;
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
@@ -152,6 +201,7 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
 
     public override void Dispose()
     {
+        _configSubscription.Dispose();
         _syncGate.Dispose();
         _syncSignal.Dispose();
         base.Dispose();

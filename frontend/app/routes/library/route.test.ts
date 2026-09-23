@@ -9,6 +9,7 @@ vi.mock("~/clients/backend-client.server", async (importOriginal) => {
     ...actual,
     backendClient: {
       ...actual.backendClient,
+      getConfig: vi.fn(),
       getLibraryBrowse: vi.fn(),
       getNativeCacheStatus: vi.fn(),
     },
@@ -16,6 +17,8 @@ vi.mock("~/clients/backend-client.server", async (importOriginal) => {
 });
 
 beforeEach(() => {
+  configMock().mockReset();
+  configMock().mockResolvedValue([]);
   installFrontendRuntimeConfig({ frontendBackendApiKey: "test-api-key" });
   browseMock().mockReset();
   browseMock().mockResolvedValue({
@@ -39,6 +42,11 @@ function browseMock() {
   return vi.mocked(backendClient.getLibraryBrowse);
 }
 
+function configMock() {
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  return vi.mocked(backendClient.getConfig);
+}
+
 function nativeCacheMock() {
   // eslint-disable-next-line @typescript-eslint/unbound-method
   return vi.mocked(backendClient.getNativeCacheStatus);
@@ -49,6 +57,18 @@ function requestFor(path: string): Request {
 }
 
 describe("library browse loader", () => {
+  it("redirects to settings when Media Library is disabled", async () => {
+    configMock().mockResolvedValue([
+      {
+        configName: "media.library-enabled",
+        configValue: "false",
+      },
+    ]);
+    const result = await loader({ request: requestFor("/library"), params: {} } as never);
+    expect(result).toBeInstanceOf(Response);
+    expect((result as Response).headers.get("Location")).toBe("/settings?tab=library");
+    expect(browseMock()).not.toHaveBeenCalled();
+  });
   it("passes category, search, mapping filter, and group paging", async () => {
     await loader({
       request: requestFor(
@@ -143,6 +163,8 @@ describe("library browse loader", () => {
       request: requestFor("/library?group=movies%2FFilm"),
       params: {},
     } as never);
+
+    if (data instanceof Response) throw new Error("Expected Media Library browse data.");
 
     expect(data.previewUrls["11111111-1111-1111-1111-111111111111"]).toMatch(
       /^\/view\/content\/film\.mkv\?downloadKey=.+/,

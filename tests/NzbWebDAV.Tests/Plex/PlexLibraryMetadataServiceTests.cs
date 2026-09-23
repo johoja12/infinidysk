@@ -38,6 +38,13 @@ public sealed class PlexLibraryMetadataServiceTests
             Assert.False(service.Status.Ready);
             Assert.True((await service.SyncAsync()).Ready);
             Assert.Equal("episode", service.Match("TV-4K/A Show/A.Show.S01E01.mkv")?.MediaType);
+            config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryPlexServerIds, ConfigValue = "[]" }]);
+            Assert.Null(service.Match("A.Show.S01E01.mkv"));
+            config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryPlexServerIds, ConfigValue = "[\"machine\"]" }]);
+            Assert.Equal("episode", service.Match("A.Show.S01E01.mkv")?.MediaType);
+            config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryEnabled, ConfigValue = "false" }]);
+            Assert.Null(service.Match("A.Show.S01E01.mkv"));
+            config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryEnabled, ConfigValue = "true" }]);
             fail = true;
             var failed = await service.SyncAsync();
             Assert.True(failed.Ready);

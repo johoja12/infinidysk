@@ -21,7 +21,7 @@ describe("settings tabs", () => {
       },
       { title: "Providers & Search", tabs: ["usenet", "indexers", "profiles"] },
       { title: "Queue & Import", tabs: ["queue", "sabnzbd"] },
-      { title: "Playback & Files", tabs: ["streaming", "webdav"] },
+      { title: "Playback & Files", tabs: ["streaming", "library", "webdav"] },
       { title: "Automation", tabs: ["watchdog", "preflight", "watchtower", "warden"] },
       { title: "Integrations", tabs: ["arrs", "rclone"] },
     ]);
