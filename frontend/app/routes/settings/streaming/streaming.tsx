@@ -255,7 +255,9 @@ export function StreamingSettings({
       </SettingsCard>
 
       <NativeCacheSettings config={config} setNewConfig={setNewConfig} />
-      <PlexSettings />
+      <div id="plex-connections">
+        <PlexSettings />
+      </div>
       <SmartPrefetchSettings
         config={config}
         savedConfig={savedConfig}

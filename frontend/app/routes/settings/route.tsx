@@ -57,12 +57,14 @@ import {
 import { isWardenSettingsUpdated, WardenSettings } from "./warden/warden";
 import { isRcloneSettingsUpdated, RcloneSettings } from "./rclone/rclone";
 import { SupportSettings } from "./support/support";
+import { isLibrarySettingsUpdated, LibrarySettings } from "./library/library";
 import { useCallback, useMemo, useState, type Dispatch, type SetStateAction } from "react";
 import {
   useBlocker,
   useNavigate,
   useOutletContext,
   useRouteLoaderData,
+  useRevalidator,
   useSearchParams,
 } from "react-router";
 import type { loader as rootLoader } from "~/root";
@@ -152,6 +154,9 @@ const defaultConfig = {
   "rclone.pass": "",
   "rclone.mount-dir": "",
   "media.library-dir": "",
+  "media.library-enabled": "true",
+  "media.library-scan-interval-minutes": "15",
+  "media.library-plex-server-ids": "",
   "arr.instances": '{"RadarrInstances":[],"SonarrInstances":[],"QueueRules":[]}',
   "arr.health-enabled": "true",
   "indexers.instances": '{"Indexers":[]}',
@@ -403,6 +408,7 @@ type BodyProps = {
 };
 
 function Body(props: BodyProps) {
+  const revalidator = useRevalidator();
   const { role } = useOutletContext<AppOutletContext>();
   const appData = useRouteLoaderData<typeof rootLoader>("root");
   const isReadOnly = role === "readonly";
@@ -433,6 +439,7 @@ function Body(props: BodyProps) {
   const isQueueUpdated = isQueueSettingsUpdated(config, newConfig);
   const isSabnzbdUpdated = isSabnzbdSettingsUpdated(config, newConfig);
   const isStreamingUpdated = isStreamingSettingsUpdated(config, newConfig);
+  const isLibraryUpdated = isLibrarySettingsUpdated(config, newConfig);
   const isWebdavUpdated = isWebdavSettingsUpdated(config, newConfig);
   const isArrsUpdated = isArrsSettingsUpdated(config, newConfig);
   const isIndexersUpdated = isIndexersSettingsUpdated(config, newConfig);
@@ -452,6 +459,7 @@ function Body(props: BodyProps) {
     isQueueUpdated ||
     isSabnzbdUpdated ||
     isStreamingUpdated ||
+    isLibraryUpdated ||
     isWebdavUpdated ||
     isArrsUpdated ||
     isIndexersUpdated ||
@@ -530,6 +538,7 @@ function Body(props: BodyProps) {
       await postConfigUpdate(changedConfig);
       setConfig(newConfig);
       setIsSaved(true);
+      if ("media.library-enabled" in changedConfig) void revalidator.revalidate();
       if ("usenet.providers" in changedConfig) {
         setShowProviderChangeNotice(true);
         setHealthQueueResetCount(null);
@@ -540,7 +549,7 @@ function Body(props: BodyProps) {
     } finally {
       setIsSaving(false);
     }
-  }, [config, newConfig, managedEnv, postConfigUpdate]);
+  }, [config, newConfig, managedEnv, postConfigUpdate, revalidator]);
 
   const persistConfigPatch = useCallback(
     async (patch: Record<string, string>) => {
@@ -666,6 +675,13 @@ function Body(props: BodyProps) {
                 setNewConfig={setNewConfig}
                 persistConfigPatch={persistConfigPatch}
                 effectiveArticleBudgetBytes={props.inFlightArticleBudgetBytes}
+              />
+            )}
+            {activeTab === "library" && (
+              <LibrarySettings
+                savedConfig={config}
+                config={newConfig}
+                setNewConfig={setNewConfig}
               />
             )}
             {activeTab === "webdav" && (

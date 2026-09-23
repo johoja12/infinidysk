@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using NzbWebDAV.Api.Errors;
 using NzbWebDAV.Database;
+using NzbWebDAV.Config;
 using NzbWebDAV.Extensions;
 using NzbWebDAV.Services.Library;
 using NzbWebDAV.Services.Plex;
@@ -14,10 +15,13 @@ namespace NzbWebDAV.Api.Controllers.GetLibraryBrowse;
 [Route("api/get-library-browse")]
 [ProducesResponseType(typeof(LibraryBrowseResult), StatusCodes.Status200OK)]
 public sealed class GetLibraryBrowseController(DavDatabaseClient dbClient,
-    PlexLibraryMetadataService plexMetadata, NativeCacheService nativeCache) : GetOnlyApiController
+    PlexLibraryMetadataService plexMetadata, NativeCacheService nativeCache,
+    ConfigManager config) : GetOnlyApiController
 {
     protected override async Task<IActionResult> HandleRequest()
     {
+        if (!config.IsMediaLibraryEnabled())
+            return NotFound(new { status = false, error = "Media Library is disabled." });
         var request = new GetLibraryBrowseRequest(HttpContext);
         var scanner = HttpContext.RequestServices.GetService<LibraryCatalogScanner>();
         var catalog = new LibraryCatalogService(dbClient.Ctx);

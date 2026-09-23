@@ -960,7 +960,8 @@ export function LibraryDirectoryStep({
           />
           <HelpText>
             Use the parent of your Radarr and Sonarr root folders, visible inside the InfiniDysk
-            container. Do not use the rclone mount.
+            container. Do not use the rclone mount. After setup, use Settings → Media Library to
+            turn catalog browsing off or change its scan interval.
           </HelpText>
         </Field>
       </ManagedSetting>

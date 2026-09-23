@@ -21,7 +21,7 @@ public sealed class LibraryCatalogScanner(
     IDbContextFactory<DavDatabaseContext> dbContextFactory) : BackgroundService
 {
     private static readonly TimeSpan StartupDelay = TimeSpan.FromSeconds(30);
-    private static readonly TimeSpan RescanInterval = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan SettingsPollInterval = TimeSpan.FromSeconds(30);
 
     public DateTimeOffset? LastSuccessfulScanAt { get; private set; }
     public string? LastScanWarning { get; private set; }
@@ -31,23 +31,34 @@ public sealed class LibraryCatalogScanner(
         try { await Task.Delay(StartupDelay, stoppingToken).ConfigureAwait(false); }
         catch (OperationCanceledException) { return; }
 
+        DateTimeOffset? lastScanFinishedAt = null;
         while (!stoppingToken.IsCancellationRequested)
         {
-            try { await ReconcileOnceAsync(stoppingToken).ConfigureAwait(false); }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
-            catch (Exception e) when (e is not OutOfMemoryException)
+            if (!configManager.IsMediaLibraryEnabled())
             {
-                e.LogWarningKnownOrStack("Library catalog scan failed.");
-                LastScanWarning = e.Message;
+                lastScanFinishedAt = null;
+            }
+            else if (lastScanFinishedAt is null ||
+                     DateTimeOffset.UtcNow >= lastScanFinishedAt.Value + configManager.GetMediaLibraryScanInterval())
+            {
+                try { await ReconcileOnceAsync(stoppingToken).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { return; }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                    e.LogWarningKnownOrStack("Library catalog scan failed.");
+                    LastScanWarning = e.Message;
+                }
+                lastScanFinishedAt = DateTimeOffset.UtcNow;
             }
 
-            try { await Task.Delay(RescanInterval, stoppingToken).ConfigureAwait(false); }
+            try { await Task.Delay(SettingsPollInterval, stoppingToken).ConfigureAwait(false); }
             catch (OperationCanceledException) { return; }
         }
     }
 
     public async Task ReconcileOnceAsync(CancellationToken ct)
     {
+        if (!configManager.IsMediaLibraryEnabled()) return;
         var libraryRoot = configManager.GetLibraryDir();
         if (string.IsNullOrWhiteSpace(libraryRoot))
         {
