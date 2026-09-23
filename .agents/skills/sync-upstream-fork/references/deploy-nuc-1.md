@@ -1,0 +1,11 @@
+# Deploy the merged upstream sync to nuc-1
+
+The parallel InfiniDysk instance runs in Docker Compose on `nuc-1`. Compose lives at `/opt/docker/infinidysk`; its override selects `local/infinidysk:<sha8>`. Persistent config is mounted from `/opt/infinidysk/config`, and the PostgreSQL container is `infinidysk-postgres`. Inspect the live Compose config and mounts before changing them; do not print secrets.
+
+1. Fetch `origin/main` and verify the PR is `MERGED`. Build from a clean checkout of the merged source tree (with `libs/rapidyenc` initialized). Confirm the build tree equals `origin/main^{tree}`. Read the version from `version.txt`; tag the image `local/infinidysk:<head-sha8>` and pass `NZBDAV_VERSION`, full `NZBDAV_COMMIT_SHA`, and `REPO_URL=https://github.com/johoja12/infinidysk` to `docker buildx build --load`. If the PR merge commit has the same tree as the PR head, the head SHA can identify the image; report that distinction.
+2. Transfer the image to `nuc-1` with `docker save`/`docker load`. Verify the tag exists on the host before changing Compose. Record the currently running image and preserve it for rollback.
+3. Before changing Compose, back up `/opt/infinidysk/config` and make a PostgreSQL dump on the host. Store both outside the config mount in a timestamped directory under `/opt/infinidysk/backups`; verify the archives and restrict their permissions. Do not expose database contents or credentials in output.
+4. Back up `/opt/docker/infinidysk/docker-compose.override.yml`. Replace only its expected current `infinidysk` image tag with the new one. Run `docker compose --env-file secrets/app.env config --quiet` from the Compose directory, then recreate only `infinidysk` with `up -d --no-deps --force-recreate`.
+5. Wait for Docker health plus `http://127.0.0.1:3004/healthz`, `http://192.168.20.65:8080/health`, and `https://infin.sakhter.org/healthz`. Confirm the container reports the expected version and commit SHA. If startup or health fails, restore the saved override and recreate the previous image, then report the rollback.
+
+Keep the previous image and backups until the new deployment has been verified. Do not change the original NzbDav container or the rclone service as part of this sync.
