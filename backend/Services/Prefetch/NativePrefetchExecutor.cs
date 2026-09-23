@@ -72,6 +72,9 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         var position = start / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize;
         var alignedEnd = end % NativeCacheStore.BlockSize == 0 ? end
             : end + Math.Min(NativeCacheStore.BlockSize - end % NativeCacheStore.BlockSize, stream.Length - end);
+        if (canContinue?.Invoke() == false) throw new PrefetchDeferredException("Warming is paused or foreground playback has priority.");
+        var initialMissing = await store.GetMissingRangeBytesAsync(stream.Identity, position, alignedEnd, ct).ConfigureAwait(false);
+        await store.RestartPartialWarmAsync(stream.Identity, initialMissing, ct).ConfigureAwait(false);
         await VerifyExistingRangesAsync(store, stream, position, alignedEnd, canContinue, ct).ConfigureAwait(false);
         var missing = await store.GetMissingRangeBytesAsync(stream.Identity, position, alignedEnd, ct).ConfigureAwait(false);
         if (missing == 0)

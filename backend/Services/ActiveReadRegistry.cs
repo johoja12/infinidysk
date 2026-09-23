@@ -88,13 +88,14 @@ public class ActiveReadRegistry
             {
                 if (bytesRead > 0 && currentOffset is { } end && end >= bytesRead)
                 {
-                    if (entry.SequentialBytes == 0 || now - entry.LastActivityAt > ActivityWindow
+                    if (entry.SequentialBytes == 0 || now - entry.LastSequentialReadAt > ActivityWindow
                         || end - bytesRead != entry.CurrentOffset)
                     {
                         entry.SequentialStartedAt = now;
                         entry.SequentialBytes = 0;
                     }
                     entry.SequentialBytes += bytesRead;
+                    entry.LastSequentialReadAt = now;
                 }
                 else if (bytesRead > 0) entry.SequentialBytes = 0;
                 if (currentOffset.HasValue) entry.CurrentOffset = currentOffset.Value;
@@ -210,13 +211,14 @@ public class ActiveReadRegistry
         public long CurrentOffset;
         internal Lock ActivityGate { get; } = new();
         internal DateTimeOffset SequentialStartedAt;
+        internal DateTimeOffset LastSequentialReadAt;
         internal long SequentialBytes;
 
         public bool QualifiesForWarming(DateTimeOffset now)
         {
             lock (ActivityGate) return SequentialBytes >= 64L * 1024 * 1024
                 && now - SequentialStartedAt >= TimeSpan.FromSeconds(30)
-                && now - LastActivityAt <= ActivityWindow;
+                && now - LastSequentialReadAt <= ActivityWindow;
         }
     }
 }
