@@ -140,9 +140,14 @@ export default function Library({ loaderData }: Route.ComponentProps) {
   const [plexSyncError, setPlexSyncError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (plexSyncing || (!browse.plexStatus.syncing &&
-      (browse.plexStatus.ready || browse.plexStatus.warning))) return;
-    const timer = window.setTimeout(() => { void revalidator.revalidate(); }, 3000);
+    if (
+      plexSyncing ||
+      (!browse.plexStatus.syncing && (browse.plexStatus.ready || browse.plexStatus.warning))
+    )
+      return;
+    const timer = window.setTimeout(() => {
+      void revalidator.revalidate();
+    }, 3000);
     return () => window.clearTimeout(timer);
   }, [browse.plexStatus, plexSyncing, revalidator]);
 
@@ -278,7 +283,11 @@ export default function Library({ loaderData }: Route.ComponentProps) {
             ? `Plex matched index: ${browse.plexStatus.entryCount.toLocaleString()} items · synced ${new Date(browse.plexStatus.syncedAt!).toLocaleString()}`
             : "Plex matching is pending. Sync Plex to classify your library."}
         </span>
-        <Button type="button" onClick={() => void syncPlex()} disabled={plexSyncing || browse.plexStatus.syncing}>
+        <Button
+          type="button"
+          onClick={() => void syncPlex()}
+          disabled={plexSyncing || browse.plexStatus.syncing}
+        >
           {plexSyncing || browse.plexStatus.syncing ? "Syncing Plex…" : "Sync Plex now"}
         </Button>
       </div>
@@ -374,10 +383,14 @@ export default function Library({ loaderData }: Route.ComponentProps) {
       {browse.groups.length === 0 ? (
         <div className="rounded-xl border border-dashed border-base-content/20 bg-base-200 p-10 text-center">
           <p className="font-semibold">
-            {browse.plexStatus.ready ? "No media matches these filters." : "Plex matching has not completed yet."}
+            {browse.plexStatus.ready
+              ? "No media matches these filters."
+              : "Plex matching has not completed yet."}
           </p>
           <p className="mt-1 text-sm text-base-content/60">
-            {browse.plexStatus.ready ? "Try a different search or mapping filter." : "Use Sync Plex now to match your library files."}
+            {browse.plexStatus.ready
+              ? "Try a different search or mapping filter."
+              : "Use Sync Plex now to match your library files."}
           </p>
         </div>
       ) : (
