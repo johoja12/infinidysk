@@ -213,3 +213,27 @@ Aggregate native hit/miss/commit/fallback/timeout counters are available in the 
 support pack, and existing Prometheus endpoint. Memory snapshots include configured
 native buffer budget and reserved admission, including still-running timed-out IO;
 these are not measurements of the NAS page cache.
+
+## Cache reliability follow-ups [since unreleased testing branch](https://github.com/johoja12/infinidysk/issues/38){ .nzbdav-since }
+
+Partial warming can restart on another eligible folder when an unpinned entry's
+original folder is full or offline. This refetches verified source bytes through
+the warming budget; it does not stripe a file across folders. Previous allocation
+remains charged until safe cleanup. Pinned/read-only entries stay in place.
+
+The buffer budget reserves one block for overflow playback reads when at least
+8 MiB is configured. Playback writes can finish after the current read returns;
+only durably published blocks count as coverage. Status checks time out with an
+explicit unknown state. Independent filesystems have separate writer gates;
+folders on the same filesystem share space accounting and serialization.
+
+Raw read hints require 64 MiB of contiguous reads over at least 30 seconds. A seek
+or a gap over 15 seconds resets eligibility. This filters probes and previews but
+cannot identify every scanner. Keep the raw-read trigger off for Plex-only warming.
+
+After a source repair, native-backed WebDAV files expose a changed modification
+time. Refresh metadata on each rclone mount and reopen the file to revalidate its
+payload. Already-open player buffers remain outside the server's control.
+Repeated whole-file warming still reads/hashes the cached file; only concurrent
+in-flight verification is shared. See the [validation report](../testing/native-cache-followups.md)
+for exact boundaries and upgrade/downgrade notes. Back up `/config` before upgrading.
