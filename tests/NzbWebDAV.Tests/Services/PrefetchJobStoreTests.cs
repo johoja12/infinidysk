@@ -201,7 +201,7 @@ public sealed class PrefetchJobStoreTests : IDisposable
     {
         var settings = new PrefetchSettings { QueueCapacity = 1, MaxRetries = 0 };
         using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"), settings: () => settings);
-        var job = jobs.Enqueue(Guid.NewGuid(), "manual", 0);
+        var job = jobs.Enqueue(Guid.NewGuid(), "manual", 1);
         Assert.Throws<ArgumentException>(() => jobs.Enqueue(Guid.NewGuid(), "manual", 0));
         settings = settings with { QueueCapacity = 2 };
         jobs.Enqueue(Guid.NewGuid(), "manual", 0);
