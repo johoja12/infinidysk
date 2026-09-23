@@ -1,4 +1,5 @@
-import { withUrlBase } from "~/utils/url-base";
+import { plexRequest } from "~/utils/plex-request";
+export { plexRequest } from "~/utils/plex-request";
 
 export type PlexAccount = { id: string; name: string; token: string };
 export type PlexMapping = { plexPath: string; davPath?: string | null; localPath?: string | null };
@@ -58,28 +59,6 @@ export type PlexSnapshot<T> = {
   isStale: boolean;
   error: string | null;
 };
-
-export async function plexRequest<T>(
-  operation: string,
-  body: object = {},
-  signal?: AbortSignal,
-): Promise<T> {
-  const response = await fetch(withUrlBase(`/api/plex/${operation}`), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    ...(signal ? { signal } : {}),
-  });
-  if (!response.ok)
-    throw new Error(
-      response.status === 401
-        ? "Plex session expired. Reload and sign in again."
-        : response.status === 409
-          ? "Plex settings or login changed. Reload and retry."
-          : "Plex request failed. Check authorization, connection, and settings.",
-    );
-  return (await response.json()) as T;
-}
 
 let bootstrap: Promise<{ accounts: PlexAccount[]; servers: PlexServer[] }> | null = null;
 export function loadPlexBootstrap() {

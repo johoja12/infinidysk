@@ -1006,6 +1006,13 @@ const libraryBrowseResponseSchema = z.object({
   expandedGroup: libraryBrowseExpandedGroupSchema.nullable().optional(),
   indexScannedAt: z.string().nullable().optional(),
   indexWarning: z.string().nullable().optional(),
+  plexStatus: z.object({
+    ready: z.boolean(),
+    syncedAt: z.string().nullable(),
+    entryCount: z.number().int(),
+    warning: z.string().nullable(),
+    syncing: z.boolean(),
+  }),
 });
 
 export type LibraryBrowseResponse = z.infer<typeof libraryBrowseResponseSchema>;
