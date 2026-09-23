@@ -1,6 +1,6 @@
 import type { Route } from "./+types/route";
-import { useCallback, useState } from "react";
-import { Form, Link, useFetcher, useSearchParams } from "react-router";
+import { useCallback, useEffect, useState } from "react";
+import { Form, Link, useFetcher, useRevalidator, useSearchParams } from "react-router";
 import {
   backendClient,
   type LibraryBrowseResponse,
@@ -14,6 +14,7 @@ import { withUrlBase } from "~/utils/url-base";
 import { Alert, Badge, Button, Input, PageHeader } from "~/components/ui";
 import { LibraryFileModal, type LibraryModalFeedback } from "./file-modal";
 import { MediaPreview } from "~/components/media-preview";
+import { plexRequest } from "~/utils/plex-request";
 
 type Category = "shows" | "movies" | "unmatched";
 type MappingFilter = "all" | "internal" | "external" | "broken";
@@ -125,6 +126,7 @@ const categories: { value: Category; label: string }[] = [
 
 export default function Library({ loaderData }: Route.ComponentProps) {
   const [searchParams] = useSearchParams();
+  const revalidator = useRevalidator();
   const fetcher = useFetcher<{ status: boolean; error?: string }>();
   const { query, browse, previewUrls, nativeCacheActive } = loaderData;
   const [selected, setSelected] = useState<LibraryCatalogItem | null>(null);
@@ -134,6 +136,39 @@ export default function Library({ loaderData }: Route.ComponentProps) {
   const [showPreview, setShowPreview] = useState(false);
   const [actionPending, setActionPending] = useState(false);
   const [feedback, setFeedback] = useState<LibraryModalFeedback>(null);
+  const [plexSyncing, setPlexSyncing] = useState(false);
+  const [plexSyncError, setPlexSyncError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (
+      plexSyncing ||
+      (!browse.plexStatus.syncing && (browse.plexStatus.ready || browse.plexStatus.warning))
+    )
+      return;
+    const timer = window.setTimeout(() => {
+      void revalidator.revalidate();
+    }, 3000);
+    return () => window.clearTimeout(timer);
+  }, [browse.plexStatus, plexSyncing, revalidator]);
+
+  const syncPlex = useCallback(async () => {
+    setPlexSyncing(true);
+    setPlexSyncError(null);
+    try {
+      await plexRequest("library/sync");
+      let status: { syncing: boolean; warning: string | null };
+      do {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        status = await plexRequest<{ syncing: boolean; warning: string | null }>("library/status");
+      } while (status.syncing);
+      if (status.warning) setPlexSyncError(status.warning);
+      void revalidator.revalidate();
+    } catch (error) {
+      setPlexSyncError(error instanceof Error ? error.message : "Plex sync failed.");
+    } finally {
+      setPlexSyncing(false);
+    }
+  }, [revalidator]);
 
   const openModal = useCallback((item: LibraryCatalogItem) => {
     setSelected(item);
@@ -242,6 +277,25 @@ export default function Library({ loaderData }: Route.ComponentProps) {
           Library index may be stale: {browse.indexWarning}
         </Alert>
       ) : null}
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-base-content/10 bg-base-200 px-4 py-3 text-sm">
+        <span>
+          {browse.plexStatus.ready
+            ? `Plex matched index: ${browse.plexStatus.entryCount.toLocaleString()} items · synced ${new Date(browse.plexStatus.syncedAt!).toLocaleString()}`
+            : "Plex matching is pending. Sync Plex to classify your library."}
+        </span>
+        <Button
+          type="button"
+          onClick={() => void syncPlex()}
+          disabled={plexSyncing || browse.plexStatus.syncing}
+        >
+          {plexSyncing || browse.plexStatus.syncing ? "Syncing Plex…" : "Sync Plex now"}
+        </Button>
+      </div>
+      {plexSyncError || browse.plexStatus.warning ? (
+        <Alert variant="warning" role="alert">
+          {plexSyncError ?? browse.plexStatus.warning}
+        </Alert>
+      ) : null}
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <Metric label="Indexed files" value={browse.totalItems} hint="Matching current filters" />
@@ -260,7 +314,7 @@ export default function Library({ loaderData }: Route.ComponentProps) {
         <Metric
           label="Unmatched"
           value={browse.unmatchedItems}
-          hint="Review their paths"
+          hint={browse.plexStatus.ready ? "No Plex filename match" : "Plex sync pending"}
           tone="info"
         />
       </div>
@@ -313,7 +367,7 @@ export default function Library({ loaderData }: Route.ComponentProps) {
             }`}
           >
             {label}
-            {value === "unmatched" ? ` (${browse.unmatchedItems})` : ""}
+            {value === "unmatched" && browse.plexStatus.ready ? ` (${browse.unmatchedItems})` : ""}
           </Link>
         ))}
       </nav>
@@ -328,9 +382,15 @@ export default function Library({ loaderData }: Route.ComponentProps) {
       </div>
       {browse.groups.length === 0 ? (
         <div className="rounded-xl border border-dashed border-base-content/20 bg-base-200 p-10 text-center">
-          <p className="font-semibold">No media matches these filters.</p>
+          <p className="font-semibold">
+            {browse.plexStatus.ready
+              ? "No media matches these filters."
+              : "Plex matching has not completed yet."}
+          </p>
           <p className="mt-1 text-sm text-base-content/60">
-            Try a different search or mapping filter.
+            {browse.plexStatus.ready
+              ? "Try a different search or mapping filter."
+              : "Use Sync Plex now to match your library files."}
           </p>
         </div>
       ) : (

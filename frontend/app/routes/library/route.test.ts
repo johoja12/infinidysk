@@ -27,6 +27,7 @@ beforeEach(() => {
     healthyItems: 0,
     attentionItems: 0,
     unmatchedItems: 0,
+    plexStatus: { ready: false, syncedAt: null, entryCount: 0, warning: null, syncing: false },
     expandedGroup: null,
   });
   nativeCacheMock().mockReset();
@@ -99,6 +100,13 @@ describe("library browse loader", () => {
       healthyItems: 1,
       attentionItems: 0,
       unmatchedItems: 0,
+      plexStatus: {
+        ready: true,
+        syncedAt: "2026-09-23T00:00:00Z",
+        entryCount: 1,
+        warning: null,
+        syncing: false,
+      },
       expandedGroup: {
         key: "movies/Film",
         page: 1,

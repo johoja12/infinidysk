@@ -5,20 +5,22 @@ using NzbWebDAV.Api.Errors;
 using NzbWebDAV.Database;
 using NzbWebDAV.Extensions;
 using NzbWebDAV.Services.Library;
+using NzbWebDAV.Services.Plex;
 
 namespace NzbWebDAV.Api.Controllers.GetLibraryBrowse;
 
 [ApiController]
 [Route("api/get-library-browse")]
 [ProducesResponseType(typeof(LibraryBrowseResult), StatusCodes.Status200OK)]
-public sealed class GetLibraryBrowseController(DavDatabaseClient dbClient) : GetOnlyApiController
+public sealed class GetLibraryBrowseController(DavDatabaseClient dbClient,
+    PlexLibraryMetadataService plexMetadata) : GetOnlyApiController
 {
     protected override async Task<IActionResult> HandleRequest()
     {
         var request = new GetLibraryBrowseRequest(HttpContext);
         var scanner = HttpContext.RequestServices.GetService<LibraryCatalogScanner>();
         var catalog = new LibraryCatalogService(dbClient.Ctx);
-        var browse = new LibraryBrowseService(catalog);
+        var browse = new LibraryBrowseService(catalog, plexMetadata);
         var result = await browse.QueryAsync(request.Query, scanner, request.CancellationToken)
             .ConfigureAwait(false);
         return Ok(result);

@@ -13,7 +13,8 @@ namespace NzbWebDAV.Api.Controllers.Plex;
 [RequestSizeLimit(512 * 1024)]
 public sealed class PlexController(PlexOwnerAuthenticator owners, PlexAccountService accounts,
     PlexServerConfigService servers, PlexCatalogueService catalogue, PlexApiClient api,
-    PlexAccountConfigService accountConfig, ConfigManager config) : PostOnlyApiController
+    PlexAccountConfigService accountConfig, PlexLibraryMetadataService libraryMetadata,
+    ConfigManager config) : PostOnlyApiController
 {
     private string _owner = "";
 
@@ -64,6 +65,10 @@ public sealed class PlexController(PlexOwnerAuthenticator owners, PlexAccountSer
                     return Ok(new { status = true });
                 case "libraries":
                     return Ok(await catalogue.GetLibrariesAsync(servers.GetServer(Required(request.ServerId)), request.ForceRefresh, ct).ConfigureAwait(false));
+                case "library/sync":
+                    return Ok(libraryMetadata.RequestSync());
+                case "library/status":
+                    return Ok(libraryMetadata.Status);
                 case "users":
                     return Ok(await catalogue.GetUsersAsync(servers.GetServer(Required(request.ServerId)), request.ForceRefresh, ct).ConfigureAwait(false));
                 case "sources":
