@@ -33,6 +33,29 @@ Settings show configured and active modes separately until a restart activates t
 change. A Native failure falls back to ordinary source streaming, never to Segment.
 Explicit mode changes retain inactive cache files for rollback.
 
+## Browse native cache [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
+
+Open **Native Cache** in the main navigation to see capacity, verified file coverage,
+24-hour block hit rate, source misses, active cache writes, and recent activity.
+The **All files** tab searches live cache entries across folders and opens a verified
+range list for each file. A coverage percentage can hide gaps: only listed verified
+ranges are cache hits, and reads across gaps use the source when available.
+**Recently evicted** records confirmed pressure, idle-age, folder-rollover, and folder-clear removals
+from the time this feature is enabled; earlier removals cannot be reconstructed.
+
+Folder allocated size includes retired allocation waiting for safe cleanup, while
+the file count includes only live entries with verified bytes. Legacy entries may
+initially show an ID until the local catalogue fills display names in the
+background. The 24-hour traffic view begins with the first observation after
+upgrade, and an unclean shutdown can lose its most recent unflushed seconds.
+Browser queries read local catalogue metadata and never warm files or enumerate
+NAS payloads. Folder configuration and maintenance remain under **Settings →
+Streaming**.
+
+The upgrade adds tables and columns to the local native-cache catalogue under
+`/config`. Back up `/config` before upgrading. The schema change is additive, but
+older binaries do not understand browser history or the new telemetry fields.
+
 Add each container-visible native folder with its name, enabled/read-only state,
 storage type, placement priority, byte quota, minimum free bytes, maximum age, and
 high/low eviction watermarks (90%/80% defaults). Eviction starts at the high watermark

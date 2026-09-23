@@ -190,7 +190,8 @@ public sealed class NativeCacheService : IAsyncDisposable
         if (dependencies is null || !watch.IsCurrent || item.FileSize is not > 0) return null;
         var revision = _repairs.CaptureNativeRevisions(dependencies);
         return (new NativeCacheIdentity(item.Id.ToString("N"),
-            $"v2:{blobId:N}:{Convert.ToHexString(hash)}:{revision.Fingerprint}", item.FileSize.Value), revision);
+            $"v2:{blobId:N}:{Convert.ToHexString(hash)}:{revision.Fingerprint}", item.FileSize.Value)
+            { DisplayName = item.Name }, revision);
     }
 
     private async Task<IEnumerable<string>?> GetSourceSegmentsAsync(DavItem item, Guid blobId)
