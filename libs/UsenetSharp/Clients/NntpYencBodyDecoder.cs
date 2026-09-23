@@ -137,6 +137,14 @@ internal sealed class NntpYencBodyDecoder(
                         out var contentStart,
                         out var contentLength))
                     {
+                        // The consumer can dispose the decoded stream while the NNTP read
+                        // is pending. Stop decoding immediately instead of relying on a
+                        // later pipe flush to discover that its reader has completed.
+                        if (decodedStream.Completion.IsCompleted)
+                        {
+                            shouldWrite = false;
+                        }
+
                         var content = span.Slice(contentStart, contentLength);
                         if (contentLength == 1 && content[0] == (byte)'.')
                         {
