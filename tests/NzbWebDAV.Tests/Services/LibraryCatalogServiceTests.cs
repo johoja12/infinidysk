@@ -6,6 +6,7 @@ using NzbWebDAV.Database.MigrationHelpers;
 using NzbWebDAV.Database.Models;
 using NzbWebDAV.MediaLibrary;
 using NzbWebDAV.Services.Library;
+using NzbWebDAV.Services.Plex;
 
 namespace NzbWebDAV.Tests.Services;
 
@@ -125,7 +126,12 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
         await _context.SaveChangesAsync();
         _context.ChangeTracker.Clear();
 
-        var service = new LibraryBrowseService(new LibraryCatalogService(_context));
+        var metadata = new FakePlexIndex(Enumerable.Range(1, 60)
+            .Select(episode => new PlexLibraryMedia($"Example Show - S01E{episode:00}.mkv",
+                "episode", $"Episode {episode}", "Example Show", 1, episode, $"e{episode}", "server"))
+            .Append(new PlexLibraryMedia("Other Show - S01E01.mkv", "episode",
+                "Episode 1", "Other Show", 1, 1, "other", "server")));
+        var service = new LibraryBrowseService(new LibraryCatalogService(_context), metadata);
         var first = await service.QueryAsync(new LibraryBrowseQuery
         {
             Category = "shows", PageSize = 1, GroupKey = "shows/Example Show",
@@ -173,7 +179,9 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
         await _context.SaveChangesAsync();
         _context.ChangeTracker.Clear();
 
-        var service = new LibraryBrowseService(new LibraryCatalogService(_context));
+        var service = new LibraryBrowseService(new LibraryCatalogService(_context),
+            new FakePlexIndex([new PlexLibraryMedia("Arrival.mkv", "movie", "Arrival",
+                null, null, null, "film", "server")]));
         var movies = await service.QueryAsync(new LibraryBrowseQuery { Category = "movies" });
         var movie = Assert.Single(movies.Groups);
         Assert.Equal("Arrival (2016)", movie.Title);
@@ -219,7 +227,12 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
         await _context.SaveChangesAsync();
         _context.ChangeTracker.Clear();
 
-        var service = new LibraryBrowseService(new LibraryCatalogService(_context));
+        var metadata = new FakePlexIndex(paths.Take(5).Select((path, index) =>
+            new PlexLibraryMedia(Path.GetFileName(path), index < 3 ? "episode" : "movie",
+                index < 3 ? "Episode" : Path.GetFileNameWithoutExtension(path),
+                index < 3 ? path.Split('/')[1] : null, index < 3 ? 1 : null,
+                index < 3 ? index + 1 : null, index.ToString(), "server")));
+        var service = new LibraryBrowseService(new LibraryCatalogService(_context), metadata);
         var shows = await service.QueryAsync(new LibraryBrowseQuery { Category = "shows" });
         var movies = await service.QueryAsync(new LibraryBrowseQuery { Category = "movies" });
         var unmatched = await service.QueryAsync(new LibraryBrowseQuery { Category = "unmatched" });
@@ -228,5 +241,54 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
         Assert.Equal(2, movies.TotalGroups);
         Assert.Equal("Unknown Show - S01E01.mkv", Assert.Single(unmatched.Groups).Title);
         Assert.Equal(1, unmatched.UnmatchedItems);
+    }
+
+    [Fact]
+    public async Task Browse_UsesPlexTypeEvenWhenFolderIsUnrecognizedOrMisleading()
+    {
+        var item = DavItem.New(Guid.NewGuid(), DavItem.ContentFolder, "episode.mkv", 100,
+            DavItem.ItemType.UsenetFile, DavItem.ItemSubType.NzbFile,
+            null, null, null, null);
+        _context.Items.Add(item);
+        _context.LinkMaps.Add(new LibraryLinkMap
+        {
+            Id = Guid.NewGuid(), DavItemId = item.Id,
+            LinkPath = "Movies-HD/Wrong Folder/Actual Show - S02E03.mkv",
+            TargetText = $"/mnt/.ids/{item.Id}.mkv", MappingType = LibraryMappingType.Internal,
+            Status = LibraryLinkStatus.Valid, LastSeenUtc = DateTime.UtcNow,
+        });
+        await _context.SaveChangesAsync();
+        var catalog = new LibraryCatalogService(_context);
+        var matched = new LibraryBrowseService(catalog,
+            new FakePlexIndex([new PlexLibraryMedia("Actual Show - S02E03.mkv", "episode",
+                "Episode 3", "Actual Show", 2, 3, "episode", "server")]));
+        var shows = await matched.QueryAsync(new LibraryBrowseQuery
+        {
+            Category = "shows", GroupKey = "shows/Actual Show",
+        });
+        Assert.Equal("Actual Show", Assert.Single(shows.Groups).Title);
+        Assert.Equal("S02E03", Assert.Single(shows.ExpandedGroup!.Items).Episode);
+        Assert.Equal(0, (await matched.QueryAsync(new LibraryBrowseQuery { Category = "movies" })).TotalGroups);
+
+        var noMatch = new LibraryBrowseService(catalog, new FakePlexIndex([]));
+        Assert.Equal(1, (await noMatch.QueryAsync(new LibraryBrowseQuery { Category = "unmatched" })).UnmatchedItems);
+        var pending = new LibraryBrowseService(catalog, new FakePlexIndex([], ready: false));
+        var pendingResult = await pending.QueryAsync(new LibraryBrowseQuery { Category = "unmatched" });
+        Assert.False(pendingResult.PlexStatus.Ready);
+        Assert.Equal(0, pendingResult.UnmatchedItems);
+        Assert.Empty(pendingResult.Groups);
+    }
+
+    private sealed class FakePlexIndex(IEnumerable<PlexLibraryMedia> entries, bool ready = true)
+        : IPlexLibraryMetadataIndex
+    {
+        private readonly Dictionary<string, PlexLibraryMedia> _entries = entries.ToDictionary(
+            entry => entry.FileName, StringComparer.OrdinalIgnoreCase);
+
+        public PlexLibraryMetadataStatus Status => new(ready,
+            ready ? DateTimeOffset.UtcNow : null, _entries.Count, null);
+
+        public PlexLibraryMedia? Match(string? fileName) => fileName is not null &&
+            _entries.TryGetValue(Path.GetFileName(fileName.Replace('\\', '/')), out var entry) ? entry : null;
     }
 }

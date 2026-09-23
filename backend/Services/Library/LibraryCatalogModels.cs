@@ -1,3 +1,5 @@
+using NzbWebDAV.Services.Plex;
+
 namespace NzbWebDAV.Services.Library;
 
 public sealed record LibraryCatalogQuery
@@ -76,4 +78,5 @@ public sealed record LibraryBrowseResult(
     int UnmatchedItems,
     LibraryBrowseExpandedGroupDto? ExpandedGroup,
     DateTimeOffset? IndexScannedAt,
-    string? IndexWarning);
+    string? IndexWarning,
+    PlexLibraryMetadataStatus PlexStatus);

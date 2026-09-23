@@ -118,6 +118,51 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
         .Select(item => new PlexLibrary(Attribute(item, "key") ?? "", Attribute(item, "title") ?? "", Attribute(item, "type") ?? ""))
         .Where(item => item.Id.Length > 0 && item.Type is "movie" or "show").ToArray();
 
+    /// <summary>Read a complete library for filename matching. A truncated page is never
+    /// accepted as a complete snapshot, because that would mislabel files as unmatched.</summary>
+    public async Task<IReadOnlyList<PlexLibraryMedia>> GetLibraryMediaAsync(PlexServer server,
+        PlexLibrary library, CancellationToken ct = default)
+    {
+        if (library.Type is not ("movie" or "show")) return [];
+        var path = $"/library/sections/{Identifier(library.Id)}/" +
+            (library.Type == "show" ? "allLeaves" : "all?type=1");
+        const int pageSize = 100;
+        const int maxItems = 100_000;
+        var entries = new List<PlexLibraryMedia>();
+        for (var start = 0; start < maxItems; start += pageSize)
+        {
+            var separator = path.Contains('?', StringComparison.Ordinal) ? '&' : '?';
+            var document = await GetXmlAsync(server,
+                $"{path}{separator}X-Plex-Container-Start={start}&X-Plex-Container-Size={pageSize}", ct)
+                .ConfigureAwait(false);
+            var root = document.Root ?? throw new PlexRequestException("Plex returned an empty library response.");
+            var videos = root.Elements("Video").ToArray();
+            foreach (var video in videos)
+            {
+                var file = video.Elements("Media").SelectMany(media => media.Elements("Part"))
+                    .Select(part => Attribute(part, "file")).FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate));
+                if (string.IsNullOrWhiteSpace(file)) continue;
+                var name = Path.GetFileName(file.Replace('\\', '/'));
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                entries.Add(new PlexLibraryMedia(name, library.Type == "show" ? "episode" : "movie",
+                    Attribute(video, "title") ?? "", Attribute(video, "grandparentTitle"),
+                    Integer(video, "parentIndex"), Integer(video, "index"),
+                    Attribute(video, "ratingKey") ?? "", server.Id));
+            }
+            var total = Long(root, "totalSize");
+            if (videos.Length == 0)
+            {
+                if (total > start) throw new PlexRequestException("Plex returned an incomplete library page.");
+                return entries;
+            }
+            if ((total.HasValue && start + videos.Length >= total.Value)
+                || (!total.HasValue && videos.Length < pageSize)) return entries;
+            if (videos.Length < pageSize)
+                throw new PlexRequestException("Plex returned an incomplete library page.");
+        }
+        throw new PlexRequestException("Plex library exceeds the 100,000 item sync limit.");
+    }
+
     public async Task<IReadOnlyList<PlexUser>> GetUsersAsync(PlexServer server, CancellationToken ct = default) =>
         (await ReadPagesAsync(server, "/accounts", 2000, ["Account"], ct).ConfigureAwait(false))
         .Select(item => new PlexUser(Attribute(item, "id") ?? "", Attribute(item, "name") ?? Attribute(item, "title") ?? ""))

@@ -6,6 +6,33 @@ namespace NzbWebDAV.Tests.Plex;
 
 public sealed class PlexApiClientTests
 {
+    [Fact]
+    public async Task LibraryMedia_ReadsEveryPageAndProjectsEpisodeMetadata()
+    {
+        var firstPage = string.Concat(Enumerable.Range(1, 100).Select(index =>
+            $"<Video ratingKey='{index}' title='Episode {index}' grandparentTitle='Show' parentIndex='1' index='{index}'><Media><Part file='/plex/Show - S01E{index:000}.mkv'/></Media></Video>"));
+        using var handler = new FakePlexHandler(request =>
+            request.RequestUri!.Query.Contains("Start=100", StringComparison.Ordinal)
+                ? Xml("""<MediaContainer totalSize="101"><Video ratingKey="101" title="Last" grandparentTitle="Show" parentIndex="2" index="1"><Media><Part file="/plex/Last.mkv"/></Media></Video></MediaContainer>""")
+                : Xml($"<MediaContainer totalSize='101'>{firstPage}</MediaContainer>"));
+        var api = new PlexApiClient(new HttpClient(handler), "installation");
+        var result = await api.GetLibraryMediaAsync(Server(), new PlexLibrary("1", "TV", "show"));
+        Assert.Equal(101, result.Count);
+        Assert.Equal("Last.mkv", result[100].FileName);
+        Assert.Equal("Show", result[100].ShowName);
+        Assert.Equal(2, result[100].Season);
+        Assert.Equal(2, handler.Requests.Count);
+    }
+
+    [Fact]
+    public async Task LibraryMedia_RejectsIncompletePage()
+    {
+        using var handler = new FakePlexHandler(_ => Xml("""<MediaContainer totalSize="101"><Video ratingKey="1"><Media><Part file="/plex/first.mkv"/></Media></Video></MediaContainer>"""));
+        var api = new PlexApiClient(new HttpClient(handler), "installation");
+        await Assert.ThrowsAsync<PlexRequestException>(() =>
+            api.GetLibraryMediaAsync(Server(), new PlexLibrary("1", "TV", "show")));
+    }
+
     [Theory]
     [InlineData(true, "next-season")]
     [InlineData(false, "owner-watched")]

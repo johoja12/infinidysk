@@ -363,6 +363,8 @@ public sealed partial class Program
                     EnvironmentUtil.GetRequiredVariable("FRONTEND_BACKEND_API_KEY"), TimeProvider.System))
                 .AddSingleton(sp => new NzbWebDAV.Services.Plex.PlexCatalogueService(
                     sp.GetRequiredService<NzbWebDAV.Services.Plex.PlexApiClient>(), TimeProvider.System))
+                .AddSingleton<NzbWebDAV.Services.Plex.PlexLibraryMetadataService>()
+                .AddHostedService(sp => sp.GetRequiredService<NzbWebDAV.Services.Plex.PlexLibraryMetadataService>())
                 .AddScoped<NzbWebDAV.Services.Plex.PlexServerConfigService>()
                 .AddScoped<NzbWebDAV.Services.Plex.PlexAccountConfigService>()
                 .AddSingleton<StreamingReadinessCheck>()
