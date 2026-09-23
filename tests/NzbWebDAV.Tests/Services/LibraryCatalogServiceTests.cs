@@ -189,4 +189,44 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
         Assert.Equal(1, unmatched.TotalItems);
         Assert.Equal(1, unmatched.UnmatchedItems);
     }
+
+    [Fact]
+    public async Task Browse_ClassifiesSuffixedLibraryRoots_AndLeavesUnknownRootsUnmatched()
+    {
+        var paths = new[]
+        {
+            "TV-4K/All Her Fault/Season 1/All Her Fault - S01E01.mkv",
+            "TV-HD/Star Trek - Voyager/Season 4/Star Trek - Voyager - S04E22.avi",
+            "TV-Kids/The Amazing World of Gumball/Season 6/Gumball - S06E37.mp4",
+            "Movies-4K/Ash (2025)/Ash (2025).mkv",
+            "Movies-HD/Project X (2012)/Project X (2012).mkv",
+            "TVExtras/Unknown Show/Season 1/Unknown Show - S01E01.mkv",
+        };
+        foreach (var path in paths)
+        {
+            var item = DavItem.New(Guid.NewGuid(), DavItem.ContentFolder,
+                Path.GetFileName(path), 100, DavItem.ItemType.UsenetFile,
+                DavItem.ItemSubType.NzbFile, null, null, null, null);
+            _context.Items.Add(item);
+            _context.LinkMaps.Add(new LibraryLinkMap
+            {
+                Id = Guid.NewGuid(), DavItemId = item.Id, LinkPath = path,
+                TargetText = $"/mnt/.ids/{item.Id}",
+                MappingType = LibraryMappingType.Internal,
+                Status = LibraryLinkStatus.Valid, LastSeenUtc = DateTime.UtcNow,
+            });
+        }
+        await _context.SaveChangesAsync();
+        _context.ChangeTracker.Clear();
+
+        var service = new LibraryBrowseService(new LibraryCatalogService(_context));
+        var shows = await service.QueryAsync(new LibraryBrowseQuery { Category = "shows" });
+        var movies = await service.QueryAsync(new LibraryBrowseQuery { Category = "movies" });
+        var unmatched = await service.QueryAsync(new LibraryBrowseQuery { Category = "unmatched" });
+
+        Assert.Equal(3, shows.TotalGroups);
+        Assert.Equal(2, movies.TotalGroups);
+        Assert.Equal("Unknown Show - S01E01.mkv", Assert.Single(unmatched.Groups).Title);
+        Assert.Equal(1, unmatched.UnmatchedItems);
+    }
 }
