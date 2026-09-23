@@ -198,6 +198,28 @@ public sealed class NativeCacheServiceTests : IDisposable
         Assert.Equal(3, await hit.ReadAsync(new byte[3]));
     }
 
+    [Fact]
+    public async Task CurrentCoverage_IgnoresCachedBytesFromPreviousBlob()
+    {
+        using var blobs = new FileBlobStore();
+        var oldBlobId = Guid.NewGuid();
+        var newBlobId = Guid.NewGuid();
+        await blobs.WriteBlob(oldBlobId, new DavNzbFile { Id = oldBlobId, SegmentIds = ["old-segment"] });
+        await blobs.WriteBlob(newBlobId, new DavNzbFile { Id = newBlobId, SegmentIds = ["new-segment"] });
+        var item = new DavItem { Id = Guid.NewGuid(), Name = "movie.mkv", FileSize = 3,
+            FileBlobId = oldBlobId, SubType = DavItem.ItemSubType.NzbFile };
+        using var repair = new RepairPatchStore(Path.Combine(_root, "patches"), 100);
+        await using var service = new NativeCacheService(Config("native"), blobs, repair);
+        Assert.True(await service.WaitForInitializationAsync());
+        await using (var stream = await service.WrapAsync(item, _ => Task.FromResult<Stream>(new VerifiedStream()), CancellationToken.None))
+            Assert.Equal(3, await stream.ReadAsync(new byte[3]));
+
+        Assert.Equal(100, await service.GetCurrentCoverageAsync(item));
+        Assert.Contains(item.Id.ToString("N"), await service.Store!.GetCachedItemIdsAsync());
+        item.FileBlobId = newBlobId;
+        Assert.Equal(0, await service.GetCurrentCoverageAsync(item));
+    }
+
     [Theory]
     [InlineData("off")]
     [InlineData("segment")]

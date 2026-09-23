@@ -117,28 +117,20 @@ public sealed class NativeCacheService : IAsyncDisposable
         IDisposable? admission = admitted ? new AdmissionLease(_bufferSlots, watch) : watch;
         try
         {
-            await using var blob = _blobs.ReadBlob(blobId);
-            if (blob is not null && watch.IsCurrent)
+            var current = await GetCurrentIdentityAsync(item, blobId, watch, cancellationToken).ConfigureAwait(false);
+            if (current is { } cached)
             {
-                var hash = await SHA256.HashDataAsync(blob, cancellationToken).ConfigureAwait(false);
-                var dependencies = await GetSourceSegmentsAsync(item, blobId).ConfigureAwait(false);
-                if (dependencies is not null && watch.IsCurrent)
+                if (!admitted)
                 {
-                    var repairRevision = _repairs.CaptureNativeRevisions(dependencies);
-                    var identity = new NativeCacheIdentity(item.Id.ToString("N"),
-                        $"v2:{blobId:N}:{Convert.ToHexString(hash)}:{repairRevision.Fingerprint}", item.FileSize.Value);
-                    if (!admitted)
-                    {
-                        var overflow = new NativeCacheOverflowStream(store, identity, open,
-                            () => watch.IsCurrent && repairRevision.IsCurrent, watch, _capacity > 1 ? _hitSlot : _bufferSlots, Statistics);
-                        admission = null;
-                        return overflow;
-                    }
-                    var stream = new NativeCachedStream(store, identity, open,
-                        () => watch.IsCurrent && repairRevision.IsCurrent, admission, background: requireNative, statistics: Statistics, writeBehind: true);
-                    admission = null; // The returned stream owns the watch and buffer admission.
-                    return stream;
+                    var overflow = new NativeCacheOverflowStream(store, cached.Identity, open,
+                        () => watch.IsCurrent && cached.Revision.IsCurrent, watch, _capacity > 1 ? _hitSlot : _bufferSlots, Statistics);
+                    admission = null;
+                    return overflow;
                 }
+                var stream = new NativeCachedStream(store, cached.Identity, open,
+                    () => watch.IsCurrent && cached.Revision.IsCurrent, admission, background: requireNative, statistics: Statistics, writeBehind: true);
+                admission = null; // The returned stream owns the watch and buffer admission.
+                return stream;
             }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or SqliteException
@@ -169,15 +161,36 @@ public sealed class NativeCacheService : IAsyncDisposable
         if (InitializationPending) await WaitForInitializationAsync(ct).ConfigureAwait(false);
         if (Store is not { } store || item.FileBlobId is not { } blobId) return item.CreatedAt;
         using var watch = ContentRevisionTracker.Watch(blobId);
-        await using var blob = _blobs.ReadBlob(blobId);
-        if (blob is null) return item.CreatedAt;
-        var hash = await SHA256.HashDataAsync(blob, ct).ConfigureAwait(false);
-        var dependencies = await GetSourceSegmentsAsync(item, blobId).ConfigureAwait(false);
-        if (dependencies is null) return item.CreatedAt;
-        var revision = _repairs.CaptureNativeRevisions(dependencies);
-        if (!watch.IsCurrent || !revision.IsCurrent) throw new IOException("Media revision is changing; retry metadata refresh.");
+        var current = await GetCurrentIdentityAsync(item, blobId, watch, ct).ConfigureAwait(false);
+        if (current is not { } cached) return item.CreatedAt;
+        if (!watch.IsCurrent || !cached.Revision.IsCurrent) throw new IOException("Media revision is changing; retry metadata refresh.");
         return await store.ModificationTimeAsync(item.Id.ToString("N"),
-            $"{blobId:N}:{Convert.ToHexString(hash)}:{revision.Fingerprint}", item.CreatedAt, ct).ConfigureAwait(false);
+            cached.Identity.Generation, item.CreatedAt, ct).ConfigureAwait(false);
+    }
+
+    public async Task<int?> GetCurrentCoverageAsync(DavItem item, CancellationToken cancellationToken = default)
+    {
+        var store = Store;
+        if (store is null || item.FileBlobId is not { } blobId || item.FileSize is not > 0) return null;
+        using var watch = ContentRevisionTracker.Watch(blobId);
+        var current = await GetCurrentIdentityAsync(item, blobId, watch, cancellationToken).ConfigureAwait(false);
+        if (current is null || !watch.IsCurrent || !current.Value.Revision.IsCurrent) return null;
+        var bytes = await store.GetCoverageAsync(current.Value.Identity, cancellationToken).ConfigureAwait(false);
+        return watch.IsCurrent && current.Value.Revision.IsCurrent
+            ? (int)Math.Floor(Math.Min(100.0, bytes * 100.0 / item.FileSize.Value)) : null;
+    }
+
+    private async Task<(NativeCacheIdentity Identity, RepairRevisionStore.Snapshot Revision)?> GetCurrentIdentityAsync(
+        DavItem item, Guid blobId, ContentRevisionTracker.RevisionWatch watch, CancellationToken cancellationToken)
+    {
+        await using var blob = _blobs.ReadBlob(blobId);
+        if (blob is null || !watch.IsCurrent) return null;
+        var hash = await SHA256.HashDataAsync(blob, cancellationToken).ConfigureAwait(false);
+        var dependencies = await GetSourceSegmentsAsync(item, blobId).ConfigureAwait(false);
+        if (dependencies is null || !watch.IsCurrent || item.FileSize is not > 0) return null;
+        var revision = _repairs.CaptureNativeRevisions(dependencies);
+        return (new NativeCacheIdentity(item.Id.ToString("N"),
+            $"v2:{blobId:N}:{Convert.ToHexString(hash)}:{revision.Fingerprint}", item.FileSize.Value), revision);
     }
 
     private async Task<IEnumerable<string>?> GetSourceSegmentsAsync(DavItem item, Guid blobId)

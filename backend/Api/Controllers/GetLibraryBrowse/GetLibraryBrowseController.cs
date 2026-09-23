@@ -6,6 +6,7 @@ using NzbWebDAV.Database;
 using NzbWebDAV.Extensions;
 using NzbWebDAV.Services.Library;
 using NzbWebDAV.Services.Plex;
+using NzbWebDAV.Services.NativeCache;
 
 namespace NzbWebDAV.Api.Controllers.GetLibraryBrowse;
 
@@ -13,14 +14,14 @@ namespace NzbWebDAV.Api.Controllers.GetLibraryBrowse;
 [Route("api/get-library-browse")]
 [ProducesResponseType(typeof(LibraryBrowseResult), StatusCodes.Status200OK)]
 public sealed class GetLibraryBrowseController(DavDatabaseClient dbClient,
-    PlexLibraryMetadataService plexMetadata) : GetOnlyApiController
+    PlexLibraryMetadataService plexMetadata, NativeCacheService nativeCache) : GetOnlyApiController
 {
     protected override async Task<IActionResult> HandleRequest()
     {
         var request = new GetLibraryBrowseRequest(HttpContext);
         var scanner = HttpContext.RequestServices.GetService<LibraryCatalogScanner>();
         var catalog = new LibraryCatalogService(dbClient.Ctx);
-        var browse = new LibraryBrowseService(catalog, plexMetadata);
+        var browse = new LibraryBrowseService(catalog, plexMetadata, nativeCache);
         var result = await browse.QueryAsync(request.Query, scanner, request.CancellationToken)
             .ConfigureAwait(false);
         return Ok(result);
@@ -33,6 +34,10 @@ public sealed class GetLibraryBrowseRequest
         new(StringComparer.OrdinalIgnoreCase) { "shows", "movies", "unmatched" };
     private static readonly HashSet<string> AllowedTypes =
         new(StringComparer.OrdinalIgnoreCase) { "all", "internal", "external", "broken" };
+    private static readonly HashSet<string> AllowedQualities =
+        new(StringComparer.OrdinalIgnoreCase) { "all", "4k", "1080p", "720p", "sd", "unknown" };
+    private static readonly HashSet<string> AllowedCacheFilters =
+        new(StringComparer.OrdinalIgnoreCase) { "all", "any", "complete", "empty", "unavailable" };
 
     public LibraryBrowseQuery Query { get; }
     public CancellationToken CancellationToken { get; }
@@ -43,8 +48,12 @@ public sealed class GetLibraryBrowseRequest
         var errors = new ValidationErrors();
         var category = context.GetQueryParam("category") ?? "shows";
         var type = context.GetQueryParam("type") ?? "all";
+        var quality = context.GetQueryParam("quality") ?? "all";
+        var cache = context.GetQueryParam("cache") ?? "all";
         if (!AllowedCategories.Contains(category)) errors.Add("category", "Invalid category parameter.");
         if (!AllowedTypes.Contains(type)) errors.Add("type", "Invalid type parameter.");
+        if (!AllowedQualities.Contains(quality)) errors.Add("quality", "Invalid quality parameter.");
+        if (!AllowedCacheFilters.Contains(cache)) errors.Add("cache", "Invalid cache parameter.");
         var search = context.GetQueryParam("q");
         if (search is { Length: > 200 }) errors.Add("q", "Search query is too long.");
         var group = context.GetQueryParam("group");
@@ -62,6 +71,8 @@ public sealed class GetLibraryBrowseRequest
             Search = string.IsNullOrWhiteSpace(search) ? null : search.Trim(),
             Category = category.ToLowerInvariant(),
             TypeFilter = type.ToLowerInvariant(),
+            Quality = quality.ToLowerInvariant(),
+            Cache = cache.ToLowerInvariant(),
             Page = page,
             GroupKey = group,
             GroupPage = groupPage,

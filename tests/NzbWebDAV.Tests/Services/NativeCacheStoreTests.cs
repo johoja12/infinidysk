@@ -37,6 +37,22 @@ public sealed class NativeCacheStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task CachedItemIds_IncludeOnlyItemsWithVerifiedBytes()
+    {
+        var folder = CreateFolder();
+        await using var store = new NativeCacheStore(Path.Combine(_root, "catalogue.db"), [folder]);
+        var partial = new NativeCacheIdentity("partial-item", "v1", NativeCacheStore.BlockSize * 2L + 3);
+        var complete = new NativeCacheIdentity("complete-item", "v1", 3);
+        Assert.True(await store.WriteBlockAsync(partial, 0, new byte[NativeCacheStore.BlockSize]));
+        Assert.True(await store.WriteBlockAsync(complete, 0, new byte[3]));
+
+        var ids = await store.GetCachedItemIdsAsync();
+        Assert.Contains("partial-item", ids);
+        Assert.Contains("complete-item", ids);
+        Assert.DoesNotContain("absent-item", ids);
+    }
+
+    [Fact]
     public async Task EntryGeneration_SurvivesReopen_AndExplicitCatalogueRecovery()
     {
         var folder = CreateFolder();

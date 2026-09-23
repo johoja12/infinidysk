@@ -11,6 +11,8 @@ export type LibraryModalFeedback = {
 
 export type LibraryFileModalProps = {
   item: LibraryCatalogItem;
+  quality: "4k" | "1080p" | "720p" | "sd" | "unknown";
+  cachePercentage: number | null;
   details: LibraryFileDetails | null;
   detailsLoading: boolean;
   detailsError: string | null;
@@ -31,28 +33,83 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
   const downloadUrl = previewUrl
     ? `${previewUrl}${previewUrl.includes("?") ? "&" : "?"}download=true`
     : null;
+  const qualityLabel =
+    props.quality === "4k" ? "4K" : props.quality === "unknown" ? "Unknown" : props.quality;
+  const sourcePath = details?.contentPath ?? item.contentPath ?? item.mappings[0]?.targetText;
 
   return (
     <Modal open title={item.displayName} onClose={props.onClose} size="wide">
-      <div className="flex flex-col gap-4">
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge>{item.health}</Badge>
-          {item.size != null && (
-            <span className="font-mono text-xs">{formatFileSize(item.size)}</span>
-          )}
-          <span className="break-all font-mono text-xs text-base-content/60">
-            {item.contentPath ?? item.mappings[0]?.targetText ?? "—"}
-          </span>
+      <div className="flex flex-col gap-5">
+        <div className="rounded-2xl border border-primary/20 bg-gradient-to-br from-primary/15 via-base-200 to-base-200 p-5">
+          <div className="flex flex-wrap items-start gap-4">
+            <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl bg-primary/20 text-primary">
+              <Icon name="movie" className="!text-[30px]" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-xs font-semibold uppercase tracking-wide text-base-content/55">
+                Library file
+              </p>
+              <p className="mt-1 break-all text-lg font-semibold leading-snug">
+                {item.displayName}
+              </p>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Badge>{item.health}</Badge>
+                <Badge>{qualityLabel}</Badge>
+                <Badge>{item.kind === "internal" ? "InfiniDysk" : "External"}</Badge>
+              </div>
+            </div>
+          </div>
         </div>
 
-        {detailsLoading && <p role="status">Loading file details…</p>}
+        <div className="grid gap-3 sm:grid-cols-4">
+          <Fact
+            label="File size"
+            value={item.size != null ? formatFileSize(item.size) : "Unknown"}
+          />
+          <Fact label="Quality" value={qualityLabel} />
+          <Fact
+            label="Native Cache"
+            value={props.cachePercentage == null ? "Unavailable" : `${props.cachePercentage}%`}
+          />
+          <Fact label="Mappings" value={String(item.mappingCount)} />
+        </div>
+
+        {details ? (
+          <div className="grid gap-3 sm:grid-cols-3">
+            <Fact label="Release date" value={formatDate(details.releaseDate)} />
+            <Fact label="Last health check" value={formatDate(details.lastHealthCheck)} />
+            <Fact
+              label="Next health check"
+              value={
+                details.healthRepairPending ? "Repair pending" : formatDate(details.nextHealthCheck)
+              }
+            />
+          </div>
+        ) : null}
+
+        {sourcePath ? (
+          <section className="rounded-xl border border-base-content/10 bg-base-200 p-4">
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-base-content/55">
+              Source path
+            </h3>
+            <p className="mt-2 break-all font-mono text-xs leading-relaxed text-base-content/75">
+              {sourcePath}
+            </p>
+          </section>
+        ) : null}
+
+        {detailsLoading && (
+          <p role="status" className="text-sm text-base-content/60">
+            Loading file details…
+          </p>
+        )}
         {detailsError && (
           <Alert variant="danger" role="alert">
             {detailsError}
           </Alert>
         )}
 
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap gap-2 rounded-xl border border-base-content/10 bg-base-200 p-3">
           {previewUrl && (
             <Button
               size="small"
@@ -121,37 +178,62 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
           </Alert>
         )}
 
-        <div>
-          <h3 className="text-sm font-semibold">Mappings ({item.mappingCount})</h3>
-          <ul className="mt-1 flex flex-col gap-1">
+        <section className="rounded-xl border border-base-content/10 bg-base-200 p-4">
+          <h3 className="text-sm font-semibold">
+            Mappings <span className="font-normal text-base-content/50">({item.mappingCount})</span>
+          </h3>
+          <ul className="mt-3 flex flex-col gap-2">
             {item.mappings.map((m) => (
-              <li key={m.linkPath} className="flex flex-wrap items-center gap-2 text-sm">
-                <Badge>{m.mappingType}</Badge>
-                <Badge>{m.status}</Badge>
-                <code className="break-all">
-                  {m.linkPath} → {m.targetText}
-                </code>
+              <li
+                key={m.linkPath}
+                className="rounded-lg border border-base-content/10 bg-base-300/50 p-3 text-sm"
+              >
+                <div className="mb-2 flex flex-wrap gap-2">
+                  <Badge>{m.mappingType}</Badge>
+                  <Badge>{m.status}</Badge>
+                </div>
+                <p className="break-all font-medium">{m.linkPath}</p>
+                <p className="mt-1 break-all font-mono text-xs text-base-content/55">
+                  → {m.targetText}
+                </p>
               </li>
             ))}
           </ul>
-        </div>
+        </section>
 
-        <div>
+        <section className="rounded-xl border border-base-content/10 bg-base-200 p-4">
           <h3 className="text-sm font-semibold">Health history</h3>
           {latest ? (
-            <p className="text-sm">
+            <p className="mt-2 text-sm">
               {latest.result} · {latest.repairStatus} ·{" "}
               {new Date(latest.createdAt).toLocaleString()}
               {latest.message ? ` — ${latest.message}` : ""}
             </p>
           ) : (
-            <p className="text-sm text-base-content/60">No health checks recorded for this file.</p>
+            <p className="mt-2 text-sm text-base-content/60">
+              No health checks recorded for this file.
+            </p>
           )}
-          <a className="link text-sm" href="/health">
+          <a className="link mt-3 inline-block text-sm" href="/health">
             Open Health
           </a>
-        </div>
+        </section>
       </div>
     </Modal>
   );
+}
+
+function Fact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl border border-base-content/10 bg-base-200 p-4">
+      <p className="text-xs font-semibold uppercase tracking-wide text-base-content/55">{label}</p>
+      <p className="mt-1 text-base font-semibold">{value}</p>
+    </div>
+  );
+}
+
+function formatDate(value: string | null | undefined): string {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? "—" : date.toLocaleDateString();
 }

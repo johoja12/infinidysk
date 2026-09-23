@@ -268,6 +268,8 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
         });
         Assert.Equal("Actual Show", Assert.Single(shows.Groups).Title);
         Assert.Equal("S02E03", Assert.Single(shows.ExpandedGroup!.Items).Episode);
+        Assert.Equal("unknown", Assert.Single(shows.ExpandedGroup.Items).Quality);
+        Assert.Empty((await matched.QueryAsync(new LibraryBrowseQuery { Category = "shows", Quality = "4k" })).Groups);
         Assert.Equal(0, (await matched.QueryAsync(new LibraryBrowseQuery { Category = "movies" })).TotalGroups);
 
         var noMatch = new LibraryBrowseService(catalog, new FakePlexIndex([]));
@@ -277,6 +279,17 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
         Assert.False(pendingResult.PlexStatus.Ready);
         Assert.Equal(0, pendingResult.UnmatchedItems);
         Assert.Empty(pendingResult.Groups);
+    }
+
+    [Theory]
+    [InlineData("Film.2160p.WEB-DL.mkv", "4k")]
+    [InlineData("Film.4K.WEB-DL.mkv", "4k")]
+    [InlineData("Film.1080p.WEB-DL.mkv", "1080p")]
+    [InlineData("Film.720p.WEB-DL.mkv", "720p")]
+    [InlineData("Film.mkv", "unknown")]
+    public void Browse_InfersQualityFromReleaseName(string name, string expected)
+    {
+        Assert.Equal(expected, LibraryBrowseService.QualityFromName(name));
     }
 
     private sealed class FakePlexIndex(IEnumerable<PlexLibraryMedia> entries, bool ready = true)

@@ -18,12 +18,16 @@ import { plexRequest } from "~/utils/plex-request";
 
 type Category = "shows" | "movies" | "unmatched";
 type MappingFilter = "all" | "internal" | "external" | "broken";
+type QualityFilter = "all" | "4k" | "1080p" | "720p" | "sd" | "unknown";
+type CacheFilter = "all" | "any" | "complete" | "empty" | "unavailable";
 
 export type LibraryPageData = {
   query: {
     q: string;
     category: Category;
     type: MappingFilter;
+    quality: QualityFilter;
+    cache: CacheFilter;
     page: number;
     group: string | null;
     groupPage: number;
@@ -41,6 +45,22 @@ function parseType(value: string | null): MappingFilter {
   return value === "internal" || value === "external" || value === "broken" ? value : "all";
 }
 
+function parseQuality(value: string | null): QualityFilter {
+  return value === "4k" ||
+    value === "1080p" ||
+    value === "720p" ||
+    value === "sd" ||
+    value === "unknown"
+    ? value
+    : "all";
+}
+
+function parseCache(value: string | null): CacheFilter {
+  return value === "any" || value === "complete" || value === "empty" || value === "unavailable"
+    ? value
+    : "all";
+}
+
 function parsePage(value: string | null): number {
   const page = Number(value);
   return Number.isSafeInteger(page) && page > 0 ? page : 1;
@@ -52,6 +72,8 @@ export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPage
     q: url.searchParams.get("q")?.trim() ?? "",
     category: parseCategory(url.searchParams.get("category")),
     type: parseType(url.searchParams.get("type")),
+    quality: parseQuality(url.searchParams.get("quality")),
+    cache: parseCache(url.searchParams.get("cache")),
     page: parsePage(url.searchParams.get("page")),
     group: url.searchParams.get("group"),
     groupPage: parsePage(url.searchParams.get("groupPage")),
@@ -60,6 +82,8 @@ export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPage
     ...(query.q ? { q: query.q } : {}),
     category: query.category,
     type: query.type,
+    quality: query.quality,
+    cache: query.cache,
     page: query.page,
     ...(query.group ? { group: query.group } : {}),
     groupPage: query.groupPage,
@@ -128,7 +152,9 @@ export default function Library({ loaderData }: Route.ComponentProps) {
   const [searchParams] = useSearchParams();
   const revalidator = useRevalidator();
   const fetcher = useFetcher<{ status: boolean; error?: string }>();
+  const groupFetcher = useFetcher<LibraryPageData>();
   const { query, browse, previewUrls, nativeCacheActive } = loaderData;
+  const [expandedKey, setExpandedKey] = useState<string | null>(query.group);
   const [selected, setSelected] = useState<LibraryCatalogItem | null>(null);
   const [details, setDetails] = useState<LibraryFileDetails | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
@@ -138,6 +164,31 @@ export default function Library({ loaderData }: Route.ComponentProps) {
   const [feedback, setFeedback] = useState<LibraryModalFeedback>(null);
   const [plexSyncing, setPlexSyncing] = useState(false);
   const [plexSyncError, setPlexSyncError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setExpandedKey(query.group);
+  }, [query.group, query.category, query.type, query.quality, query.cache, query.q, query.page]);
+
+  const expandedGroup =
+    groupFetcher.data?.browse.expandedGroup?.key === expandedKey
+      ? groupFetcher.data.browse.expandedGroup
+      : browse.expandedGroup?.key === expandedKey
+        ? browse.expandedGroup
+        : null;
+  const expandedPreviewUrls =
+    groupFetcher.data?.browse.expandedGroup?.key === expandedKey
+      ? groupFetcher.data.previewUrls
+      : previewUrls;
+
+  const loadGroup = useCallback(
+    (key: string, page = 1) => {
+      setExpandedKey(key);
+      void groupFetcher.load(
+        withUrlBase(`/library${withParams(searchParams, { group: key, groupPage: String(page) })}`),
+      );
+    },
+    [groupFetcher, searchParams],
+  );
 
   useEffect(() => {
     if (
@@ -258,7 +309,7 @@ export default function Library({ loaderData }: Route.ComponentProps) {
   }, [fetcher, selected]);
 
   const selectedPreviewUrl =
-    selected?.davItemId != null ? (previewUrls[selected.davItemId] ?? null) : null;
+    selected?.davItemId != null ? (expandedPreviewUrls[selected.davItemId] ?? null) : null;
   const totalPages = Math.max(1, Math.ceil(browse.totalGroups / browse.pageSize));
 
   return (
@@ -346,8 +397,41 @@ export default function Library({ loaderData }: Route.ComponentProps) {
             <option value="broken">Broken links</option>
           </select>
         </label>
+        <label className="text-xs font-semibold text-base-content/70">
+          Quality
+          <select
+            name="quality"
+            defaultValue={query.quality}
+            className="select mt-1 block select-bordered"
+          >
+            <option value="all">All qualities</option>
+            <option value="4k">4K</option>
+            <option value="1080p">1080p</option>
+            <option value="720p">720p</option>
+            <option value="sd">SD</option>
+            <option value="unknown">Unknown</option>
+          </select>
+        </label>
+        <label className="text-xs font-semibold text-base-content/70">
+          Native Cache
+          <select
+            name="cache"
+            defaultValue={query.cache}
+            className="select mt-1 block select-bordered"
+          >
+            <option value="all">All cache states</option>
+            <option value="any">Has cached data</option>
+            <option value="complete">Fully cached</option>
+            <option value="empty">Not cached</option>
+            <option value="unavailable">Unavailable</option>
+          </select>
+        </label>
         <Button type="submit">Apply filters</Button>
       </Form>
+      <p className="-mt-3 text-xs text-base-content/55">
+        Quality is inferred from the filename. Native Cache shows verified coverage for the current
+        file revision{nativeCacheActive ? "." : "; Native Cache is inactive."}
+      </p>
 
       <nav className="flex gap-1 border-b border-base-content/15" aria-label="Media type">
         {categories.map(({ value, label }) => (
@@ -396,19 +480,18 @@ export default function Library({ loaderData }: Route.ComponentProps) {
       ) : (
         <div className="flex flex-col gap-3">
           {browse.groups.map((group) => {
-            const open = browse.expandedGroup?.key === group.key;
+            const open = expandedKey === group.key;
             return (
               <section
                 key={group.key}
                 className="overflow-hidden rounded-xl border border-base-content/10 bg-base-200"
               >
-                <Link
-                  to={withParams(searchParams, {
-                    group: open ? null : group.key,
-                    groupPage: null,
-                  })}
+                <button
+                  type="button"
+                  onClick={() => (open ? setExpandedKey(null) : loadGroup(group.key))}
                   aria-expanded={open}
-                  className="flex items-center gap-4 p-4 hover:bg-base-content/5"
+                  aria-controls={`library-group-${browse.groups.indexOf(group)}`}
+                  className="flex w-full items-center gap-4 p-4 text-left transition-colors hover:bg-base-content/5"
                 >
                   <span className="flex h-14 w-12 shrink-0 items-center justify-center rounded-lg bg-primary/15 text-xl font-bold text-primary">
                     {group.category === "shows" ? "TV" : group.category === "movies" ? "▶" : "?"}
@@ -420,6 +503,23 @@ export default function Library({ loaderData }: Route.ComponentProps) {
                     </span>
                   </span>
                   <span className="hidden items-center gap-2 text-xs sm:flex">
+                    {group.quality ? (
+                      <Badge>
+                        {group.quality === "4k"
+                          ? "4K"
+                          : group.quality === "unknown"
+                            ? "Quality unknown"
+                            : group.quality}
+                      </Badge>
+                    ) : null}
+                    {group.itemCount === 1 ? (
+                      <span className="text-base-content/65">
+                        Cache{" "}
+                        {group.cachePercentage == null
+                          ? "unavailable"
+                          : `${group.cachePercentage}%`}
+                      </span>
+                    ) : null}
                     {group.healthyCount > 0 && <Badge>{group.healthyCount} valid</Badge>}
                     {group.attentionCount > 0 && (
                       <Badge>{group.attentionCount} need attention</Badge>
@@ -428,74 +528,107 @@ export default function Library({ loaderData }: Route.ComponentProps) {
                   <span className="text-xl text-base-content/50" aria-hidden="true">
                     {open ? "⌄" : "›"}
                   </span>
-                </Link>
-                {open && browse.expandedGroup ? (
-                  <div className="border-t border-base-content/10 bg-base-300/45 px-4 py-2">
-                    {browse.expandedGroup.items.map(({ item, season, episode }) => (
-                      <div
-                        key={item.davItemId ?? item.mappings[0]?.linkPath ?? item.displayName}
-                        className="border-b border-base-content/10 py-3 last:border-b-0"
-                      >
-                        <div className="flex flex-wrap items-center gap-3">
-                          {episode ? (
-                            <span className="w-16 shrink-0 font-mono text-xs font-bold text-primary">
-                              {episode}
+                </button>
+                {open ? (
+                  <div
+                    id={`library-group-${browse.groups.indexOf(group)}`}
+                    className="border-t border-base-content/10 bg-base-300/45 px-4 py-2"
+                  >
+                    {!expandedGroup ? (
+                      <p role="status" className="py-4 text-sm text-base-content/60">
+                        Loading files…
+                      </p>
+                    ) : null}
+                    {expandedGroup?.items.map(
+                      ({ item, season, episode, quality, cachePercentage }) => (
+                        <div
+                          key={item.davItemId ?? item.mappings[0]?.linkPath ?? item.displayName}
+                          className="border-b border-base-content/10 py-3 last:border-b-0"
+                        >
+                          <div className="flex flex-wrap items-center gap-3">
+                            {episode ? (
+                              <span className="w-16 shrink-0 font-mono text-xs font-bold text-primary">
+                                {episode}
+                              </span>
+                            ) : null}
+                            <div className="min-w-48 flex-1">
+                              <button
+                                type="button"
+                                className="link text-left font-semibold"
+                                onClick={() => openModal(item)}
+                              >
+                                {item.displayName}
+                              </button>
+                              <p className="truncate text-xs text-base-content/50">
+                                {season ? `${season} · ` : ""}
+                                {item.contentPath ?? item.mappings[0]?.linkPath ?? "External link"}
+                              </p>
+                            </div>
+                            <span className="text-xs text-base-content/70">
+                              {item.size != null ? formatFileSize(item.size) : "—"}
                             </span>
-                          ) : null}
-                          <div className="min-w-48 flex-1">
+                            <Badge>
+                              {quality === "4k"
+                                ? "4K"
+                                : quality === "unknown"
+                                  ? "Quality unknown"
+                                  : quality}
+                            </Badge>
+                            <span className="text-xs text-base-content/65">
+                              Cache{" "}
+                              {cachePercentage == null ? "unavailable" : `${cachePercentage}%`}
+                            </span>
+                            <Badge>{item.health}</Badge>
                             <button
                               type="button"
-                              className="link text-left font-semibold"
+                              className="btn btn-sm btn-outline"
                               onClick={() => openModal(item)}
                             >
-                              {item.displayName}
+                              Details
                             </button>
-                            <p className="truncate text-xs text-base-content/50">
-                              {season ? `${season} · ` : ""}
-                              {item.contentPath ?? item.mappings[0]?.linkPath ?? "External link"}
-                            </p>
                           </div>
-                          <span className="text-xs text-base-content/70">
-                            {item.size != null ? formatFileSize(item.size) : "—"}
-                          </span>
-                          <Badge>{item.health}</Badge>
-                          <button
-                            type="button"
-                            className="btn btn-sm btn-outline"
-                            onClick={() => openModal(item)}
-                          >
-                            Details
-                          </button>
+                          <details className="mt-2 text-xs text-base-content/65">
+                            <summary className="cursor-pointer">
+                              {item.mappingCount} {item.mappingCount === 1 ? "mapping" : "mappings"}
+                            </summary>
+                            <ul className="mt-2 space-y-1 pl-4">
+                              {item.mappings.map((mapping) => (
+                                <li key={mapping.linkPath} className="break-all">
+                                  <Badge>{mapping.status}</Badge> {mapping.linkPath} →{" "}
+                                  {mapping.targetText}
+                                </li>
+                              ))}
+                            </ul>
+                          </details>
                         </div>
-                        <details className="mt-2 text-xs text-base-content/65">
-                          <summary className="cursor-pointer">
-                            {item.mappingCount} {item.mappingCount === 1 ? "mapping" : "mappings"}
-                          </summary>
-                          <ul className="mt-2 space-y-1 pl-4">
-                            {item.mappings.map((mapping) => (
-                              <li key={mapping.linkPath} className="break-all">
-                                <Badge>{mapping.status}</Badge> {mapping.linkPath} →{" "}
-                                {mapping.targetText}
-                              </li>
-                            ))}
-                          </ul>
-                        </details>
+                      ),
+                    )}
+                    {expandedGroup && expandedGroup.totalItems > expandedGroup.pageSize ? (
+                      <div className="flex items-center justify-between py-3 text-sm">
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={expandedGroup.page <= 1 || groupFetcher.state !== "idle"}
+                          onClick={() => loadGroup(group.key, expandedGroup.page - 1)}
+                        >
+                          Previous files
+                        </button>
+                        <span>
+                          Page {expandedGroup.page} of{" "}
+                          {Math.ceil(expandedGroup.totalItems / expandedGroup.pageSize)}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          disabled={
+                            expandedGroup.page * expandedGroup.pageSize >=
+                              expandedGroup.totalItems || groupFetcher.state !== "idle"
+                          }
+                          onClick={() => loadGroup(group.key, expandedGroup.page + 1)}
+                        >
+                          Next files
+                        </button>
                       </div>
-                    ))}
-                    {browse.expandedGroup.totalItems > browse.expandedGroup.pageSize ? (
-                      <Pagination
-                        page={browse.expandedGroup.page}
-                        total={Math.ceil(
-                          browse.expandedGroup.totalItems / browse.expandedGroup.pageSize,
-                        )}
-                        previous={withParams(searchParams, {
-                          groupPage: String(browse.expandedGroup.page - 1),
-                        })}
-                        next={withParams(searchParams, {
-                          groupPage: String(browse.expandedGroup.page + 1),
-                        })}
-                        label="Group files"
-                      />
                     ) : null}
                   </div>
                 ) : null}
@@ -530,6 +663,18 @@ export default function Library({ loaderData }: Route.ComponentProps) {
       {selected ? (
         <LibraryFileModal
           item={selected}
+          quality={
+            expandedGroup?.items.find(
+              ({ item }) =>
+                item.davItemId === selected.davItemId && item.displayName === selected.displayName,
+            )?.quality ?? "unknown"
+          }
+          cachePercentage={
+            expandedGroup?.items.find(
+              ({ item }) =>
+                item.davItemId === selected.davItemId && item.displayName === selected.displayName,
+            )?.cachePercentage ?? null
+          }
           details={details}
           detailsLoading={detailsLoading}
           detailsError={detailsError}
