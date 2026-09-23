@@ -129,7 +129,8 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
         const int pageSize = 100;
         const int maxItems = 100_000;
         var entries = new List<PlexLibraryMedia>();
-        for (var start = 0; start < maxItems; start += pageSize)
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (var start = 0; start < maxItems;)
         {
             var separator = path.Contains('?', StringComparison.Ordinal) ? '&' : '?';
             var document = await GetXmlAsync(server,
@@ -137,8 +138,13 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
                 .ConfigureAwait(false);
             var root = document.Root ?? throw new PlexRequestException("Plex returned an empty library response.");
             var videos = root.Elements("Video").ToArray();
+            var total = Long(root, "totalSize");
+            if (total > maxItems) throw new PlexRequestException("Plex library exceeds the 100,000 item sync limit.");
             foreach (var video in videos)
             {
+                var ratingKey = Attribute(video, "ratingKey");
+                if (string.IsNullOrWhiteSpace(ratingKey) || !seen.Add(ratingKey))
+                    throw new PlexRequestException("Plex returned duplicate or incomplete library pages.");
                 var file = video.Elements("Media").SelectMany(media => media.Elements("Part"))
                     .Select(part => Attribute(part, "file")).FirstOrDefault(candidate => !string.IsNullOrWhiteSpace(candidate));
                 if (string.IsNullOrWhiteSpace(file)) continue;
@@ -147,9 +153,8 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
                 entries.Add(new PlexLibraryMedia(name, library.Type == "show" ? "episode" : "movie",
                     Attribute(video, "title") ?? "", Attribute(video, "grandparentTitle"),
                     Integer(video, "parentIndex"), Integer(video, "index"),
-                    Attribute(video, "ratingKey") ?? "", server.Id));
+                    ratingKey, server.Id, Integer(video, "year")));
             }
-            var total = Long(root, "totalSize");
             if (videos.Length == 0)
             {
                 if (total > start) throw new PlexRequestException("Plex returned an incomplete library page.");
@@ -157,8 +162,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
             }
             if ((total.HasValue && start + videos.Length >= total.Value)
                 || (!total.HasValue && videos.Length < pageSize)) return entries;
-            if (videos.Length < pageSize)
-                throw new PlexRequestException("Plex returned an incomplete library page.");
+            start += videos.Length;
         }
         throw new PlexRequestException("Plex library exceeds the 100,000 item sync limit.");
     }

@@ -142,6 +142,8 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
         }
         var plexTitle = category == "shows" ? plex.ShowName : plex.Title;
         var fallback = string.IsNullOrWhiteSpace(plexTitle) ? item.DisplayName : plexTitle;
+        if (category == "movies" && plex.Year is { } year && !fallback.Contains(year.ToString(), StringComparison.Ordinal))
+            fallback = $"{fallback} ({year})";
         return new GroupIdentity(category, $"{category}/{fallback}", fallback);
     }
 

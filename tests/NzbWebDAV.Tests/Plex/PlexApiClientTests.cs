@@ -33,6 +33,18 @@ public sealed class PlexApiClientTests
             api.GetLibraryMediaAsync(Server(), new PlexLibrary("1", "TV", "show")));
     }
 
+    [Fact]
+    public async Task LibraryMedia_FollowsServerPageCapUntilTotalIsComplete()
+    {
+        using var handler = new FakePlexHandler(request =>
+            request.RequestUri!.Query.Contains("Start=2", StringComparison.Ordinal)
+                ? Xml("""<MediaContainer totalSize="3"><Video ratingKey="3"><Media><Part file="/plex/three.mkv"/></Media></Video></MediaContainer>""")
+                : Xml("""<MediaContainer totalSize="3"><Video ratingKey="1"><Media><Part file="/plex/one.mkv"/></Media></Video><Video ratingKey="2"><Media><Part file="/plex/two.mkv"/></Media></Video></MediaContainer>"""));
+        var api = new PlexApiClient(new HttpClient(handler), "installation");
+        Assert.Equal(3, (await api.GetLibraryMediaAsync(Server(), new PlexLibrary("1", "Films", "movie"))).Count);
+        Assert.Equal(2, handler.Requests.Count);
+    }
+
     [Theory]
     [InlineData(true, "next-season")]
     [InlineData(false, "owner-watched")]

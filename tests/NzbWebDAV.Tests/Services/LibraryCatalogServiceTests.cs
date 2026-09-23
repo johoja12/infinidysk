@@ -286,7 +286,7 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
             entry => entry.FileName, StringComparer.OrdinalIgnoreCase);
 
         public PlexLibraryMetadataStatus Status => new(ready,
-            ready ? DateTimeOffset.UtcNow : null, _entries.Count, null);
+            ready ? DateTimeOffset.UtcNow : null, _entries.Count, null, false);
 
         public PlexLibraryMedia? Match(string? fileName) => fileName is not null &&
             _entries.TryGetValue(Path.GetFileName(fileName.Replace('\\', '/')), out var entry) ? entry : null;

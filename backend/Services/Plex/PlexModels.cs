@@ -16,7 +16,8 @@ public sealed record PlexServer
 
 public sealed record PlexLibrary(string Id, string Title, string Type);
 public sealed record PlexLibraryMedia(string FileName, string MediaType, string Title,
-    string? ShowName, int? Season, int? Episode, string RatingKey, string ServerId);
+    string? ShowName, int? Season, int? Episode, string RatingKey, string ServerId,
+    int? Year = null);
 public sealed record PlexUser(string Id, string Name);
 public sealed record PlexHomeUser(string Id, string Name, bool Protected, bool Admin);
 public sealed record PlexAccount(string Id, string Name, string Token)

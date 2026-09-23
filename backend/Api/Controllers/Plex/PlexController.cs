@@ -66,7 +66,9 @@ public sealed class PlexController(PlexOwnerAuthenticator owners, PlexAccountSer
                 case "libraries":
                     return Ok(await catalogue.GetLibrariesAsync(servers.GetServer(Required(request.ServerId)), request.ForceRefresh, ct).ConfigureAwait(false));
                 case "library/sync":
-                    return Ok(await libraryMetadata.SyncAsync(ct).ConfigureAwait(false));
+                    return Ok(libraryMetadata.RequestSync());
+                case "library/status":
+                    return Ok(libraryMetadata.Status);
                 case "users":
                     return Ok(await catalogue.GetUsersAsync(servers.GetServer(Required(request.ServerId)), request.ForceRefresh, ct).ConfigureAwait(false));
                 case "sources":

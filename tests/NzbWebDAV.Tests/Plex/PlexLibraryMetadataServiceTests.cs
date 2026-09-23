@@ -48,6 +48,7 @@ public sealed class PlexLibraryMetadataServiceTests
                 NullLogger<PlexLibraryMetadataService>.Instance);
             Assert.True(reloaded.Status.Ready);
             Assert.Equal("A Show", reloaded.Match("A.Show.S01E01.mkv")?.ShowName);
+            Assert.True(reloaded.RequestSync().Syncing);
         }
         finally
         {

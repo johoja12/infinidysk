@@ -671,6 +671,9 @@
               "string"
             ]
           },
+          "plexStatus": {
+            "$ref": "#/components/schemas/PlexLibraryMetadataStatus"
+          },
           "totalGroups": {
             "format": "int32",
             "pattern": "^-?(?:0|[1-9]\\d*)$",
@@ -705,6 +708,7 @@
           "indexWarning",
           "page",
           "pageSize",
+          "plexStatus",
           "totalGroups",
           "totalItems",
           "unmatchedItems"
@@ -1073,6 +1077,45 @@
         "required": [
           "packageDigest",
           "selectionCount"
+        ],
+        "type": "object"
+      },
+      "PlexLibraryMetadataStatus": {
+        "properties": {
+          "entryCount": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "syncedAt": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "syncing": {
+            "type": "boolean"
+          },
+          "warning": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "entryCount",
+          "ready",
+          "syncedAt",
+          "syncing",
+          "warning"
         ],
         "type": "object"
       },

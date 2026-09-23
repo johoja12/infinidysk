@@ -10,7 +10,7 @@ public sealed record PlexLibraryMetadataSnapshot(DateTimeOffset SyncedAt,
     IReadOnlyList<PlexLibraryMedia> Entries);
 
 public sealed record PlexLibraryMetadataStatus(bool Ready, DateTimeOffset? SyncedAt,
-    int EntryCount, string? Warning);
+    int EntryCount, string? Warning, bool Syncing);
 
 public interface IPlexLibraryMetadataIndex
 {
@@ -21,12 +21,20 @@ public interface IPlexLibraryMetadataIndex
 /// <summary>Complete, persisted Plex filename index for Media Library matching.</summary>
 public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibraryMetadataIndex
 {
+    private static readonly Action<ILogger, Exception?> LogLoadFailure =
+        LoggerMessage.Define(LogLevel.Warning, new EventId(1, "PlexLibraryMetadataLoadFailure"),
+            "Could not load Plex library metadata snapshot");
+    private static readonly Action<ILogger, Exception?> LogSyncFailure =
+        LoggerMessage.Define(LogLevel.Warning, new EventId(2, "PlexLibraryMetadataSyncFailure"),
+            "Plex library metadata sync failed; retaining previous snapshot");
     private readonly ConfigManager _config;
     private readonly PlexApiClient _api;
     private readonly ILogger<PlexLibraryMetadataService> _logger;
     private readonly string _path;
     private readonly SemaphoreSlim _syncGate = new(1, 1);
+    private readonly SemaphoreSlim _syncSignal = new(0, 1);
     private volatile Index _index = Index.Empty;
+    private volatile bool _syncing;
     private string? _warning;
 
     public PlexLibraryMetadataService(ConfigManager config, PlexApiClient api,
@@ -48,14 +56,22 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
         catch (Exception error) when (error is IOException or JsonException or UnauthorizedAccessException)
         {
             _warning = "Saved Plex library metadata could not be loaded. Sync Plex again.";
-            _logger.LogWarning(error, "Could not load Plex library metadata snapshot");
+            LogLoadFailure(_logger, error);
         }
     }
 
     public PlexLibraryMetadataStatus Status => new(_index.SyncedAt.HasValue,
         _index.SyncedAt, _index.Count, _warning ??
             (_index.SyncedAt is { } synced && DateTimeOffset.UtcNow - synced > TimeSpan.FromHours(24)
-                ? "Plex matching is more than 24 hours old. Sync Plex to refresh it." : null));
+                ? "Plex matching is more than 24 hours old. Sync Plex to refresh it." : null),
+        _syncing || _syncSignal.CurrentCount > 0);
+
+    public PlexLibraryMetadataStatus RequestSync()
+    {
+        try { _syncSignal.Release(); }
+        catch (SemaphoreFullException) { /* An existing request is already queued. */ }
+        return Status;
+    }
 
     public PlexLibraryMedia? Match(string? fileName)
     {
@@ -67,7 +83,8 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
         return candidates.All(candidate => candidate.MediaType == first.MediaType &&
             string.Equals(candidate.ShowName, first.ShowName, StringComparison.OrdinalIgnoreCase) &&
             string.Equals(candidate.Title, first.Title, StringComparison.OrdinalIgnoreCase) &&
-            candidate.Season == first.Season && candidate.Episode == first.Episode) ? first : null;
+            candidate.Season == first.Season && candidate.Episode == first.Episode &&
+            candidate.Year == first.Year) ? first : null;
     }
 
     public async Task<PlexLibraryMetadataStatus> SyncAsync(CancellationToken ct = default)
@@ -110,7 +127,7 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception error) when (error is PlexRequestException or IOException or UnauthorizedAccessException or ArgumentException)
         {
-            _logger.LogWarning(error, "Plex library metadata sync failed; retaining previous snapshot");
+            LogSyncFailure(_logger, error);
             _warning = $"Plex sync failed: {error.Message} The previous matching snapshot is retained.";
             return Status;
         }
@@ -124,11 +141,20 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
             await Task.Delay(TimeSpan.FromSeconds(15), stoppingToken).ConfigureAwait(false);
             while (!stoppingToken.IsCancellationRequested)
             {
-                await SyncAsync(stoppingToken).ConfigureAwait(false);
-                await Task.Delay(TimeSpan.FromHours(6), stoppingToken).ConfigureAwait(false);
+                _syncing = true;
+                try { await SyncAsync(stoppingToken).ConfigureAwait(false); }
+                finally { _syncing = false; }
+                await _syncSignal.WaitAsync(TimeSpan.FromHours(6), stoppingToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
+    }
+
+    public override void Dispose()
+    {
+        _syncGate.Dispose();
+        _syncSignal.Dispose();
+        base.Dispose();
     }
 
     private sealed record Index(DateTimeOffset? SyncedAt,
