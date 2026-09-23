@@ -41,6 +41,8 @@ public sealed record LibraryBrowseQuery
     public string? Search { get; init; }
     public string Category { get; init; } = "shows"; // shows|movies|unmatched
     public string TypeFilter { get; init; } = "all"; // all|internal|external|broken
+    public string Quality { get; init; } = "all"; // all|4k|1080p|720p|sd|unknown
+    public string Cache { get; init; } = "all"; // all|any|complete|empty|unavailable
     public int Page { get; init; } = 1;
     public int PageSize { get; init; } = 12;
     public string? GroupKey { get; init; }
@@ -53,12 +55,16 @@ public sealed record LibraryBrowseGroupDto(
     string Category,
     int ItemCount,
     int HealthyCount,
-    int AttentionCount);
+    int AttentionCount,
+    string? Quality,
+    int? CachePercentage);
 
 public sealed record LibraryBrowseFileDto(
     LibraryCatalogItemDto Item,
     string? Season,
-    string? Episode);
+    string? Episode,
+    string Quality,
+    int? CachePercentage);
 
 public sealed record LibraryBrowseExpandedGroupDto(
     string Key,

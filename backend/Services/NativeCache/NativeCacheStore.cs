@@ -406,6 +406,21 @@ public sealed class NativeCacheStore : IAsyncDisposable
     }
 
     [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
+    public async Task<IReadOnlySet<string>> GetCachedItemIdsAsync(CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            using var command = Command("SELECT DISTINCT ItemId FROM Entries WHERE ItemId <> '' AND VerifiedBytes > 0");
+            using var reader = command.ExecuteReader();
+            var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (reader.Read()) ids.Add(reader.GetString(0));
+            return ids;
+        }
+        finally { _gate.Release(); }
+    }
+
+    [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
     public async Task<IReadOnlyList<NativeCacheEntry>> ListEntriesAsync(string folderId, string? after, int limit, CancellationToken ct = default)
     {
         if (!_folders.Any(folder => folder.Id == folderId) || limit is < 1 or > 200 || after?.Length > 64)

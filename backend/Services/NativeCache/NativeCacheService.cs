@@ -112,21 +112,13 @@ public sealed class NativeCacheService : IAsyncDisposable
         AdmissionLease? admission = new(_bufferSlots, watch);
         try
         {
-            await using var blob = _blobs.ReadBlob(blobId);
-            if (blob is not null && watch.IsCurrent)
+            var current = await GetCurrentIdentityAsync(item, blobId, watch, cancellationToken).ConfigureAwait(false);
+            if (current is { } cached)
             {
-                var hash = await SHA256.HashDataAsync(blob, cancellationToken).ConfigureAwait(false);
-                var dependencies = await GetSourceSegmentsAsync(item, blobId).ConfigureAwait(false);
-                if (dependencies is not null && watch.IsCurrent)
-                {
-                    var repairRevision = _repairs.CaptureNativeRevisions(dependencies);
-                    var identity = new NativeCacheIdentity(item.Id.ToString("N"),
-                        $"v2:{blobId:N}:{Convert.ToHexString(hash)}:{repairRevision.Fingerprint}", item.FileSize.Value);
-                    var stream = new NativeCachedStream(store, identity, open,
-                        () => watch.IsCurrent && repairRevision.IsCurrent, admission, background: requireNative, statistics: Statistics);
-                    admission = null; // The returned stream owns the watch and buffer admission.
-                    return stream;
-                }
+                var stream = new NativeCachedStream(store, cached.Identity, open,
+                    () => watch.IsCurrent && cached.Revision.IsCurrent, admission, background: requireNative, statistics: Statistics);
+                admission = null; // The returned stream owns the watch and buffer admission.
+                return stream;
             }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or SqliteException
@@ -138,6 +130,31 @@ public sealed class NativeCacheService : IAsyncDisposable
         finally { admission?.Dispose(); }
         if (requireNative) throw new InvalidOperationException("Native cache metadata is unavailable; no source bytes were requested.");
         return await open(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<int?> GetCurrentCoverageAsync(DavItem item, CancellationToken cancellationToken = default)
+    {
+        var store = Store;
+        if (store is null || item.FileBlobId is not { } blobId || item.FileSize is not > 0) return null;
+        using var watch = ContentRevisionTracker.Watch(blobId);
+        var current = await GetCurrentIdentityAsync(item, blobId, watch, cancellationToken).ConfigureAwait(false);
+        if (current is null || !watch.IsCurrent || !current.Value.Revision.IsCurrent) return null;
+        var bytes = await store.GetCoverageAsync(current.Value.Identity, cancellationToken).ConfigureAwait(false);
+        return watch.IsCurrent && current.Value.Revision.IsCurrent
+            ? (int)Math.Floor(Math.Min(100.0, bytes * 100.0 / item.FileSize.Value)) : null;
+    }
+
+    private async Task<(NativeCacheIdentity Identity, RepairRevisionStore.Snapshot Revision)?> GetCurrentIdentityAsync(
+        DavItem item, Guid blobId, ContentRevisionTracker.RevisionWatch watch, CancellationToken cancellationToken)
+    {
+        await using var blob = _blobs.ReadBlob(blobId);
+        if (blob is null || !watch.IsCurrent) return null;
+        var hash = await SHA256.HashDataAsync(blob, cancellationToken).ConfigureAwait(false);
+        var dependencies = await GetSourceSegmentsAsync(item, blobId).ConfigureAwait(false);
+        if (dependencies is null || !watch.IsCurrent || item.FileSize is not > 0) return null;
+        var revision = _repairs.CaptureNativeRevisions(dependencies);
+        return (new NativeCacheIdentity(item.Id.ToString("N"),
+            $"v2:{blobId:N}:{Convert.ToHexString(hash)}:{revision.Fingerprint}", item.FileSize.Value), revision);
     }
 
     private async Task<IEnumerable<string>?> GetSourceSegmentsAsync(DavItem item, Guid blobId)

@@ -81,6 +81,10 @@ public sealed class LibraryCatalogService(DavDatabaseContext context)
         return dtos;
     }
 
+    internal Task<List<DavItem>> LoadItemsByIdsAsync(IReadOnlyCollection<Guid> ids, CancellationToken ct) =>
+        ids.Count == 0 ? Task.FromResult(new List<DavItem>())
+            : context.Items.AsNoTracking().Where(item => ids.Contains(item.Id)).ToListAsync(ct);
+
     internal static bool MatchesSearch(LibraryCatalogItemDto dto, string search) =>
         dto.DisplayName.Contains(search, StringComparison.OrdinalIgnoreCase)
         || (dto.ContentPath?.Contains(search, StringComparison.OrdinalIgnoreCase) ?? false)

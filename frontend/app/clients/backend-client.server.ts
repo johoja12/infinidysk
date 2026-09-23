@@ -550,6 +550,8 @@ class BackendClient {
     if (query.group) qs.set("group", query.group);
     qs.set("category", query.category ?? "shows");
     qs.set("type", query.type ?? "all");
+    qs.set("quality", query.quality ?? "all");
+    qs.set("cache", query.cache ?? "all");
     qs.set("page", String(query.page ?? 1));
     qs.set("groupPage", String(query.groupPage ?? 1));
     return await call<LibraryBrowseResponse>(
@@ -978,6 +980,8 @@ const libraryBrowseGroupSchema = z.object({
   itemCount: z.number().int(),
   healthyCount: z.number().int(),
   attentionCount: z.number().int(),
+  quality: z.enum(["4k", "1080p", "720p", "sd", "unknown"]).nullable(),
+  cachePercentage: z.number().int().nullable(),
 });
 
 const libraryBrowseExpandedGroupSchema = z.object({
@@ -990,6 +994,8 @@ const libraryBrowseExpandedGroupSchema = z.object({
       item: libraryCatalogItemSchema,
       season: z.string().nullable(),
       episode: z.string().nullable(),
+      quality: z.enum(["4k", "1080p", "720p", "sd", "unknown"]),
+      cachePercentage: z.number().int().nullable(),
     }),
   ),
 });
@@ -1021,6 +1027,8 @@ export type LibraryBrowseQuery = {
   q?: string;
   category?: "shows" | "movies" | "unmatched";
   type?: "all" | "internal" | "external" | "broken";
+  quality?: "all" | "4k" | "1080p" | "720p" | "sd" | "unknown";
+  cache?: "all" | "any" | "complete" | "empty" | "unavailable";
   page?: number;
   group?: string;
   groupPage?: number;

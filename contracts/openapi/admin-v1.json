@@ -539,6 +539,15 @@
       },
       "LibraryBrowseFileDto": {
         "properties": {
+          "cachePercentage": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          },
           "episode": {
             "type": [
               "null",
@@ -548,6 +557,9 @@
           "item": {
             "$ref": "#/components/schemas/LibraryCatalogItemDto"
           },
+          "quality": {
+            "type": "string"
+          },
           "season": {
             "type": [
               "null",
@@ -556,8 +568,10 @@
           }
         },
         "required": [
+          "cachePercentage",
           "episode",
           "item",
+          "quality",
           "season"
         ],
         "type": "object"
@@ -569,6 +583,15 @@
             "pattern": "^-?(?:0|[1-9]\\d*)$",
             "type": [
               "integer",
+              "string"
+            ]
+          },
+          "cachePercentage": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
               "string"
             ]
           },
@@ -594,16 +617,24 @@
           "key": {
             "type": "string"
           },
+          "quality": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
           "title": {
             "type": "string"
           }
         },
         "required": [
           "attentionCount",
+          "cachePercentage",
           "category",
           "healthyCount",
           "itemCount",
           "key",
+          "quality",
           "title"
         ],
         "type": "object"
