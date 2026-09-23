@@ -15,6 +15,8 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     private readonly IDisposable _lease;
     private IDisposable? _bufferAdmission;
     private readonly bool _background;
+    private readonly bool _writeBehind;
+    private Task<bool>? _pendingWrite;
     private readonly NativeCacheStatistics? _statistics;
     private Stream? _source;
     private byte[]? _buffer;
@@ -32,7 +34,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
 
     public NativeCachedStream(NativeCacheStore store, NativeCacheIdentity identity,
         Func<CancellationToken, Task<Stream>> openSource, Func<bool> generationIsCurrent,
-        IDisposable? bufferAdmission = null, bool background = false, NativeCacheStatistics? statistics = null)
+        IDisposable? bufferAdmission = null, bool background = false, NativeCacheStatistics? statistics = null, bool writeBehind = false)
     {
         _store = store;
         _identity = identity;
@@ -41,6 +43,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         _lease = store.AcquireLease(identity);
         _bufferAdmission = bufferAdmission;
         _background = background;
+        _writeBehind = writeBehind && !background;
         _statistics = statistics;
     }
 
@@ -52,6 +55,35 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     public override bool CanSeek => true;
     public override long Position { get => _position; set => Seek(value, SeekOrigin.Begin); }
     public override void Flush() { }
+
+    /// <summary>Checks existing bytes without opening the source or spending a warming budget.</summary>
+    internal async Task<bool> VerifyCachedBlockAsync(long blockStart, CancellationToken cancellationToken)
+    {
+        var valid = await _store.VerifyOnceAsync(_identity, blockStart,
+            () => VerifyOwnedBlockAsync(blockStart, cancellationToken), cancellationToken).ConfigureAwait(false);
+        return valid && _generationIsCurrent();
+    }
+
+    private async Task<bool> VerifyOwnedBlockAsync(long blockStart, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_bypassFill || !_generationIsCurrent()) return false;
+        // Use this stream's admitted buffer and IO lifetime handling. Cancellation
+        // must not return memory still owned by an uncancellable NAS read.
+        _buffer ??= ArrayPool<byte>.Shared.Rent(NativeCacheStore.BlockSize);
+        _bufferStart = -1;
+        _bufferCount = 0;
+        _bufferVerified = false;
+        _bufferFromCache = false;
+        LastReadCacheable = false;
+        var expected = (int)Math.Min(NativeCacheStore.BlockSize, Length - blockStart);
+        var buffer = _buffer;
+        var count = await CacheIoAsync(false,
+            token => _store.ReadBlockAsync(_identity, blockStart, buffer.AsMemory(0, expected), token),
+            cancellationToken).ConfigureAwait(false);
+        return count == expected && _generationIsCurrent();
+    }
 
     public override async ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default)
     {
@@ -70,6 +102,12 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         if (_bufferFromCache && !_generationIsCurrent()) _bufferStart = -1;
         if (_bufferStart != blockStart)
         {
+            if (_pendingWrite is { } pending)
+            {
+                try { await CacheIoAsync(true, _ => pending, cancellationToken).ConfigureAwait(false); }
+                catch (TimeoutException) { return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false); }
+                finally { _pendingWrite = null; }
+            }
             using var fill = await AcquireFillAsync(blockStart, cancellationToken).ConfigureAwait(false);
             if (fill is null) return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false);
             _buffer ??= ArrayPool<byte>.Shared.Rent(NativeCacheStore.BlockSize);
@@ -121,7 +159,25 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                     try
                     {
                         var buffer = _buffer;
-                        if (await CacheIoAsync(true, token => _store.WriteBlockAsync(_identity, blockStart, buffer.AsMemory(0, expected),
+                        if (_writeBehind)
+                        {
+                            // The buffer stays immutable until this write finishes. The next
+                            // block and disposal drain it or transfer ownership on timeout.
+                            _pendingWrite = Task.Run(async () =>
+                            {
+                                try
+                                {
+                                    if (BeforeCacheIo is not null) await BeforeCacheIo(true, cancellationToken).ConfigureAwait(false);
+                                    var committed = await _store.WriteBlockAsync(_identity, blockStart, buffer.AsMemory(0, expected),
+                                        waitForWriter: true, cancellationToken: cancellationToken).ConfigureAwait(false);
+                                    if (committed) _statistics?.Committed(expected);
+                                    return committed;
+                                }
+                                catch (Exception exception) when (exception is IOException or SqliteException or UnauthorizedAccessException or OperationCanceledException)
+                                { return false; }
+                            }, CancellationToken.None);
+                        }
+                        else if (await CacheIoAsync(true, token => _store.WriteBlockAsync(_identity, blockStart, buffer.AsMemory(0, expected),
                             waitForWriter: _background, cancellationToken: token), cancellationToken)
                             .ConfigureAwait(false)) _statistics?.Committed(expected);
                     }
@@ -268,7 +324,18 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             {
                 _disposed = true;
                 try { if (_source is not null) await _source.DisposeAsync().ConfigureAwait(false); }
-                finally { Release(); }
+                finally
+                {
+                    try
+                    {
+                        if (_pendingWrite is { } pending)
+                        {
+                            try { await pending.WaitAsync(CacheIoTimeout).ConfigureAwait(false); }
+                            catch (TimeoutException) { }
+                        }
+                    }
+                    finally { Release(); }
+                }
             }
         }
         finally { await base.DisposeAsync().ConfigureAwait(false); }
@@ -276,7 +343,12 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
 
     private void Release()
     {
-        if (_buffer is not null) ArrayPool<byte>.Shared.Return(_buffer);
+        if (_pendingWrite is { IsCompleted: false } pending)
+        {
+            _ = ReleaseAfterIoAsync(pending, _buffer, _bufferAdmission);
+            _bufferAdmission = null;
+        }
+        else if (_buffer is not null) ArrayPool<byte>.Shared.Return(_buffer);
         _buffer = null;
         _lease.Dispose();
         _bufferAdmission?.Dispose();

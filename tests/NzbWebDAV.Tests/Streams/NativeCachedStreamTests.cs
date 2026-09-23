@@ -8,6 +8,66 @@ public sealed class NativeCachedStreamTests : IDisposable
     private readonly string _root = Path.Combine(Path.GetTempPath(), "native-stream-tests-" + Guid.NewGuid().ToString("N"));
     public NativeCachedStreamTests() => Directory.CreateDirectory(_root);
 
+    [Fact]
+    public async Task ConcurrentVerification_SharesOnlyInFlightEvidence_AndRechecksLaterDamage()
+    {
+        await using var store = CreateStore();
+        var identity = new NativeCacheIdentity("shared-verification", "v1", 3);
+        Assert.True(await store.WriteBlockAsync(identity, 0, new byte[] { 1, 2, 3 }));
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reads = 0;
+        await using var first = new NativeCachedStream(store, identity, _ => throw new Exception("source"), () => true)
+        {
+            BeforeCacheIo = async (_, _) => { Interlocked.Increment(ref reads); entered.TrySetResult(); await release.Task; }
+        };
+        await using var second = new NativeCachedStream(store, identity, _ => throw new Exception("source"), () => true)
+        {
+            BeforeCacheIo = (_, _) => { Interlocked.Increment(ref reads); return Task.CompletedTask; }
+        };
+        var owner = first.VerifyCachedBlockAsync(0, CancellationToken.None);
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        var follower = second.VerifyCachedBlockAsync(0, CancellationToken.None);
+        release.TrySetResult();
+        Assert.True(await owner);
+        Assert.True(await follower);
+        Assert.Equal(1, reads);
+        Assert.True(await second.VerifyCachedBlockAsync(0, CancellationToken.None));
+        Assert.Equal(2, reads); // No TTL-based trust of old catalogue or verification results.
+        await File.WriteAllBytesAsync(Path.Combine(_root, "v1", identity.Key[..2], identity.Key, "content.data"), new byte[] { 9, 9, 9 });
+        Assert.False(await second.VerifyCachedBlockAsync(0, CancellationToken.None));
+        Assert.Equal(0, await store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
+    public async Task WriteBehind_ServesBytesBeforeFlush_AndRetainsBufferUntilPublication()
+    {
+        await using var store = CreateStore();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var admission = new TrackingAdmission();
+        var identity = new NativeCacheIdentity("write-behind", "v1", 3);
+        await using var stream = new NativeCachedStream(store, identity,
+            _ => Task.FromResult<Stream>(new EvidenceStream(true)), () => true, admission, writeBehind: true)
+        {
+            CacheIoTimeout = TimeSpan.FromMilliseconds(30),
+            BeforeCacheIo = async (write, _) => { if (write) { entered.TrySetResult(); await release.Task; } }
+        };
+        try
+        {
+            var bytes = new byte[3];
+            Assert.Equal(3, await stream.ReadAsync(bytes).AsTask().WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.Equal(new byte[] { 1, 2, 3 }, bytes);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.Equal(0, await store.GetCoverageAsync(identity));
+            await stream.DisposeAsync();
+            Assert.False(admission.Disposed.Task.IsCompleted);
+        }
+        finally { release.TrySetResult(); }
+        await admission.Disposed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(3, await store.GetCoverageAsync(identity));
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -49,8 +109,10 @@ public sealed class NativeCachedStreamTests : IDisposable
         public void Dispose() => Disposed.TrySetResult();
     }
 
-    [Fact]
-    public async Task CancelledBackgroundIo_RetainsAdmissionUntilUncancellableIoCompletes()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancelledBackgroundIo_RetainsAdmissionUntilUncancellableIoCompletes(bool verifyOnly)
     {
         await using var store = CreateStore();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -62,7 +124,8 @@ public sealed class NativeCachedStreamTests : IDisposable
         {
             BeforeCacheIo = async (_, _) => { entered.TrySetResult(); await release.Task; }
         };
-        var read = stream.ReadAsync(new byte[3], cancellation.Token).AsTask();
+        Task read = verifyOnly ? stream.VerifyCachedBlockAsync(0, cancellation.Token)
+            : stream.ReadAsync(new byte[3], cancellation.Token).AsTask();
         try
         {
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -182,11 +245,51 @@ public sealed class NativeCachedStreamTests : IDisposable
         Assert.Throws<ArgumentException>(() => NativeFileSystem.RequireLocalMetadata(Path.Combine(link, "index.db")));
     }
 
+    [Fact]
+    public async Task UnalignedRange_CrossesCachedHeadMissingMiddleAndCachedTailWithoutChangingBytes()
+    {
+        await using var store = CreateStore();
+        var block = NativeCacheStore.BlockSize;
+        var expected = new byte[block * 2 + 37];
+        new Random(487).NextBytes(expected);
+        var identity = new NativeCacheIdentity("gapped", "revision", expected.Length);
+        Assert.True(await store.WriteBlockAsync(identity, 0, expected.AsMemory(0, block)));
+        Assert.True(await store.WriteBlockAsync(identity, block * 2L, expected.AsMemory(block * 2)));
+        var reads = new List<(long Offset, int Count)>();
+        await using (var stream = new NativeCachedStream(store, identity,
+            _ => Task.FromResult<Stream>(new TrackedSource(expected, reads)), () => true))
+        {
+            stream.Position = block - 17;
+            var actual = new byte[block + 46];
+            await stream.ReadExactlyAsync(actual);
+            Assert.Equal(expected.AsSpan(block - 17, actual.Length).ToArray(), actual);
+            Assert.Equal([(block, block)], reads);
+        }
+
+        await using var cached = new NativeCachedStream(store, identity,
+            _ => throw new InvalidOperationException("Filled gap was fetched again"), () => true);
+        var all = new byte[expected.Length];
+        await cached.ReadExactlyAsync(all);
+        Assert.Equal(expected, all);
+    }
+
     public void Dispose() => Directory.Delete(_root, recursive: true);
 
     private sealed class EvidenceStream(bool verified) : MemoryStream(new byte[] { 1, 2, 3 }), ICacheReadEvidence
     {
         public bool LastReadCacheable => verified;
+    }
+
+    private sealed class TrackedSource(byte[] bytes, List<(long Offset, int Count)> reads) : MemoryStream(bytes), ICacheReadEvidence
+    {
+        public bool LastReadCacheable => true;
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            var offset = Position;
+            var count = await base.ReadAsync(buffer, cancellationToken);
+            reads.Add((offset, count));
+            return count;
+        }
     }
 
     private sealed class FailingTailStream() : MemoryStream(new byte[] { 1, 2, 3 }), ICacheReadEvidence

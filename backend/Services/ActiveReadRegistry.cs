@@ -78,17 +78,35 @@ public class ActiveReadRegistry
     }
 
     public void Touch(Guid id, long bytesRead, long? currentOffset = null)
+        => Touch(id, bytesRead, currentOffset, DateTimeOffset.UtcNow);
+
+    internal void Touch(Guid id, long bytesRead, long? currentOffset, DateTimeOffset now)
     {
         if (_entries.TryGetValue(id, out var entry))
         {
-            entry.LastActivityAt = DateTimeOffset.UtcNow;
+            lock (entry.ActivityGate)
+            {
+                if (bytesRead > 0 && currentOffset is { } end && end >= bytesRead)
+                {
+                    if (entry.SequentialBytes == 0 || now - entry.LastSequentialReadAt > ActivityWindow
+                        || end - bytesRead != entry.CurrentOffset)
+                    {
+                        entry.SequentialStartedAt = now;
+                        entry.SequentialBytes = 0;
+                    }
+                    entry.SequentialBytes += bytesRead;
+                    entry.LastSequentialReadAt = now;
+                }
+                else if (bytesRead > 0) entry.SequentialBytes = 0;
+                if (currentOffset.HasValue) entry.CurrentOffset = currentOffset.Value;
+                entry.LastActivityAt = now;
+            }
             if (bytesRead > 0)
             {
                 Interlocked.Add(ref entry.BytesRead, bytesRead);
                 Interlocked.Add(ref _totalBytesServed, bytesRead);
             }
-            if (currentOffset.HasValue)
-                Interlocked.Exchange(ref entry.CurrentOffset, currentOffset.Value);
+
         }
     }
 
@@ -191,5 +209,16 @@ public class ActiveReadRegistry
         /// transferred bytes (which over-counts on seek/rewind).
         /// </summary>
         public long CurrentOffset;
+        internal Lock ActivityGate { get; } = new();
+        internal DateTimeOffset SequentialStartedAt;
+        internal DateTimeOffset LastSequentialReadAt;
+        internal long SequentialBytes;
+
+        public bool QualifiesForWarming(DateTimeOffset now)
+        {
+            lock (ActivityGate) return SequentialBytes >= 64L * 1024 * 1024
+                && now - SequentialStartedAt >= TimeSpan.FromSeconds(30)
+                && now - LastSequentialReadAt <= ActivityWindow;
+        }
     }
 }

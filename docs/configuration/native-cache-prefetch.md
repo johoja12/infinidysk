@@ -13,7 +13,7 @@
 
 For HDD/NAS storage that mostly retains whole movies and episodes, choose **Native**.
 It stores one sparse final-media data file per source revision, with verified 4 MiB
-coverage and a local indexed catalogue. Completing a partially cached movie fills
+coverage and a local indexed catalogue. When its folder has capacity, completing a partially cached movie fills
 that same file; it does not assemble millions of article files into another copy.
 
 **Segment** remains useful for repeated article/range reads on fast local storage.
@@ -173,6 +173,13 @@ Cache hits spend no provider credit. If accounting storage fails, warming stops
 across jobs until local metadata is repaired and the service restarts; ordinary
 playback is not charged to this budget and remains available.
 
+Before reporting warming complete, InfiniDysk reads and verifies the existing
+cached blocks in the requested range. Missing or damaged blocks are fetched again
+under the normal warming budget; unavailable storage defers completion. This also
+means a repeated whole-file warm reads the cached file from disk, even when it
+requires no Usenet traffic. The [historical regression audit](../testing/native-cache-regression-audit.md)
+documents the protections and remaining storage/client-cache limitations.
+
 Disabling a source/trigger removes its ownership of pending work. Another enabled
 source or a manual request can retain the same job. Removing its last owner cancels
 active work. On restart, manual interrupted jobs restore paused; speculative work is
@@ -206,3 +213,27 @@ Aggregate native hit/miss/commit/fallback/timeout counters are available in the 
 support pack, and existing Prometheus endpoint. Memory snapshots include configured
 native buffer budget and reserved admission, including still-running timed-out IO;
 these are not measurements of the NAS page cache.
+
+## Cache reliability follow-ups [since unreleased testing branch](https://github.com/johoja12/infinidysk/issues/38){ .nzbdav-since }
+
+Partial warming can restart on another eligible folder when an unpinned entry's
+original folder is full or offline. This refetches verified source bytes through
+the warming budget; it does not stripe a file across folders. Previous allocation
+remains charged until safe cleanup. Pinned/read-only entries stay in place.
+
+The buffer budget reserves one block for overflow playback reads when at least
+8 MiB is configured. Playback writes can finish after the current read returns;
+only durably published blocks count as coverage. Status checks time out with an
+explicit unknown state. Independent filesystems have separate writer gates;
+folders on the same filesystem share space accounting and serialization.
+
+Raw read hints require 64 MiB of contiguous reads over at least 30 seconds. A seek
+or a gap over 15 seconds resets eligibility. This filters probes and previews but
+cannot identify every scanner. Keep the raw-read trigger off for Plex-only warming.
+
+After a source repair, native-backed WebDAV files expose a changed modification
+time. Refresh metadata on each rclone mount and reopen the file to revalidate its
+payload. Already-open player buffers remain outside the server's control.
+Repeated whole-file warming still reads/hashes the cached file; only concurrent
+in-flight verification is shared. See the [validation report](../testing/native-cache-followups.md)
+for exact boundaries and upgrade/downgrade notes. Back up `/config` before upgrading.

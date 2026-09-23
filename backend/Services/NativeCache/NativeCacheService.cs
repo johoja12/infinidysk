@@ -15,6 +15,8 @@ public sealed class NativeCacheService : IAsyncDisposable
     private readonly RepairPatchStore _repairs;
     [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "CA2213", Justification = "Managed-only semaphore: detached filesystem operations retain admissions after shutdown and must still release them. AvailableWaitHandle is never used.")]
     private readonly SemaphoreSlim? _bufferSlots;
+    [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "CA2213", Justification = "Detached IO retains managed-only admission through shutdown.")]
+    private readonly SemaphoreSlim _hitSlot = new(1, 1);
     private readonly int _capacity;
     private readonly object _lifetimeGate = new();
     private Task _initialization = Task.CompletedTask;
@@ -22,6 +24,7 @@ public sealed class NativeCacheService : IAsyncDisposable
     private NativeCacheStore? _store;
     private string? _initializationError;
     private bool _disposed;
+    private int _revisionMetadataWarning;
     internal TimeSpan InitializationWait { get; set; } = TimeSpan.FromSeconds(1);
     internal Task InitializationCompletion => Task.WhenAll(_initialization, _cleanup);
 
@@ -41,7 +44,7 @@ public sealed class NativeCacheService : IAsyncDisposable
             if (!ActiveSettings.Folders.Any(folder => folder.Enabled))
                 throw new ArgumentException("Configure at least one enabled native cache folder.");
             _capacity = Math.Max(1, ActiveSettings.BufferMb / 4);
-            _bufferSlots = new SemaphoreSlim(_capacity, _capacity);
+            _bufferSlots = new SemaphoreSlim(Math.Max(1, _capacity - 1), _capacity);
             _initialization = Task.Run(() => InitializeStoreAsync(ActiveSettings, storeFactory));
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or SqliteException or ArgumentException)
@@ -57,7 +60,7 @@ public sealed class NativeCacheService : IAsyncDisposable
     public string? InitializationError => Volatile.Read(ref _initializationError);
     public bool InitializationPending => !_initialization.IsCompleted;
     public NativeCacheStore? Store => Volatile.Read(ref _store);
-    public long ReservedBufferBytes => _bufferSlots is null ? 0 : (_capacity - _bufferSlots.CurrentCount) * (long)NativeCacheStore.BlockSize;
+    public long ReservedBufferBytes => _bufferSlots is null ? 0 : (Math.Max(1, _capacity - 1) - _bufferSlots.CurrentCount + (_capacity > 1 ? 1 - _hitSlot.CurrentCount : 0)) * (long)NativeCacheStore.BlockSize;
 
     private async Task InitializeStoreAsync(NativeCacheSettings settings, Func<NativeCacheSettings, NativeCacheStore> factory)
     {
@@ -101,22 +104,31 @@ public sealed class NativeCacheService : IAsyncDisposable
         if (InitializationPending) await WaitForInitializationAsync(cancellationToken).ConfigureAwait(false);
         ObjectDisposedException.ThrowIf(_disposed, this);
         var store = Store;
-        if (store is null || _bufferSlots is null || item.FileBlobId is not { } blobId || item.FileSize is not > 0
-            || !_bufferSlots.Wait(0))
+        if (store is null || _bufferSlots is null || item.FileBlobId is not { } blobId || item.FileSize is not > 0)
         {
             if (requireNative) throw new InvalidOperationException("Native cache admission is unavailable; no source bytes were requested.");
             return await open(cancellationToken).ConfigureAwait(false);
         }
 
+        var admitted = _bufferSlots.Wait(0);
+        if (!admitted && requireNative)
+            throw new InvalidOperationException("Native cache admission is unavailable; no source bytes were requested.");
         var watch = ContentRevisionTracker.Watch(blobId);
-        AdmissionLease? admission = new(_bufferSlots, watch);
+        IDisposable? admission = admitted ? new AdmissionLease(_bufferSlots, watch) : watch;
         try
         {
             var current = await GetCurrentIdentityAsync(item, blobId, watch, cancellationToken).ConfigureAwait(false);
             if (current is { } cached)
             {
+                if (!admitted)
+                {
+                    var overflow = new NativeCacheOverflowStream(store, cached.Identity, open,
+                        () => watch.IsCurrent && cached.Revision.IsCurrent, watch, _capacity > 1 ? _hitSlot : _bufferSlots, Statistics);
+                    admission = null;
+                    return overflow;
+                }
                 var stream = new NativeCachedStream(store, cached.Identity, open,
-                    () => watch.IsCurrent && cached.Revision.IsCurrent, admission, background: requireNative, statistics: Statistics);
+                    () => watch.IsCurrent && cached.Revision.IsCurrent, admission, background: requireNative, statistics: Statistics, writeBehind: true);
                 admission = null; // The returned stream owns the watch and buffer admission.
                 return stream;
             }
@@ -130,6 +142,30 @@ public sealed class NativeCacheService : IAsyncDisposable
         finally { admission?.Dispose(); }
         if (requireNative) throw new InvalidOperationException("Native cache metadata is unavailable; no source bytes were requested.");
         return await open(cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<DateTime> GetLastModifiedAsync(DavItem item, CancellationToken ct)
+    {
+        try { return await GetRevisionModifiedAsync(item, ct).ConfigureAwait(false); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or SqliteException
+            or NzbWebDAV.Exceptions.CorruptedBlobPayloadException)
+        {
+            if (Interlocked.Exchange(ref _revisionMetadataWarning, 1) == 0)
+                Log.Warning("Native revision metadata is unavailable; clients will revalidate source content. Reason: {Reason}", exception.GetType().Name);
+            return DateTime.UtcNow;
+        }
+    }
+
+    private async Task<DateTime> GetRevisionModifiedAsync(DavItem item, CancellationToken ct)
+    {
+        if (InitializationPending) await WaitForInitializationAsync(ct).ConfigureAwait(false);
+        if (Store is not { } store || item.FileBlobId is not { } blobId) return item.CreatedAt;
+        using var watch = ContentRevisionTracker.Watch(blobId);
+        var current = await GetCurrentIdentityAsync(item, blobId, watch, ct).ConfigureAwait(false);
+        if (current is not { } cached) return item.CreatedAt;
+        if (!watch.IsCurrent || !cached.Revision.IsCurrent) throw new IOException("Media revision is changing; retry metadata refresh.");
+        return await store.ModificationTimeAsync(item.Id.ToString("N"),
+            cached.Identity.Generation, item.CreatedAt, ct).ConfigureAwait(false);
     }
 
     public async Task<int?> GetCurrentCoverageAsync(DavItem item, CancellationToken cancellationToken = default)

@@ -22,6 +22,61 @@ public sealed class NativeCacheServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task LastModified_ChangesForSameSizeRepair_AndSurvivesRestart()
+    {
+        using var blobs = new FileBlobStore();
+        var blobId = Guid.NewGuid();
+        await blobs.WriteBlob(blobId, new DavNzbFile { Id = blobId, SegmentIds = ["movie-segment"] });
+        var item = new DavItem { Id = Guid.NewGuid(), Name = "movie", FileSize = 3, FileBlobId = blobId,
+            SubType = DavItem.ItemSubType.NzbFile, CreatedAt = new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc) };
+        using var repair = new RepairPatchStore(Path.Combine(_root, "patches"), 100);
+        DateTime changed;
+        await using (var service = new NativeCacheService(Config("native"), blobs, repair))
+        {
+            Assert.True(await service.WaitForInitializationAsync());
+            var initial = await service.GetLastModifiedAsync(item, CancellationToken.None);
+            Assert.True(initial > item.CreatedAt);
+            repair.CommitPatch("movie-segment", [4, 5, 6], new UsenetSharp.Models.UsenetYencHeader
+            {
+                FileName = "movie", FileSize = 3, PartSize = 3, PartOffset = 0, PartNumber = 1, TotalParts = 1, LineLength = 128
+            });
+            changed = await service.GetLastModifiedAsync(item, CancellationToken.None);
+            Assert.True(changed > initial);
+            Assert.Equal(changed, await service.GetLastModifiedAsync(item, CancellationToken.None));
+            await service.Store!.EvictAsync("media", clear: true);
+            Assert.Equal(changed, await service.GetLastModifiedAsync(item, CancellationToken.None));
+        }
+        await using var reopened = new NativeCacheService(Config("native"), blobs, repair);
+        Assert.True(await reopened.WaitForInitializationAsync());
+        Assert.Equal(changed, await reopened.GetLastModifiedAsync(item, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task SaturatedStreams_StillServeCachedBytesWithoutOpeningSource()
+    {
+        using var blobs = new FileBlobStore();
+        var blobId = Guid.NewGuid();
+        await blobs.WriteBlob(blobId, new DavNzbFile { Id = blobId, SegmentIds = ["segment"] });
+        var item = new DavItem { Id = Guid.NewGuid(), Name = "movie", FileSize = 3, FileBlobId = blobId, SubType = DavItem.ItemSubType.NzbFile };
+        using var repair = new RepairPatchStore(Path.Combine(_root, "patches"), 100);
+        await using var service = new NativeCacheService(Config("native"), blobs, repair);
+        await using (var seed = await service.WrapAsync(item, _ => Task.FromResult<Stream>(new VerifiedStream()), CancellationToken.None))
+            Assert.Equal(3, await seed.ReadAsync(new byte[3]));
+        var streams = new List<Stream>();
+        try
+        {
+            for (var i = 0; i < 20; i++) streams.Add(await service.WrapAsync(item,
+                _ => throw new InvalidOperationException("Cache hit opened source"), CancellationToken.None));
+            foreach (var stream in streams) Assert.Equal(3, await stream.ReadAsync(new byte[3]));
+            foreach (var stream in streams.Where(stream => stream is NativeCachedStream)) await stream.DisposeAsync();
+            Assert.Equal(0, await service.Store!.EvictAsync("media", clear: true));
+            Assert.True(service.ReservedBufferBytes <= service.ActiveSettings!.BufferMb * 1024L * 1024);
+        }
+        finally { foreach (var stream in streams) await stream.DisposeAsync(); }
+        Assert.Equal(0, service.ReservedBufferBytes);
+    }
+
+    [Fact]
     public async Task NativeBufferBudget_IsIncludedInMemoryOwnershipSnapshot()
     {
         using var blobs = new FileBlobStore();
