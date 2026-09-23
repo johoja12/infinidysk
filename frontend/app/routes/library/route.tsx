@@ -1,10 +1,10 @@
 import type { Route } from "./+types/route";
 import { useCallback, useState } from "react";
-import { Form, Link, useFetcher, useSearchParams } from "react-router";
+import { Form, Link, useFetcher, useNavigation, useSearchParams } from "react-router";
 import {
   backendClient,
   type LibraryCatalogItem,
-  type LibraryCatalogResponse,
+  type LibraryBrowseResponse,
   type LibraryFileDetails,
 } from "~/clients/backend-client.server";
 import { getDownloadKey } from "~/auth/downloads.server";
@@ -19,8 +19,8 @@ const PAGE_SIZE_OPTIONS = [25, 50, 100] as const;
 const DEFAULT_PAGE_SIZE = 25;
 
 export type LibraryPageData = {
-  query: { q: string; type: string; sort: string; dir: string; page: number; pageSize: number };
-  catalog: LibraryCatalogResponse;
+  query: { q: string; type: string; page: number; pageSize: number };
+  catalog: LibraryBrowseResponse;
   downloadKeys: Record<string, string>;
   previewUrls: Record<string, string>;
   nativeCacheActive: boolean;
@@ -28,14 +28,6 @@ export type LibraryPageData = {
 
 function parseType(value: string | null) {
   return value === "internal" || value === "external" || value === "broken" ? value : "all";
-}
-
-function parseSort(value: string | null) {
-  return value === "size" || value === "mappings" ? value : "name";
-}
-
-function parseDir(value: string | null) {
-  return value === "desc" ? "desc" : "asc";
 }
 
 function parsePage(value: string | null): number {
@@ -53,23 +45,19 @@ export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPage
   const query = {
     q: url.searchParams.get("q")?.trim() ?? "",
     type: parseType(url.searchParams.get("type")),
-    sort: parseSort(url.searchParams.get("sort")),
-    dir: parseDir(url.searchParams.get("dir")),
     page: parsePage(url.searchParams.get("page")),
     pageSize: parsePageSize(url.searchParams.get("pageSize")),
   };
-  const catalog = await backendClient.getLibraryCatalog({
+  const catalog = await backendClient.getLibraryBrowse({
     ...(query.q ? { q: query.q } : {}),
     type: query.type as "all" | "internal" | "external" | "broken",
-    sort: query.sort as "name" | "size" | "mappings",
-    dir: query.dir as "asc" | "desc",
     page: query.page,
     pageSize: query.pageSize,
   });
   const { frontendBackendApiKey } = getFrontendRuntimeConfig();
   const downloadKeys: Record<string, string> = {};
   const previewUrls: Record<string, string> = {};
-  for (const item of catalog.items) {
+  for (const item of catalog.groups.flatMap((group) => group.files.map((file) => file.item))) {
     if (item.kind === "internal" && item.contentPath && item.davItemId) {
       const relative = item.contentPath.startsWith("/")
         ? item.contentPath.slice(1)
@@ -107,9 +95,10 @@ export async function action({ request }: Route.ActionArgs) {
 
 export default function Library({ loaderData }: Route.ComponentProps) {
   const [searchParams] = useSearchParams();
+  const navigation = useNavigation();
   const fetcher = useFetcher<{ status: boolean; error?: string }>();
   const { query, catalog, downloadKeys, previewUrls, nativeCacheActive } = loaderData;
-  const totalPages = Math.max(1, Math.ceil(catalog.totalCount / catalog.pageSize));
+  const totalPages = Math.max(1, Math.ceil(catalog.totalGroups / catalog.pageSize));
   const [selected, setSelected] = useState<LibraryCatalogItem | null>(null);
   const [details, setDetails] = useState<LibraryFileDetails | null>(null);
   const [detailsLoading, setDetailsLoading] = useState(false);
@@ -223,13 +212,25 @@ export default function Library({ loaderData }: Route.ComponentProps) {
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-4 py-8 md:px-6">
       <PageHeader
         title="Media Library"
-        subtitle="Read-only catalog of InfiniDysk media and its library symlinks."
+        subtitle="Browse indexed shows, movies, and unmatched files."
       />
+      {navigation.state !== "idle" ? <p role="status">Loading library groups…</p> : null}
       {catalog.indexWarning ? (
         <div className="alert alert-warning">
           <span>Library index may be stale: {catalog.indexWarning}</span>
         </div>
       ) : null}
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <SummaryCard label="Shows" value={catalog.showCount} />
+        <SummaryCard label="Movies" value={catalog.movieCount} />
+        <SummaryCard label="Unmatched groups" value={catalog.unmatchedCount} />
+        <SummaryCard label="Files in results" value={catalog.totalFiles} />
+      </div>
+      <div className="text-sm text-base-content/60">
+        {catalog.indexScannedAt
+          ? `Library index scanned ${new Date(catalog.indexScannedAt).toLocaleString()}`
+          : "Library index has not completed a scan yet; results may be incomplete."}
+      </div>
       <Form method="get" className="flex flex-wrap gap-2">
         <Input name="q" defaultValue={query.q} placeholder="Search title, content path, symlink…" />
         <select
@@ -244,45 +245,87 @@ export default function Library({ loaderData }: Route.ComponentProps) {
           <option value="broken">Broken</option>
         </select>
         <select
-          name="sort"
-          defaultValue={query.sort}
+          name="pageSize"
+          defaultValue={query.pageSize}
           className="select select-bordered"
-          aria-label="Sort"
+          aria-label="Groups per page"
         >
-          <option value="name">Name A–Z</option>
-          <option value="size">Size</option>
-          <option value="mappings">Mappings</option>
+          {PAGE_SIZE_OPTIONS.map((size) => (
+            <option key={size} value={size}>
+              {size} groups
+            </option>
+          ))}
         </select>
         <Button type="submit">Search</Button>
       </Form>
       <p className="text-sm text-base-content/60">
-        {catalog.totalCount} items · page {catalog.page} of {totalPages}
-        {catalog.indexScannedAt ? ` · index fresh as of ${catalog.indexScannedAt}` : null}
+        {catalog.totalGroups} groups · {catalog.totalFiles} files · page {catalog.page} of{" "}
+        {totalPages}
       </p>
-      <div className="overflow-x-auto">
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>Location</th>
-              <th>Size</th>
-              <th>Mappings</th>
-              <th>State</th>
-            </tr>
-          </thead>
-          <tbody>
-            {catalog.items.map((item) => (
-              <CatalogRow
-                key={item.davItemId ?? item.displayName}
-                item={item}
-                downloadKeys={downloadKeys}
-                search={searchParams.toString()}
-                onOpen={() => openModal(item)}
-              />
-            ))}
-          </tbody>
-        </table>
-      </div>
+      {catalog.groups.length === 0 ? (
+        <div className="rounded-xl border border-base-300 p-8 text-center text-base-content/60">
+          {query.q || query.type !== "all"
+            ? "No files match this search and filter."
+            : "No indexed media yet. Check the Library Directory in Settings and wait for its first scan."}
+        </div>
+      ) : (
+        catalog.groups.map((group) => (
+          <details
+            key={group.key}
+            className="group rounded-xl border border-base-300 bg-base-200/40"
+            open={catalog.groups.length === 1}
+          >
+            <summary className="flex cursor-pointer list-none flex-wrap items-center gap-3 p-4 marker:hidden md:p-5">
+              <span className="material-symbols-outlined text-primary" aria-hidden="true">
+                {group.kind === "show" ? "tv" : group.kind === "movie" ? "movie" : "folder_off"}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-base font-semibold">{group.name}</span>
+              <Badge>
+                {group.kind === "show" ? "TV show" : group.kind === "movie" ? "Movie" : "Unmatched"}
+              </Badge>
+              <span className="text-xs text-base-content/60">
+                {group.fileCount} files · {group.mappingCount} mappings ·{" "}
+                {formatFileSize(group.totalSize)}
+              </span>
+              {group.attentionCount > 0 ? (
+                <Badge>{group.attentionCount} need attention</Badge>
+              ) : null}
+              <span
+                className="material-symbols-outlined transition-transform group-open:rotate-180"
+                aria-hidden="true"
+              >
+                expand_more
+              </span>
+            </summary>
+            <div className="border-t border-base-300 p-3 md:p-4">
+              <div className="overflow-x-auto">
+                <table className="table table-sm">
+                  <thead>
+                    <tr>
+                      <th>File</th>
+                      <th>Size</th>
+                      <th>Mappings</th>
+                      <th>Health</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {group.files.map(({ item, episodeLabel }) => (
+                      <CatalogRow
+                        key={item.davItemId ?? item.displayName}
+                        item={item}
+                        episodeLabel={episodeLabel}
+                        downloadKeys={downloadKeys}
+                        search={searchParams.toString()}
+                        onOpen={() => openModal(item)}
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </details>
+        ))
+      )}
       <nav className="join" aria-label="Pagination">
         {query.page > 1 ? (
           <Link className="btn join-item" to={`?${withPage(searchParams, query.page - 1)}`}>
@@ -361,13 +404,24 @@ function withPage(params: URLSearchParams, page: number): string {
   return next.toString();
 }
 
+function SummaryCard({ label, value }: { label: string; value: number }) {
+  return (
+    <div className="rounded-xl border border-base-300 bg-base-200/50 p-4">
+      <div className="text-2xl font-semibold tabular-nums">{value.toLocaleString()}</div>
+      <div className="text-xs text-base-content/60">{label}</div>
+    </div>
+  );
+}
+
 function CatalogRow({
   item,
+  episodeLabel,
   downloadKeys,
   search,
   onOpen,
 }: {
   item: LibraryCatalogItem;
+  episodeLabel: string | null;
   downloadKeys: Record<string, string>;
   search: string;
   onOpen: () => void;
@@ -377,6 +431,9 @@ function CatalogRow({
       <tr>
         <td>
           <button type="button" className="link text-left" aria-haspopup="dialog" onClick={onOpen}>
+            {episodeLabel ? (
+              <span className="mr-2 font-mono text-xs text-base-content/60">{episodeLabel}</span>
+            ) : null}
             {item.displayName}
           </button>
         </td>
@@ -390,7 +447,7 @@ function CatalogRow({
         </td>
       </tr>
       <tr>
-        <td colSpan={5}>
+        <td colSpan={4}>
           <details>
             <summary>{item.mappingCount} mapping(s) — expand to inspect</summary>
             <ul className="mt-2 flex flex-col gap-1">

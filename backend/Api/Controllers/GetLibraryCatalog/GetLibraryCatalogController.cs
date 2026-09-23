@@ -14,6 +14,24 @@ public class GetLibraryCatalogController(DavDatabaseClient dbClient) : GetOnlyAp
         var request = new GetLibraryCatalogRequest(HttpContext);
         var scanner = HttpContext.RequestServices.GetService<LibraryCatalogScanner>();
         var service = new LibraryCatalogService(dbClient.Ctx);
+        if (request.Grouped)
+        {
+            var browse = await service.BrowseAsync(request.Query, scanner, request.CancellationToken)
+                .ConfigureAwait(false);
+            return Ok(new
+            {
+                browse.Groups,
+                browse.TotalGroups,
+                browse.TotalFiles,
+                browse.ShowCount,
+                browse.MovieCount,
+                browse.UnmatchedCount,
+                browse.Page,
+                browse.PageSize,
+                browse.IndexScannedAt,
+                browse.IndexWarning,
+            });
+        }
         var result = await service
             .QueryAsync(request.Query, scanner, request.CancellationToken)
             .ConfigureAwait(false);

@@ -13,6 +13,7 @@ public class GetLibraryCatalogRequest
         new(StringComparer.OrdinalIgnoreCase) { "name", "size", "mappings" };
 
     public LibraryCatalogQuery Query { get; init; }
+    public bool Grouped { get; init; }
     public CancellationToken CancellationToken { get; init; }
 
     public GetLibraryCatalogRequest(HttpContext context)
@@ -35,6 +36,7 @@ public class GetLibraryCatalogRequest
         if (dir is not ("asc" or "desc")) errors.Add("dir", "Invalid dir parameter.");
 
         var search = context.GetQueryParam("q");
+        Grouped = string.Equals(context.GetQueryParam("view"), "groups", StringComparison.OrdinalIgnoreCase);
         if (search is { Length: > 200 }) errors.Add("q", "Search query is too long.");
         errors.ThrowIfAny();
 

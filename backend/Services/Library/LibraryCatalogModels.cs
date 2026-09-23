@@ -33,3 +33,27 @@ public sealed record LibraryCatalogResult(
     int PageSize,
     DateTimeOffset? IndexScannedAt,
     string? IndexWarning);
+
+public sealed record LibraryBrowseFile(LibraryCatalogItemDto Item, string? EpisodeLabel);
+
+public sealed record LibraryBrowseGroup(
+    string Key,
+    string Kind,
+    string Name,
+    IReadOnlyList<LibraryBrowseFile> Files,
+    int FileCount,
+    int MappingCount,
+    long TotalSize,
+    int AttentionCount);
+
+public sealed record LibraryBrowseResult(
+    IReadOnlyList<LibraryBrowseGroup> Groups,
+    int TotalGroups,
+    int TotalFiles,
+    int ShowCount,
+    int MovieCount,
+    int UnmatchedCount,
+    int Page,
+    int PageSize,
+    DateTimeOffset? IndexScannedAt,
+    string? IndexWarning);

@@ -2,9 +2,15 @@
 
 The **Media Library** page (`/library`) is a read-only catalog of your InfiniDysk media and the library symlinks that point at it.
 
-Each row is one media item (deduplicated by its stable InfiniDysk identity) with its symlink mappings nested underneath. Links that resolve to InfiniDysk `/.ids/...` targets are marked **internal** and can be opened for streaming; all other symlinks are marked **external** and are inspection-only.
+## Grouped browse [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
 
-Use the search box to match titles, content paths, symlink paths, or targets. Filter by mapping type (internal / external / broken) and sort by name, size, or mapping count. The header shows when the library index was last refreshed; a warning appears when the scan is stale or the library directory is unavailable.
+The page groups recognized `TV`, `TV Shows`, `Shows`, `Series`, `Movies`, and `Films` library paths by show or movie. Paths without a recognizable folder, plus external-only links, stay under **Unmatched**. The page does not infer metadata from filenames or contact Plex.
+
+Expand a group to see its real files. Each file is deduplicated by its stable InfiniDysk identity and keeps every mapping inspectable. Recognizable `S01E02` patterns in file paths appear as episode labels. Links that resolve to InfiniDysk `/.ids/...` targets are marked **internal** and can be opened for streaming; all other symlinks are marked **external** and are inspection-only.
+
+Use the search box to match group names, file names, content paths, symlink paths, or targets. Filter by mapping type (internal / external / broken). Filtering and counts cover the full index before groups are paginated. The header shows when the library index was last scanned; a warning appears when the scan is stale or the library directory is unavailable. Counts describe indexed records only, not Plex sync, cache coverage, or missing episodes.
+
+The grouped browse layout was added without a new setting. The setup wizard needs no change because it already collects the Library Directory for installations that use an organized library.
 
 ## File details modal [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
 

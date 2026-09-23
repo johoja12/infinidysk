@@ -544,6 +544,22 @@ class BackendClient {
     );
   }
 
+  public async getLibraryBrowse(query: LibraryCatalogQuery = {}): Promise<LibraryBrowseResponse> {
+    const qs = new URLSearchParams({
+      view: "groups",
+      type: query.type ?? "all",
+      page: String(query.page ?? 1),
+      pageSize: String(query.pageSize ?? 25),
+    });
+    if (query.q) qs.set("q", query.q);
+    return await call<LibraryBrowseResponse>(
+      `${adminApi.libraryCatalog}?${qs.toString()}`,
+      "Failed to browse media library",
+      { method: "GET" },
+      libraryBrowseResponseSchema,
+    );
+  }
+
   public async getLibraryFileDetails(davItemId: string): Promise<LibraryFileDetails> {
     return await call<LibraryFileDetails>(
       `${adminApi.libraryFileDetails}?davItemId=${encodeURIComponent(davItemId)}`,
@@ -954,6 +970,34 @@ const libraryCatalogResponseSchema = z.object({
 export type LibraryCatalogMapping = z.infer<typeof libraryCatalogMappingSchema>;
 export type LibraryCatalogItem = z.infer<typeof libraryCatalogItemSchema>;
 export type LibraryCatalogResponse = z.infer<typeof libraryCatalogResponseSchema>;
+
+const libraryBrowseResponseSchema = z.object({
+  groups: z.array(
+    z.object({
+      key: z.string(),
+      kind: z.enum(["show", "movie", "unmatched"]),
+      name: z.string(),
+      files: z.array(
+        z.object({ item: libraryCatalogItemSchema, episodeLabel: z.string().nullable() }),
+      ),
+      fileCount: z.number().int(),
+      mappingCount: z.number().int(),
+      totalSize: z.number(),
+      attentionCount: z.number().int(),
+    }),
+  ),
+  totalGroups: z.number().int(),
+  totalFiles: z.number().int(),
+  showCount: z.number().int(),
+  movieCount: z.number().int(),
+  unmatchedCount: z.number().int(),
+  page: z.number().int(),
+  pageSize: z.number().int(),
+  indexScannedAt: z.string().nullable().optional(),
+  indexWarning: z.string().nullable().optional(),
+});
+
+export type LibraryBrowseResponse = z.infer<typeof libraryBrowseResponseSchema>;
 
 const libraryFileDetailsHealthSchema = z.object({
   result: z.string(),

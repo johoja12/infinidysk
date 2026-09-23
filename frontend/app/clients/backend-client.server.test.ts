@@ -237,6 +237,28 @@ describe("BackendClient", () => {
     expect(init?.headers).toEqual({ "x-api-key": "test-api-key" });
   });
 
+  it("gets grouped library results before pagination", async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse({
+        groups: [],
+        totalGroups: 0,
+        totalFiles: 0,
+        showCount: 0,
+        movieCount: 0,
+        unmatchedCount: 0,
+        page: 2,
+        pageSize: 25,
+      }),
+    );
+
+    await expect(
+      backendClient.getLibraryBrowse({ q: "dune", type: "broken", page: 2 }),
+    ).resolves.toMatchObject({ totalGroups: 0, page: 2 });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "http://backend/api/get-library-catalog?view=groups&type=broken&page=2&pageSize=25&q=dune",
+    );
+  });
+
   it("adds an NZB using the configured manual category", async () => {
     fetchMock
       .mockResolvedValueOnce(

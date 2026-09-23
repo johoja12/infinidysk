@@ -1,3 +1,4 @@
+using System.Text.RegularExpressions;
 using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models;
@@ -12,6 +13,107 @@ namespace NzbWebDAV.Services.Library;
 /// </summary>
 public sealed class LibraryCatalogService(DavDatabaseContext context)
 {
+    private static readonly Regex EpisodePattern = new(
+        @"\bS(?<season>\d{1,2})[ ._-]*E(?<episode>\d{1,3})\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    public async Task<LibraryBrowseResult> BrowseAsync(
+        LibraryCatalogQuery query,
+        LibraryCatalogScanner? scanner = null,
+        CancellationToken ct = default)
+    {
+        var page = Math.Max(1, query.Page);
+        var pageSize = Math.Clamp(query.PageSize, 1, 100);
+        var items = await context.Items.AsNoTracking()
+            .Where(i => i.Type == DavItem.ItemType.UsenetFile && i.Path.StartsWith("/content/"))
+            .ToListAsync(ct).ConfigureAwait(false);
+        var maps = await context.LinkMaps.AsNoTracking().ToListAsync(ct).ConfigureAwait(false);
+        var byItem = maps.Where(m => m.DavItemId.HasValue)
+            .GroupBy(m => m.DavItemId!.Value)
+            .ToDictionary(g => g.Key, g => (IReadOnlyList<LibraryLinkMap>)g.OrderBy(m => m.LinkPath, StringComparer.OrdinalIgnoreCase).ToList());
+
+        var rows = new List<(LibraryCatalogItemDto Item, string Kind, string Name, string? Episode)>();
+        foreach (var item in items)
+        {
+            byItem.TryGetValue(item.Id, out var itemMaps);
+            itemMaps ??= [];
+            var dto = ToInternalDto(item, itemMaps);
+            if (!PassesTypeFilter(dto, query.TypeFilter)) continue;
+            var classifications = itemMaps.Select(m => Classify(m.LinkPath))
+                .Where(c => c.Kind != "unmatched")
+                .DistinctBy(c => $"{c.Kind}:{c.Name}", StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var classification = classifications.Count == 1
+                ? classifications[0] : (Kind: "unmatched", Name: "Unmatched");
+            rows.Add((dto, classification.Kind ?? "unmatched", classification.Name ?? "Unmatched",
+                classification.Kind == "show"
+                    ? itemMaps.Select(m => EpisodeLabel(m.LinkPath)).FirstOrDefault(label => label != null)
+                    : null));
+        }
+        foreach (var external in maps.Where(m => m.DavItemId == null)
+                     .GroupBy(m => m.LinkPath, StringComparer.Ordinal))
+        {
+            var dto = ToExternalDto(external.ToList());
+            if (PassesTypeFilter(dto, query.TypeFilter))
+                rows.Add((dto, "unmatched", "Unmatched", null));
+        }
+
+        var search = query.Search?.Trim();
+        if (!string.IsNullOrEmpty(search))
+        {
+            rows = rows.Where(row => row.Name.Contains(search, StringComparison.OrdinalIgnoreCase)
+                || row.Item.DisplayName.Contains(search, StringComparison.OrdinalIgnoreCase)
+                || (row.Item.ContentPath?.Contains(search, StringComparison.OrdinalIgnoreCase) ?? false)
+                || row.Item.Mappings.Any(m => m.LinkPath.Contains(search, StringComparison.OrdinalIgnoreCase)
+                    || m.TargetText.Contains(search, StringComparison.OrdinalIgnoreCase))).ToList();
+        }
+
+        var groups = rows.GroupBy(row => (row.Kind, Name: row.Name.ToUpperInvariant()))
+            .Select(g => new LibraryBrowseGroup(
+                $"{g.Key.Kind}:{g.Key.Name}", g.Key.Kind, g.First().Name,
+                g.OrderBy(row => row.Item.DisplayName, StringComparer.OrdinalIgnoreCase)
+                    .Select(row => new LibraryBrowseFile(row.Item, row.Episode)).ToList(),
+                g.Count(), g.Sum(row => row.Item.MappingCount),
+                g.Sum(row => row.Item.Size ?? 0),
+                g.Count(row => row.Item.Health == "attention")))
+            .ToList();
+        var showCount = groups.Count(g => g.Kind == "show");
+        var movieCount = groups.Count(g => g.Kind == "movie");
+        var unmatchedCount = groups.Count(g => g.Kind == "unmatched");
+        groups = groups.OrderBy(g => g.Kind == "show" ? 0 : g.Kind == "movie" ? 1 : 2)
+            .ThenBy(g => g.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        return new LibraryBrowseResult(
+            groups.Skip((page - 1) * pageSize).Take(pageSize).ToList(),
+            groups.Count, rows.Count, showCount, movieCount, unmatchedCount,
+            page, pageSize, scanner?.LastSuccessfulScanAt, scanner?.LastScanWarning);
+    }
+
+    private static (string? Kind, string? Name) Classify(string linkPath)
+    {
+        var parts = linkPath.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        for (var i = 0; i + 2 < parts.Length; i++)
+        {
+            var marker = parts[i].Trim().ToLowerInvariant();
+            var kind = marker switch
+            {
+                "tv" or "tv shows" or "shows" or "series" => "show",
+                "movies" or "films" => "movie",
+                _ => null,
+            };
+            if (kind != null && !string.IsNullOrWhiteSpace(parts[i + 1]))
+                return (kind, parts[i + 1].Trim());
+        }
+        return ("unmatched", "Unmatched");
+    }
+
+    private static string? EpisodeLabel(string linkPath)
+    {
+        var match = EpisodePattern.Match(Path.GetFileName(linkPath));
+        return match.Success
+            ? $"S{int.Parse(match.Groups["season"].Value):00}E{int.Parse(match.Groups["episode"].Value):00}"
+            : null;
+    }
+
     public async Task<LibraryCatalogResult> QueryAsync(
         LibraryCatalogQuery query,
         LibraryCatalogScanner? scanner = null,

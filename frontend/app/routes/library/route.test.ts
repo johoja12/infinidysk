@@ -9,7 +9,7 @@ vi.mock("~/clients/backend-client.server", async (importOriginal) => {
     ...actual,
     backendClient: {
       ...actual.backendClient,
-      getLibraryCatalog: vi.fn(),
+      getLibraryBrowse: vi.fn(),
       getNativeCacheStatus: vi.fn(),
     },
   };
@@ -19,8 +19,12 @@ beforeEach(() => {
   installFrontendRuntimeConfig({ frontendBackendApiKey: "test-api-key" });
   catalogMock().mockReset();
   catalogMock().mockResolvedValue({
-    items: [],
-    totalCount: 0,
+    groups: [],
+    totalGroups: 0,
+    totalFiles: 0,
+    showCount: 0,
+    movieCount: 0,
+    unmatchedCount: 0,
     page: 1,
     pageSize: 25,
   });
@@ -36,7 +40,7 @@ function requestFor(path: string): Request {
 // Fine here: the mock carries no `this` state.
 function catalogMock() {
   // eslint-disable-next-line @typescript-eslint/unbound-method
-  return vi.mocked(backendClient.getLibraryCatalog);
+  return vi.mocked(backendClient.getLibraryBrowse);
 }
 
 function nativeCacheMock() {
@@ -45,17 +49,15 @@ function nativeCacheMock() {
 }
 
 describe("library loader", () => {
-  it("passes search, filter, sort, and pagination to the catalog client", async () => {
+  it("passes search, filter, and pagination to the grouped catalog client", async () => {
     await loader({
-      request: requestFor("/library?q=dune&type=broken&sort=size&dir=desc&page=2"),
+      request: requestFor("/library?q=dune&type=broken&page=2"),
       params: {},
     } as never);
 
     expect(catalogMock()).toHaveBeenCalledWith({
       q: "dune",
       type: "broken",
-      sort: "size",
-      dir: "desc",
       page: 2,
       pageSize: 25,
     });
@@ -69,19 +71,37 @@ describe("library loader", () => {
 
   it("builds signed preview urls for internal rows", async () => {
     catalogMock().mockResolvedValue({
-      items: [
+      groups: [
         {
-          kind: "internal",
-          davItemId: "11111111-1111-1111-1111-111111111111",
-          displayName: "film.mkv",
-          contentPath: "/content/film.mkv",
-          size: 100,
+          key: "movie:FILM",
+          kind: "movie",
+          name: "Film",
+          fileCount: 1,
           mappingCount: 1,
-          health: "healthy",
-          mappings: [],
+          totalSize: 100,
+          attentionCount: 0,
+          files: [
+            {
+              episodeLabel: null,
+              item: {
+                kind: "internal",
+                davItemId: "11111111-1111-1111-1111-111111111111",
+                displayName: "film.mkv",
+                contentPath: "/content/film.mkv",
+                size: 100,
+                mappingCount: 1,
+                health: "healthy",
+                mappings: [],
+              },
+            },
+          ],
         },
       ],
-      totalCount: 1,
+      totalGroups: 1,
+      totalFiles: 1,
+      showCount: 0,
+      movieCount: 1,
+      unmatchedCount: 0,
       page: 1,
       pageSize: 25,
     });
