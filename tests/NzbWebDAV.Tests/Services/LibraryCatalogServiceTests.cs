@@ -64,6 +64,12 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
         var row = Assert.Single(result.Items, x => x.DavItemId == item.Id);
         Assert.Equal(2, row.Mappings.Count);
         Assert.Equal(100, row.Size);
+
+        var searched = await service.QueryAsync(new LibraryCatalogQuery
+        {
+            Search = "film.srt", Page = 1, PageSize = 25,
+        });
+        Assert.Equal(2, Assert.Single(searched.Items).Mappings.Count);
     }
 
     [Fact]
@@ -84,5 +90,103 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
         var row = Assert.Single(result.Items);
         Assert.Null(row.DavItemId);
         Assert.Equal("external", row.Kind);
+    }
+
+    [Fact]
+    public async Task Browse_GroupsAllEpisodesBeforePagination_AndPagesExpandedFiles()
+    {
+        for (var episode = 1; episode <= 60; episode++)
+        {
+            var item = DavItem.New(Guid.NewGuid(), DavItem.ContentFolder,
+                $"episode-{episode:00}.mkv", 100,
+                DavItem.ItemType.UsenetFile, DavItem.ItemSubType.NzbFile,
+                null, null, null, null);
+            _context.Items.Add(item);
+            _context.LinkMaps.Add(new LibraryLinkMap
+            {
+                Id = Guid.NewGuid(), DavItemId = item.Id,
+                LinkPath = $"tv/Example Show/Season 01/Example Show - S01E{episode:00}.mkv",
+                TargetText = $"/mnt/.ids/{item.Id}.mkv",
+                MappingType = LibraryMappingType.Internal,
+                Status = LibraryLinkStatus.Valid, LastSeenUtc = DateTime.UtcNow,
+            });
+        }
+        var other = DavItem.New(Guid.NewGuid(), DavItem.ContentFolder, "other.mkv", 100,
+            DavItem.ItemType.UsenetFile, DavItem.ItemSubType.NzbFile,
+            null, null, null, null);
+        _context.Items.Add(other);
+        _context.LinkMaps.Add(new LibraryLinkMap
+        {
+            Id = Guid.NewGuid(), DavItemId = other.Id,
+            LinkPath = "tv/Other Show/Season 01/Other Show - S01E01.mkv",
+            TargetText = $"/mnt/.ids/{other.Id}.mkv", MappingType = LibraryMappingType.Internal,
+            Status = LibraryLinkStatus.Valid, LastSeenUtc = DateTime.UtcNow,
+        });
+        await _context.SaveChangesAsync();
+        _context.ChangeTracker.Clear();
+
+        var service = new LibraryBrowseService(new LibraryCatalogService(_context));
+        var first = await service.QueryAsync(new LibraryBrowseQuery
+        {
+            Category = "shows", PageSize = 1, GroupKey = "shows/Example Show",
+        });
+
+        Assert.Equal(2, first.TotalGroups);
+        Assert.Equal(61, first.TotalItems);
+        Assert.Equal(60, first.Groups[0].ItemCount);
+        Assert.NotNull(first.ExpandedGroup);
+        Assert.Equal(60, first.ExpandedGroup.TotalItems);
+        Assert.Equal(50, first.ExpandedGroup.Items.Count);
+        Assert.Equal("S01E01", first.ExpandedGroup.Items[0].Episode);
+        Assert.Single(first.ExpandedGroup.Items[0].Item.Mappings);
+
+        var second = await service.QueryAsync(new LibraryBrowseQuery
+        {
+            Category = "shows", PageSize = 1, GroupKey = "shows/Example Show", GroupPage = 2,
+        });
+        Assert.Equal(10, second.ExpandedGroup!.Items.Count);
+        Assert.Equal("S01E51", second.ExpandedGroup.Items[0].Episode);
+    }
+
+    [Fact]
+    public async Task Browse_ClassifiesKnownMovieFolder_ButKeepsExternalAndUnknownVisible()
+    {
+        var film = DavItem.New(Guid.NewGuid(), DavItem.ContentFolder, "arrival.mkv", 100,
+            DavItem.ItemType.UsenetFile, DavItem.ItemSubType.NzbFile,
+            null, null, null, null);
+        _context.Items.Add(film);
+        _context.LinkMaps.AddRange(
+            new LibraryLinkMap
+            {
+                Id = Guid.NewGuid(), DavItemId = film.Id,
+                LinkPath = "Movies/Arrival (2016)/Arrival.mkv",
+                TargetText = $"/mnt/.ids/{film.Id}.mkv", MappingType = LibraryMappingType.Internal,
+                Status = LibraryLinkStatus.Valid, LastSeenUtc = DateTime.UtcNow,
+            },
+            new LibraryLinkMap
+            {
+                Id = Guid.NewGuid(), DavItemId = null,
+                LinkPath = "TV/External Show/Season 01/Episode.mkv",
+                TargetText = "/other/Episode.mkv", MappingType = LibraryMappingType.External,
+                Status = LibraryLinkStatus.Valid, LastSeenUtc = DateTime.UtcNow,
+            });
+        await _context.SaveChangesAsync();
+        _context.ChangeTracker.Clear();
+
+        var service = new LibraryBrowseService(new LibraryCatalogService(_context));
+        var movies = await service.QueryAsync(new LibraryBrowseQuery { Category = "movies" });
+        var movie = Assert.Single(movies.Groups);
+        Assert.Equal("Arrival (2016)", movie.Title);
+        Assert.Equal(2, movies.TotalItems);
+        Assert.Equal(1, movies.UnmatchedItems);
+
+        var unmatched = await service.QueryAsync(new LibraryBrowseQuery
+        {
+            Category = "unmatched", TypeFilter = "external",
+            Search = "External Show",
+        });
+        Assert.Single(unmatched.Groups);
+        Assert.Equal(1, unmatched.TotalItems);
+        Assert.Equal(1, unmatched.UnmatchedItems);
     }
 }

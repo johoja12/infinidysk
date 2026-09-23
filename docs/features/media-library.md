@@ -2,13 +2,19 @@
 
 The **Media Library** page (`/library`) is a read-only catalog of your InfiniDysk media and the library symlinks that point at it.
 
-Each row is one media item (deduplicated by its stable InfiniDysk identity) with its symlink mappings nested underneath. Links that resolve to InfiniDysk `/.ids/...` targets are marked **internal** and can be opened for streaming; all other symlinks are marked **external** and are inspection-only.
+Each file is one media item (deduplicated by its stable InfiniDysk identity) with its symlink mappings nested underneath. Links that resolve to InfiniDysk `/.ids/...` targets are marked **internal** and can be opened for streaming; all other symlinks are marked **external** and are inspection-only.
 
-Use the search box to match titles, content paths, symlink paths, or targets. Filter by mapping type (internal / external / broken) and sort by name, size, or mapping count. The header shows when the library index was last refreshed; a warning appears when the scan is stale or the library directory is unavailable.
+## Grouped browsing [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
+
+The **TV shows** and **Movies** tabs group files by recognized library symlink folders. Expand a group to see its files and their mappings; large groups have their own file pages, so episodes stay under the same show even when the full library spans many pages. The **Unmatched** tab keeps files without a reliable show or movie folder, including external-only links, visible without assigning a guessed title.
+
+Search matches file names, content paths, symlink paths, and targets across the full indexed catalog. The mapping filter includes internal, external, and broken links. Summary cards count indexed files, internal files with valid mappings, files needing attention, and unmatched files for the current search and mapping filter. The scan timestamp and any stale-index warning appear above the groups.
+
+These groups use library paths, not Plex metadata. The page does not claim Plex sync, missing-episode detection, analysis results, or cache coverage.
 
 ## File details modal [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
 
-Selecting a row opens a details modal without leaving the page. External items show their mappings only; internal items also offer actions:
+Selecting a file opens a details modal without leaving the page. External items show their mappings only; internal items also offer actions:
 
 - **Preview** plays the file in the built-in player; **Download** saves it directly.
 - **Run health check** queues all due health checks — not just this file.

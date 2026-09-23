@@ -492,6 +492,308 @@
         ],
         "type": "object"
       },
+      "LibraryBrowseExpandedGroupDto": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryBrowseFileDto"
+            },
+            "type": "array"
+          },
+          "key": {
+            "type": "string"
+          },
+          "page": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "pageSize": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "totalItems": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "key",
+          "page",
+          "pageSize",
+          "totalItems"
+        ],
+        "type": "object"
+      },
+      "LibraryBrowseFileDto": {
+        "properties": {
+          "episode": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "item": {
+            "$ref": "#/components/schemas/LibraryCatalogItemDto"
+          },
+          "season": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "episode",
+          "item",
+          "season"
+        ],
+        "type": "object"
+      },
+      "LibraryBrowseGroupDto": {
+        "properties": {
+          "attentionCount": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "category": {
+            "type": "string"
+          },
+          "healthyCount": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "itemCount": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "key": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "attentionCount",
+          "category",
+          "healthyCount",
+          "itemCount",
+          "key",
+          "title"
+        ],
+        "type": "object"
+      },
+      "LibraryBrowseResult": {
+        "properties": {
+          "attentionItems": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "expandedGroup": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LibraryBrowseExpandedGroupDto"
+              }
+            ]
+          },
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryBrowseGroupDto"
+            },
+            "type": "array"
+          },
+          "healthyItems": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "indexScannedAt": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "indexWarning": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "page": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "pageSize": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "totalGroups": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "totalItems": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "unmatchedItems": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "attentionItems",
+          "expandedGroup",
+          "groups",
+          "healthyItems",
+          "indexScannedAt",
+          "indexWarning",
+          "page",
+          "pageSize",
+          "totalGroups",
+          "totalItems",
+          "unmatchedItems"
+        ],
+        "type": "object"
+      },
+      "LibraryCatalogItemDto": {
+        "properties": {
+          "contentPath": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "davItemId": {
+            "format": "uuid",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "displayName": {
+            "type": "string"
+          },
+          "health": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "mappingCount": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "mappings": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryCatalogMappingDto"
+            },
+            "type": "array"
+          },
+          "size": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "contentPath",
+          "davItemId",
+          "displayName",
+          "health",
+          "kind",
+          "mappingCount",
+          "mappings",
+          "size"
+        ],
+        "type": "object"
+      },
+      "LibraryCatalogMappingDto": {
+        "properties": {
+          "linkPath": {
+            "type": "string"
+          },
+          "mappingType": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "targetText": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "linkPath",
+          "mappingType",
+          "status",
+          "targetText"
+        ],
+        "type": "object"
+      },
       "MemoryActivitySnapshot": {
         "properties": {
           "activeReads": {
@@ -3752,6 +4054,97 @@
         "summary": "Get Health Check Queue",
         "tags": [
           "GetHealthCheckQueue"
+        ]
+      }
+    },
+    "/api/get-library-browse": {
+      "get": {
+        "operationId": "get-api-get-library-browse",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryBrowseResult"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryBrowseResult"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/LibraryBrowseResult"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Bad request."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized."
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Forbidden."
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not found."
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conflict."
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected server error. Detail is sanitized; use traceId."
+          }
+        },
+        "summary": "Get Library Browse",
+        "tags": [
+          "GetLibraryBrowse"
         ]
       }
     },
@@ -14112,6 +14505,9 @@
     },
     {
       "name": "GetLibraryCatalog"
+    },
+    {
+      "name": "GetLibraryBrowse"
     },
     {
       "name": "GetHealthCheckQueue"
