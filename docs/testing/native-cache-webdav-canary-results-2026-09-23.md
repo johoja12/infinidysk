@@ -1,6 +1,6 @@
-# Native Cache direct-WebDAV canary: isolated first pass
+# Native Cache direct-WebDAV canary results
 
-Date: 2026-09-23. Status: **partial pass; production canary pending**.
+Dates: 2026-09-23/24. Status: **test execution complete; two bugs tracked**.
 
 This run used the deployed `413ebdb9bef66ad1a975001d52eb4f278190025d`
 image (`sha256:afa926e93eb23ac56f5d58add5f37191e4dddde8caed58d3975f17dbe7c91cca`)
@@ -11,8 +11,10 @@ integrations, and repair were disabled in the test configuration. The cache
 folder reported Native mode, online, writable, and zero entries at baseline.
 The test containers were stopped and removed after the run. Their cloned
 database, configuration, cache contents, and test credentials were deleted.
-The redacted evidence JSON remains root-only at
-`nuc-1:/opt/infinidysk/canary/native-cache-20260923/evidence/`.
+The redacted first-pass evidence JSON remains root-only at
+`nuc-1:/opt/infinidysk/canary/native-cache-20260923/evidence/`. The second
+isolated pass and production evidence is at
+`nuc-1:/opt/infinidysk/canary/native-cache-20260923-r2/evidence/`.
 
 ## Selected media
 
@@ -38,8 +40,8 @@ current `v2` generations and SHA-256 cache keys in the private evidence bundle.
   remained. A shorter, fully buffered response did not retain the lease long
   enough for this test, so the long response is the meaningful result.
 - With the disposable folder configured read-only, eviction returned `400` and
-  both target and neighboring entries remained. An offline-storage fault and
-  the browser confirmation dialog were not exercised.
+  both target and neighboring entries remained. The offline-storage and UI
+  checks were completed in the second pass below.
 - A full `GET` of a small associated image returned `200`, delivered all
   289,675 declared bytes, and reached 289,675 verified bytes (100%). This
   validates full-file handling for a small object, not a full media stream.
@@ -69,19 +71,54 @@ of video and audio per position and exited successfully for B at the start,
 3 minutes, and 10 minutes; C at the start, 3 minutes, 46 minutes, and 94
 minutes; and A at the start and 45 minutes. C's start emitted non-monotonic
 DTS warnings, and A's late seek emitted an invalid audio packet warning.
-Those warnings were not traced to source media versus cache, so decoder
-cleanliness is not claimed. The HTTP request log and player stderr are in the
-private evidence bundle.
+The HTTP request log and player stderr are in the private evidence bundle.
+The second pass compared these warnings with Native Cache disabled.
 
-## Remaining gates
+## Second isolated pass
 
-1. Diagnose A's interrupted full transfer and complete a **full media** GET
-   with 100% verified coverage, exact byte count, and a warm replay hash. Do
-   this within a new provider-traffic budget; the first pass stopped rather
-   than forcing repeated whole-file downloads.
-2. Exercise the disposable offline-folder fault and the UI confirmation and
-   disabled-state checks. Recheck decoder warnings against the same source
-   without Native Cache if they recur.
-3. Only after the isolated pass meets the plan's criteria, run its bounded
-   production canary on the deployed image. This run did not evict or stream
-   through the production Native Cache.
+The second pass used the same deployed image and a fresh disposable database,
+configuration, and cache root. The operator approved up to 3 GB of additional
+provider traffic. All requests still used backend WebDAV without rclone.
+
+| File and phase | HTTP and coverage | Provider and replay result |
+| --- | --- | --- |
+| A, original AVI full GET | `200`; exactly 367,192,064 bytes delivered, but only 12,582,912 bytes verified after writes settled. | 702,458,545 provider bytes; the next 4 MiB range used another 31,789,694 provider bytes and did not increase coverage. [Bug #54](https://github.com/johoja12/infinidysk/issues/54). |
+| B, alternate full episode | `200`; all 765,578,092 bytes delivered and verified; range sum matched coverage. | 1,151,353,032 provider bytes cold. Complete replay matched SHA-256, produced 183 cache hits, and used zero provider bytes. |
+| D, separate half episode | `206`; exactly 566,231,040 bytes delivered; 570,425,344 bytes verified including one read-ahead block. | 809,437,629 provider bytes cold. A crossing range filled a missing block; replay hash matched with zero provider bytes. Range sum matched coverage. |
+| C, gapped movie | Separate 8 MiB head and tail `206` responses left the middle absent; a cold middle seek filled it. | Covered head and middle replays had matching hashes and zero provider bytes. Range sum matched coverage. |
+
+The folder-identity fault check replaced the disposable cache mount with an
+empty directory while preserving its catalogue. The folder reported offline;
+the exact-key eviction job failed and retained both target and neighbor.
+After restoring the original mount, both entries and their coverage returned,
+and a warm neighbor read used zero provider bytes.
+
+FFmpeg decoded five seconds at eleven positions across B, D, and C, including
+cached, cold, near-end, forward, and backward seeks. All sessions exited 0.
+C's timestamp warnings and A's late audio warning also occurred with Native
+Cache disabled, identifying them as source-media warnings rather than cache
+errors. A focused UI component test passed for the confirmation prompt and
+disabled eviction on pinned and read-only entries. A second component test
+reproduced a stale catalogue row after a completed eviction; see
+[Bug #55](https://github.com/johoja12/infinidysk/issues/55).
+
+## Bounded production canary
+
+On deployed image `413ebdb9`, Native mode and the selected folder were healthy,
+with no active maintenance jobs. A non-pinned B cache entry held 14,797,676
+verified bytes. Its exact-key eviction completed with `result: 1`; the
+neighboring C entry retained its key, ranges, and 34,138,610 verified bytes.
+The B source still answered `HEAD`, and a cold direct-WebDAV 4 MiB range
+returned `206` with the declared length. Reads then restored every previously
+cached B range. B returned to 14,797,676 verified bytes under the same key and
+generation; a warm replay matched the cold hash and used zero provider bytes.
+The production container remained healthy. No folder clear, rclone read, or
+source-file mutation was part of this canary.
+
+## Follow-ups
+
+- [Bug #54](https://github.com/johoja12/infinidysk/issues/54): investigate why
+  healthy multipart A delivers complete bytes but stops building verified
+  coverage after 12 MiB. The alternate full-file pass does not make A healthy.
+- [Bug #55](https://github.com/johoja12/infinidysk/issues/55): refresh an open
+  catalogue when file eviction completes so the removed row disappears.

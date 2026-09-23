@@ -1,8 +1,9 @@
 # Native Cache direct-WebDAV canary plan
 
-Status: isolated first pass started on 2026-09-23. See
-[the run results](native-cache-webdav-canary-results-2026-09-23.md) for passed
-checks, deviations, and remaining gates. No production canary has run.
+Status: isolated and bounded production canaries completed on 2026-09-23/24.
+See [the run results](native-cache-webdav-canary-results-2026-09-23.md) for
+passed checks and the two bugs found. One healthy multipart file did not reach
+full Native Cache coverage; its failure is tracked separately.
 
 ## Goal and scope
 
