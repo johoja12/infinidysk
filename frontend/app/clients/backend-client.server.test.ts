@@ -257,6 +257,13 @@ describe("BackendClient", () => {
         healthyItems: 1,
         attentionItems: 0,
         unmatchedItems: 0,
+        plexStatus: {
+          ready: true,
+          syncedAt: "2026-09-23T00:00:00Z",
+          entryCount: 1,
+          warning: null,
+          syncing: false,
+        },
         expandedGroup: { key: "shows/Example", page: 1, pageSize: 50, totalItems: 0, items: [] },
       }),
     );
@@ -269,6 +276,7 @@ describe("BackendClient", () => {
     });
 
     expect(result.groups[0]?.title).toBe("Example");
+    expect(result.plexStatus.ready).toBe(true);
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe(
       "http://backend/api/get-library-browse?q=Example&group=shows%2FExample&category=shows&type=internal&page=1&groupPage=1",
