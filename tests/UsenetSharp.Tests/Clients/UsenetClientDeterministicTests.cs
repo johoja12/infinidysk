@@ -2988,7 +2988,8 @@ public class UsenetClientDeterministicTests
         var continueBody = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         // Post-dispose payload exceeds the 8 KiB flush threshold so the pump discovers
         // the completed reader, switches to drain mode, then overflows the drain limit.
-        var postDisposeBurst = string.Concat(Enumerable.Repeat(new string('x', 126) + "\r\n", 700));
+        // Keep it small enough to fit in a loopback socket buffer on macOS.
+        var postDisposeBurst = string.Concat(Enumerable.Repeat(new string('x', 126) + "\r\n", 80));
         await using var server = new ScriptedNntpServer(async (command, writer, _) =>
         {
             if (command.Contains("bad@example.com", StringComparison.Ordinal))
