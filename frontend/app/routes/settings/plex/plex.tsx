@@ -31,13 +31,16 @@ export function PlexSettings() {
   const [selectedCandidateHandle, setSelectedCandidateHandle] = useState("");
   const [connections, setConnections] = useState<Record<string, string>>({});
   const polling = useRef(false);
+  const advancedServers = useRef<HTMLDetailsElement>(null);
   const loginGeneration = useRef(0);
+  const [verifiedServerId, setVerifiedServerId] = useState<string | null>(null);
   const refreshAccounts = async () =>
     setAccounts((await plexRequest<{ accounts: PlexAccount[] }>("accounts")).accounts);
   const refreshServers = async () => {
     const result = (await plexRequest<{ servers: PlexServer[] }>("servers")).servers;
     setServers(result);
     setSavedIds(result.map((server) => server.id));
+    setVerifiedServerId(null);
     publishPlexServers(result);
   };
   useEffect(() => {
@@ -105,16 +108,38 @@ export function PlexSettings() {
     const timer = setInterval(() => void checkLogin(), 2000);
     return () => clearInterval(timer);
   }, [state, checkLogin]);
-  const start = () =>
-    act(async () => {
-      loginGeneration.current++;
-      if (login) await plexRequest("login/cancel", { handle: login.handle });
-      setHomeUsers([]);
-      setCandidates([]);
-      setPin("");
-      setLogin(await plexRequest<PlexLogin>("login/start"));
-      setState("pending");
+  const start = () => {
+    // Open the tab during the click gesture so browsers do not block the Plex sign-in.
+    // The link shown in the pending state remains available when pop-ups are blocked.
+    let authWindow: Window | null = null;
+    try {
+      authWindow = globalThis.open?.("about:blank", "_blank") ?? null;
+      if (authWindow) authWindow.opener = null;
+    } catch {
+      // A sign-in link is shown below if the browser cannot open a tab.
+    }
+    return act(async () => {
+      try {
+        loginGeneration.current++;
+        if (login) await plexRequest("login/cancel", { handle: login.handle });
+        setHomeUsers([]);
+        setCandidates([]);
+        setPin("");
+        const next = await plexRequest<PlexLogin>("login/start");
+        setLogin(next);
+        setState("pending");
+        try {
+          authWindow?.location.replace(next.url);
+        } catch {
+          authWindow?.close();
+          // The visible sign-in link still lets the user finish authorization.
+        }
+      } catch (cause) {
+        authWindow?.close();
+        throw cause;
+      }
     });
+  };
   const select = (accountId: string) =>
     act(async () => {
       loginGeneration.current++;
@@ -131,6 +156,7 @@ export function PlexSettings() {
     });
     setServers(result.servers);
     setSavedIds(result.servers.map((server) => server.id));
+    setVerifiedServerId(null);
     publishPlexServers(result.servers);
     setMessage(successMessage);
   };
@@ -178,66 +204,96 @@ export function PlexSettings() {
       {message && <p role="status">{message}</p>}
       <SettingsCard
         icon="account_circle"
-        title="Plex accounts"
-        description="Optional advanced integration. Credentials stay on the server; this does not change your Plex libraries or enable warming."
+        title="Plex connection"
+        description="Connect an account, choose a server, then test it. Credentials stay on this server."
       >
         {!loaded ? (
           <p>Loading Plex settings…</p>
         ) : (
           <>
-            <div className="my-3 flex flex-wrap gap-2">
+            {accounts.length === 0 && (
+              <div className="rounded-lg border border-base-content/10 bg-base-200/30 p-4">
+                <p className="font-semibold">1. Sign in to Plex</p>
+                <p className="mt-1 text-sm text-base-content/60">
+                  Authorize InfiniDysk in a new tab, then return here to discover your servers.
+                </p>
+              </div>
+            )}
+            <div className="space-y-2">
               {accounts.map((account) => (
-                <Button
+                <div
                   key={account.id}
-                  type="button"
-                  disabled={busy}
-                  onClick={() => void select(account.id)}
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-base-content/10 bg-base-200/30 px-4 py-3"
                 >
-                  Use account {account.name}
-                </Button>
-              ))}
-            </div>
-            <ManagedSetting configKey="plex.accounts">
-              <Button type="button" disabled={busy} onClick={() => void start()}>
-                Sign in with Plex
-              </Button>
-              <p className="mt-2 text-xs">
-                Account changes save immediately, separately from General Apply.
-              </p>
-              {accounts.map((account) => (
-                <div key={account.id} className="my-3 flex flex-wrap items-center gap-2">
-                  <span>{account.name}</span>
-                  <Button type="button" disabled={busy} onClick={() => void start()}>
-                    Reconnect account {account.name}
-                  </Button>
-                  <Button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => {
-                      if (
-                        !globalThis.confirm(
-                          "Remove this saved account and disable its linked servers? Independent manually configured servers and cached files are retained. This does not revoke authorization at Plex. Unsaved server edits will reload.",
-                        )
-                      )
-                        return;
-                      void act(async () => {
-                        loginGeneration.current++;
-                        await plexRequest("account/disconnect", { accountId: account.id });
-                        setLogin(null);
-                        setState("idle");
-                        setCandidates([]);
-                        setHomeUsers([]);
-                        await refreshAccounts();
-                        await refreshServers();
-                      });
-                    }}
-                  >
-                    Disconnect account {account.name}
+                  <div>
+                    <p className="font-semibold">
+                      Connected to Plex{" "}
+                      <span className="badge badge-success badge-soft badge-sm ml-2">
+                        Connected
+                      </span>
+                    </p>
+                    <p className="text-sm text-base-content/60">{account.name} · Saved account</p>
+                  </div>
+                  <Button type="button" disabled={busy} onClick={() => void select(account.id)}>
+                    Use account {account.name}
                   </Button>
                 </div>
               ))}
+            </div>
+            <ManagedSetting configKey="plex.accounts">
+              <Button
+                type="button"
+                variant={accounts.length ? "outline" : "primary"}
+                disabled={busy}
+                onClick={() => void start()}
+              >
+                Sign in with Plex
+              </Button>
+              <p className="mt-2 text-xs text-base-content/60">
+                Account changes save immediately, separately from General Apply.
+              </p>
+              {accounts.map((account) => (
+                <details
+                  key={account.id}
+                  className="mt-3 rounded-lg border border-base-content/10 bg-base-200/30"
+                >
+                  <summary className="cursor-pointer px-3 py-2 text-sm font-semibold">
+                    Manage {account.name} account
+                  </summary>
+                  <div className="flex flex-wrap gap-2 border-t border-base-content/10 p-3">
+                    <Button type="button" disabled={busy} onClick={() => void start()}>
+                      Reconnect account {account.name}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="danger"
+                      disabled={busy}
+                      onClick={() => {
+                        if (
+                          !globalThis.confirm(
+                            "Remove this saved account and disable its linked servers? Independent manually configured servers and cached files are retained. This does not revoke authorization at Plex. Unsaved server edits will reload.",
+                          )
+                        )
+                          return;
+                        void act(async () => {
+                          loginGeneration.current++;
+                          await plexRequest("account/disconnect", { accountId: account.id });
+                          setLogin(null);
+                          setState("idle");
+                          setCandidates([]);
+                          setHomeUsers([]);
+                          await refreshAccounts();
+                          await refreshServers();
+                        });
+                      }}
+                    >
+                      Disconnect account {account.name}
+                    </Button>
+                  </div>
+                </details>
+              ))}
               {state === "pending" && login && (
-                <div className="my-3 space-y-2">
+                <div className="my-3 space-y-2 rounded-lg border border-primary/30 bg-primary/5 p-4">
                   <p>
                     Waiting for Plex authorization. Expires{" "}
                     {new Date(login.expiresAt).toLocaleTimeString()}.
@@ -274,91 +330,95 @@ export function PlexSettings() {
                 <p role="status">Sign-in failed. Sign in with Plex again to retry.</p>
               )}
               {state === "connected" && login && (
-                <div className="space-y-3">
-                  <p>Account ready for server discovery.</p>
-                  <Button
-                    type="button"
-                    disabled={busy}
-                    onClick={() =>
-                      void act(async () => {
-                        setHomeUsers(
-                          (
-                            await plexRequest<{ users: PlexHomeUser[] }>("home/users", {
-                              handle: login.handle,
-                            })
-                          ).users,
-                        );
-                        setHomeId("");
-                      })
-                    }
-                  >
-                    Load Plex Home users
-                  </Button>
-                  {homeUsers.length > 0 && (
-                    <>
-                      <label>
-                        Plex Home user
-                        <Select
-                          aria-label="Plex Home user"
-                          value={homeId}
-                          onChange={(event) => setHomeId(event.target.value)}
-                        >
-                          <option value="">Choose user</option>
-                          {homeUsers.map((user) => (
-                            <option key={user.id} value={user.id}>
-                              {user.name}
-                              {user.protected ? " (PIN protected)" : ""}
-                            </option>
-                          ))}
-                        </Select>
-                      </label>
-                      {homeUsers.find((user) => user.id === homeId)?.protected && (
+                <details className="mt-3 rounded-lg border border-base-content/10 bg-base-200/30">
+                  <summary className="cursor-pointer px-3 py-2 text-sm font-semibold">
+                    Plex Home users
+                  </summary>
+                  <div className="space-y-3 border-t border-base-content/10 p-3">
+                    <Button
+                      type="button"
+                      disabled={busy}
+                      onClick={() =>
+                        void act(async () => {
+                          setHomeUsers(
+                            (
+                              await plexRequest<{ users: PlexHomeUser[] }>("home/users", {
+                                handle: login.handle,
+                              })
+                            ).users,
+                          );
+                          setHomeId("");
+                        })
+                      }
+                    >
+                      Load Plex Home users
+                    </Button>
+                    {homeUsers.length > 0 && (
+                      <>
                         <label>
-                          Plex Home PIN
-                          <Input
-                            aria-label="Plex Home PIN"
-                            type="password"
-                            inputMode="numeric"
-                            autoComplete="off"
-                            maxLength={4}
-                            value={pin}
-                            onChange={(event) => setPin(event.target.value)}
-                          />
+                          Plex Home user
+                          <Select
+                            aria-label="Plex Home user"
+                            value={homeId}
+                            onChange={(event) => setHomeId(event.target.value)}
+                          >
+                            <option value="">Choose user</option>
+                            {homeUsers.map((user) => (
+                              <option key={user.id} value={user.id}>
+                                {user.name}
+                                {user.protected ? " (PIN protected)" : ""}
+                              </option>
+                            ))}
+                          </Select>
                         </label>
-                      )}
-                      <Button
-                        type="button"
-                        disabled={
-                          busy ||
-                          !homeId ||
-                          Boolean(
-                            homeUsers.find((user) => user.id === homeId)?.protected &&
-                            !/^\d{4}$/.test(pin),
-                          )
-                        }
-                        onClick={() =>
-                          void act(async () => {
-                            try {
-                              const switched = await plexRequest<{
-                                handle: string;
-                                expiresAt: string;
-                              }>("home/switch", { handle: login.handle, userId: homeId, pin });
-                              setLogin({ ...switched, url: "" });
-                              setCandidates([]);
-                              setHomeUsers([]);
-                              await refreshAccounts();
-                              setMessage("Plex Home user connected and saved.");
-                            } finally {
-                              setPin("");
-                            }
-                          })
-                        }
-                      >
-                        Switch Plex Home user
-                      </Button>
-                    </>
-                  )}
-                </div>
+                        {homeUsers.find((user) => user.id === homeId)?.protected && (
+                          <label>
+                            Plex Home PIN
+                            <Input
+                              aria-label="Plex Home PIN"
+                              type="password"
+                              inputMode="numeric"
+                              autoComplete="off"
+                              maxLength={4}
+                              value={pin}
+                              onChange={(event) => setPin(event.target.value)}
+                            />
+                          </label>
+                        )}
+                        <Button
+                          type="button"
+                          disabled={
+                            busy ||
+                            !homeId ||
+                            Boolean(
+                              homeUsers.find((user) => user.id === homeId)?.protected &&
+                              !/^\d{4}$/.test(pin),
+                            )
+                          }
+                          onClick={() =>
+                            void act(async () => {
+                              try {
+                                const switched = await plexRequest<{
+                                  handle: string;
+                                  expiresAt: string;
+                                }>("home/switch", { handle: login.handle, userId: homeId, pin });
+                                setLogin({ ...switched, url: "" });
+                                setCandidates([]);
+                                setHomeUsers([]);
+                                await refreshAccounts();
+                                setMessage("Plex Home user connected and saved.");
+                              } finally {
+                                setPin("");
+                              }
+                            })
+                          }
+                        >
+                          Switch Plex Home user
+                        </Button>
+                      </>
+                    )}
+                  </div>
+                </details>
               )}
             </ManagedSetting>
             <p className="text-xs text-base-content/60">
@@ -372,17 +432,90 @@ export function PlexSettings() {
       {loaded && (
         <SettingsCard
           icon="dns"
-          title="Plex servers and mappings"
-          description="Choose a tested server connection. Save here applies immediately without overwriting unrelated settings."
+          title="Plex servers"
+          description="Choose a connection address and test it. Server changes save here without General Apply."
         >
           <ManagedSetting configKey="plex.servers">
             {state === "connected" && login && (
-              <Button type="button" disabled={busy} onClick={() => void discover()}>
-                Discover Plex servers
+              <Button
+                type="button"
+                className="mb-5"
+                aria-label="Discover Plex servers"
+                disabled={busy}
+                onClick={() => void discover()}
+              >
+                {candidates.length ? "Refresh discovery" : "Discover Plex servers"}
               </Button>
             )}
+            {servers.length === 0 && candidates.length === 0 && (
+              <div className="rounded-lg border border-base-content/10 bg-base-200/30 p-4">
+                <p className="font-semibold">2. Choose a server</p>
+                <p className="mt-1 text-sm text-base-content/60">
+                  {accounts.length
+                    ? "Use a saved account, then discover its servers. Open Advanced server configuration to add one manually."
+                    : "Your servers will appear here after sign-in."}
+                </p>
+              </div>
+            )}
+            {servers.length > 0 && (
+              <div className="space-y-3">
+                {servers
+                  .filter((server) => savedIds.includes(server.id))
+                  .map((server) => (
+                    <div
+                      key={server.id}
+                      className="rounded-lg border border-base-content/10 bg-base-200/30 p-4"
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-4">
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <h3 className="font-semibold">{server.name || server.id}</h3>
+                            <span
+                              className={`badge badge-sm ${server.enabled ? "badge-success badge-soft" : "badge-ghost"}`}
+                            >
+                              {server.enabled ? "Enabled" : "Disabled"}
+                            </span>
+                            {verifiedServerId === server.id && (
+                              <span className="badge badge-success badge-soft badge-sm">
+                                Tested
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-xs text-base-content/60">Connection address</p>
+                          <p className="break-all text-sm font-medium">{server.url}</p>
+                        </div>
+                        <div className="flex flex-wrap gap-2">
+                          <Button
+                            type="button"
+                            disabled={busy}
+                            onClick={() =>
+                              void act(async () => {
+                                await plexRequest("test", { server: serverSaveRequest(server) });
+                                setVerifiedServerId(server.id);
+                                setMessage(
+                                  `${server.name || server.id} identity and authorization verified.`,
+                                );
+                              })
+                            }
+                          >
+                            Test server
+                          </Button>
+                          <Button
+                            type="button"
+                            onClick={() => {
+                              if (advancedServers.current) advancedServers.current.open = true;
+                            }}
+                          >
+                            Edit server &amp; paths
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+              </div>
+            )}
             {candidates.length > 0 && (
-              <div className="my-4 space-y-3">
+              <div className="mt-5 space-y-3">
                 <div className="flex items-center justify-between gap-3">
                   <h3 className="text-base font-semibold">Detected servers</h3>
                   <span className="badge badge-success badge-soft">{candidates.length} found</span>
@@ -454,7 +587,10 @@ export function PlexSettings() {
                 </div>
               </div>
             )}
-            <details className="collapse collapse-arrow border border-base-content/10 bg-base-200/40">
+            <details
+              ref={advancedServers}
+              className="collapse collapse-arrow mt-5 border border-base-content/10 bg-base-200/40"
+            >
               <summary className="collapse-title text-sm font-semibold">
                 Advanced server configuration
               </summary>
