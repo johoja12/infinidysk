@@ -80,6 +80,16 @@ playback result.
 
 ## Full-library recovery for orphan NZBs
 
+!!! warning "Mapped-only import gate"
+
+    The current full-library CLI inventories `.ids` symlinks but does not verify
+    each file against NzbDav's `LocalLinks` mapping table. Do not run the full
+    recovery, export, or batch submission commands below until the
+    [mapped-only production plan](../superpowers/plans/2026-09-24-nzbdav-full-library-import-runbook.md)
+    is implemented and its mapping checks pass. Only NZBs with at least one
+    verified mapped file may be submitted; mixed NZBs may be imported, but only
+    their mapped files receive parallel library links.
+
 Complete the canary first. Before running these commands, back up InfiniDysk
 `/config`, its database, the legacy PostgreSQL database, and the orphan blob tree.
 The full-batch ledger migration is additive and auto-applies when the upgraded
