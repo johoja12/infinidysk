@@ -13,7 +13,7 @@
 
 For HDD/NAS storage that mostly retains whole movies and episodes, choose **Native**.
 It stores one sparse final-media data file per source revision, with verified 4 MiB
-coverage and a local indexed catalogue. Completing a partially cached movie fills
+coverage and a local indexed catalogue. When its folder has capacity, completing a partially cached movie fills
 that same file; it does not assemble millions of article files into another copy.
 
 **Segment** remains useful for repeated article/range reads on fast local storage.
