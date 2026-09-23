@@ -180,7 +180,7 @@ public sealed class PlexLibraryMetadataService : BackgroundService, IPlexLibrary
                 if (!_config.IsMediaLibraryEnabled())
                 {
                     lastSyncFinishedAt = null;
-                    _ = _syncSignal.Wait(0);
+                    _ = _syncSignal.Wait(0, stoppingToken);
                     await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken).ConfigureAwait(false);
                     continue;
                 }
