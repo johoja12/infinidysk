@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ManagedEnvProvider } from "~/components/ui";
 import { PlexSources } from "../smart-prefetch/plex-sources";
 import { parsePrefetchSettings } from "../smart-prefetch/smart-prefetch-model";
@@ -35,12 +35,60 @@ function responses(extra: Record<string, unknown> = {}) {
       return Promise.resolve(new Response(JSON.stringify(data)));
     });
 }
+beforeEach(() =>
+  vi.stubGlobal(
+    "open",
+    vi.fn(() => null),
+  ),
+);
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
 });
 
 describe("Plex settings", () => {
+  it("opens the Plex authorization tab from the sign-in button and keeps a fallback link", async () => {
+    const replace = vi.fn();
+    vi.stubGlobal(
+      "open",
+      vi.fn(() => ({ opener: null, location: { replace }, close: vi.fn() })),
+    );
+    vi.stubGlobal("fetch", responses());
+    render(<PlexSettings />);
+    await userEvent.click(await screen.findByRole("button", { name: "Sign in with Plex" }));
+    expect(await screen.findByText("Open Plex sign-in")).toBeTruthy();
+    expect(replace).toHaveBeenCalledWith("https://app.plex.tv/auth#pin");
+  });
+
+  it("shows a saved server in a compact card with direct test and edit actions", async () => {
+    const fetcher = responses({
+      servers: {
+        servers: [
+          {
+            id: "machine",
+            name: "Home",
+            url: "http://home:32400",
+            token: "masked",
+            enabled: true,
+            pathMappings: [],
+          },
+        ],
+      },
+    });
+    vi.stubGlobal("fetch", fetcher);
+    render(<PlexSettings />);
+    expect(await screen.findByText("http://home:32400")).toBeTruthy();
+    const advanced = screen.getByText("Advanced server configuration").closest("details");
+    expect(advanced?.open).toBe(false);
+    await userEvent.click(screen.getByRole("button", { name: "Edit server & paths" }));
+    expect(advanced?.open).toBe(true);
+    await userEvent.click(screen.getByRole("button", { name: "Test server" }));
+    await screen.findByText("Home identity and authorization verified.");
+    expect(fetcher.mock.calls.some((call) => String(call[0]).endsWith("/api/plex/test"))).toBe(
+      true,
+    );
+  });
+
   it("makes a saved server available to Smart Prefetch without reloading", async () => {
     vi.stubGlobal("fetch", responses());
     render(
