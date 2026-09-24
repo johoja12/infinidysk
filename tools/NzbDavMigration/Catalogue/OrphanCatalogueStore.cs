@@ -61,6 +61,10 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
         var state = await ReadStateAsync(cancellationToken).ConfigureAwait(false);
         if (!string.Equals(state.Status, "complete", StringComparison.Ordinal))
             throw new InvalidOperationException("Recovery requires a sealed catalogue.");
+        // Older sealed catalogues lack this index. Build it once on the writable
+        // working copy before recovery starts; otherwise each exact match rereads
+        // the entire Articles table to load a single NZB's article sequence.
+        await EnsureBlobArticleIndexAsync(cancellationToken).ConfigureAwait(false);
         _complete = true;
     }
 
@@ -307,6 +311,7 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
         if (!string.Equals(state.InputDigest, summary.InputDigest, StringComparison.Ordinal))
             throw new InvalidOperationException("The summary input digest does not match the catalogue.");
         await FlushAsync(cancellationToken).ConfigureAwait(false);
+        await EnsureBlobArticleIndexAsync(cancellationToken).ConfigureAwait(false);
 
         var connection = RequireConnection();
         await using (var update = connection.CreateCommand())
@@ -376,6 +381,16 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
     {
         await using var command = RequireConnection().CreateCommand();
         command.CommandText = sql;
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task EnsureBlobArticleIndexAsync(CancellationToken cancellationToken)
+    {
+        await using var command = RequireConnection().CreateCommand();
+        command.CommandText = """
+            CREATE INDEX IF NOT EXISTS IX_Articles_BlobPath_Order
+            ON Articles(BlobPath,FileOrdinal,SegmentOrdinal,MessageId)
+            """;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 

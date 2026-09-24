@@ -147,6 +147,42 @@ public sealed class OrphanCatalogueStoreTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task OpenCompleted_AddsBlobArticleLookupIndexToOlderCatalogue()
+    {
+        var (database, summaryPath) = Paths();
+        await using (var store = new OrphanCatalogueStore(database, summaryPath))
+        {
+            await store.BeginAsync(Digest('a'));
+            await store.UpsertAsync(Blob("one.nzb", Digest('1'), "release-a", "one@test"));
+            await store.SealAsync(new OrphanCatalogueSummary(1, 1, 0, 1, Digest('a')));
+        }
+
+        await using (var legacy = new SqliteConnection($"Data Source={database}"))
+        {
+            await legacy.OpenAsync();
+            await using var drop = legacy.CreateCommand();
+            drop.CommandText = "DROP INDEX IX_Articles_BlobPath_Order";
+            await drop.ExecuteNonQueryAsync();
+        }
+
+        await using var reopened = new OrphanCatalogueStore(database, summaryPath);
+        await reopened.OpenCompletedAsync();
+        Assert.Equal("one@test", Assert.Single((await reopened.ReadBlobAsync("one.nzb"))!.Articles).MessageId);
+
+        await using var observer = new SqliteConnection($"Data Source={database};Mode=ReadOnly");
+        await observer.OpenAsync();
+        await using var plan = observer.CreateCommand();
+        plan.CommandText = """
+            EXPLAIN QUERY PLAN SELECT MessageId,FileOrdinal,SegmentOrdinal,SegmentBytes
+            FROM Articles WHERE BlobPath=$path ORDER BY FileOrdinal,SegmentOrdinal,MessageId
+            """;
+        plan.Parameters.AddWithValue("$path", "one.nzb");
+        await using var reader = await plan.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        Assert.Contains("IX_Articles_BlobPath_Order", reader.GetString(3), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task DatabaseAndSummary_ArePrivateOnLinux()
     {
         if (OperatingSystem.IsWindows()) return;
