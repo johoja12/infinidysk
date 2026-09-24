@@ -28,10 +28,22 @@ type PlexStatus = {
 const KEYS = [
   "media.library-enabled",
   "media.library-dir",
+  "media.library-scan-dirs",
   "media.library-scan-interval-minutes",
   "media.library-plex-server-ids",
 ];
 const INTERVALS = [5, 15, 30, 60, 360];
+
+export function parseScanDirectories(value: string): string[] {
+  try {
+    const paths: unknown = JSON.parse(value);
+    return Array.isArray(paths)
+      ? paths.filter((path): path is string => typeof path === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
 
 export function selectedPlexServerIds(value: string, servers: PlexServer[]): Set<string> {
   if (!value.trim())
@@ -53,6 +65,8 @@ export function LibrarySettings({ config, savedConfig, setNewConfig }: Props) {
   const [servers, setServers] = useState<PlexServer[]>([]);
   const [status, setStatus] = useState<PlexStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [directoryDraft, setDirectoryDraft] = useState("");
+  const [directoryError, setDirectoryError] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
     void Promise.all([
@@ -96,6 +110,33 @@ export function LibrarySettings({ config, savedConfig, setNewConfig }: Props) {
     config["media.library-plex-server-ids"] ?? "",
     enabledServers,
   );
+  const scanDirectories = parseScanDirectories(config["media.library-scan-dirs"] ?? "[]");
+  const addScanDirectory = () => {
+    const path = directoryDraft.trim().replace(/\/+$/, "");
+    if (
+      !path.startsWith("/") ||
+      path === "" ||
+      path === config["media.library-dir"]?.replace(/\/+$/, "")
+    ) {
+      setDirectoryError("Enter an absolute path different from the primary library directory.");
+      return;
+    }
+    if (scanDirectories.includes(path)) {
+      setDirectoryError("This directory is already in the scan list.");
+      return;
+    }
+    setNewConfig((current) => ({
+      ...current,
+      "media.library-scan-dirs": JSON.stringify([...scanDirectories, path]),
+    }));
+    setDirectoryDraft("");
+    setDirectoryError(null);
+  };
+  const removeScanDirectory = (path: string) =>
+    setNewConfig((current) => ({
+      ...current,
+      "media.library-scan-dirs": JSON.stringify(scanDirectories.filter((entry) => entry !== path)),
+    }));
   const sourcesHaveUnsavedChanges =
     config["media.library-plex-server-ids"] !== savedConfig["media.library-plex-server-ids"];
   const changeSource = (id: string, checked: boolean) => {
@@ -118,7 +159,7 @@ export function LibrarySettings({ config, savedConfig, setNewConfig }: Props) {
   return (
     <SettingsPage>
       <SettingsIntro>
-        Choose the library root and the Plex sources used to organize your catalog.
+        Choose the directories to scan and the Plex sources used to organize your catalog.
       </SettingsIntro>
       <SettingsCard
         icon="video_library"
@@ -170,9 +211,50 @@ export function LibrarySettings({ config, savedConfig, setNewConfig }: Props) {
                 }
               />
               <p className="text-xs text-base-content/60">
-                Path inside the InfiniDysk container to the parent of your Radarr and Sonarr root
-                folders. Changing it changes what appears in Media Library; existing files are not
-                moved.
+                Primary path inside the InfiniDysk container. It also remains the destination for
+                links created by InfiniDysk. Changing it does not move files.
+              </p>
+            </div>
+          </ManagedSetting>
+          <ManagedSetting configKey="media.library-scan-dirs">
+            <div className="space-y-3">
+              <label className="block text-sm font-medium" htmlFor="library-scan-dir-input">
+                Additional scan directories
+              </label>
+              {scanDirectories.map((path) => (
+                <div key={path} className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1 break-all rounded-lg bg-base-200/40 p-2 text-sm">
+                    {path}
+                  </span>
+                  <Button
+                    type="button"
+                    size="small"
+                    variant="outline"
+                    onClick={() => removeScanDirectory(path)}
+                  >
+                    Remove
+                  </Button>
+                </div>
+              ))}
+              <div className="flex flex-wrap gap-2">
+                <Input
+                  id="library-scan-dir-input"
+                  className="min-w-56 flex-1"
+                  placeholder="/mnt/special2"
+                  value={directoryDraft}
+                  onChange={(event) => {
+                    setDirectoryDraft(event.target.value);
+                    setDirectoryError(null);
+                  }}
+                />
+                <Button type="button" size="small" variant="outline" onClick={addScanDirectory}>
+                  Add directory
+                </Button>
+              </div>
+              {directoryError && <p className="text-xs text-error">{directoryError}</p>}
+              <p className="text-xs text-base-content/60">
+                Add mounted paths inside the container. These roots are scanned for symlinks and
+                STRM files only; InfiniDysk does not create links there. Save before scanning.
               </p>
             </div>
           </ManagedSetting>

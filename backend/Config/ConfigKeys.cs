@@ -107,6 +107,7 @@ public static class ConfigKeys
 
     // media / repair / arr
     public const string MediaLibraryDir = "media.library-dir";
+    public const string MediaLibraryScanDirs = "media.library-scan-dirs";
     public const string MediaLibraryEnabled = "media.library-enabled";
     public const string MediaLibraryScanIntervalMinutes = "media.library-scan-interval-minutes";
     public const string MediaLibraryPlexServerIds = "media.library-plex-server-ids";

@@ -154,6 +154,7 @@ const defaultConfig = {
   "rclone.pass": "",
   "rclone.mount-dir": "",
   "media.library-dir": "",
+  "media.library-scan-dirs": "[]",
   "media.library-enabled": "true",
   "media.library-scan-interval-minutes": "15",
   "media.library-plex-server-ids": "",

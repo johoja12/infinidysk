@@ -15,6 +15,7 @@ afterEach(() => {
 const initial = {
   "media.library-enabled": "true",
   "media.library-dir": "/mnt/media",
+  "media.library-scan-dirs": "[]",
   "media.library-scan-interval-minutes": "15",
   "media.library-plex-server-ids": "",
 };
@@ -74,5 +75,25 @@ describe("Media Library settings", () => {
       '"media.library-plex-server-ids":"[]"',
     );
     expect(screen.getByRole("button", { name: "Sync Plex now" }).matches(":disabled")).toBe(true);
+  });
+
+  it("adds and removes an additional scan directory", async () => {
+    plexRequest.mockResolvedValue({
+      servers: [],
+      ready: false,
+      syncedAt: null,
+      entryCount: 0,
+      warning: null,
+      syncing: false,
+    });
+    const user = userEvent.setup();
+    render(<Harness />);
+    await user.type(screen.getByLabelText("Additional scan directories"), "/mnt/special2");
+    await user.click(screen.getByRole("button", { name: "Add directory" }));
+    expect(screen.getByTestId("config").textContent).toContain(
+      '"media.library-scan-dirs":"[\\"/mnt/special2\\"]"',
+    );
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    expect(screen.getByTestId("config").textContent).toContain('"media.library-scan-dirs":"[]"');
   });
 });

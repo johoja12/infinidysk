@@ -487,6 +487,11 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 _ = MediaLibraryOptions.ParsePlexServerIds(item.ConfigValue);
                 continue;
             }
+            if (item.ConfigName == ConfigKeys.MediaLibraryScanDirs)
+            {
+                _ = MediaLibraryOptions.ParseScanDirectories(item.ConfigValue);
+                continue;
+            }
             if (item.ConfigName == ConfigKeys.MediaLibraryScanIntervalMinutes)
             {
                 if (!string.IsNullOrWhiteSpace(item.ConfigValue) &&
@@ -1037,6 +1042,9 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
     {
         return StringUtil.EmptyToNull(GetConfigValue(ConfigKeys.MediaLibraryDir));
     }
+
+    public IReadOnlyList<string> GetMediaLibraryScanDirs() =>
+        MediaLibraryOptions.ParseScanDirectories(GetConfigValue(ConfigKeys.MediaLibraryScanDirs));
 
     public bool IsMediaLibraryEnabled() =>
         !bool.TryParse(GetConfigValue(ConfigKeys.MediaLibraryEnabled), out var enabled) || enabled;
