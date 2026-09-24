@@ -201,9 +201,12 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
         }
 
         var recoveryRoot = Path.Join(_root, "recovery");
-        Assert.Equal(0, await NzbDavMigrationProgram.RunAsync(
-            ["recover-full", "--inventory", initialInventory, "--catalogue", catalogue,
-                "--output", recoveryRoot, "--minimum-coverage", "0.90"]));
+        await using (var store = new OrphanCatalogueStore(catalogue, catalogue + ".completion.json"))
+        {
+            await store.OpenCompletedAsync();
+            var recovery = await new LegacySourceRecovery().WriteAsync(candidates, store, recoveryRoot, 0.90m);
+            Assert.True(recovery.MeetsMinimumCoverage);
+        }
         var masterPath = Path.Join(recoveryRoot, "master-manifest.json");
         var master = System.Text.Json.JsonSerializer.Deserialize<FullRecoveryMasterManifest>(
             await File.ReadAllTextAsync(masterPath),
@@ -218,9 +221,41 @@ public sealed class NzbDavCanaryEndToEndTests : IDisposable
             master.Items.Single(item => item.LibraryRelativePath == "TV/Renamed Lazy.mkv").Classification);
 
         var batchesRoot = Path.Join(_root, "batches");
-        Assert.Equal(0, await NzbDavMigrationProgram.RunAsync(
-            ["export-batches", "--master", masterPath, "--blob-root", blobRoot,
-                "--output", batchesRoot, "--max-releases", "2", "--max-payload-bytes", "1048576"]));
+        var releases = master.Items.Where(item => item.Classification is "exact-direct" or "exact-archive")
+            .GroupBy(item => item.PayloadSha256, StringComparer.Ordinal)
+            .Select(group =>
+            {
+                var relativePath = group.First().SourceRelativePath!;
+                return new FullRecoveryRelease(group.Key!, group.Key!, relativePath,
+                    new FileInfo(Path.Join(blobRoot, relativePath)).Length, group.ToArray());
+            }).ToArray();
+        var batches = new BatchPackagePlanner().Partition(releases, 2, 1_048_576);
+        Directory.CreateDirectory(batchesRoot);
+        var masterDigest = Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            await File.ReadAllBytesAsync(masterPath))).ToLowerInvariant();
+        foreach (var batch in batches)
+        {
+            var exportReleases = batch.Releases.Select(release =>
+            {
+                var names = NzbDavSourceNameResolver.FromLegacyPaths(release.Items.Select(item => item.LegacyPath!));
+                var leaves = release.Items.Select(item => new NzbDavExportLeaf(
+                    item.LegacyDavItemId, item.LegacyPath!, item.FileSize!.Value,
+                    release.SourceReleaseId, null, null, item.IdentityKind!, item.IdentityDigest,
+                    "ready", null,
+                    item.Classification == "exact-archive" ? item.IdentityKind : null,
+                    item.Classification == "exact-archive" ? item.IdentityDigest : null)).ToArray();
+                return new CanaryExportRelease(release.SourceReleaseId, null,
+                    Path.Join(blobRoot, release.PayloadRelativePath), leaves,
+                    SourceFileName: names.FileName, SourceJobName: names.JobName);
+            }).ToArray();
+            var selected = batch.Releases.SelectMany(release => release.Items).Select(item =>
+                new NzbDavSelectedLibraryLink(item.LibraryRelativePath, item.OriginalTarget,
+                    item.LegacyDavItemId)).ToArray();
+            var request = new CanaryExportRequest($"fixture-{batch.BatchIndex + 1}",
+                Path.Join(batchesRoot, $"batch-{batch.BatchIndex + 1:D4}"), exportReleases, selected);
+            await new CanaryPackageWriter().WriteFullBatchAsync(
+                request, masterDigest, batch.BatchIndex, batches.Count);
+        }
         var batchDirectories = Directory.GetDirectories(batchesRoot).Order(StringComparer.Ordinal).ToArray();
         Assert.Equal(2, batchDirectories.Length);
         foreach (var batch in batchDirectories)
