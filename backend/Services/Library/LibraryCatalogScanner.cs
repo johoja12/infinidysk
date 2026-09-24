@@ -11,7 +11,7 @@ using Serilog;
 namespace NzbWebDAV.Services.Library;
 
 /// <summary>
-/// Discovers symlinks/STRMs under <c>media.library-dir</c> and upserts
+/// Discovers symlinks/STRMs under the primary and additional scan directories and upserts
 /// <see cref="LibraryLinkMap"/> rows. Never follows a link whose target sits
 /// under the rclone mount (self-deadlock risk); such targets are classified
 /// from text only. Links absent from a completed full scan are marked Stale.
@@ -32,8 +32,16 @@ public sealed class LibraryCatalogScanner(
         catch (OperationCanceledException) { return; }
 
         DateTimeOffset? lastScanFinishedAt = null;
+        string? lastRootSelection = null;
         while (!stoppingToken.IsCancellationRequested)
         {
+            var rootSelection = string.Join("\n",
+                new[] { configManager.GetLibraryDir() ?? "" }.Concat(configManager.GetMediaLibraryScanDirs()));
+            if (!string.Equals(rootSelection, lastRootSelection, StringComparison.Ordinal))
+            {
+                lastRootSelection = rootSelection;
+                lastScanFinishedAt = null;
+            }
             if (!configManager.IsMediaLibraryEnabled())
             {
                 lastScanFinishedAt = null;
@@ -67,17 +75,35 @@ public sealed class LibraryCatalogScanner(
         }
 
         var mountDir = configManager.GetRcloneMountDir();
-        List<(string LinkPath, string TargetText, bool IsStrm)> discovered;
+        var primaryRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(libraryRoot));
+        var roots = new List<(bool IsPrimary, string Path)> { (true, primaryRoot) };
+        roots.AddRange(configManager.GetMediaLibraryScanDirs()
+            .Where(path => !string.Equals(path, primaryRoot, StringComparison.Ordinal))
+            .Select(path => (false, path)));
+        var normalizedMount = Path.TrimEndingDirectorySeparator(Path.GetFullPath(mountDir));
+        if (roots.Any(root => IsSameOrWithin(root.Path, normalizedMount) ||
+                              IsSameOrWithin(normalizedMount, root.Path)) ||
+            roots.SelectMany((root, index) => roots.Skip(index + 1)
+                .Select(other => (root.Path, OtherPath: other.Path)))
+                .Any(pair => IsSameOrWithin(pair.Path, pair.OtherPath) ||
+                             IsSameOrWithin(pair.OtherPath, pair.Path)))
+        {
+            LastScanWarning = "Media Library scan directories overlap each other or the rclone mount.";
+            return;
+        }
+        List<(bool IsPrimary, string RootPath, string LinkPath, string TargetText, bool IsStrm)> discovered = [];
         try
         {
-            discovered = SymlinkAndStrmUtil.GetAllSymlinksAndStrms(libraryRoot)
-                .Select(info => info switch
-                {
-                    SymlinkAndStrmUtil.SymlinkInfo s => (s.SymlinkPath, s.TargetPath, false),
-                    SymlinkAndStrmUtil.StrmInfo s => (s.StrmPath, s.TargetUrl, true),
-                    _ => throw new InvalidOperationException("Unknown link type"),
-                })
-                .ToList();
+            foreach (var (isPrimary, rootPath) in roots)
+            {
+                discovered.AddRange(SymlinkAndStrmUtil.GetAllSymlinksAndStrms(rootPath)
+                    .Select(info => info switch
+                    {
+                        SymlinkAndStrmUtil.SymlinkInfo s => (isPrimary, rootPath, s.SymlinkPath, s.TargetPath, false),
+                        SymlinkAndStrmUtil.StrmInfo s => (isPrimary, rootPath, s.StrmPath, s.TargetUrl, true),
+                        _ => throw new InvalidOperationException("Unknown link type"),
+                    }));
+            }
         }
         catch (Exception e) when (e is not OutOfMemoryException)
         {
@@ -87,32 +113,35 @@ public sealed class LibraryCatalogScanner(
         }
 
         await using var context = await dbContextFactory.CreateDbContextAsync(ct).ConfigureAwait(false);
+        var existingRows = await context.LinkMaps.ToListAsync(ct).ConfigureAwait(false);
+        var existingByKey = existingRows.ToDictionary(row => row.LinkPath, StringComparer.Ordinal);
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var (linkPath, targetText, isStrm) in discovered)
+        foreach (var (isPrimary, rootPath, linkPath, targetText, isStrm) in discovered)
         {
             ct.ThrowIfCancellationRequested();
             ClassifiedLink classified;
             try
             {
-                classified = LibraryLinkClassifier.Classify(linkPath, targetText, isStrm, mountDir, libraryRoot);
+                classified = LibraryLinkClassifier.Classify(linkPath, targetText, isStrm, mountDir, rootPath);
             }
             catch (ArgumentException)
             {
                 continue; // escaping link — skip, never touch it
             }
 
-            seen.Add(classified.RelativeLinkPath);
+            // Keep legacy primary mappings relative. Extra roots use absolute paths so
+            // identical relative names in different roots cannot overwrite one another.
+            var key = isPrimary ? classified.RelativeLinkPath : Path.GetFullPath(linkPath);
+            seen.Add(key);
             var status = await ResolveStatusAsync(context, classified, mountDir, ct).ConfigureAwait(false);
-            var existing = await context.LinkMaps
-                .FirstOrDefaultAsync(x => x.LinkPath == classified.RelativeLinkPath, ct)
-                .ConfigureAwait(false);
+            existingByKey.TryGetValue(key, out var existing);
             if (existing is null)
             {
                 context.LinkMaps.Add(new LibraryLinkMap
                 {
                     Id = Guid.NewGuid(),
                     DavItemId = classified.DavItemId,
-                    LinkPath = classified.RelativeLinkPath,
+                    LinkPath = key,
                     TargetText = classified.TargetText,
                     MappingType = classified.MappingType,
                     Status = status,
@@ -131,17 +160,18 @@ public sealed class LibraryCatalogScanner(
             }
         }
 
-        var stale = await context.LinkMaps
-            .Where(x => !seen.Contains(x.LinkPath) && x.Status != LibraryLinkStatus.Stale)
-            .ToListAsync(ct)
-            .ConfigureAwait(false);
-        foreach (var row in stale)
+        foreach (var row in existingRows.Where(row =>
+                     !seen.Contains(row.LinkPath) && row.Status != LibraryLinkStatus.Stale))
             row.Status = LibraryLinkStatus.Stale;
 
         await context.SaveChangesAsync(ct).ConfigureAwait(false);
         LastSuccessfulScanAt = DateTimeOffset.UtcNow;
         LastScanWarning = null;
     }
+
+    private static bool IsSameOrWithin(string path, string root) =>
+        string.Equals(path, root, StringComparison.Ordinal) ||
+        path.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.Ordinal);
 
     private static async Task<LibraryLinkStatus> ResolveStatusAsync(
         DavDatabaseContext context,

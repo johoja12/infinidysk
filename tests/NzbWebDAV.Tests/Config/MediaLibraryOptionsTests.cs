@@ -12,6 +12,7 @@ public sealed class MediaLibraryOptionsTests
         Assert.True(config.IsMediaLibraryEnabled());
         Assert.Equal(TimeSpan.FromMinutes(15), config.GetMediaLibraryScanInterval());
         Assert.Null(config.GetMediaLibraryPlexServerIds());
+        Assert.Empty(config.GetMediaLibraryScanDirs());
     }
 
     [Theory]
@@ -48,5 +49,18 @@ public sealed class MediaLibraryOptionsTests
         Assert.Null(MediaLibraryOptions.ParsePlexServerIds(""));
         Assert.Empty(MediaLibraryOptions.ParsePlexServerIds("[]")!);
         Assert.Throws<ArgumentException>(() => MediaLibraryOptions.ParsePlexServerIds("[\"same\",\"same\"]"));
+    }
+
+    [Fact]
+    public void AdditionalScanDirectoriesRequireDistinctAbsolutePaths()
+    {
+        Assert.Equal(new[] { "/mnt/plex2", "/mnt/special2" },
+            MediaLibraryOptions.ParseScanDirectories("[\"/mnt/plex2/\",\"/mnt/special2\"]"));
+        foreach (var invalid in new[] { "{ }", "[\"relative\"]", "[\"/\"]", "[\"/mnt/a\",\"/mnt/a/\"]" })
+            Assert.Throws<ArgumentException>(() => ConfigManager.ValidateConfigItems([new ConfigItem
+            {
+                ConfigName = ConfigKeys.MediaLibraryScanDirs,
+                ConfigValue = invalid,
+            }]));
     }
 }
