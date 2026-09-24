@@ -24,13 +24,17 @@ internal static class NzbDavMigrationProgram
         if (args.Length == 0 || args[0] is "-h" or "--help")
         {
             await Console.Error.WriteLineAsync("Usage: NzbDavMigration inventory --library-root PATH --blob-root PATH --output FILE");
+            await Console.Error.WriteLineAsync("       NzbDavMigration mapped-inventory --library-root PATH --legacy-ids-root PATH --blob-root PATH --output FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-list --blob-root PATH --output FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-scan --blob-root PATH --inventory FILE --database FILE --summary FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration recover-full --inventory FILE --catalogue FILE --output DIR [--minimum-coverage 0.90]");
-            await Console.Error.WriteLineAsync("       NzbDavMigration export-batches --master FILE --blob-root PATH --output DIR [--max-releases 250] [--max-payload-bytes 4294967296]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration verify-mapped-roots --plex-inventory FILE --special-inventory FILE --plex-master FILE --special-master FILE");
+            await Console.Error.WriteLineAsync("       NzbDavMigration export-batches --master FILE --peer-master FILE --peer-inventory FILE --blob-root PATH --output DIR [--max-releases 250] [--max-payload-bytes 4294967296]");
             await Console.Error.WriteLineAsync("       NzbDavMigration export --selection FILE --inventory FILE --blob-root PATH --output DIR --package-id ID");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration apply-mapped-links --plan FILE --mapped-inventory FILE --blob-root PATH --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
             await Console.Error.WriteLineAsync("       NzbDavMigration coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --master FILE_OR_DIR --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration mapped-coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --blob-root PATH --master FILE_OR_DIR --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration rollback-links --journal FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration validate-links --journal FILE --output FILE [--ffprobe PATH] [--max-read-bytes N] [--timeout-seconds N]");
             await Console.Error.WriteLineAsync("       NzbDavMigration benchmark-links --selection FILE --plan FILE --output DIR --legacy-url URL --legacy-route KIND --infinidysk-url URL --infinidysk-route KIND [--legacy-root /mnt/plex] [--infinidysk-root /mnt/plex2] [--legacy-cache-root PATH] [--infinidysk-cache-root PATH] [--timeout-seconds N]");
@@ -42,13 +46,17 @@ internal static class NzbDavMigrationProgram
             return args[0] switch
             {
                 "inventory" => await InventoryAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "mapped-inventory" => await MappedInventoryAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "catalogue-list" => await CatalogueListAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "catalogue-scan" => await CatalogueScanAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "recover-full" => await RecoverFullAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "verify-mapped-roots" => await VerifyMappedRootsAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "export-batches" => await ExportBatchesAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "export" => await ExportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "apply-links" => await ApplyLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "apply-mapped-links" => await ApplyMappedLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "coverage-report" => await CoverageReportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "mapped-coverage-report" => await MappedCoverageReportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "rollback-links" => await RollbackLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "validate-links" => await ValidateLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "benchmark-links" => await BenchmarkLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
@@ -80,16 +88,59 @@ internal static class NzbDavMigrationProgram
 
     private static async Task<int> RecoverFullAsync(IReadOnlyDictionary<string, string> options)
     {
-        var inventory = await ReadJsonAsync<LegacyInventoryCandidate[]>(Required(options, "--inventory"))
-            .ConfigureAwait(false) ?? throw new InvalidDataException("Inventory file is empty.");
+        var inventory = await ReadJsonAsync<MappedLibraryInventory>(Required(options, "--inventory"))
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Mapped inventory file is empty.");
+        inventory.Validate();
+        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
+        if (minimum < 0.90m)
+            throw new InvalidDataException("Mapped recovery minimum coverage cannot be below 0.90.");
         var cataloguePath = Required(options, "--catalogue");
         await using var store = new OrphanCatalogueStore(
             cataloguePath, cataloguePath + ".completion.json");
         await store.OpenCompletedAsync().ConfigureAwait(false);
-        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
         var result = await new LegacySourceRecovery().WriteAsync(
-            inventory, store, Required(options, "--output"), minimum).ConfigureAwait(false);
+            inventory.Rows.Select(row => row.Candidate).ToArray(), store, Required(options, "--output"), minimum,
+            mappedSource: new MappedSourceProof(inventory.SourceRoot, inventory.LegacyIdsRoot,
+                inventory.Rows.Count, inventory.RowsSha256)).ConfigureAwait(false);
         return result.MeetsMinimumCoverage ? 0 : 3;
+    }
+
+    private static async Task<int> VerifyMappedRootsAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var plex = await ReadJsonAsync<MappedLibraryInventory>(Required(options, "--plex-inventory"))
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Plex mapped inventory is empty.");
+        var special = await ReadJsonAsync<MappedLibraryInventory>(Required(options, "--special-inventory"))
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Special mapped inventory is empty.");
+        plex.Validate();
+        special.Validate();
+        if (plex.SourceRoot != "/mnt/plex" || special.SourceRoot != "/mnt/special")
+            throw new InvalidDataException("Cross-root verification requires the two configured legacy roots.");
+        var plexMaster = await ReadJsonAsync<FullRecoveryMasterManifest>(Required(options, "--plex-master"))
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Plex recovery master is empty.");
+        var specialMaster = await ReadJsonAsync<FullRecoveryMasterManifest>(Required(options, "--special-master"))
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Special recovery master is empty.");
+        ValidateMappedMaster(plexMaster);
+        ValidateMappedMaster(specialMaster);
+        ValidateMasterMatchesInventory(plexMaster, plex);
+        ValidateMasterMatchesInventory(specialMaster, special);
+        if (plexMaster.RecoverableFraction < 0.90m || specialMaster.RecoverableFraction < 0.90m)
+            throw new InvalidDataException("Both roots must pass 90% mapped recovery before export.");
+        var sharedIds = plex.Rows.Select(row => row.DavItemId).ToHashSet()
+            .Intersect(special.Rows.Select(row => row.DavItemId)).Count();
+        var sharedPayloads = plexMaster.Items.Where(item => item.Classification is "exact-direct" or "exact-archive")
+            .Select(item => item.PayloadSha256).Where(value => value is not null).ToHashSet(StringComparer.Ordinal)
+            .Intersect(specialMaster.Items.Where(item => item.Classification is "exact-direct" or "exact-archive")
+                .Select(item => item.PayloadSha256).Where(value => value is not null), StringComparer.Ordinal)
+            .Count();
+        await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new
+        {
+            plexMappedRows = plex.Rows.Count,
+            specialMappedRows = special.Rows.Count,
+            sharedDavItemIds = sharedIds,
+            sharedNzbPayloads = sharedPayloads,
+            mayExport = sharedIds == 0 && sharedPayloads == 0,
+        }, ReportJsonOptions));
+        return sharedIds == 0 && sharedPayloads == 0 ? 0 : 3;
     }
 
     private static async Task<int> ExportBatchesAsync(IReadOnlyDictionary<string, string> options)
@@ -98,10 +149,47 @@ internal static class NzbDavMigrationProgram
         var masterBytes = await File.ReadAllBytesAsync(masterPath).ConfigureAwait(false);
         var master = JsonSerializer.Deserialize<FullRecoveryMasterManifest>(masterBytes, ReportJsonOptions)
             ?? throw new InvalidDataException("Master recovery manifest is empty.");
+        ValidateMappedMaster(master);
+        var mappedSource = master.MappedSource
+            ?? throw new InvalidDataException("Batch export requires a mapped LocalLinks source proof.");
         if (master.RecoverableLinks == 0 || master.RecoverableFraction < 0.90m)
             throw new InvalidDataException("Master recovery manifest has not passed the 90% coverage gate.");
         var masterDigest = Convert.ToHexString(SHA256.HashData(masterBytes)).ToLowerInvariant();
         var blobRoot = Required(options, "--blob-root");
+        var currentMapping = await BuildMappedInventoryAsync(
+            mappedSource.SourceRoot, mappedSource.LegacyIdsRoot, blobRoot).ConfigureAwait(false);
+        if (currentMapping.Rows.Count != mappedSource.RowCount
+            || !string.Equals(currentMapping.RowsSha256, mappedSource.RowsSha256, StringComparison.Ordinal))
+            throw new InvalidDataException("LocalLinks or source symlinks changed since mapped inventory; re-inventory.");
+        ValidateMasterMatchesInventory(master, currentMapping);
+        var peerInventory = await ReadJsonAsync<MappedLibraryInventory>(Required(options, "--peer-inventory"))
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Peer mapped inventory is empty.");
+        peerInventory.Validate();
+        var currentPeer = await BuildMappedInventoryAsync(
+            peerInventory.SourceRoot, peerInventory.LegacyIdsRoot, blobRoot).ConfigureAwait(false);
+        if (currentPeer.RowsSha256 != peerInventory.RowsSha256)
+            throw new InvalidDataException("Peer LocalLinks or source symlinks changed since mapped inventory.");
+        var peerMaster = await ReadJsonAsync<FullRecoveryMasterManifest>(Required(options, "--peer-master"))
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Peer recovery master is empty.");
+        ValidateMappedMaster(peerMaster);
+        ValidateMasterMatchesInventory(peerMaster, peerInventory);
+        if (!((currentMapping.SourceRoot == "/mnt/plex" && peerInventory.SourceRoot == "/mnt/special")
+              || (currentMapping.SourceRoot == "/mnt/special" && peerInventory.SourceRoot == "/mnt/plex"))
+            || peerMaster.RecoverableFraction < 0.90m)
+            throw new InvalidDataException("Peer root has not passed mapped recovery.");
+        var currentIds = currentMapping.Rows.Select(row => row.DavItemId).ToHashSet();
+        var peerIds = peerInventory.Rows.Select(row => row.DavItemId).ToHashSet();
+        var currentPayloads = master.Items.Where(item =>
+                item.Classification is "exact-direct" or "exact-archive")
+            .Select(item => item.PayloadSha256).Where(value => value is not null)
+            .ToHashSet(StringComparer.Ordinal);
+        var peerPayloads = peerMaster.Items.Where(item =>
+                item.Classification is "exact-direct" or "exact-archive")
+            .Select(item => item.PayloadSha256).Where(value => value is not null)
+            .ToHashSet(StringComparer.Ordinal);
+        if (currentIds.Overlaps(peerIds) || currentPayloads.Overlaps(peerPayloads))
+            throw new InvalidDataException(
+                "The roots share mapped leaves or NZB payloads; target reuse must be implemented before export.");
         var releases = new List<FullRecoveryRelease>();
         foreach (var group in master.Items.Where(item =>
                      item.Classification is "exact-direct" or "exact-archive")
@@ -194,6 +282,44 @@ internal static class NzbDavMigrationProgram
         return 0;
     }
 
+    private static async Task<int> ApplyMappedLinksAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var snapshot = await ReadJsonAsync<MappedLibraryInventory>(Required(options, "--mapped-inventory"))
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Mapped inventory is empty.");
+        snapshot.Validate();
+        var sourceRoot = Path.GetFullPath(Required(options, "--source-root"))
+            .TrimEnd(Path.DirectorySeparatorChar);
+        if (sourceRoot != snapshot.SourceRoot)
+            throw new InvalidDataException("Apply source root disagrees with the mapped inventory.");
+        var current = await BuildMappedInventoryAsync(
+            sourceRoot, snapshot.LegacyIdsRoot, Required(options, "--blob-root"))
+            .ConfigureAwait(false);
+        if (current.RowsSha256 != snapshot.RowsSha256)
+            throw new InvalidDataException("LocalLinks or source symlinks changed since mapped inventory; re-inventory.");
+        var planPath = Required(options, "--plan");
+        var verified = await CanaryPlanVerifier.ReadAsync(planPath).ConfigureAwait(false);
+        var byPath = current.Rows.ToDictionary(row => row.Candidate.LibraryRelativePath, StringComparer.Ordinal);
+        foreach (var planned in verified.Plan.Links)
+        {
+            if (!byPath.TryGetValue(planned.LibraryRelativePath, out var row)
+                || row.IsBroken || row.Candidate.ExclusionReason is not null
+                || row.DavItemId != planned.LegacyDavItemId
+                || !string.Equals(row.Candidate.OriginalTarget, planned.OriginalLegacyTarget,
+                    StringComparison.Ordinal))
+                throw new InvalidDataException("Plan contains a link outside the current mapped allowlist.");
+        }
+        var journal = Optional(options, "--journal")
+                      ?? Path.Join(Path.GetDirectoryName(Path.GetFullPath(planPath))!, "apply-journal.json");
+        var reader = new LegacyNzbDavReader();
+        await new CanaryLinkApplier(CanaryPathSafety.IsLocalMount,
+            verifyMapping: (planned, path, cancellationToken) =>
+                reader.AssertMappedLinkAsync(path, planned.LegacyDavItemId, cancellationToken))
+            .ApplyAsync(planPath, sourceRoot, Required(options, "--library-root"),
+                Required(options, "--target-root"), journal).ConfigureAwait(false);
+        await Console.Out.WriteLineAsync(journal);
+        return 0;
+    }
+
     private static async Task<int> RollbackLinksAsync(IReadOnlyDictionary<string, string> options)
     {
         var result = await new CanaryLinkRollback().RollbackAsync(Required(options, "--journal"))
@@ -212,6 +338,35 @@ internal static class NzbDavMigrationProgram
             Required(options, "--journals-dir"),
             Required(options, "--output"),
             ParseCoverage(options, "--minimum-coverage", 0.90m)).ConfigureAwait(false);
+        await Console.Out.WriteLineAsync(Path.GetFullPath(Required(options, "--output")));
+        if (result.HasOwnershipErrors) return 1;
+        return result.Report.MeetsMinimumCoverage ? 0 : 3;
+    }
+
+    private static async Task<int> MappedCoverageReportAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var initial = await ReadJsonAsync<MappedLibraryInventory>(Required(options, "--initial-inventory"))
+            .ConfigureAwait(false) ?? throw new InvalidDataException("Mapped initial inventory is empty.");
+        initial.Validate();
+        var sourceRoot = Required(options, "--source-root");
+        if (Path.GetFullPath(sourceRoot).TrimEnd(Path.DirectorySeparatorChar) != initial.SourceRoot)
+            throw new InvalidDataException("Coverage source root disagrees with mapped initial inventory.");
+        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
+        if (minimum < 0.90m)
+            throw new InvalidDataException("Mapped final coverage minimum cannot be below 0.90.");
+        var final = await BuildMappedInventoryAsync(
+            initial.SourceRoot, initial.LegacyIdsRoot, Required(options, "--blob-root"))
+            .ConfigureAwait(false);
+        var result = await new CanaryCoverageReporter().WriteAsync(
+            sourceRoot,
+            Required(options, "--library-root"),
+            Required(options, "--initial-inventory"),
+            Required(options, "--master"),
+            Required(options, "--journals-dir"),
+            Required(options, "--output"),
+            minimum,
+            initialMapped: initial,
+            finalMapped: final).ConfigureAwait(false);
         await Console.Out.WriteLineAsync(Path.GetFullPath(Required(options, "--output")));
         if (result.HasOwnershipErrors) return 1;
         return result.Report.MeetsMinimumCoverage ? 0 : 3;
@@ -270,6 +425,77 @@ internal static class NzbDavMigrationProgram
         stream.Flush(flushToDisk: true);
 #pragma warning restore CA1849
         return 0;
+    }
+
+    private static async Task<int> MappedInventoryAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var report = await BuildMappedInventoryAsync(
+            Required(options, "--library-root"), Required(options, "--legacy-ids-root"),
+            Required(options, "--blob-root")).ConfigureAwait(false);
+        await WriteJsonCreateNewAsync(Required(options, "--output"), report).ConfigureAwait(false);
+        static bool IsMappingConflict(string? reason) => reason is
+            "broken-mapping" or "missing-source-link" or "mapping-target-id-mismatch"
+            or "mapping-target-root-mismatch" or "duplicate-mapped-id";
+        await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new
+        {
+            mappedRows = report.Rows.Count,
+            validSourceLinks = report.Rows.Count(row => !IsMappingConflict(row.Candidate.ExclusionReason)),
+            mappingConflicts = report.Rows.Count(row => IsMappingConflict(row.Candidate.ExclusionReason)),
+            eligibleCandidates = report.Rows.Count(row => row.Candidate.ExclusionReason is null),
+            excluded = report.Rows.Count(row => row.Candidate.ExclusionReason is not null),
+            outOfScopeFilesystemLinks = report.OutOfScopeFilesystemLinks,
+            report.RowsSha256,
+        }, ReportJsonOptions));
+        return 0;
+    }
+
+    private static async Task<MappedLibraryInventory> BuildMappedInventoryAsync(
+        string sourceRoot,
+        string legacyIdsRoot,
+        string blobRoot)
+    {
+        var database = await new LegacyNzbDavReader().ReadMappedAsync(sourceRoot).ConfigureAwait(false);
+        var filesystem = new LibraryInventoryService().Inventory(sourceRoot);
+        return new MappedLibraryInventoryBuilder().Build(
+            sourceRoot, legacyIdsRoot, database, filesystem, blobRoot);
+    }
+
+    private static void ValidateMappedMaster(FullRecoveryMasterManifest master)
+    {
+        var exact = master.Items.Count(item => item.Classification is "exact-direct" or "exact-archive");
+        if (master.SchemaVersion != FullRecoveryMasterManifest.CurrentSchemaVersion
+            || master.MappedSource is null
+            || master.TotalLinks != master.Items.Count
+            || master.RecoverableLinks != exact
+            || master.RecoverableFraction != (master.TotalLinks == 0
+                ? 0m : decimal.Divide(exact, master.TotalLinks))
+            || master.MappedSource.RowCount != master.TotalLinks
+            || master.Items.Select(item => item.LibraryRelativePath).Distinct(StringComparer.Ordinal).Count()
+                != master.Items.Count)
+            throw new InvalidDataException("Mapped recovery master counts or provenance are invalid.");
+    }
+
+    private static void ValidateMasterMatchesInventory(
+        FullRecoveryMasterManifest master,
+        MappedLibraryInventory inventory)
+    {
+        ValidateMappedMaster(master);
+        inventory.Validate();
+        if (master.MappedSource!.SourceRoot != inventory.SourceRoot
+            || master.MappedSource.LegacyIdsRoot != inventory.LegacyIdsRoot
+            || master.MappedSource.RowsSha256 != inventory.RowsSha256
+            || master.MappedSource.RowCount != inventory.Rows.Count)
+            throw new InvalidDataException("Recovery master does not match its mapped LocalLinks inventory.");
+        var byPath = inventory.Rows.ToDictionary(row => row.Candidate.LibraryRelativePath, StringComparer.Ordinal);
+        foreach (var item in master.Items)
+        {
+            if (!byPath.TryGetValue(item.LibraryRelativePath, out var mapped)
+                || mapped.DavItemId != item.LegacyDavItemId
+                || !string.Equals(mapped.Candidate.OriginalTarget, item.OriginalTarget, StringComparison.Ordinal)
+                || (item.Classification is "exact-direct" or "exact-archive"
+                    && (mapped.IsBroken || mapped.Candidate.ExclusionReason is not null)))
+                throw new InvalidDataException("Recovery master contains a file outside its mapped allowlist.");
+        }
     }
 
     private static async Task<int> ExportAsync(IReadOnlyDictionary<string, string> options)

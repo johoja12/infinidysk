@@ -49,10 +49,17 @@ public sealed record FullRecoveryMasterManifest(
     int TotalLinks,
     int RecoverableLinks,
     decimal RecoverableFraction,
-    IReadOnlyList<LegacySourceRecoveryItem> Items)
+    IReadOnlyList<LegacySourceRecoveryItem> Items,
+    MappedSourceProof? MappedSource = null)
 {
     public const int CurrentSchemaVersion = 1;
 }
+
+public sealed record MappedSourceProof(
+    string SourceRoot,
+    string LegacyIdsRoot,
+    int RowCount,
+    string RowsSha256);
 
 public sealed record LegacyRecoveryWriteResult(
     LegacySourceRecoveryReport Report,

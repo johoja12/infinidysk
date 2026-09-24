@@ -28,6 +28,13 @@ public sealed record LegacyReadResult(
     IReadOnlyList<LegacyDavItemRow> Items,
     IReadOnlyList<Guid> MissingIds);
 
+public sealed record LegacyLocalLinkRow(string LinkPath, Guid DavItemId, bool IsBroken);
+
+public sealed record LegacyMappedReadResult(
+    IReadOnlyList<LegacyLocalLinkRow> Links,
+    IReadOnlyList<LegacyDavItemRow> Items,
+    IReadOnlyList<Guid> MissingIds);
+
 public sealed class LegacyNzbDavReader
 {
     public const string ConnectionEnvironmentVariable = "NZBDAV_MIGRATION_LEGACY_DB";
@@ -99,14 +106,105 @@ public sealed class LegacyNzbDavReader
 
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await using var transaction = await connection
-            .BeginTransactionAsync(IsolationLevel.RepeatableRead, cancellationToken)
+        await using var transaction = await BeginReadOnlyTransactionAsync(connection, cancellationToken)
             .ConfigureAwait(false);
-        await ExecuteAsync(connection, transaction, "SET TRANSACTION READ ONLY", cancellationToken)
-            .ConfigureAwait(false);
-        await RequireReadOnlyTransactionAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
-        await RequireSelectOnlyLoginAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+        var rows = await ReadItemsAsync(connection, transaction, ids, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        return AccountForRequestedIds(ids, rows);
+    }
 
+    public async Task<LegacyMappedReadResult> ReadMappedAsync(
+        string libraryRoot,
+        CancellationToken cancellationToken = default)
+    {
+        var connectionString = Environment.GetEnvironmentVariable(ConnectionEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(connectionString))
+            throw new InvalidOperationException($"{ConnectionEnvironmentVariable} is required.");
+        return await ReadMappedAsync(connectionString, libraryRoot, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<LegacyMappedReadResult> ReadMappedAsync(
+        string connectionString,
+        string libraryRoot,
+        CancellationToken cancellationToken = default)
+    {
+        var root = Path.GetFullPath(libraryRoot).TrimEnd(Path.DirectorySeparatorChar);
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginReadOnlyTransactionAsync(connection, cancellationToken)
+            .ConfigureAwait(false);
+        const string mappingQuery = """
+            SELECT "LinkPath", "DavItemId", "IsBroken"
+            FROM "LocalLinks"
+            WHERE left("LinkPath", length(@prefix)) = @prefix
+            ORDER BY "LinkPath", "DavItemId"
+            """;
+        var links = new List<LegacyLocalLinkRow>();
+        await using (var command = new NpgsqlCommand(mappingQuery, connection, transaction))
+        {
+            command.Parameters.AddWithValue("prefix", root + Path.DirectorySeparatorChar);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                links.Add(new LegacyLocalLinkRow(reader.GetString(0), reader.GetGuid(1), reader.GetBoolean(2)));
+        }
+        var ids = links.Select(link => link.DavItemId).Distinct().ToArray();
+        var rows = await ReadItemsAsync(connection, transaction, ids, cancellationToken).ConfigureAwait(false);
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
+        var accounted = AccountForRequestedIds(ids, rows);
+        return new LegacyMappedReadResult(links, accounted.Items, accounted.MissingIds);
+    }
+
+    public async Task AssertMappedLinkAsync(
+        string linkPath,
+        Guid expectedDavItemId,
+        CancellationToken cancellationToken = default)
+    {
+        var connectionString = Environment.GetEnvironmentVariable(ConnectionEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(connectionString))
+            throw new InvalidOperationException($"{ConnectionEnvironmentVariable} is required.");
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginReadOnlyTransactionAsync(connection, cancellationToken)
+            .ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            "SELECT \"DavItemId\", \"IsBroken\" FROM \"LocalLinks\" WHERE \"LinkPath\" = @path",
+            connection, transaction);
+        command.Parameters.AddWithValue("path", linkPath);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            || reader.GetGuid(0) != expectedDavItemId || reader.GetBoolean(1)
+            || await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            throw new InvalidDataException("Planned source link is no longer a unique, unbroken LocalLinks mapping.");
+    }
+
+    private static async Task<NpgsqlTransaction> BeginReadOnlyTransactionAsync(
+        NpgsqlConnection connection,
+        CancellationToken cancellationToken)
+    {
+        var transaction = await connection.BeginTransactionAsync(IsolationLevel.RepeatableRead, cancellationToken)
+            .ConfigureAwait(false);
+        try
+        {
+            await ExecuteAsync(connection, transaction, "SET TRANSACTION READ ONLY", cancellationToken)
+                .ConfigureAwait(false);
+            await RequireReadOnlyTransactionAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+            await RequireSelectOnlyLoginAsync(connection, transaction, cancellationToken).ConfigureAwait(false);
+            return transaction;
+        }
+        catch
+        {
+            await transaction.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    private static async Task<List<LegacyDavItemRow>> ReadItemsAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        Guid[] ids,
+        CancellationToken cancellationToken)
+    {
         var rows = new List<LegacyDavItemRow>();
         foreach (var batch in ids.Chunk(256))
         {
@@ -135,8 +233,7 @@ public sealed class LegacyNzbDavReader
             }
         }
 
-        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
-        return AccountForRequestedIds(ids, rows);
+        return rows;
     }
 
     public static LegacyReadResult AccountForRequestedIds(

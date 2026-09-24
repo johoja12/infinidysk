@@ -6,15 +6,20 @@ public sealed class CanaryLinkApplier
 {
     private readonly Func<string, bool> _isLocalMount;
     private readonly Action<string>? _beforeCreate;
+    private readonly Func<NzbDavCanaryPlanLink, string, CancellationToken, Task>? _verifyMapping;
 
     public CanaryLinkApplier() : this(CanaryPathSafety.IsLocalMount)
     {
     }
 
-    internal CanaryLinkApplier(Func<string, bool> isLocalMount, Action<string>? beforeCreate = null)
+    internal CanaryLinkApplier(
+        Func<string, bool> isLocalMount,
+        Action<string>? beforeCreate = null,
+        Func<NzbDavCanaryPlanLink, string, CancellationToken, Task>? verifyMapping = null)
     {
         _isLocalMount = isLocalMount;
         _beforeCreate = beforeCreate;
+        _verifyMapping = verifyMapping;
     }
 
     public async Task<CanaryApplyJournal> ApplyAsync(
@@ -57,6 +62,8 @@ public sealed class CanaryLinkApplier
                 source, planned.LibraryRelativePath, "source library path");
             var linkPath = CanaryPathSafety.ResolveBeneath(library, planned.LibraryRelativePath, "library path");
             var targetPath = CanaryPathSafety.ResolveBeneath(target, planned.NewRelativeTarget!, "target path");
+            if (_verifyMapping is not null)
+                await _verifyMapping(planned, sourceLinkPath, cancellationToken).ConfigureAwait(false);
             VerifySourceLink(source, sourceLinkPath, planned.OriginalLegacyTarget);
             VerifyTarget(targetPath, planned.ExpectedFileSize);
             var existingJournal = journal.Links.SingleOrDefault(link =>
@@ -106,6 +113,8 @@ public sealed class CanaryLinkApplier
             _ = CanaryPathSafety.ResolveBeneath(source, planned.LibraryRelativePath, "source library path");
             _ = CanaryPathSafety.ResolveBeneath(library, planned.LibraryRelativePath, "library path");
             _ = CanaryPathSafety.ResolveBeneath(target, planned.NewRelativeTarget!, "target path");
+            if (_verifyMapping is not null)
+                await _verifyMapping(planned, sourceLinkPath, cancellationToken).ConfigureAwait(false);
             VerifySourceLink(source, sourceLinkPath, planned.OriginalLegacyTarget);
             CanaryPathSafety.EnsureParentsExistWithoutLinks(library, linkPath);
             VerifyTarget(targetPath, planned.ExpectedFileSize);

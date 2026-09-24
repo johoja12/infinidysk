@@ -91,6 +91,8 @@ public sealed class LegacyNzbDavReaderTests
                 CREATE TABLE "{schema}"."DavNzbFiles" ("Id" uuid PRIMARY KEY, "SegmentIds" text);
                 CREATE TABLE "{schema}"."DavRarFiles" ("Id" uuid PRIMARY KEY, "RarParts" text);
                 CREATE TABLE "{schema}"."DavMultipartFiles" ("Id" uuid PRIMARY KEY, "Metadata" text);
+                CREATE TABLE "{schema}"."LocalLinks" (
+                    "LinkPath" text PRIMARY KEY, "DavItemId" uuid NOT NULL, "IsBroken" boolean NOT NULL);
                 CREATE TABLE "{schema}"."SourceValidationBlocks" ("DavItemId" uuid, "Status" integer);
                 INSERT INTO "{schema}"."HistoryItems" VALUES ('{historyId}', 'a.nzb', 'wrong-job-name', 'tv', 1, '{releaseId}', '<nzb />');
                 INSERT INTO "{schema}"."DavItems" ("Id", "Path", "FileSize", "Type", "ParentId") VALUES
@@ -100,6 +102,10 @@ public sealed class LegacyNzbDavReaderTests
                     ('{withoutHistory}', '/content/b.mkv', 456, 3, NULL);
                 INSERT INTO "{schema}"."DavNzbFiles" VALUES
                     ('{withHistory}', '["one@example"]'), ('{withoutHistory}', '["two@example"]');
+                INSERT INTO "{schema}"."LocalLinks" VALUES
+                    ('/mnt/plex/a.mkv', '{withHistory}', false),
+                    ('/mnt/plex/b.mkv', '{withoutHistory}', true),
+                    ('/mnt/special/c.mkv', '{withHistory}', false);
                 """);
             await ExecuteAsync(admin, $"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'");
             roleCreated = true;
@@ -118,6 +124,12 @@ public sealed class LegacyNzbDavReaderTests
 
             var result = await new LegacyNzbDavReader().ReadAsync(
                 builder.ConnectionString, [withHistory, withoutHistory, missing]);
+            var mapped = await new LegacyNzbDavReader().ReadMappedAsync(
+                builder.ConnectionString, "/mnt/plex");
+            Assert.Equal(2, mapped.Links.Count);
+            Assert.Equal(2, mapped.Items.Count);
+            Assert.True(mapped.Links.Single(link => link.DavItemId == withoutHistory).IsBroken);
+            Assert.All(mapped.Links, link => Assert.StartsWith("/mnt/plex/", link.LinkPath, StringComparison.Ordinal));
 
             Assert.Equal(2, result.Items.Count);
             Assert.NotNull(result.Items.Single(item => item.Id == withHistory).HistoryItemId);
