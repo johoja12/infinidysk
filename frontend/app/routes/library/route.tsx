@@ -1,6 +1,6 @@
 import type { Route } from "./+types/route";
 import { useCallback, useEffect, useState } from "react";
-import { Form, Link, useFetcher, useRevalidator, useSearchParams } from "react-router";
+import { Form, Link, redirect, useFetcher, useRevalidator, useSearchParams } from "react-router";
 import {
   backendClient,
   type LibraryBrowseResponse,
@@ -66,7 +66,15 @@ function parsePage(value: string | null): number {
   return Number.isSafeInteger(page) && page > 0 ? page : 1;
 }
 
-export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPageData> {
+export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPageData | Response> {
+  const settings = await backendClient.getConfig(["media.library-enabled"]);
+  if (
+    settings.some(
+      (item) =>
+        item.configName === "media.library-enabled" && item.configValue.toLowerCase() === "false",
+    )
+  )
+    return redirect("/settings?tab=library");
   const url = new URL(request.url);
   const query = {
     q: url.searchParams.get("q")?.trim() ?? "",

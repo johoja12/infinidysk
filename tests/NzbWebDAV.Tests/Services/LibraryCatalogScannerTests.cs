@@ -60,4 +60,115 @@ public sealed class LibraryCatalogScannerTests : IAsyncLifetime
         Assert.Equal(LibraryMappingType.External, row.MappingType);
         Assert.Null(row.DavItemId);
     }
+
+    [Fact]
+    public async Task DisabledLibrary_DoesNotScanOrMarkExistingMappingsStale()
+    {
+        var target = Path.Join(_libraryRoot, "real.mkv");
+        await File.WriteAllTextAsync(target, "x");
+        var link = Path.Join(_libraryRoot, "linked.mkv");
+        File.CreateSymbolicLink(link, target);
+        var config = new ConfigManager();
+        config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryDir, ConfigValue = _libraryRoot }]);
+        var factory = _provider.GetRequiredService<IDbContextFactory<DavDatabaseContext>>();
+        var scanner = new LibraryCatalogScanner(config, factory);
+        await scanner.ReconcileOnceAsync(CancellationToken.None);
+
+        File.Delete(link);
+        config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryEnabled, ConfigValue = "false" }]);
+        await scanner.ReconcileOnceAsync(CancellationToken.None);
+
+        await using var context = factory.CreateDbContext();
+        Assert.Equal(LibraryLinkStatus.Valid, (await context.LinkMaps.SingleAsync()).Status);
+    }
+
+    [Fact]
+    public async Task AdditionalRoots_KeepIdenticalRelativeLinkNamesDistinct()
+    {
+        var secondRoot = Path.Join(Path.GetTempPath(), $"nzbdav-special-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(secondRoot);
+        try
+        {
+            var target = Path.Join(_libraryRoot, "real.mkv");
+            await File.WriteAllTextAsync(target, "x");
+            File.CreateSymbolicLink(Path.Join(_libraryRoot, "linked.mkv"), target);
+            File.CreateSymbolicLink(Path.Join(secondRoot, "linked.mkv"), target);
+            var config = new ConfigManager();
+            config.UpdateValues([
+                new ConfigItem { ConfigName = ConfigKeys.MediaLibraryDir, ConfigValue = _libraryRoot },
+                new ConfigItem { ConfigName = ConfigKeys.MediaLibraryScanDirs,
+                    ConfigValue = System.Text.Json.JsonSerializer.Serialize(new[] { secondRoot }) },
+            ]);
+            var factory = _provider.GetRequiredService<IDbContextFactory<DavDatabaseContext>>();
+            var scanner = new LibraryCatalogScanner(config, factory);
+
+            await scanner.ReconcileOnceAsync(CancellationToken.None);
+            await using (var context = factory.CreateDbContext())
+            {
+                var paths = await context.LinkMaps.Select(x => x.LinkPath).ToListAsync();
+                Assert.Equal(2, paths.Count);
+                Assert.Contains("linked.mkv", paths);
+                Assert.Contains(Path.Join(secondRoot, "linked.mkv"), paths);
+            }
+
+            File.Delete(Path.Join(secondRoot, "linked.mkv"));
+            await scanner.ReconcileOnceAsync(CancellationToken.None);
+            await using var updated = factory.CreateDbContext();
+            Assert.Equal(LibraryLinkStatus.Stale,
+                (await updated.LinkMaps.SingleAsync(x => x.LinkPath == Path.Join(secondRoot, "linked.mkv"))).Status);
+            Assert.Equal(LibraryLinkStatus.Valid,
+                (await updated.LinkMaps.SingleAsync(x => x.LinkPath == "linked.mkv")).Status);
+        }
+        finally
+        {
+            Directory.Delete(secondRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task OverlappingRoot_DoesNotMarkExistingMappingsStale()
+    {
+        var target = Path.Join(_libraryRoot, "real.mkv");
+        await File.WriteAllTextAsync(target, "x");
+        var link = Path.Join(_libraryRoot, "linked.mkv");
+        File.CreateSymbolicLink(link, target);
+        var config = new ConfigManager();
+        config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryDir, ConfigValue = _libraryRoot }]);
+        var factory = _provider.GetRequiredService<IDbContextFactory<DavDatabaseContext>>();
+        var scanner = new LibraryCatalogScanner(config, factory);
+        await scanner.ReconcileOnceAsync(CancellationToken.None);
+
+        File.Delete(link);
+        Directory.CreateDirectory(Path.Join(_libraryRoot, "nested"));
+        config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryScanDirs,
+            ConfigValue = System.Text.Json.JsonSerializer.Serialize(new[] { Path.Join(_libraryRoot, "nested") }) }]);
+        await scanner.ReconcileOnceAsync(CancellationToken.None);
+
+        await using var context = factory.CreateDbContext();
+        Assert.Equal(LibraryLinkStatus.Valid, (await context.LinkMaps.SingleAsync()).Status);
+        Assert.Contains("overlap", scanner.LastScanWarning);
+    }
+
+    [Fact]
+    public async Task MissingAdditionalRoot_KeepsPreviousCatalog()
+    {
+        var target = Path.Join(_libraryRoot, "real.mkv");
+        await File.WriteAllTextAsync(target, "x");
+        var link = Path.Join(_libraryRoot, "linked.mkv");
+        File.CreateSymbolicLink(link, target);
+        var config = new ConfigManager();
+        config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryDir, ConfigValue = _libraryRoot }]);
+        var factory = _provider.GetRequiredService<IDbContextFactory<DavDatabaseContext>>();
+        var scanner = new LibraryCatalogScanner(config, factory);
+        await scanner.ReconcileOnceAsync(CancellationToken.None);
+
+        File.Delete(link);
+        config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryScanDirs,
+            ConfigValue = System.Text.Json.JsonSerializer.Serialize(new[] { Path.Join(_libraryRoot, "missing") }) }]);
+        await scanner.ReconcileOnceAsync(CancellationToken.None);
+
+        await using var context = factory.CreateDbContext();
+        Assert.Equal(LibraryLinkStatus.Valid, (await context.LinkMaps.SingleAsync()).Status);
+        Assert.NotNull(scanner.LastScanWarning);
+    }
 }

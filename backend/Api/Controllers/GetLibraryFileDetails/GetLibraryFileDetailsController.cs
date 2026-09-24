@@ -1,15 +1,18 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Database;
+using NzbWebDAV.Config;
 
 namespace NzbWebDAV.Api.Controllers.GetLibraryFileDetails;
 
 [ApiController]
 [Route("api/get-library-file-details")]
-public class GetLibraryFileDetailsController(DavDatabaseClient dbClient) : GetOnlyApiController
+public class GetLibraryFileDetailsController(DavDatabaseClient dbClient, ConfigManager config) : GetOnlyApiController
 {
     protected override async Task<IActionResult> HandleRequest()
     {
+        if (!config.IsMediaLibraryEnabled())
+            return NotFound(new BaseApiResponse { Status = false, Error = "Media Library is disabled." });
         var request = new GetLibraryFileDetailsRequest(HttpContext);
         var ct = request.CancellationToken;
 
