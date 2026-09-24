@@ -2,7 +2,7 @@
 
 !!! warning "Parallel-library workflow"
 
-    Keep legacy NzbDav running and keep Plex and every Arr application away from `/mnt/plex2`. Start with the 20–50-link canary below. The full-library recovery uses the same create-only parallel tree and leaves `/mnt/plex` unchanged; it is not a Plex cutover.
+    Keep legacy NzbDav running and keep Plex and every Arr application away from `/mnt/plex2` and `/mnt/special2`. Start with a 20–50-link canary for each source tree. Full-library recovery uses create-only parallel trees and leaves `/mnt/plex` and `/mnt/special` unchanged; it is not a Plex cutover.
 
 This is a two-stage migration with an explicit trust boundary:
 
@@ -24,11 +24,32 @@ legacy reader remaining installed.
 - Build `tools/NzbDavMigration` from the same InfiniDysk release you will run.
 - Create dedicated migration categories in InfiniDysk. They must not be monitored by Sonarr or Radarr.
 - Confirm InfiniDysk providers work before importing.
-- Create `/mnt/plex2` on the host as a new local directory. Do not add it to Plex yet.
+- Create `/mnt/plex2` and `/mnt/special2` on the host as separate local directories. Do not add either to Plex yet.
 - Make the InfiniDysk rclone mount and its canonical `.ids` tree visible on the host, for example at `/mnt/remote/infinidysk`.
 - Route throughput tests directly to backend port `8080` on the trusted Docker or local network. Port `3000` is functional for WebDAV, but its Node proxy handles every streamed byte and measurements through it are diagnostic only. Never publish `8080` to an untrusted network.
 
 Use a separate results directory and retain the inventory, selection, export package, downloaded plan bundle, apply journal, validation output, and performance reports together.
+
+The legacy library has two independent symlink roots. Process each source and its
+parallel destination as a pair; a scan of `/mnt/plex` does **not** include
+`/mnt/special`. Keep private artifacts and migration sessions separate by root:
+
+| Legacy source | Parallel validation tree | Artifact subdirectory |
+|---|---|---|
+| `/mnt/plex` | `/mnt/plex2` | `plex/` |
+| `/mnt/special` | `/mnt/special2` | `special/` |
+
+The current inventory, package, apply, benchmark, and coverage commands each
+accept one source root. Do not merge their inventories or plan files by relative
+path: the same relative path can occur in both trees. Before export, compare
+legacy DavItem IDs and original link targets across both inventories. If the same
+legacy leaf appears in both, record both locations and stop the second import
+until its target reuse and journal ownership have a reviewed procedure. Do not
+silently import it twice or drop either link from the coverage denominator.
+Full-library handling of those duplicates requires a root-qualified link
+identity in the package/plan workflow, one import per unique source release,
+and separate source-verified apply plans and journals for both destinations.
+The current single-root commands do not provide that reuse automatically.
 
 Keep that directory private (`0700` on Unix, with files restricted to the
 operator). Inventories can contain original NZB contents and archive metadata,
@@ -48,10 +69,19 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   inventory \
   --library-root /mnt/plex \
   --blob-root /path/to/legacy/config/blobs \
-  --output /path/to/results/inventory.json
+  --output /path/to/results/plex/inventory.json
+
+dotnet run --project tools/NzbDavMigration -c Release -- \
+  inventory \
+  --library-root /mnt/special \
+  --blob-root /path/to/legacy/config/blobs \
+  --output /path/to/results/special/inventory.json
 ```
 
-The command walks only the supplied library root, does not follow directory symlinks, and records legacy `.ids/<guid>` links. Review every exclusion in `inventory.json`.
+Each command walks only its supplied library root, does not follow directory
+symlinks, and records legacy `.ids/<guid>` links. Review exclusions and link
+counts in **both** inventories. Pick canary leaves from both roots and keep
+their selections and export packages separate.
 
 ### Legacy schema and recovery limits
 
@@ -105,12 +135,19 @@ weaken these permissions or upload the artifacts to issues or pull requests.
 umask 077
 RUN=/opt/infinidysk-migration/full/2026-09-21T000000Z
 mkdir -m 0700 -p "$RUN"
+mkdir -m 0700 -p "$RUN/plex" "$RUN/special"
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
   inventory \
   --library-root /mnt/plex \
   --blob-root /opt/nzbdav/config/blobs \
-  --output "$RUN/initial-inventory.json"
+  --output "$RUN/plex/initial-inventory.json"
+
+dotnet run --project tools/NzbDavMigration -c Release -- \
+  inventory \
+  --library-root /mnt/special \
+  --blob-root /opt/nzbdav/config/blobs \
+  --output "$RUN/special/initial-inventory.json"
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
   catalogue-list \
@@ -126,9 +163,16 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
   recover-full \
-  --inventory "$RUN/initial-inventory.json" \
+  --inventory "$RUN/plex/initial-inventory.json" \
   --catalogue "$RUN/orphan-catalogue.sqlite" \
-  --output "$RUN/recovery" \
+  --output "$RUN/plex/recovery" \
+  --minimum-coverage 0.90
+
+dotnet run --project tools/NzbDavMigration -c Release -- \
+  recover-full \
+  --inventory "$RUN/special/initial-inventory.json" \
+  --catalogue "$RUN/orphan-catalogue.sqlite" \
+  --output "$RUN/special/recovery" \
   --minimum-coverage 0.90
 ```
 
@@ -136,9 +180,10 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
 bounded transactions and can be run again with the same inventory/database after
 an interruption; already completed snapshots are skipped. Do not edit or replace
 the frozen blob files while scanning. Review `recovery.json`, `exclusions.json`,
-`master-manifest.json`, and `SHA256SUMS`. Export is blocked unless at least 90% of
-the original library links have an exact article-backed payload. Byte-identical
-NZB copies collapse to one logical payload; distinct matches remain ambiguous.
+`master-manifest.json`, and `SHA256SUMS` for **each** root. Export is blocked unless
+at least 90% of each root's original links have an exact article-backed payload.
+Byte-identical NZB copies collapse to one logical payload; distinct matches
+remain ambiguous.
 
 Export immutable batches. The defaults are at most 250 releases and 4 GiB of NZB
 payload bytes per batch; lower either bound to reduce queue or review pressure.
@@ -147,9 +192,17 @@ One oversized release is isolated and explicitly marked rather than hidden.
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
   export-batches \
-  --master "$RUN/recovery/master-manifest.json" \
+  --master "$RUN/plex/recovery/master-manifest.json" \
   --blob-root /opt/nzbdav/config/blobs \
-  --output "$RUN/batches" \
+  --output "$RUN/plex/batches" \
+  --max-releases 250 \
+  --max-payload-bytes 4294967296
+
+dotnet run --project tools/NzbDavMigration -c Release -- \
+  export-batches \
+  --master "$RUN/special/recovery/master-manifest.json" \
+  --blob-root /opt/nzbdav/config/blobs \
+  --output "$RUN/special/batches" \
   --max-releases 250 \
   --max-payload-bytes 4294967296
 ```
@@ -163,78 +216,102 @@ a second submission. A reconnect of the same package digest is idempotent. The
 next batch is fenced until the current batch has a terminal, fully exact,
 fully-applied plan acknowledgement.
 
-For each batch, download its checksummed plan and apply it with all three roots.
+For each root's batch, download its checksummed plan and apply it with that
+root's three paths. Keep batch numbers, sessions, plans, journals, and validations
+under the matching `plex/` or `special/` artifact directory; `batch-0001` in one
+root is unrelated to `batch-0001` in the other.
 The source root is required so the command can verify the original legacy symlink
 immediately before creating its parallel link:
 
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
   apply-links \
-  --plan "$RUN/plans/batch-0001/plan.json" \
+  --plan "$RUN/plex/plans/batch-0001/plan.json" \
   --source-root /mnt/plex \
   --library-root /mnt/plex2 \
   --target-root /mnt/remote/infinidysk \
-  --journal "$RUN/journals/batch-0001/apply-journal.json"
+  --journal "$RUN/plex/journals/batch-0001/apply-journal.json"
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
   validate-links \
-  --journal "$RUN/journals/batch-0001/apply-journal.json" \
-  --output "$RUN/journals/batch-0001/validation.json" \
+  --journal "$RUN/plex/journals/batch-0001/apply-journal.json" \
+  --output "$RUN/plex/journals/batch-0001/validation.json" \
   --ffprobe /usr/bin/ffprobe
 ```
+
+Repeat with `special/` artifacts, `--source-root /mnt/special`, and
+`--library-root /mnt/special2`. Apply never copies links from one source tree
+to the other staging tree. Keep both staging trees out of Plex and Arr.
 
 The plan must contain exact rows only. Apply is create-only and source-drift
 fenced; retain each plan and journal as its ownership proof. Validation checks
 size and bounded beginning/middle/end reads. Do not acknowledge a batch whose
 validation has failures.
 
-After the first pass, freeze a fresh inventory and catalogue snapshot. Recover
-and process only links added since the initial snapshot as a delta pass. Removed
+After the first pass, freeze fresh inventories of **both** roots and a fresh
+catalogue snapshot. Recover and process only links added since each root's
+initial snapshot as separate delta passes. Removed
 links need no parallel entry, and changed legacy targets must be reviewed rather
 than forced. Copy each unmodified initial/delta `master-manifest.json` into a
-dedicated private directory; duplicate relative paths across those masters are an
-error. Then generate aggregate coverage against the initial snapshot and the live
-final source tree:
+dedicated private directory **per root**; duplicate relative paths across
+masters for the same root are an error. Then generate coverage against each
+root's initial snapshot and live final source tree:
 
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
   coverage-report \
   --source-root /mnt/plex \
   --library-root /mnt/plex2 \
-  --initial-inventory "$RUN/initial-inventory.json" \
-  --master "$RUN/coverage-masters" \
-  --journals-dir "$RUN/journals" \
-  --output "$RUN/coverage" \
+  --initial-inventory "$RUN/plex/initial-inventory.json" \
+  --master "$RUN/plex/coverage-masters" \
+  --journals-dir "$RUN/plex/journals" \
+  --output "$RUN/plex/coverage" \
+  --minimum-coverage 0.90
+
+dotnet run --project tools/NzbDavMigration -c Release -- \
+  coverage-report \
+  --source-root /mnt/special \
+  --library-root /mnt/special2 \
+  --initial-inventory "$RUN/special/initial-inventory.json" \
+  --master "$RUN/special/coverage-masters" \
+  --journals-dir "$RUN/special/journals" \
+  --output "$RUN/special/coverage" \
   --minimum-coverage 0.90
 ```
 
 `--master` accepts either one manifest file or a directory of initial/delta JSON
-master manifests. The final live `/mnt/plex` snapshot is the denominator. Review every `covered`,
+master manifests. The final live snapshot of **each** source root is its
+denominator. Review every `covered`,
 `missing-parallel`, `wrong-target`, `added-after-initial`, and removed item in
-`coverage.json` and `coverage.md`; the counts must classify every final source
-link exactly once. A 90% aggregate is a recovery milestone, not permission to
-register `/mnt/plex2` with Plex or expose it to Sonarr/Radarr.
+both `coverage.json` and `coverage.md` reports; the counts must classify every
+final source link exactly once within its root. Calculate combined coverage as
+`(plex covered + special covered) / (plex final source + special final source)`
+from the two reports. Require both per-root reports to pass their 90% gate and
+review the combined result; neither a single-root report nor the combined ratio
+is permission to register the parallel trees with Plex or Arr.
 
 To undo a reviewed batch, pause migration activity and use only its journal:
 
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
   rollback-links \
-  --journal "$RUN/journals/batch-0001/apply-journal.json"
+  --journal "$RUN/plex/journals/batch-0001/apply-journal.json"
 ```
 
 Rollback removes only unchanged links owned by that journal. It does not delete
 imported InfiniDysk releases, source links, packages, or evidence.
+Use the matching `special/` journal to roll back a `/mnt/special2` batch.
 
 ### Replacing a failed canary import
 
 Keep replacement work inside the dedicated canary boundary. Only history entries
 whose reconciled migration ledger IDs resolve to the dedicated `migration-*`
-categories, and links owned by the matching `/mnt/plex2` apply journal, are eligible.
+categories, and links owned by the matching `/mnt/plex2` or `/mnt/special2`
+apply journal, are eligible.
 Freshly reconcile the IDs and counts immediately before deleting anything. Stop on
 any ownership or count mismatch.
 
-Do not delete or modify the legacy NzbDav deployment, `/mnt/plex`, Plex libraries,
+Do not delete or modify the legacy NzbDav deployment, `/mnt/plex`, `/mnt/special`, Plex libraries,
 Sonarr or Radarr configuration, unrelated InfiniDysk history, or shared migration
 tooling. Delete imported content through the supported SAB history API with completed
 files enabled, remove only verified canary links, reset and forget the matching
@@ -246,7 +323,10 @@ or repairing files. A previously repaired file may rely on local patches that
 the original NZB does not contain. Repeated normalized article IDs within an NZB
 are also excluded from this workflow rather than silently choosing one entry.
 
-Choose 20–50 representative candidates across media types and representations. Create `selection.json` with exact path/ID pairs from the inventory:
+Choose 20–50 representative candidates **from each source root** across media
+types and representations. The `export` command enforces 20–50 links per
+selection. Create a separate
+`selection.json` for each source root with exact path/ID pairs from its inventory:
 
 ```json
 {
@@ -266,12 +346,16 @@ The destination must not already exist:
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
   export \
-  --selection /path/to/results/selection.json \
-  --inventory /path/to/results/inventory.json \
+  --selection /path/to/results/plex/selection.json \
+  --inventory /path/to/results/plex/inventory.json \
   --blob-root /path/to/legacy/config/blobs \
-  --output /path/to/results/nzbdav-canary-package \
-  --package-id nuc-1-canary-2026-09-20
+  --output /path/to/results/plex/nzbdav-canary-package \
+  --package-id nuc-1-plex-canary-2026-09-20
 ```
+
+Repeat for `special/` with its own selection, inventory, output package, and
+unique package ID. Review the cross-root ID comparison before exporting either
+package.
 
 The tool writes the package through a staging directory, requires strong identity
 for every selected leaf, and refuses duplicates or excluded candidates. Each release
@@ -294,27 +378,32 @@ services:
   infinidysk:
     volumes:
       - /host/path/config:/config
-      - /host/path/nzbdav-canary-package:/config/migration-input/nzbdav-canary:ro
+      - /host/path/plex/nzbdav-canary-package:/config/migration-input/nzbdav-plex-canary:ro
+      - /host/path/special/nzbdav-canary-package:/config/migration-input/nzbdav-special-canary:ro
 ```
 
-Do not mount the legacy database, credentials, live blob tree, `/mnt/plex`, or `/mnt/plex2` into InfiniDysk for this workflow.
+Do not mount the legacy database, credentials, live blob tree, `/mnt/plex`,
+`/mnt/special`, `/mnt/plex2`, or `/mnt/special2` into InfiniDysk for this workflow.
 
 ## 3. Import through InfiniDysk
 
 Open **Settings → System → Migration → NzbDav**.
 
-1. Connect `/config/migration-input/nzbdav-canary`.
+1. Connect `/config/migration-input/nzbdav-plex-canary`. Complete and download
+   its plan before connecting `/config/migration-input/nzbdav-special-canary`
+   for a separate run. Apply and validate each root with its matching plan.
 2. Confirm the displayed package digest, selected count, and exclusions.
 3. Map every included source category to a dedicated migration-only category.
 4. Keep **Submit Workers** at `1` and **Max Queue Depth** at `5` for the canary.
 5. Scan and review every row. Resolve red findings before continuing.
 6. To run, type the exact package digest and selected count shown by the UI.
 7. Wait for import and reconciliation to reach a terminal state.
-8. Review every correlation. A canary plan is unavailable while any row is ambiguous or duplicated.
+8. Review every correlation for each run. A canary plan is unavailable while any
+   row is ambiguous or duplicated.
 
 An `exact` result means article identity and file size agree. Path or filename similarity is not enough. Unmatched rows remain in the report and do not receive a target.
 
-## 4. Generate and apply `/mnt/plex2`
+## 4. Generate and apply both parallel trees
 
 Generate the canary plan in the UI, then download its ZIP bundle. Extract it into a new directory; `plan.json` and `SHA256SUMS` must remain adjacent.
 
@@ -323,12 +412,16 @@ Apply it on the host that owns both mounts:
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
   apply-links \
-  --plan /path/to/results/canary-plan/plan.json \
+  --plan /path/to/results/plex/canary-plan/plan.json \
   --source-root /mnt/plex \
   --library-root /mnt/plex2 \
   --target-root /mnt/remote/infinidysk \
-  --journal /path/to/results/apply-journal.json
+  --journal /path/to/results/plex/apply-journal.json
 ```
+
+Repeat for the `special/` plan with `--source-root /mnt/special`,
+`--library-root /mnt/special2`, and a `special/` journal. Never apply a plan
+against the other source root, even if relative link paths look the same.
 
 Apply is create-only. It verifies the plan checksum, confines paths to the two supplied roots, checks the exact target and expected size, refuses symlinked parent directories, and never overwrites an existing entry. The journal is the ownership record for rollback; retain it.
 
@@ -337,16 +430,23 @@ Validate bounded reads before manual playback:
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
   validate-links \
-  --journal /path/to/results/apply-journal.json \
-  --output /path/to/results/validation.json \
+  --journal /path/to/results/plex/apply-journal.json \
+  --output /path/to/results/plex/validation.json \
   --ffprobe /usr/bin/ffprobe
 ```
 
-Review all failures. Then manually open several files through `/mnt/plex2`, seek near the beginning, middle, and end, and confirm the original `/mnt/plex` versions still work. Do not point Plex at `/mnt/plex2` during the canary.
+Validate the `special/` journal separately. Review all failures. Manually open
+several files through each parallel tree, seek near the beginning, middle, and
+end, and confirm that their originals under `/mnt/plex` or `/mnt/special` still
+work. Do not point Plex at either parallel tree during the canary.
 
-## 5. Record six-file speed and seek evidence
+## 5. Record speed and seek evidence for both roots
 
-Manually choose exactly six `exact` plan rows. Include both `direct` and `rar-multipart` representations and exactly one deliberately large-file case. Create a schema-1 `benchmark-selection.json`:
+The benchmark tool requires exactly six rows per selection and accepts one
+source root. Manually choose six `exact` plan rows from **each** root, for 12
+files overall. In each six-file set, include both `direct` and `rar-multipart`
+representations where available and exactly one deliberately large-file case.
+Create a separate schema-1 `benchmark-selection.json` for each root:
 
 ```json
 {
@@ -371,9 +471,9 @@ Run the paired benchmark without purging caches or restarting either service bet
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
   benchmark-links \
-  --selection /path/to/results/benchmark-selection.json \
-  --plan /path/to/results/canary-plan/plan.json \
-  --output /path/to/results/performance \
+  --selection /path/to/results/plex/benchmark-selection.json \
+  --plan /path/to/results/plex/canary-plan/plan.json \
+  --output /path/to/results/plex/performance \
   --legacy-root /mnt/plex \
   --infinidysk-root /mnt/plex2 \
   --legacy-url http://legacy-backend:8080 \
@@ -381,6 +481,10 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --infinidysk-url http://infinidysk-backend:8080 \
   --infinidysk-route direct-backend
 ```
+
+Run a separate `benchmark-links` command for the `special/` selection and plan,
+using `/mnt/special` and `/mnt/special2` as the two roots. Review both reports
+as two six-file sets; neither command measures paths under the other root.
 
 If cache roots are available, add `--legacy-cache-root` and
 `--infinidysk-cache-root`. When a root uses rclone's standard `vfs/<remote>`
@@ -399,21 +503,26 @@ Pause library automation before rollback. The command removes only links created
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
   rollback-links \
-  --journal /path/to/results/apply-journal.json
+  --journal /path/to/results/plex/apply-journal.json
 ```
 
-Changed, missing, or unowned entries are not deleted. Review the JSON result, confirm `/mnt/plex2` contains no unexpected remnants, and retain all evidence until the migration decision is closed. Rollback does not remove imported InfiniDysk releases; dedicated categories keep that later cleanup independently reviewable.
+Use the `special/` journal separately for `/mnt/special2`. Changed, missing, or
+unowned entries are not deleted. Review both results, confirm both parallel trees
+contain no unexpected remnants, and retain all evidence until the migration
+decision is closed. Rollback does not remove imported InfiniDysk releases;
+dedicated categories keep that later cleanup independently reviewable.
 
 ## Promotion gate
 
-Do not add `/mnt/plex2` to Plex or scale beyond the canary until all of these are true:
+Do not add `/mnt/plex2` or `/mnt/special2` to Plex or scale beyond the canary
+until all of these are true:
 
 - every selected item has a reviewed terminal import and correlation result;
 - all applied links validate and representative playback succeeds;
-- the six-file JSON and Markdown reports contain no unexplained errors or timeouts;
+- both six-file JSON and Markdown reports contain no unexplained errors or timeouts;
 - direct-backend measurements are acceptable for both first and repeat passes;
 - rollback has been rehearsed or its journal has been independently checked;
-- the original NzbDav service, data, and `/mnt/plex` library remain available.
+- the original NzbDav service, data, `/mnt/plex`, and `/mnt/special` libraries remain available.
 
 ## Retire the temporary importer
 
