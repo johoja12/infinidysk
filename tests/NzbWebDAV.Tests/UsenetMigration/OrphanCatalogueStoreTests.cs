@@ -44,6 +44,31 @@ public sealed class OrphanCatalogueStoreTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task FindBlobsContainingAll_VerifiesEveryIdAfterBoundedProbe()
+    {
+        var (database, summary) = Paths();
+        await using var store = new OrphanCatalogueStore(database, summary);
+        await store.BeginAsync(Digest('a'));
+        var ids = Enumerable.Range(0, 1000).Select(index => $"id-{index}@test").ToArray();
+        const int probeCount = 128;
+        var sampled = Enumerable.Range(0, probeCount)
+            .Select(index => (int)((long)index * (ids.Length - 1) / (probeCount - 1)))
+            .ToHashSet();
+        var absent = Enumerable.Range(1, ids.Length - 2).First(index => !sampled.Contains(index));
+        await store.UpsertAsync(new OrphanCatalogueBlob("complete.nzb", 100, 200,
+            Digest('1'), "valid", null, Digest('3'),
+            ids.Select((id, index) => new OrphanCatalogueArticle(id, 0, index, 100)).ToArray()));
+        await store.UpsertAsync(new OrphanCatalogueBlob("decoy.nzb", 100, 200,
+            Digest('2'), "valid", null, Digest('4'),
+            ids.Where((_, index) => index != absent)
+                .Select((id, index) => new OrphanCatalogueArticle(id, 0, index, 100)).ToArray()));
+
+        var found = await store.FindBlobsContainingAllAsync(ids);
+
+        Assert.Equal("complete.nzb", Assert.Single(found).RelativePath);
+    }
+
+    [Fact]
     public async Task CancelledBuild_PersistsThePartialBatchForResume()
     {
         var (database, summary) = Paths();

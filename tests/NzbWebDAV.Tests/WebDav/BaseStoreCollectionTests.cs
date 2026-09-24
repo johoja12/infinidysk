@@ -97,8 +97,12 @@ public sealed class BaseStoreCollectionTests
                     $"metadata-{i}.nfo", Stream.Null, overwrite: true, CancellationToken.None);
             }
 
-            var warnings = sink.Events.Where(e => e.Level == LogEventLevel.Warning).ToList();
-            var debugs = sink.Events.Where(e => e.Level == LogEventLevel.Debug).ToList();
+            var warnings = sink.Events.Where(e =>
+                e.Level == LogEventLevel.Warning &&
+                e.MessageTemplate.Text.StartsWith("Refused to {Operation} under a read-only path", StringComparison.Ordinal)).ToList();
+            var debugs = sink.Events.Where(e =>
+                e.Level == LogEventLevel.Debug &&
+                e.MessageTemplate.Text == "Refused to {Operation} {ItemName} under {Scope}: read-only").ToList();
 
             Assert.Single(warnings);
             Assert.Equal(25, debugs.Count);
@@ -130,8 +134,12 @@ public sealed class BaseStoreCollectionTests
                     "metadata.nfo", Stream.Null, overwrite: true, CancellationToken.None);
             }
 
-            Assert.Single(sink.Events, e => e.Level == LogEventLevel.Warning);
-            Assert.Equal(40, sink.Events.Count(e => e.Level == LogEventLevel.Debug));
+            Assert.Single(sink.Events, e =>
+                e.Level == LogEventLevel.Warning &&
+                e.MessageTemplate.Text.StartsWith("Refused to {Operation} under a read-only path", StringComparison.Ordinal));
+            Assert.Equal(40, sink.Events.Count(e =>
+                e.Level == LogEventLevel.Debug &&
+                e.MessageTemplate.Text == "Refused to {Operation} {ItemName} under {Scope}: read-only"));
         }
         finally
         {
@@ -161,8 +169,12 @@ public sealed class BaseStoreCollectionTests
                     "metadata.nfo", Stream.Null, overwrite: true, CancellationToken.None);
             }
 
-            Assert.Single(sink.Events, e => e.Level == LogEventLevel.Warning);
-            Assert.Equal(40, sink.Events.Count(e => e.Level == LogEventLevel.Debug));
+            Assert.Single(sink.Events, e =>
+                e.Level == LogEventLevel.Warning &&
+                e.MessageTemplate.Text.StartsWith("Refused to {Operation} under a read-only path", StringComparison.Ordinal));
+            Assert.Equal(40, sink.Events.Count(e =>
+                e.Level == LogEventLevel.Debug &&
+                e.MessageTemplate.Text == "Refused to {Operation} {ItemName} under {Scope}: read-only"));
         }
         finally
         {

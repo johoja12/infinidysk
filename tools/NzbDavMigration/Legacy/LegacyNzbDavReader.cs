@@ -35,7 +35,17 @@ public sealed record LegacyMappedReadResult(
     IReadOnlyList<LegacyDavItemRow> Items,
     IReadOnlyList<Guid> MissingIds);
 
-public sealed class LegacyNzbDavReader
+public interface ILegacyMappedBatchReader
+{
+    Task ReadMappedBatchesAsync(
+        string connectionString,
+        string libraryRoot,
+        Func<IReadOnlyList<LegacyLocalLinkRow>, LegacyMappedReadResult, Task> onBatch,
+        int batchSize = 128,
+        CancellationToken cancellationToken = default);
+}
+
+public sealed class LegacyNzbDavReader : ILegacyMappedBatchReader
 {
     public const string ConnectionEnvironmentVariable = "NZBDAV_MIGRATION_LEGACY_DB";
 
@@ -153,6 +163,54 @@ public sealed class LegacyNzbDavReader
         await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         var accounted = AccountForRequestedIds(ids, rows);
         return new LegacyMappedReadResult(links, accounted.Items, accounted.MissingIds);
+    }
+
+    /// <summary>
+    /// Reads one repeatable-read, SELECT-only mapping snapshot without retaining the
+    /// article metadata for every mapped file at once. The callback must finish
+    /// before the next batch is read; an exception aborts the source transaction.
+    /// </summary>
+    public async Task ReadMappedBatchesAsync(
+        string connectionString,
+        string libraryRoot,
+        Func<IReadOnlyList<LegacyLocalLinkRow>, LegacyMappedReadResult, Task> onBatch,
+        int batchSize = 128,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(onBatch);
+        if (batchSize is < 1 or > 256)
+            throw new ArgumentOutOfRangeException(nameof(batchSize));
+        var root = Path.GetFullPath(libraryRoot).TrimEnd(Path.DirectorySeparatorChar);
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginReadOnlyTransactionAsync(connection, cancellationToken)
+            .ConfigureAwait(false);
+        const string mappingQuery = """
+            SELECT "LinkPath", "DavItemId", "IsBroken"
+            FROM "LocalLinks"
+            WHERE left("LinkPath", length(@prefix)) = @prefix
+            ORDER BY "LinkPath", "DavItemId"
+            """;
+        var links = new List<LegacyLocalLinkRow>();
+        await using (var command = new NpgsqlCommand(mappingQuery, connection, transaction))
+        {
+            command.Parameters.AddWithValue("prefix", root + Path.DirectorySeparatorChar);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+                links.Add(new LegacyLocalLinkRow(reader.GetString(0), reader.GetGuid(1), reader.GetBoolean(2)));
+        }
+        links.Sort((left, right) => string.CompareOrdinal(left.LinkPath, right.LinkPath));
+
+        foreach (var batch in links.Chunk(batchSize))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var ids = batch.Select(link => link.DavItemId).Distinct().ToArray();
+            var rows = await ReadItemsAsync(connection, transaction, ids, cancellationToken).ConfigureAwait(false);
+            var accounted = AccountForRequestedIds(ids, rows);
+            await onBatch(links, new LegacyMappedReadResult(batch, accounted.Items, accounted.MissingIds))
+                .ConfigureAwait(false);
+        }
+        await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public async Task AssertMappedLinkAsync(

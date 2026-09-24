@@ -96,8 +96,9 @@ public sealed class PrefetchJobStore : IDisposable
             Execute("DELETE FROM Jobs WHERE Id IN (SELECT Id FROM Jobs WHERE State IN ('completed','failed','cancelled') ORDER BY Updated DESC LIMIT -1 OFFSET 255)");
             var id = Guid.NewGuid().ToString("N");
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            Execute("INSERT INTO Jobs(Id,ItemId,Trigger,Priority,State,Start,Length,Updated,Created) VALUES($id,$item,$trigger,$priority,'queued',$start,$length,$now,$now)",
-                ("$id", id), ("$item", itemId.ToString("N")), ("$trigger", trigger), ("$priority", priority), ("$start", start), ("$length", length), ("$now", now));
+            var created = NextCreated(now);
+            Execute("INSERT INTO Jobs(Id,ItemId,Trigger,Priority,State,Start,Length,Updated,Created) VALUES($id,$item,$trigger,$priority,'queued',$start,$length,$now,$created)",
+                ("$id", id), ("$item", itemId.ToString("N")), ("$trigger", trigger), ("$priority", priority), ("$start", start), ("$length", length), ("$now", now), ("$created", created));
             AddOwner(id, trigger);
             return new PrefetchEnqueueResult(new PrefetchJob(id, itemId, trigger, priority, "queued", start, length, null, 0, null, now), true);
         });
@@ -306,7 +307,8 @@ public sealed class PrefetchJobStore : IDisposable
             {
                 Execute("DELETE FROM Deferred WHERE Id=$id", ("$id", id));
                 if (operation == "retry") Execute("DELETE FROM Attempts WHERE Id=$id", ("$id", id));
-                Execute("UPDATE Jobs SET Created=$now WHERE Id=$id", ("$id", id), ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                Execute("UPDATE Jobs SET Created=$created WHERE Id=$id", ("$id", id),
+                    ("$created", NextCreated(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds())));
             }
         });
     }
@@ -344,6 +346,12 @@ public sealed class PrefetchJobStore : IDisposable
     private static PrefetchJob Read(SqliteDataReader reader) => new(reader.GetString(0), Guid.Parse(reader.GetString(1)),
         reader.GetString(2), reader.GetInt32(3), reader.GetString(4), reader.GetInt64(5), reader.GetInt64(6),
         reader.IsDBNull(7) ? null : reader.GetString(7), reader.GetInt64(8), reader.IsDBNull(9) ? null : reader.GetString(9), reader.GetInt64(10));
+    private long NextCreated(long wallClockMilliseconds)
+    {
+        using var command = Command("SELECT COALESCE(MAX(Created),0) FROM Jobs");
+        var latest = (long)command.ExecuteScalar()!;
+        return Math.Max(wallClockMilliseconds, checked(latest + 1));
+    }
     private SqliteCommand Command(string sql, params (string Key, object Value)[] parameters)
     {
         var command = _database.CreateCommand();

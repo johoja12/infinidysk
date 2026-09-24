@@ -25,16 +25,22 @@ internal static class NzbDavMigrationProgram
         {
             await Console.Error.WriteLineAsync("Usage: NzbDavMigration inventory --library-root PATH --blob-root PATH --output FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration mapped-inventory --library-root PATH --legacy-ids-root PATH --blob-root PATH --output FILE");
+            await Console.Error.WriteLineAsync("       NzbDavMigration mapped-inventory-shards --library-root PATH --legacy-ids-root PATH --blob-root PATH --output DIR [--batch-size 64]");
             await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-list --blob-root PATH --output FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-scan --blob-root PATH --inventory FILE --database FILE --summary FILE");
-            await Console.Error.WriteLineAsync("       NzbDavMigration recover-full --inventory FILE --catalogue FILE --output DIR [--minimum-coverage 0.90]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration recover-full --inventory FILE --catalogue FILE --output DIR [--catalogue-summary FILE] [--minimum-coverage 0.90]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration recover-shards --inventory DIR --catalogue FILE --output DIR [--catalogue-summary FILE] [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration verify-mapped-roots --plex-inventory FILE --special-inventory FILE --plex-master FILE --special-master FILE");
+            await Console.Error.WriteLineAsync("       NzbDavMigration verify-sharded-roots --plex-inventory DIR --special-inventory DIR --plex-recovery DIR --special-recovery DIR");
             await Console.Error.WriteLineAsync("       NzbDavMigration export-batches --master FILE --peer-master FILE --peer-inventory FILE --blob-root PATH --output DIR [--max-releases 250] [--max-payload-bytes 4294967296]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration export-sharded-batches --root plex|special --plex-inventory DIR --special-inventory DIR --plex-recovery DIR --special-recovery DIR --blob-root PATH --payload-root PATH --output DIR [--max-releases 250] [--max-payload-bytes 4294967296]");
             await Console.Error.WriteLineAsync("       NzbDavMigration export --selection FILE --inventory FILE --blob-root PATH --output DIR --package-id ID");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-mapped-links --plan FILE --mapped-inventory FILE --blob-root PATH --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration apply-sharded-links --plan FILE --mapped-inventory DIR --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
             await Console.Error.WriteLineAsync("       NzbDavMigration coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --master FILE_OR_DIR --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration mapped-coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --blob-root PATH --master FILE_OR_DIR --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration sharded-coverage-report --inventory DIR --recovery DIR --blob-root PATH --library-root PATH --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration rollback-links --journal FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration validate-links --journal FILE --output FILE [--ffprobe PATH] [--max-read-bytes N] [--timeout-seconds N]");
             await Console.Error.WriteLineAsync("       NzbDavMigration benchmark-links --selection FILE --plan FILE --output DIR --legacy-url URL --legacy-route KIND --infinidysk-url URL --infinidysk-route KIND [--legacy-root /mnt/plex] [--infinidysk-root /mnt/plex2] [--legacy-cache-root PATH] [--infinidysk-cache-root PATH] [--timeout-seconds N]");
@@ -47,16 +53,22 @@ internal static class NzbDavMigrationProgram
             {
                 "inventory" => await InventoryAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "mapped-inventory" => await MappedInventoryAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "mapped-inventory-shards" => await MappedInventoryShardsAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "catalogue-list" => await CatalogueListAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "catalogue-scan" => await CatalogueScanAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "recover-full" => await RecoverFullAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "recover-shards" => await RecoverShardsAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "verify-mapped-roots" => await VerifyMappedRootsAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "verify-sharded-roots" => await VerifyShardedRootsAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "export-batches" => await ExportBatchesAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "export-sharded-batches" => await ExportShardedBatchesAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "export" => await ExportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "apply-links" => await ApplyLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "apply-mapped-links" => await ApplyMappedLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "apply-sharded-links" => await ApplyShardedLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "coverage-report" => await CoverageReportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "mapped-coverage-report" => await MappedCoverageReportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "sharded-coverage-report" => await ShardedCoverageReportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "rollback-links" => await RollbackLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "validate-links" => await ValidateLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "benchmark-links" => await BenchmarkLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
@@ -96,13 +108,36 @@ internal static class NzbDavMigrationProgram
             throw new InvalidDataException("Mapped recovery minimum coverage cannot be below 0.90.");
         var cataloguePath = Required(options, "--catalogue");
         await using var store = new OrphanCatalogueStore(
-            cataloguePath, cataloguePath + ".completion.json");
+            cataloguePath, Optional(options, "--catalogue-summary") ?? cataloguePath + ".completion.json");
         await store.OpenCompletedAsync().ConfigureAwait(false);
         var result = await new LegacySourceRecovery().WriteAsync(
             inventory.Rows.Select(row => row.Candidate).ToArray(), store, Required(options, "--output"), minimum,
             mappedSource: new MappedSourceProof(inventory.SourceRoot, inventory.LegacyIdsRoot,
                 inventory.Rows.Count, inventory.RowsSha256)).ConfigureAwait(false);
         return result.MeetsMinimumCoverage ? 0 : 3;
+    }
+
+    private static async Task<int> RecoverShardsAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
+        if (minimum < 0.90m)
+            throw new InvalidDataException("Mapped recovery minimum coverage cannot be below 0.90.");
+        var cataloguePath = Required(options, "--catalogue");
+        await using var store = new OrphanCatalogueStore(
+            cataloguePath, Optional(options, "--catalogue-summary") ?? cataloguePath + ".completion.json");
+        await store.OpenCompletedAsync().ConfigureAwait(false);
+        var manifest = await new ShardedMappedRecovery().WriteAsync(
+            Required(options, "--inventory"), store, Required(options, "--output"))
+            .ConfigureAwait(false);
+        await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new
+        {
+            totalLinks = manifest.TotalLinks,
+            recoverableLinks = manifest.RecoverableLinks,
+            manifest.RecoverableFraction,
+            shards = manifest.Shards.Count,
+            meetsMinimumCoverage = manifest.RecoverableFraction >= minimum,
+        }, ReportJsonOptions));
+        return manifest.RecoverableFraction >= minimum ? 0 : 3;
     }
 
     private static async Task<int> VerifyMappedRootsAsync(IReadOnlyDictionary<string, string> options)
@@ -141,6 +176,44 @@ internal static class NzbDavMigrationProgram
             mayExport = sharedIds == 0 && sharedPayloads == 0,
         }, ReportJsonOptions));
         return sharedIds == 0 && sharedPayloads == 0 ? 0 : 3;
+    }
+
+    private static Task<ShardedMappedPairEvidence> LoadShardedPairAsync(
+        IReadOnlyDictionary<string, string> options) => new ShardedMappedExporter().VerifyPairAsync(
+            Required(options, "--plex-inventory"), Required(options, "--plex-recovery"),
+            Required(options, "--special-inventory"), Required(options, "--special-recovery"));
+
+    private static async Task<int> VerifyShardedRootsAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var pair = await LoadShardedPairAsync(options).ConfigureAwait(false);
+        await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new
+        {
+            plexMappedRows = pair.Plex.Inventory.RowCount,
+            plexRecoverableRows = pair.Plex.Recovery.RecoverableLinks,
+            specialMappedRows = pair.Special.Inventory.RowCount,
+            specialRecoverableRows = pair.Special.Recovery.RecoverableLinks,
+            pair.CombinedRecoveryFraction,
+            sharedDavItemIds = 0,
+            sharedNzbPayloads = 0,
+            mayExport = true,
+        }, ReportJsonOptions));
+        return 0;
+    }
+
+    private static async Task<int> ExportShardedBatchesAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var root = Required(options, "--root");
+        if (root is not ("plex" or "special"))
+            throw new InvalidDataException("Export root must be plex or special.");
+        var pair = await LoadShardedPairAsync(options).ConfigureAwait(false);
+        var count = await new ShardedMappedExporter().ExportAsync(
+            pair, root == "plex", Required(options, "--blob-root"),
+            Required(options, "--payload-root"), Required(options, "--output"),
+            ParsePositiveInt(options, "--max-releases", 250),
+            ParsePositiveLong(options, "--max-payload-bytes", 4L * 1024 * 1024 * 1024))
+            .ConfigureAwait(false);
+        await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new { batches = count }, ReportJsonOptions));
+        return 0;
     }
 
     private static async Task<int> ExportBatchesAsync(IReadOnlyDictionary<string, string> options)
@@ -320,6 +393,41 @@ internal static class NzbDavMigrationProgram
         return 0;
     }
 
+    private static async Task<int> ApplyShardedLinksAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var inventoryDirectory = Required(options, "--mapped-inventory");
+        var snapshot = await ShardedMappedInventoryWriter.ReadManifestAsync(inventoryDirectory)
+            .ConfigureAwait(false);
+        var sourceRoot = Path.GetFullPath(Required(options, "--source-root"))
+            .TrimEnd(Path.DirectorySeparatorChar);
+        if (sourceRoot != snapshot.SourceRoot)
+            throw new InvalidDataException("Apply source root disagrees with the mapped inventory.");
+        var allowlist = await ShardedMappedInventoryWriter.ReadAllowlistAsync(
+            inventoryDirectory, snapshot).ConfigureAwait(false);
+        var byPath = allowlist.ToDictionary(row => row.LinkPath, StringComparer.Ordinal);
+        var planPath = Required(options, "--plan");
+        var verified = await CanaryPlanVerifier.ReadAsync(planPath).ConfigureAwait(false);
+        foreach (var planned in verified.Plan.Links)
+        {
+            var path = CanaryPathSafety.ResolveBeneath(
+                sourceRoot, planned.LibraryRelativePath, "source library path");
+            if (!byPath.TryGetValue(path, out var row) || row.IsBroken
+                || row.ExclusionReason is not null || row.DavItemId != planned.LegacyDavItemId
+                || row.OriginalTarget != planned.OriginalLegacyTarget)
+                throw new InvalidDataException("Plan contains a link outside the sealed mapped allowlist.");
+        }
+        var journal = Optional(options, "--journal")
+                      ?? Path.Join(Path.GetDirectoryName(Path.GetFullPath(planPath))!, "apply-journal.json");
+        var reader = new LegacyNzbDavReader();
+        await new CanaryLinkApplier(CanaryPathSafety.IsLocalMount,
+            verifyMapping: (planned, path, cancellationToken) =>
+                reader.AssertMappedLinkAsync(path, planned.LegacyDavItemId, cancellationToken))
+            .ApplyAsync(planPath, sourceRoot, Required(options, "--library-root"),
+                Required(options, "--target-root"), journal).ConfigureAwait(false);
+        await Console.Out.WriteLineAsync(journal);
+        return 0;
+    }
+
     private static async Task<int> RollbackLinksAsync(IReadOnlyDictionary<string, string> options)
     {
         var result = await new CanaryLinkRollback().RollbackAsync(Required(options, "--journal"))
@@ -368,6 +476,25 @@ internal static class NzbDavMigrationProgram
             initialMapped: initial,
             finalMapped: final).ConfigureAwait(false);
         await Console.Out.WriteLineAsync(Path.GetFullPath(Required(options, "--output")));
+        if (result.HasOwnershipErrors) return 1;
+        return result.Report.MeetsMinimumCoverage ? 0 : 3;
+    }
+
+    private static async Task<int> ShardedCoverageReportAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var result = await new ShardedMappedCoverage().WriteAsync(
+            Required(options, "--inventory"), Required(options, "--recovery"),
+            Required(options, "--blob-root"), Required(options, "--library-root"),
+            Required(options, "--journals-dir"), Required(options, "--output"),
+            ParseCoverage(options, "--minimum-coverage", 0.90m)).ConfigureAwait(false);
+        await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new
+        {
+            result.Report.FinalSourceCount,
+            result.Report.CoveredCount,
+            result.Report.CoverageFraction,
+            result.Report.MeetsMinimumCoverage,
+            result.HasOwnershipErrors,
+        }, ReportJsonOptions));
         if (result.HasOwnershipErrors) return 1;
         return result.Report.MeetsMinimumCoverage ? 0 : 3;
     }
@@ -458,6 +585,22 @@ internal static class NzbDavMigrationProgram
         var filesystem = new LibraryInventoryService().Inventory(sourceRoot);
         return new MappedLibraryInventoryBuilder().Build(
             sourceRoot, legacyIdsRoot, database, filesystem, blobRoot);
+    }
+
+    private static async Task<int> MappedInventoryShardsAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var manifest = await new ShardedMappedInventoryWriter().WriteAsync(
+            Required(options, "--library-root"), Required(options, "--legacy-ids-root"),
+            Required(options, "--blob-root"), Required(options, "--output"),
+            ParsePositiveInt(options, "--batch-size", 64)).ConfigureAwait(false);
+        await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new
+        {
+            mappedRows = manifest.RowCount,
+            shards = manifest.Shards.Count,
+            manifest.OutOfScopeFilesystemLinks,
+            manifest.RowsSha256,
+        }, ReportJsonOptions));
+        return 0;
     }
 
     private static void ValidateMappedMaster(FullRecoveryMasterManifest master)
