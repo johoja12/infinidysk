@@ -4,6 +4,21 @@
 
 Prove that legacy NzbDav releases can be reconstructed, imported, correlated, and streamed through InfiniDysk without modifying the production library or registering a new Plex library. Phase one creates a local nuc-1 validation tree at `/mnt/plex2` containing 20–50 representative media symlinks.
 
+## 2026-09-24 extension: second legacy link root
+
+Legacy links also exist under `/mnt/special`. The parallel validation tree for
+that source is `/mnt/special2`. Preserve both existing roots and their relative
+paths; sample 20–50 links from each root in separate canary packages. The
+current migration package and host tools
+represent one library root, so inventory, export, migration session, link plan,
+apply journal, rollback, benchmark, and coverage must be separate for each pair.
+The NZB blob catalogue may be shared. Check for duplicate legacy DavItem IDs
+and targets across the two inventories before export; target reuse needs a
+reviewed procedure before a duplicate enters a second import. Combined coverage
+uses the sum of covered links divided by the sum of final links across both
+roots, with per-root reports retained. See the updated
+[operator guide](../../guides/nzbdav-migration.md) for the commands and gates.
+
 ## Why this approach
 
 The production library contains 41,274 symlinks targeting legacy `/.ids/...` DavItem IDs. Only 153 linked IDs descend from retained completed-history rows; the legacy blob store contains 55,104 additional XML-like NZB files. Replaying retained history alone is insufficient, replay creates new IDs, and filename matching is not a safe identity mechanism.

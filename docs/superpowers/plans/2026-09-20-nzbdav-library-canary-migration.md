@@ -10,6 +10,41 @@
 
 ---
 
+## 2026-09-24 two-root migration extension
+
+The legacy library also has symlinks under `/mnt/special`. Treat
+`/mnt/plex` → `/mnt/plex2` and `/mnt/special` → `/mnt/special2` as two
+independent source/destination pairs. The shipped inventory, package, apply,
+benchmark, and coverage commands take one source root each. Use separate
+inventories, reviewed selections, migration sessions, plans, apply journals,
+validation outputs, and per-root coverage reports. The NZB blob catalogue can
+be shared read-only between the two recovery passes. The executable operator
+procedure is [Import a legacy NzbDav library](../../guides/nzbdav-migration.md).
+
+- Select 20–50 links **per root** for two canary packages, because `export`
+  enforces that range for each selection. Keep both parallel destinations out
+  of Plex and Arr.
+- Compare legacy DavItem IDs and original targets across roots before export.
+  A duplicate leaf needs an explicit reviewed target-reuse/ownership procedure;
+  the current single-root plan must not silently import it twice or omit its
+  second link.
+- Before a full-library run containing cross-root duplicates, extend the
+  package/plan workflow to key each source link by its root plus relative path,
+  import each unique source release once, and emit a separately verifiable link
+  plan for each destination. Both plans may point to the same exact imported
+  target; each apply must recheck its own original source target and write its
+  own ownership journal. Add focused duplicate-path and duplicate-DavItem tests
+  before using that workflow. Until then, hold duplicate leaves for review.
+- Apply a plan only against its own source and destination pair. Preserve
+  separate journals for rollback and test six benchmark files **per root**,
+  because the benchmark command requires six files and accepts one root.
+- Run delta inventory and coverage independently for both roots. Review the
+  combined ratio from both final source counts and covered counts, and keep
+  every unresolved item in the disposition ledger. Neither tree is ready for
+  promotion based only on the other's result.
+
+---
+
 ## Non-negotiable boundaries
 
 - Legacy NzbDav stays authoritative and online throughout the canary.
