@@ -26,7 +26,11 @@ public sealed class ShardedMappedCoverage
             throw new InvalidDataException("Mapped final coverage minimum must be between 0.90 and 1.00.");
         var root = await new ShardedMappedExporter().LoadRootAsync(
             inventoryDirectory, recoveryDirectory, cancellationToken).ConfigureAwait(false);
-        var scratch = Path.Join(Path.GetTempPath(), $"mapped-coverage-{Guid.NewGuid():N}");
+        var parent = Path.GetDirectoryName(Path.GetFullPath(outputDirectory))
+            ?? throw new InvalidDataException("Coverage destination has no parent directory.");
+        if (!Directory.Exists(parent) || new DirectoryInfo(parent).LinkTarget is not null)
+            throw new InvalidDataException("Coverage scratch parent must be an existing regular directory.");
+        var scratch = Path.Join(parent, $".mapped-coverage-{Guid.NewGuid():N}");
         Directory.CreateDirectory(scratch);
         try
         {

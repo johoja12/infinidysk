@@ -98,9 +98,13 @@ public sealed class ShardedMappedExporter
     public async Task VerifyFreshSourceAsync(
         ShardedMappedRootEvidence root,
         string blobRoot,
+        string scratchParent,
         CancellationToken cancellationToken = default)
     {
-        var scratch = Path.Join(Path.GetTempPath(), $"mapped-drift-{Guid.NewGuid():N}");
+        var parent = Path.GetFullPath(scratchParent);
+        if (!Directory.Exists(parent) || new DirectoryInfo(parent).LinkTarget is not null)
+            throw new InvalidDataException("Drift-check scratch parent must be an existing regular directory.");
+        var scratch = Path.Join(parent, $".mapped-drift-{Guid.NewGuid():N}");
         try
         {
             var current = await new ShardedMappedInventoryWriter().WriteAsync(
@@ -128,8 +132,12 @@ public sealed class ShardedMappedExporter
         long maxPayloadBytes = 4L * 1024 * 1024 * 1024,
         CancellationToken cancellationToken = default)
     {
-        await VerifyFreshSourceAsync(pair.Plex, legacyBlobRoot, cancellationToken).ConfigureAwait(false);
-        await VerifyFreshSourceAsync(pair.Special, legacyBlobRoot, cancellationToken).ConfigureAwait(false);
+        var scratchParent = Path.GetDirectoryName(Path.GetFullPath(outputDirectory))
+            ?? throw new InvalidDataException("Export destination has no parent directory.");
+        await VerifyFreshSourceAsync(pair.Plex, legacyBlobRoot, scratchParent, cancellationToken)
+            .ConfigureAwait(false);
+        await VerifyFreshSourceAsync(pair.Special, legacyBlobRoot, scratchParent, cancellationToken)
+            .ConfigureAwait(false);
         return await ExportVerifiedAsync(pair, exportPlex, payloadRoot, outputDirectory,
             maxReleases, maxPayloadBytes, cancellationToken).ConfigureAwait(false);
     }
