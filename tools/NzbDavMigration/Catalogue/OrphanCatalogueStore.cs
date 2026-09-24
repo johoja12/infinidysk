@@ -156,16 +156,24 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
     {
         var ids = messageIds.Select(NormalizeMessageId).Distinct(StringComparer.Ordinal).ToArray();
         if (ids.Length == 0) return [];
+        // Large media files can exceed SQLite's bound-parameter limit. Probe a
+        // deterministic spread, then verify every requested ID in each result.
+        const int maxProbeIds = 128;
+        var probe = ids.Length <= maxProbeIds
+            ? ids
+            : Enumerable.Range(0, maxProbeIds)
+                .Select(index => ids[(int)((long)index * (ids.Length - 1) / (maxProbeIds - 1))])
+                .Distinct(StringComparer.Ordinal).ToArray();
         var connection = RequireConnection();
         await using var command = connection.CreateCommand();
         command.Transaction = _transaction;
-        var parameters = ids.Select((id, index) =>
+        var parameters = probe.Select((id, index) =>
         {
             var name = $"$id{index}";
             command.Parameters.AddWithValue(name, id);
             return name;
         }).ToArray();
-        command.Parameters.AddWithValue("$count", ids.Length);
+        command.Parameters.AddWithValue("$count", probe.Length);
         command.CommandText = $"""
             SELECT b.RelativePath
             FROM Blobs b JOIN Articles a ON a.BlobPath=b.RelativePath
@@ -181,7 +189,11 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
         }
         var blobs = new List<OrphanCatalogueBlob>(paths.Count);
         foreach (var path in paths)
-            blobs.Add((await ReadBlobAsync(path, cancellationToken).ConfigureAwait(false))!);
+        {
+            var blob = (await ReadBlobAsync(path, cancellationToken).ConfigureAwait(false))!;
+            var available = blob.Articles.Select(article => article.MessageId).ToHashSet(StringComparer.Ordinal);
+            if (ids.All(available.Contains)) blobs.Add(blob);
+        }
         return blobs;
     }
 
