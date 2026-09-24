@@ -141,18 +141,18 @@ mkdir -m 0700 -p "$RUN/plex" "$RUN/special"
 mkdir -m 0700 -p "$SCRATCH"
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  mapped-inventory \
+  mapped-inventory-shards \
   --library-root /mnt/plex \
   --legacy-ids-root /mnt/remote/nzbdav/.ids \
   --blob-root /opt/nzbdav/config/blobs \
-  --output "$RUN/plex/initial-inventory.json"
+  --output "$RUN/plex/initial-inventory"
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  mapped-inventory \
+  mapped-inventory-shards \
   --library-root /mnt/special \
   --legacy-ids-root /mnt/remote/nzbdav/.ids \
   --blob-root /opt/nzbdav/config/blobs \
-  --output "$RUN/special/initial-inventory.json"
+  --output "$RUN/special/initial-inventory"
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
   catalogue-list \
@@ -171,25 +171,27 @@ test "$(sha256sum "$SCRATCH/orphan-catalogue.sqlite" | cut -d' ' -f1)" = \
   "$(sha256sum "$RUN/orphan-catalogue.sqlite" | cut -d' ' -f1)"
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  recover-full \
-  --inventory "$RUN/plex/initial-inventory.json" \
+  recover-shards \
+  --inventory "$RUN/plex/initial-inventory" \
   --catalogue "$SCRATCH/orphan-catalogue.sqlite" \
+  --catalogue-summary "$RUN/orphan-catalogue-summary.json" \
   --output "$RUN/plex/recovery" \
   --minimum-coverage 0.90
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  recover-full \
-  --inventory "$RUN/special/initial-inventory.json" \
+  recover-shards \
+  --inventory "$RUN/special/initial-inventory" \
   --catalogue "$SCRATCH/orphan-catalogue.sqlite" \
+  --catalogue-summary "$RUN/orphan-catalogue-summary.json" \
   --output "$RUN/special/recovery" \
   --minimum-coverage 0.90
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  verify-mapped-roots \
-  --plex-inventory "$RUN/plex/initial-inventory.json" \
-  --special-inventory "$RUN/special/initial-inventory.json" \
-  --plex-master "$RUN/plex/recovery/master-manifest.json" \
-  --special-master "$RUN/special/recovery/master-manifest.json"
+  verify-sharded-roots \
+  --plex-inventory "$RUN/plex/initial-inventory" \
+  --special-inventory "$RUN/special/initial-inventory" \
+  --plex-recovery "$RUN/plex/recovery" \
+  --special-recovery "$RUN/special/recovery"
 ```
 
 `catalogue-list` freezes a no-follow input snapshot. `catalogue-scan` commits in
@@ -198,12 +200,16 @@ an interruption; already completed snapshots are skipped. Do not edit or replace
 the frozen blob files while scanning. Keep the SQLite catalogue on local
 `$SCRATCH`, verify free space there, and copy a checksummed sealed copy to `$RUN`
 for recovery. Verify that the artifact share is the mounted volume 3 NFS export
-before writing; keep backups on the separate volume 2 share. Review `recovery.json`, `exclusions.json`,
-`master-manifest.json`, and `SHA256SUMS` for **each** root. Export is blocked unless
+before writing; keep backups on the separate volume 2 share. Review each root's
+inventory and recovery `manifest.json`, shard masters, and exclusions. Shards
+resume only when their row and catalogue digests still match. Export is blocked unless
 at least 90% of each root's `LocalLinks` rows have an exact article-backed payload.
 Byte-identical NZB copies collapse to one logical payload; distinct matches
 remain ambiguous. Cross-root verification blocks export when the roots share
 DavItem IDs or NZB payloads; those require the separate target-reuse workflow.
+When the sealed catalogue was scanned from a verified backup tree, pass that
+same tree as `--payload-root` for export. Keep `--blob-root` pointed at the live
+legacy blob tree used by the mapped inventory for its drift check.
 
 Export immutable batches. The defaults are at most 250 releases and 4 GiB of NZB
 payload bytes per batch; lower either bound to reduce queue or review pressure.
@@ -211,21 +217,27 @@ One oversized release is isolated and explicitly marked rather than hidden.
 
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  export-batches \
-  --master "$RUN/plex/recovery/master-manifest.json" \
-  --peer-master "$RUN/special/recovery/master-manifest.json" \
-  --peer-inventory "$RUN/special/initial-inventory.json" \
+  export-sharded-batches \
+  --root plex \
+  --plex-inventory "$RUN/plex/initial-inventory" \
+  --special-inventory "$RUN/special/initial-inventory" \
+  --plex-recovery "$RUN/plex/recovery" \
+  --special-recovery "$RUN/special/recovery" \
   --blob-root /opt/nzbdav/config/blobs \
+  --payload-root /opt/nzbdav/config/blobs \
   --output "$RUN/plex/batches" \
   --max-releases 250 \
   --max-payload-bytes 4294967296
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  export-batches \
-  --master "$RUN/special/recovery/master-manifest.json" \
-  --peer-master "$RUN/plex/recovery/master-manifest.json" \
-  --peer-inventory "$RUN/plex/initial-inventory.json" \
+  export-sharded-batches \
+  --root special \
+  --plex-inventory "$RUN/plex/initial-inventory" \
+  --special-inventory "$RUN/special/initial-inventory" \
+  --plex-recovery "$RUN/plex/recovery" \
+  --special-recovery "$RUN/special/recovery" \
   --blob-root /opt/nzbdav/config/blobs \
+  --payload-root /opt/nzbdav/config/blobs \
   --output "$RUN/special/batches" \
   --max-releases 250 \
   --max-payload-bytes 4294967296
@@ -249,10 +261,9 @@ immediately before creating its parallel link:
 
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  apply-mapped-links \
+  apply-sharded-links \
   --plan "$RUN/plex/plans/batch-0001/plan.json" \
-  --mapped-inventory "$RUN/plex/initial-inventory.json" \
-  --blob-root /opt/nzbdav/config/blobs \
+  --mapped-inventory "$RUN/plex/initial-inventory" \
   --source-root /mnt/plex \
   --library-root /mnt/plex2 \
   --target-root /mnt/remote/infinidysk \
@@ -275,41 +286,37 @@ fenced; retain each plan and journal as its ownership proof. Validation checks
 size and bounded beginning/middle/end reads. Do not acknowledge a batch whose
 validation has failures.
 
-After the first pass, freeze fresh inventories of **both** roots and a fresh
-catalogue snapshot. Recover and process only links added since each root's
-initial snapshot as separate delta passes. Removed
-links need no parallel entry, and changed legacy targets must be reviewed rather
-than forced. Copy each unmodified initial/delta `master-manifest.json` into a
-dedicated private directory **per root**; duplicate relative paths across
-masters for the same root are an error. Then generate coverage against each
-root's initial snapshot and live final source tree:
+After the first pass, generate coverage against each root's initial snapshot
+and a fresh live mapped source snapshot. The report classifies added, removed,
+broken, and changed mappings without dropping new rows from the denominator.
+If new links need a delta import, pause and prepare a separately reviewed
+selection; rerunning the full sharded exporter would resubmit old releases.
+Removed links need no parallel entry, and changed legacy targets must be
+reviewed rather than forced.
 
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  mapped-coverage-report \
-  --source-root /mnt/plex \
+  sharded-coverage-report \
+  --inventory "$RUN/plex/initial-inventory" \
+  --recovery "$RUN/plex/recovery" \
   --library-root /mnt/plex2 \
-  --initial-inventory "$RUN/plex/initial-inventory.json" \
   --blob-root /opt/nzbdav/config/blobs \
-  --master "$RUN/plex/coverage-masters" \
   --journals-dir "$RUN/plex/journals" \
   --output "$RUN/plex/coverage" \
   --minimum-coverage 0.90
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  mapped-coverage-report \
-  --source-root /mnt/special \
+  sharded-coverage-report \
+  --inventory "$RUN/special/initial-inventory" \
+  --recovery "$RUN/special/recovery" \
   --library-root /mnt/special2 \
-  --initial-inventory "$RUN/special/initial-inventory.json" \
   --blob-root /opt/nzbdav/config/blobs \
-  --master "$RUN/special/coverage-masters" \
   --journals-dir "$RUN/special/journals" \
   --output "$RUN/special/coverage" \
   --minimum-coverage 0.90
 ```
 
-`--master` accepts either one manifest file or a directory of initial/delta JSON
-master manifests. The final live `LocalLinks` snapshot beneath **each** source
+The final live `LocalLinks` snapshot beneath **each** source
 root is its denominator, including broken and missing source links. Review every `covered`,
 `missing-parallel`, `wrong-target`, `added-after-initial`, and removed item in
 both `coverage.json` and `coverage.md` reports; the counts must classify every
