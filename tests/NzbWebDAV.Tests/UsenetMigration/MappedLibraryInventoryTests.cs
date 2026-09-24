@@ -94,6 +94,24 @@ public sealed class MappedLibraryInventoryTests : IDisposable
         Assert.False(result.Report.MeetsMinimumCoverage);
     }
 
+    [Fact]
+    public void Build_ExcludesDuplicateDavItemMappingsWithoutDroppingEitherRow()
+    {
+        var source = Directory.CreateDirectory(Path.Join(_root, "plex")).FullName;
+        var ids = Directory.CreateDirectory(Path.Join(_root, "legacy", ".ids")).FullName;
+        var id = Guid.NewGuid();
+        CreateLink(source, "one.mkv", Path.Join(ids, id.ToString()));
+        CreateLink(source, "two.mkv", Path.Join(ids, id.ToString()));
+        var database = new LegacyMappedReadResult(
+            [Row("one.mkv", id), Row("two.mkv", id)], [], []);
+
+        var snapshot = new MappedLibraryInventoryBuilder().Build(
+            source, ids, database, new LibraryInventoryService().Inventory(source), Path.Join(_root, "blobs"));
+
+        Assert.Equal(2, snapshot.Rows.Count);
+        Assert.All(snapshot.Rows, row => Assert.Equal("duplicate-mapped-id", row.Candidate.ExclusionReason));
+    }
+
     private LegacyLocalLinkRow Row(string relative, Guid id, bool isBroken = false) =>
         new(Path.Join(_root, "plex", relative), id, isBroken);
 

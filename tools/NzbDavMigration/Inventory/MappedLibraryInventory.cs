@@ -42,7 +42,7 @@ public sealed record MappedLibraryInventory(
                     Path.GetRelativePath(source, row.LinkPath).Replace(Path.DirectorySeparatorChar, '/'),
                     StringComparison.Ordinal))
                 throw new InvalidDataException("Mapped inventory contains a duplicate or inconsistent row.");
-            if (row.IsBroken && row.Candidate.ExclusionReason != "broken-mapping")
+            if (row.IsBroken && row.Candidate.ExclusionReason is not ("broken-mapping" or "duplicate-mapped-id"))
                 throw new InvalidDataException("Broken mapping was not excluded.");
         }
         if (!string.Equals(RowsSha256, ComputeRowsSha256(Rows), StringComparison.Ordinal))
@@ -76,6 +76,8 @@ public sealed class MappedLibraryInventoryBuilder
         var enrichedByPath = new LibraryInventoryService().Enrich(filesystem, database.Items, resolver)
             .ToDictionary(item => item.LibraryRelativePath, StringComparer.Ordinal);
         var itemsById = database.Items.ToDictionary(item => item.Id);
+        var duplicateIds = database.Links.GroupBy(link => link.DavItemId)
+            .Where(group => group.Count() > 1).Select(group => group.Key).ToHashSet();
         foreach (var mapping in database.Links.OrderBy(link => link.LinkPath, StringComparer.Ordinal))
         {
             if (!Path.IsPathFullyQualified(mapping.LinkPath)
@@ -87,7 +89,8 @@ public sealed class MappedLibraryInventoryBuilder
                 throw new InvalidDataException("Duplicate mapped LinkPath in source database.");
             byPath.TryGetValue(relative, out var link);
             string? exclusion = null;
-            if (mapping.IsBroken) exclusion = "broken-mapping";
+            if (duplicateIds.Contains(mapping.DavItemId)) exclusion = "duplicate-mapped-id";
+            else if (mapping.IsBroken) exclusion = "broken-mapping";
             else if (link is null) exclusion = "missing-source-link";
             else if (link.LegacyDavItemId != mapping.DavItemId) exclusion = "mapping-target-id-mismatch";
             else if (!IsUnderIdsRoot(mapping.LinkPath, link.OriginalTarget, idsRoot))
