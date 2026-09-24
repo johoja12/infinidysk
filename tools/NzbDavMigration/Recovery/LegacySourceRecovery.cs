@@ -41,6 +41,7 @@ public sealed class LegacySourceRecovery
         OrphanCatalogueStore catalogue,
         string outputDirectory,
         decimal minimumCoverage,
+        MappedSourceProof? mappedSource = null,
         CancellationToken cancellationToken = default)
     {
         if (minimumCoverage is < 0 or > 1)
@@ -58,7 +59,8 @@ public sealed class LegacySourceRecovery
         try
         {
             var master = new FullRecoveryMasterManifest(FullRecoveryMasterManifest.CurrentSchemaVersion,
-                report.CreatedAt, report.TotalLinks, report.RecoverableLinks, report.RecoverableFraction, report.Items);
+                report.CreatedAt, report.TotalLinks, report.RecoverableLinks, report.RecoverableFraction, report.Items,
+                mappedSource);
             var exclusions = report.Items.Where(item =>
                 item.Classification is not ("exact-direct" or "exact-archive")).ToArray();
             await WriteJsonAsync(Path.Join(stage, "recovery.json"), report, cancellationToken).ConfigureAwait(false);

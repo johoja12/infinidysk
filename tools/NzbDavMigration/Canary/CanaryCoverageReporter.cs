@@ -53,6 +53,8 @@ public sealed class CanaryCoverageReporter
         string outputDirectory,
         decimal minimumCoverage = 0.90m,
         TimeSpan? statTimeout = null,
+        MappedLibraryInventory? initialMapped = null,
+        MappedLibraryInventory? finalMapped = null,
         CancellationToken cancellationToken = default)
     {
         if (minimumCoverage is < 0 or > 1)
@@ -60,13 +62,31 @@ public sealed class CanaryCoverageReporter
         var source = CanaryPathSafety.ResolveRoot(sourceRoot, "Source library root");
         var library = CanaryPathSafety.ResolveRoot(libraryRoot, "Parallel library root");
         var journals = CanaryPathSafety.ResolveRoot(journalsDirectory, "Journals directory");
-        var initial = await ReadJsonAsync<LegacyInventoryCandidate[]>(initialInventoryPath, cancellationToken)
-            .ConfigureAwait(false) ?? throw new InvalidDataException("Initial inventory is empty.");
-        var masterItems = await ReadMasterItemsAsync(masterManifestPath, cancellationToken).ConfigureAwait(false);
+        if ((initialMapped is null) != (finalMapped is null))
+            throw new InvalidDataException("Mapped coverage requires both initial and final mapping snapshots.");
+        initialMapped?.Validate();
+        finalMapped?.Validate();
+        if (initialMapped is not null && (initialMapped.SourceRoot != source
+            || finalMapped!.SourceRoot != source
+            || initialMapped.LegacyIdsRoot != finalMapped.LegacyIdsRoot))
+            throw new InvalidDataException("Mapped coverage source roots disagree.");
+        var initial = initialMapped is null
+            ? await ReadJsonAsync<LegacyInventoryCandidate[]>(initialInventoryPath, cancellationToken)
+                .ConfigureAwait(false) ?? throw new InvalidDataException("Initial inventory is empty.")
+            : initialMapped.Rows.Select(row => row.Candidate).ToArray();
+        var masterItems = await ReadMasterItemsAsync(
+            masterManifestPath, initialMapped?.SourceRoot, cancellationToken).ConfigureAwait(false);
         var initialByPath = UniqueByPath(initial.Select(item =>
             new LibraryInventoryLink(item.LibraryRelativePath, item.OriginalTarget, item.LegacyDavItemId)),
             "initial inventory");
-        var final = new LibraryInventoryService().Inventory(source);
+        var final = finalMapped is null
+            ? new LibraryInventoryService().Inventory(source)
+            : finalMapped.Rows.Select(row => new LibraryInventoryLink(
+                row.Candidate.LibraryRelativePath, row.Candidate.OriginalTarget, row.DavItemId)).ToArray();
+        var mappedExclusions = finalMapped?.Rows.ToDictionary(
+            row => row.Candidate.LibraryRelativePath,
+            row => row.Candidate.ExclusionReason,
+            StringComparer.Ordinal);
         var finalByPath = UniqueByPath(final, "final inventory");
         var parallel = new LibraryInventoryService().Inventory(library);
         var orphanParallelCount = parallel.Count(item => !finalByPath.ContainsKey(item.LibraryRelativePath));
@@ -82,7 +102,10 @@ public sealed class CanaryCoverageReporter
             cancellationToken.ThrowIfCancellationRequested();
             string classification;
             var existedInitially = initialByPath.TryGetValue(current.LibraryRelativePath, out var original);
-            if (existedInitially && (original!.LegacyDavItemId != current.LegacyDavItemId
+            if (mappedExclusions is not null
+                && mappedExclusions[current.LibraryRelativePath] is { } mappingExclusion)
+                classification = mappingExclusion;
+            else if (existedInitially && (original!.LegacyDavItemId != current.LegacyDavItemId
                                      || !string.Equals(original.OriginalTarget, current.OriginalTarget,
                                          StringComparison.Ordinal)))
                 classification = "source-drift";
@@ -213,7 +236,7 @@ public sealed class CanaryCoverageReporter
         }
     }
 
-    private static void ValidateMaster(FullRecoveryMasterManifest master)
+    private static void ValidateMaster(FullRecoveryMasterManifest master, string? mappedSourceRoot)
     {
         var recoverable = master.Items.Count(item => item.Classification is "exact-direct" or "exact-archive");
         var fraction = master.Items.Count == 0 ? 0m : decimal.Divide(recoverable, master.Items.Count);
@@ -222,10 +245,13 @@ public sealed class CanaryCoverageReporter
             || master.RecoverableLinks != recoverable
             || master.RecoverableFraction != fraction)
             throw new InvalidDataException("Master manifest counts or schema are invalid.");
+        if (mappedSourceRoot is not null && master.MappedSource?.SourceRoot != mappedSourceRoot)
+            throw new InvalidDataException("Mapped coverage master belongs to a different source root.");
     }
 
     private static async Task<IReadOnlyList<LegacySourceRecoveryItem>> ReadMasterItemsAsync(
         string path,
+        string? mappedSourceRoot,
         CancellationToken cancellationToken)
     {
         var fullPath = Path.GetFullPath(path);
@@ -248,7 +274,7 @@ public sealed class CanaryCoverageReporter
                     throw new InvalidDataException($"Coverage master manifest must not be a symbolic link: {file.FullName}");
                 var master = await ReadJsonAsync<FullRecoveryMasterManifest>(file.FullName, cancellationToken)
                     .ConfigureAwait(false) ?? throw new InvalidDataException($"Master manifest is empty: {file.FullName}");
-                ValidateMaster(master);
+                ValidateMaster(master, mappedSourceRoot);
                 items.AddRange(master.Items);
             }
             return items;
@@ -256,7 +282,7 @@ public sealed class CanaryCoverageReporter
 
         var single = await ReadJsonAsync<FullRecoveryMasterManifest>(fullPath, cancellationToken)
             .ConfigureAwait(false) ?? throw new InvalidDataException("Master manifest is empty.");
-        ValidateMaster(single);
+        ValidateMaster(single, mappedSourceRoot);
         return single.Items;
     }
 

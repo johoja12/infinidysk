@@ -147,6 +147,27 @@ public sealed class CanaryLinkApplierTests : IDisposable
         Assert.False(CanaryPathSafety.PathExistsNoFollow(Path.Join(fixture.LibraryRoot, "TV", "episode.mkv")));
     }
 
+    [Fact]
+    public async Task ApplyAsync_StopsWhenMappingChangesImmediatelyBeforeCreate()
+    {
+        var fixture = await CreateFixtureAsync("TV/episode.mkv");
+        var mapped = true;
+        var checks = 0;
+        var applier = new CanaryLinkApplier(_ => true, _ => mapped = false,
+            (_, _, _) =>
+            {
+                checks++;
+                if (!mapped) throw new InvalidDataException("Mapping changed.");
+                return Task.CompletedTask;
+            });
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => applier.ApplyAsync(
+            fixture.PlanPath, fixture.SourceRoot, fixture.LibraryRoot, fixture.TargetRoot, fixture.JournalPath));
+
+        Assert.Equal(2, checks);
+        Assert.False(CanaryPathSafety.PathExistsNoFollow(Path.Join(fixture.LibraryRoot, "TV", "episode.mkv")));
+    }
+
     private async Task<Fixture> CreateFixtureAsync(string libraryPath, Action<string>? beforeCreate = null)
     {
         var library = Directory.CreateDirectory(Path.Join(_root, $"library-{Guid.NewGuid():N}")).FullName;
