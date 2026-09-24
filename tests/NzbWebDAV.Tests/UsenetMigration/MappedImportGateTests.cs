@@ -39,6 +39,24 @@ public sealed class MappedImportGateTests : IDisposable
         Assert.Equal(expectedExit, exit);
     }
 
+    [Fact]
+    public async Task FullRecovery_RefusesLoweredMappedCoverageGate()
+    {
+        Directory.CreateDirectory(_root);
+        await WriteAsync("plex-inventory.json", Snapshot("/mnt/plex", Guid.NewGuid()));
+
+        var exit = await NzbDavMigrationProgram.RunAsync(
+        [
+            "recover-full", "--inventory", Path.Join(_root, "plex-inventory.json"),
+            "--catalogue", Path.Join(_root, "missing-catalogue.sqlite"),
+            "--output", Path.Join(_root, "recovery"),
+            "--minimum-coverage", "0.50",
+        ]);
+
+        Assert.Equal(1, exit);
+        Assert.False(Directory.Exists(Path.Join(_root, "recovery")));
+    }
+
     private static MappedLibraryInventory Snapshot(string source, Guid id)
     {
         var target = $"/mnt/remote/nzbdav/.ids/a/b/c/{id}";

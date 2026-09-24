@@ -91,11 +91,13 @@ internal static class NzbDavMigrationProgram
         var inventory = await ReadJsonAsync<MappedLibraryInventory>(Required(options, "--inventory"))
             .ConfigureAwait(false) ?? throw new InvalidDataException("Mapped inventory file is empty.");
         inventory.Validate();
+        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
+        if (minimum < 0.90m)
+            throw new InvalidDataException("Mapped recovery minimum coverage cannot be below 0.90.");
         var cataloguePath = Required(options, "--catalogue");
         await using var store = new OrphanCatalogueStore(
             cataloguePath, cataloguePath + ".completion.json");
         await store.OpenCompletedAsync().ConfigureAwait(false);
-        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
         var result = await new LegacySourceRecovery().WriteAsync(
             inventory.Rows.Select(row => row.Candidate).ToArray(), store, Required(options, "--output"), minimum,
             mappedSource: new MappedSourceProof(inventory.SourceRoot, inventory.LegacyIdsRoot,
@@ -349,6 +351,9 @@ internal static class NzbDavMigrationProgram
         var sourceRoot = Required(options, "--source-root");
         if (Path.GetFullPath(sourceRoot).TrimEnd(Path.DirectorySeparatorChar) != initial.SourceRoot)
             throw new InvalidDataException("Coverage source root disagrees with mapped initial inventory.");
+        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
+        if (minimum < 0.90m)
+            throw new InvalidDataException("Mapped final coverage minimum cannot be below 0.90.");
         var final = await BuildMappedInventoryAsync(
             initial.SourceRoot, initial.LegacyIdsRoot, Required(options, "--blob-root"))
             .ConfigureAwait(false);
@@ -359,7 +364,7 @@ internal static class NzbDavMigrationProgram
             Required(options, "--master"),
             Required(options, "--journals-dir"),
             Required(options, "--output"),
-            ParseCoverage(options, "--minimum-coverage", 0.90m),
+            minimum,
             initialMapped: initial,
             finalMapped: final).ConfigureAwait(false);
         await Console.Out.WriteLineAsync(Path.GetFullPath(Required(options, "--output")));
