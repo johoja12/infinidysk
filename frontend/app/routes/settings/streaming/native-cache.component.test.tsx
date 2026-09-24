@@ -303,6 +303,8 @@ describe("native cache folder editor", () => {
       screen.getByLabelText("Read-only (hits/import only; no writes or eviction)"),
     );
     expect(evict).toHaveProperty("disabled", true);
+  });
+
   it("refreshes the open catalogue and ranges after a completed exact-file eviction", async () => {
     const key = "a".repeat(64);
     let evicted = false;
