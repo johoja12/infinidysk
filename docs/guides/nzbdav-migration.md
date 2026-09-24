@@ -134,9 +134,11 @@ weaken these permissions or upload the artifacts to issues or pull requests.
 
 ```bash
 umask 077
-RUN=/opt/infinidysk-migration/full/2026-09-21T000000Z
+RUN=/mnt/nzbdav-cache3/infinidysk-migration-artifacts/2026-09-24T000000Z
+SCRATCH=/opt/infinidysk-migration/full-scratch/2026-09-24T000000Z
 mkdir -m 0700 -p "$RUN"
 mkdir -m 0700 -p "$RUN/plex" "$RUN/special"
+mkdir -m 0700 -p "$SCRATCH"
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
   mapped-inventory \
@@ -161,20 +163,24 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   catalogue-scan \
   --blob-root /opt/nzbdav/config/blobs \
   --inventory "$RUN/catalogue-input.json" \
-  --database "$RUN/orphan-catalogue.sqlite" \
+  --database "$SCRATCH/orphan-catalogue.sqlite" \
   --summary "$RUN/orphan-catalogue-summary.json"
+
+cp "$SCRATCH/orphan-catalogue.sqlite" "$RUN/orphan-catalogue.sqlite"
+test "$(sha256sum "$SCRATCH/orphan-catalogue.sqlite" | cut -d' ' -f1)" = \
+  "$(sha256sum "$RUN/orphan-catalogue.sqlite" | cut -d' ' -f1)"
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
   recover-full \
   --inventory "$RUN/plex/initial-inventory.json" \
-  --catalogue "$RUN/orphan-catalogue.sqlite" \
+  --catalogue "$SCRATCH/orphan-catalogue.sqlite" \
   --output "$RUN/plex/recovery" \
   --minimum-coverage 0.90
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
   recover-full \
   --inventory "$RUN/special/initial-inventory.json" \
-  --catalogue "$RUN/orphan-catalogue.sqlite" \
+  --catalogue "$SCRATCH/orphan-catalogue.sqlite" \
   --output "$RUN/special/recovery" \
   --minimum-coverage 0.90
 
@@ -189,7 +195,10 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
 `catalogue-list` freezes a no-follow input snapshot. `catalogue-scan` commits in
 bounded transactions and can be run again with the same inventory/database after
 an interruption; already completed snapshots are skipped. Do not edit or replace
-the frozen blob files while scanning. Review `recovery.json`, `exclusions.json`,
+the frozen blob files while scanning. Keep the SQLite catalogue on local
+`$SCRATCH`, verify free space there, and copy a checksummed sealed copy to `$RUN`
+for recovery. Verify that the artifact share is the mounted volume 3 NFS export
+before writing; keep backups on the separate volume 2 share. Review `recovery.json`, `exclusions.json`,
 `master-manifest.json`, and `SHA256SUMS` for **each** root. Export is blocked unless
 at least 90% of each root's `LocalLinks` rows have an exact article-backed payload.
 Byte-identical NZB copies collapse to one logical payload; distinct matches
