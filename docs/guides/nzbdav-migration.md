@@ -112,13 +112,14 @@ playback result.
 
 !!! warning "Mapped-only import gate"
 
-    The current full-library CLI inventories `.ids` symlinks but does not verify
-    each file against NzbDav's `LocalLinks` mapping table. Do not run the full
-    recovery, export, or batch submission commands below until the
+    The previously installed full-library CLI inventories `.ids` symlinks
+    without verifying NzbDav's `LocalLinks` table. Build and install the
+    mapping-aware tool from the same tested revision as the backend before
+    running the commands below. Complete every hold point in the
     [mapped-only production plan](../superpowers/plans/2026-09-24-nzbdav-full-library-import-runbook.md)
-    is implemented and its mapping checks pass. Only NZBs with at least one
-    verified mapped file may be submitted; mixed NZBs may be imported, but only
-    their mapped files receive parallel library links.
+    first. Only NZBs with at least one verified mapped file may be submitted;
+    mixed NZBs may be imported, but only their mapped files receive parallel
+    library links.
 
 Complete the canary first. Before running these commands, back up InfiniDysk
 `/config`, its database, the legacy PostgreSQL database, and the orphan blob tree.
@@ -138,14 +139,16 @@ mkdir -m 0700 -p "$RUN"
 mkdir -m 0700 -p "$RUN/plex" "$RUN/special"
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  inventory \
+  mapped-inventory \
   --library-root /mnt/plex \
+  --legacy-ids-root /mnt/remote/nzbdav/.ids \
   --blob-root /opt/nzbdav/config/blobs \
   --output "$RUN/plex/initial-inventory.json"
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  inventory \
+  mapped-inventory \
   --library-root /mnt/special \
+  --legacy-ids-root /mnt/remote/nzbdav/.ids \
   --blob-root /opt/nzbdav/config/blobs \
   --output "$RUN/special/initial-inventory.json"
 
@@ -174,6 +177,13 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --catalogue "$RUN/orphan-catalogue.sqlite" \
   --output "$RUN/special/recovery" \
   --minimum-coverage 0.90
+
+dotnet run --project tools/NzbDavMigration -c Release -- \
+  verify-mapped-roots \
+  --plex-inventory "$RUN/plex/initial-inventory.json" \
+  --special-inventory "$RUN/special/initial-inventory.json" \
+  --plex-master "$RUN/plex/recovery/master-manifest.json" \
+  --special-master "$RUN/special/recovery/master-manifest.json"
 ```
 
 `catalogue-list` freezes a no-follow input snapshot. `catalogue-scan` commits in
@@ -181,9 +191,10 @@ bounded transactions and can be run again with the same inventory/database after
 an interruption; already completed snapshots are skipped. Do not edit or replace
 the frozen blob files while scanning. Review `recovery.json`, `exclusions.json`,
 `master-manifest.json`, and `SHA256SUMS` for **each** root. Export is blocked unless
-at least 90% of each root's original links have an exact article-backed payload.
+at least 90% of each root's `LocalLinks` rows have an exact article-backed payload.
 Byte-identical NZB copies collapse to one logical payload; distinct matches
-remain ambiguous.
+remain ambiguous. Cross-root verification blocks export when the roots share
+DavItem IDs or NZB payloads; those require the separate target-reuse workflow.
 
 Export immutable batches. The defaults are at most 250 releases and 4 GiB of NZB
 payload bytes per batch; lower either bound to reduce queue or review pressure.
@@ -193,6 +204,8 @@ One oversized release is isolated and explicitly marked rather than hidden.
 dotnet run --project tools/NzbDavMigration -c Release -- \
   export-batches \
   --master "$RUN/plex/recovery/master-manifest.json" \
+  --peer-master "$RUN/special/recovery/master-manifest.json" \
+  --peer-inventory "$RUN/special/initial-inventory.json" \
   --blob-root /opt/nzbdav/config/blobs \
   --output "$RUN/plex/batches" \
   --max-releases 250 \
@@ -201,6 +214,8 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
 dotnet run --project tools/NzbDavMigration -c Release -- \
   export-batches \
   --master "$RUN/special/recovery/master-manifest.json" \
+  --peer-master "$RUN/plex/recovery/master-manifest.json" \
+  --peer-inventory "$RUN/plex/initial-inventory.json" \
   --blob-root /opt/nzbdav/config/blobs \
   --output "$RUN/special/batches" \
   --max-releases 250 \
@@ -225,8 +240,10 @@ immediately before creating its parallel link:
 
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  apply-links \
+  apply-mapped-links \
   --plan "$RUN/plex/plans/batch-0001/plan.json" \
+  --mapped-inventory "$RUN/plex/initial-inventory.json" \
+  --blob-root /opt/nzbdav/config/blobs \
   --source-root /mnt/plex \
   --library-root /mnt/plex2 \
   --target-root /mnt/remote/infinidysk \
@@ -239,8 +256,9 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --ffprobe /usr/bin/ffprobe
 ```
 
-Repeat with `special/` artifacts, `--source-root /mnt/special`, and
-`--library-root /mnt/special2`. Apply never copies links from one source tree
+Repeat with `special/` artifacts, its mapped inventory,
+`--source-root /mnt/special`, and `--library-root /mnt/special2`.
+Apply checks `LocalLinks` again before each link creation and never copies links from one source tree
 to the other staging tree. Keep both staging trees out of Plex and Arr.
 
 The plan must contain exact rows only. Apply is create-only and source-drift
@@ -259,20 +277,22 @@ root's initial snapshot and live final source tree:
 
 ```bash
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  coverage-report \
+  mapped-coverage-report \
   --source-root /mnt/plex \
   --library-root /mnt/plex2 \
   --initial-inventory "$RUN/plex/initial-inventory.json" \
+  --blob-root /opt/nzbdav/config/blobs \
   --master "$RUN/plex/coverage-masters" \
   --journals-dir "$RUN/plex/journals" \
   --output "$RUN/plex/coverage" \
   --minimum-coverage 0.90
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
-  coverage-report \
+  mapped-coverage-report \
   --source-root /mnt/special \
   --library-root /mnt/special2 \
   --initial-inventory "$RUN/special/initial-inventory.json" \
+  --blob-root /opt/nzbdav/config/blobs \
   --master "$RUN/special/coverage-masters" \
   --journals-dir "$RUN/special/journals" \
   --output "$RUN/special/coverage" \
@@ -280,8 +300,8 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
 ```
 
 `--master` accepts either one manifest file or a directory of initial/delta JSON
-master manifests. The final live snapshot of **each** source root is its
-denominator. Review every `covered`,
+master manifests. The final live `LocalLinks` snapshot beneath **each** source
+root is its denominator, including broken and missing source links. Review every `covered`,
 `missing-parallel`, `wrong-target`, `added-after-initial`, and removed item in
 both `coverage.json` and `coverage.md` reports; the counts must classify every
 final source link exactly once within its root. Calculate combined coverage as
