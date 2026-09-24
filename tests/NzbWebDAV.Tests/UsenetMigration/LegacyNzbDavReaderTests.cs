@@ -2,6 +2,9 @@ using NzbDavMigration.Legacy;
 using Npgsql;
 using NzbWebDAV.Database;
 using NzbDavMigration.Export;
+using NzbDavMigration.Inventory;
+using NzbDavMigration.Catalogue;
+using NzbDavMigration.Recovery;
 using NzbWebDAV.Models.Nzb;
 using NzbWebDAV.UsenetMigration.NzbDav;
 
@@ -126,6 +129,17 @@ public sealed class LegacyNzbDavReaderTests
                 builder.ConnectionString, [withHistory, withoutHistory, missing]);
             var mapped = await new LegacyNzbDavReader().ReadMappedAsync(
                 builder.ConnectionString, "/mnt/plex");
+            var batches = new List<LegacyMappedReadResult>();
+            await new LegacyNzbDavReader().ReadMappedBatchesAsync(
+                builder.ConnectionString, "/mnt/plex", (allMappings, batch) =>
+                {
+                    Assert.Equal(2, allMappings.Count);
+                    batches.Add(batch);
+                    return Task.CompletedTask;
+                }, batchSize: 1);
+            Assert.Equal(2, batches.Count);
+            Assert.All(batches, batch => Assert.Single(batch.Links));
+            Assert.Equal(2, batches.Sum(batch => batch.Items.Count));
             Assert.Equal(2, mapped.Links.Count);
             Assert.Equal(2, mapped.Items.Count);
             Assert.True(mapped.Links.Single(link => link.DavItemId == withoutHistory).IsBroken);
@@ -144,6 +158,102 @@ public sealed class LegacyNzbDavReaderTests
             Assert.Equal("missing-history", orphan.HistoryExclusion);
             Assert.Null(orphan.SafetyExclusion);
             Assert.Null(orphan.ResolutionExclusion);
+
+            var shardFixture = Path.Join(Path.GetTempPath(), $"mapped-shards-{Guid.NewGuid():N}");
+            try
+            {
+                var sourceRoot = Path.Join(shardFixture, "library");
+                var idsRoot = Path.Join(shardFixture, ".ids");
+                var outputRoot = Path.Join(shardFixture, "inventory");
+                Directory.CreateDirectory(sourceRoot);
+                Directory.CreateDirectory(idsRoot);
+                Directory.CreateDirectory(Path.Join(shardFixture, "blobs"));
+                File.CreateSymbolicLink(Path.Join(sourceRoot, "a.mkv"), Path.Join(idsRoot, withHistory.ToString()));
+                File.CreateSymbolicLink(Path.Join(sourceRoot, "b.mkv"), Path.Join(idsRoot, withoutHistory.ToString()));
+                await using (var insert = new NpgsqlCommand($"""
+                    INSERT INTO "{schema}"."LocalLinks" VALUES
+                    (@first, @withHistory, false), (@second, @withoutHistory, false)
+                    """, admin))
+                {
+                    insert.Parameters.AddWithValue("first", Path.Join(sourceRoot, "a.mkv"));
+                    insert.Parameters.AddWithValue("withHistory", withHistory);
+                    insert.Parameters.AddWithValue("second", Path.Join(sourceRoot, "b.mkv"));
+                    insert.Parameters.AddWithValue("withoutHistory", withoutHistory);
+                    await insert.ExecuteNonQueryAsync();
+                }
+                var writer = new ShardedMappedInventoryWriter();
+                var manifest = await writer.WriteAsync(sourceRoot, idsRoot,
+                    Path.Join(shardFixture, "blobs"), outputRoot, batchSize: 1,
+                    connectionString: builder.ConnectionString);
+                Assert.Equal(2, manifest.RowCount);
+                Assert.Equal(2, manifest.Shards.Count);
+                File.Delete(Path.Join(outputRoot, "manifest.json"));
+                var resumedInventory = await writer.WriteAsync(sourceRoot, idsRoot,
+                    Path.Join(shardFixture, "blobs"), outputRoot, batchSize: 1,
+                    connectionString: builder.ConnectionString);
+                Assert.Equal(manifest.RowsSha256, resumedInventory.RowsSha256);
+                foreach (var shard in manifest.Shards)
+                    Assert.Single((await ShardedMappedInventoryWriter.ReadVerifiedShardAsync(
+                        outputRoot, manifest, shard)).Rows);
+
+                var allowlist = await ShardedMappedInventoryWriter.ReadAllowlistAsync(outputRoot, manifest);
+                Assert.Equal(2, allowlist.Count);
+                var cataloguePath = Path.Join(shardFixture, "catalogue.sqlite");
+                await using (var store = new OrphanCatalogueStore(
+                                 cataloguePath, cataloguePath + ".completion.json"))
+                {
+                    var inputDigest = new string('f', 64);
+                    await store.BeginAsync(inputDigest);
+                    foreach (var (id, article, bytes, digest) in new[]
+                             {
+                                 (withHistory, "one@example", 123L, new string('1', 64)),
+                                 (withoutHistory, "two@example", 456L, new string('2', 64)),
+                             })
+                    {
+                        var segments = new[] { new NzbDavArticleSegment(1, bytes, article) };
+                        await store.UpsertAsync(new OrphanCatalogueBlob(
+                            $"{id}.nzb", 100, 200, digest, "valid", null,
+                            NzbDavArticleIdentity.ComputeRelease([segments]),
+                            [new OrphanCatalogueArticle(article, 0, 1, bytes)]));
+                    }
+                    await store.SealAsync(await store.BuildSummaryAsync(inputDigest));
+                    var recoveryRoot = Path.Join(shardFixture, "recovery");
+                    var recovery = await new ShardedMappedRecovery().WriteAsync(
+                        outputRoot, store, recoveryRoot);
+                    Assert.Equal(2, recovery.TotalLinks);
+                    Assert.Equal(2, recovery.RecoverableLinks);
+                    Assert.Equal(1m, recovery.RecoverableFraction);
+                    File.Delete(Path.Join(recoveryRoot, "manifest.json"));
+                    var resumed = await new ShardedMappedRecovery().WriteAsync(
+                        outputRoot, store, recoveryRoot);
+                    Assert.Equal(recovery.RecoverableLinks, resumed.RecoverableLinks);
+                    var loaded = await new ShardedMappedExporter().LoadRootAsync(outputRoot, recoveryRoot);
+                    Assert.Equal(2, loaded.Items.Count);
+                }
+
+                await ExecuteAsync(admin, $"""
+                    UPDATE "{schema}"."LocalLinks" SET "DavItemId" = '{withoutHistory}'
+                    WHERE "LinkPath" = '{Path.Join(sourceRoot, "a.mkv")}'
+                    """);
+                var changed = await writer.WriteAsync(sourceRoot, idsRoot,
+                    Path.Join(shardFixture, "blobs"), Path.Join(shardFixture, "changed"),
+                    batchSize: 1, connectionString: builder.ConnectionString);
+                Assert.NotEqual(manifest.RowsSha256, changed.RowsSha256);
+                await ExecuteAsync(admin, $"""
+                    UPDATE "{schema}"."LocalLinks" SET "DavItemId" = '{withHistory}'
+                    WHERE "LinkPath" = '{Path.Join(sourceRoot, "a.mkv")}'
+                    """);
+
+                var firstPath = Path.Join(outputRoot, manifest.Shards[0].RelativePath);
+                await File.AppendAllTextAsync(firstPath, " ");
+                await Assert.ThrowsAsync<InvalidDataException>(() =>
+                    ShardedMappedInventoryWriter.ReadVerifiedShardAsync(
+                        outputRoot, manifest, manifest.Shards[0]));
+            }
+            finally
+            {
+                if (Directory.Exists(shardFixture)) Directory.Delete(shardFixture, recursive: true);
+            }
 
             foreach (var assignment in new[] { "\"IsCorrupted\" = true", "\"RepairStatus\" = 2",
                          "\"ZeroPadCorruptSegments\" = true", "\"HealthCheckQueueReason\" = ' Source-Validation '" })

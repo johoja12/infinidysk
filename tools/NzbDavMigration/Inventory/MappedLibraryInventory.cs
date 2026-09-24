@@ -61,7 +61,8 @@ public sealed class MappedLibraryInventoryBuilder
         string legacyIdsRoot,
         LegacyMappedReadResult database,
         IReadOnlyList<LibraryInventoryLink> filesystem,
-        string blobRoot)
+        string blobRoot,
+        IReadOnlySet<Guid>? allDuplicateIds = null)
     {
         var root = Path.GetFullPath(sourceRoot).TrimEnd(Path.DirectorySeparatorChar);
         var idsRoot = Path.GetFullPath(legacyIdsRoot).TrimEnd(Path.DirectorySeparatorChar);
@@ -76,7 +77,7 @@ public sealed class MappedLibraryInventoryBuilder
         var enrichedByPath = new LibraryInventoryService().Enrich(filesystem, database.Items, resolver)
             .ToDictionary(item => item.LibraryRelativePath, StringComparer.Ordinal);
         var itemsById = database.Items.ToDictionary(item => item.Id);
-        var duplicateIds = database.Links.GroupBy(link => link.DavItemId)
+        var duplicateIds = allDuplicateIds ?? database.Links.GroupBy(link => link.DavItemId)
             .Where(group => group.Count() > 1).Select(group => group.Key).ToHashSet();
         foreach (var mapping in database.Links.OrderBy(link => link.LinkPath, StringComparer.Ordinal))
         {
