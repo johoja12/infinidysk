@@ -433,10 +433,15 @@ internal static class NzbDavMigrationProgram
             Required(options, "--library-root"), Required(options, "--legacy-ids-root"),
             Required(options, "--blob-root")).ConfigureAwait(false);
         await WriteJsonCreateNewAsync(Required(options, "--output"), report).ConfigureAwait(false);
+        static bool IsMappingConflict(string? reason) => reason is
+            "broken-mapping" or "missing-source-link" or "mapping-target-id-mismatch"
+            or "mapping-target-root-mismatch" or "duplicate-mapped-id";
         await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new
         {
             mappedRows = report.Rows.Count,
-            validSourceLinks = report.Rows.Count(row => row.Candidate.ExclusionReason is null),
+            validSourceLinks = report.Rows.Count(row => !IsMappingConflict(row.Candidate.ExclusionReason)),
+            mappingConflicts = report.Rows.Count(row => IsMappingConflict(row.Candidate.ExclusionReason)),
+            eligibleCandidates = report.Rows.Count(row => row.Candidate.ExclusionReason is null),
             excluded = report.Rows.Count(row => row.Candidate.ExclusionReason is not null),
             outOfScopeFilesystemLinks = report.OutOfScopeFilesystemLinks,
             report.RowsSha256,
