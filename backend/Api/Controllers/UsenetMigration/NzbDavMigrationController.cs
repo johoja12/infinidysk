@@ -84,8 +84,6 @@ public sealed class NzbDavMigrationController(
             || request.RecoverableCount > request.SourceLinkCount)
             throw new BadHttpRequestException("Projected source and recoverable counts are invalid.");
         var coverage = (double)request.RecoverableCount / request.SourceLinkCount;
-        if (coverage < 0.90)
-            throw new BadHttpRequestException("Projected recoverable coverage must be at least 90%.");
         if (package.Manifest.SelectedLinks.Count == 0
             || package.Manifest.SelectedLinks.Count > request.RecoverableCount)
             throw new BadHttpRequestException("The batch selection count is invalid for this recovery master.");

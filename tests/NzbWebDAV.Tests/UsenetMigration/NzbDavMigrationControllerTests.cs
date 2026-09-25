@@ -310,7 +310,7 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         var controller = CreateController(harness);
 
         Assert.IsType<OkObjectResult>(await controller.ConnectFull(
-            new NzbDavFullConnectRequest(special, specialDigest, 10, 9, 5, 1)));
+            new NzbDavFullConnectRequest(special, specialDigest, 10, 1, 5, 1)));
         Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(
             new NzbDavFullConnectRequest(plex, plexDigest, 100, 95, 5, 1)));
 

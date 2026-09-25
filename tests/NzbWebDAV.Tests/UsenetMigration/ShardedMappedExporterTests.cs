@@ -10,7 +10,7 @@ namespace NzbWebDAV.Tests.UsenetMigration;
 public sealed class ShardedMappedExporterTests
 {
     [Fact]
-    public void ValidatePair_RequiresPerRootAndCombinedCoverage()
+    public void ValidatePair_ReportsCoverageWithoutBlockingImport()
     {
         var plex = Evidence("/mnt/plex", 100, 90, [Guid.NewGuid()], [Digest('a')]);
         var special = Evidence("/mnt/special", 10, 9, [Guid.NewGuid()], [Digest('b')]);
@@ -18,8 +18,9 @@ public sealed class ShardedMappedExporterTests
         var valid = ShardedMappedExporter.ValidatePair(plex, special);
         Assert.Equal(99, valid.CombinedRecoverableRows);
         Assert.Equal(0.9m, valid.CombinedRecoveryFraction);
-        Assert.Throws<InvalidDataException>(() => ShardedMappedExporter.ValidatePair(
-            plex, Evidence("/mnt/special", 10, 8, [Guid.NewGuid()], [Digest('b')])));
+        var lowerCoverage = ShardedMappedExporter.ValidatePair(
+            plex, Evidence("/mnt/special", 10, 8, [Guid.NewGuid()], [Digest('b')]));
+        Assert.Equal(decimal.Divide(98, 110), lowerCoverage.CombinedRecoveryFraction);
     }
 
     [Fact]
@@ -35,16 +36,16 @@ public sealed class ShardedMappedExporterTests
     }
 
     [Fact]
-    public void ValidateSpecialAhead_RequiresCompleteSpecialRecoveryAndDistinctMappedIds()
+    public void ValidateSpecialAhead_RequiresDistinctMappedIds()
     {
         var specialId = Guid.NewGuid();
         var special = Evidence("/mnt/special", 100, 98, [specialId], [Digest('a')]);
         var plex = Evidence("/mnt/plex", 1000, 1, [Guid.NewGuid()], [Digest('b')]);
 
         ShardedMappedExporter.ValidateSpecialAhead(special, plex.Inventory, plex.DavItemIds);
-        Assert.Throws<InvalidDataException>(() => ShardedMappedExporter.ValidateSpecialAhead(
+        ShardedMappedExporter.ValidateSpecialAhead(
             Evidence("/mnt/special", 100, 89, [specialId], [Digest('a')]),
-            plex.Inventory, plex.DavItemIds));
+            plex.Inventory, plex.DavItemIds);
         Assert.Throws<InvalidDataException>(() => ShardedMappedExporter.ValidateSpecialAhead(
             special, plex.Inventory, new HashSet<Guid> { specialId }));
         Assert.Throws<InvalidDataException>(() => ShardedMappedExporter.ValidateSpecialAhead(

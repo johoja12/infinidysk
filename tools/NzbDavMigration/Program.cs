@@ -28,8 +28,8 @@ internal static class NzbDavMigrationProgram
             await Console.Error.WriteLineAsync("       NzbDavMigration mapped-inventory-shards --library-root PATH --legacy-ids-root PATH --blob-root PATH --output DIR [--batch-size 64]");
             await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-list --blob-root PATH --output FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration catalogue-scan --blob-root PATH --inventory FILE --database FILE --summary FILE");
-            await Console.Error.WriteLineAsync("       NzbDavMigration recover-full --inventory FILE --catalogue FILE --output DIR [--catalogue-summary FILE] [--minimum-coverage 0.90]");
-            await Console.Error.WriteLineAsync("       NzbDavMigration recover-shards --inventory DIR --catalogue FILE --output DIR [--catalogue-summary FILE] [--minimum-coverage 0.90]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration recover-full --inventory FILE --catalogue FILE --output DIR [--catalogue-summary FILE] [--minimum-coverage 0]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration recover-shards --inventory DIR --catalogue FILE --output DIR [--catalogue-summary FILE] [--minimum-coverage 0]");
             await Console.Error.WriteLineAsync("       NzbDavMigration verify-mapped-roots --plex-inventory FILE --special-inventory FILE --plex-master FILE --special-master FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration verify-sharded-roots --plex-inventory DIR --special-inventory DIR --plex-recovery DIR --special-recovery DIR");
             await Console.Error.WriteLineAsync("       NzbDavMigration export-batches --master FILE --peer-master FILE --peer-inventory FILE --blob-root PATH --output DIR [--max-releases 250] [--max-payload-bytes 4294967296]");
@@ -107,9 +107,7 @@ internal static class NzbDavMigrationProgram
         var inventory = await ReadJsonAsync<MappedLibraryInventory>(Required(options, "--inventory"))
             .ConfigureAwait(false) ?? throw new InvalidDataException("Mapped inventory file is empty.");
         inventory.Validate();
-        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
-        if (minimum < 0.90m)
-            throw new InvalidDataException("Mapped recovery minimum coverage cannot be below 0.90.");
+        var minimum = ParseCoverage(options, "--minimum-coverage", 0m);
         var cataloguePath = Required(options, "--catalogue");
         await using var store = new OrphanCatalogueStore(
             cataloguePath, Optional(options, "--catalogue-summary") ?? cataloguePath + ".completion.json");
@@ -123,9 +121,7 @@ internal static class NzbDavMigrationProgram
 
     private static async Task<int> RecoverShardsAsync(IReadOnlyDictionary<string, string> options)
     {
-        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
-        if (minimum < 0.90m)
-            throw new InvalidDataException("Mapped recovery minimum coverage cannot be below 0.90.");
+        var minimum = ParseCoverage(options, "--minimum-coverage", 0m);
         var cataloguePath = Required(options, "--catalogue");
         await using var store = new OrphanCatalogueStore(
             cataloguePath, Optional(options, "--catalogue-summary") ?? cataloguePath + ".completion.json");

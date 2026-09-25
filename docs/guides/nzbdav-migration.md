@@ -176,7 +176,7 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --catalogue "$SCRATCH/orphan-catalogue.sqlite" \
   --catalogue-summary "$RUN/orphan-catalogue-summary.json" \
   --output "$RUN/plex/recovery" \
-  --minimum-coverage 0.90
+  --minimum-coverage 0
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
   recover-shards \
@@ -184,7 +184,7 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --catalogue "$SCRATCH/orphan-catalogue.sqlite" \
   --catalogue-summary "$RUN/orphan-catalogue-summary.json" \
   --output "$RUN/special/recovery" \
-  --minimum-coverage 0.90
+  --minimum-coverage 0
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
   verify-sharded-roots \
@@ -204,8 +204,9 @@ needed, so run it against the writable local copy and retain the sealed NAS copy
 as the unchanged checkpoint. Verify that the artifact share is the mounted volume 3 NFS export
 before writing; keep backups on the separate volume 2 share. Review each root's
 inventory and recovery `manifest.json`, shard masters, and exclusions. Shards
-resume only when their row and catalogue digests still match. Export is blocked unless
-at least 90% of each root's `LocalLinks` rows have an exact article-backed payload.
+resume only when their row and catalogue digests still match. Export every
+uniquely recovered mapped payload even when coverage is below 90%; retain the
+unrecovered and excluded rows in the cumulative not-imported list.
 Byte-identical NZB copies collapse to one logical payload; distinct matches
 remain ambiguous. Cross-root verification blocks export when the roots share
 DavItem IDs or NZB payloads; those require the separate target-reuse workflow.
@@ -219,7 +220,7 @@ One oversized release is isolated and explicitly marked rather than hidden.
 
 ### Start the isolated scenes root before Plex recovery finishes
 
-When `/mnt/special` has a complete mapped recovery above 90% but the much larger
+When `/mnt/special` has a complete mapped recovery but the much larger
 `/mnt/plex` recovery is still running, `export-special-ahead-batches` can prepare
 the `scenes/` leaves from the sealed special recovery. It verifies the complete
 Plex mapped inventory, rejects shared DavItem IDs, and checks every selected
@@ -227,8 +228,8 @@ special link against current `LocalLinks` and its original symlink target. New
 source links do not invalidate previously verified links; account for them in
 the final live coverage pass. Recovered releases whose legacy job names would
 change on ID submission are counted and excluded for separate remediation; the
-remaining exact `scenes/` links must still cover at least 90% of the sealed
-special mapped inventory.
+remaining exact `scenes/` links can be imported while excluded rows remain
+listed for later remediation.
 It does not claim that Plex has passed recovery or
 that all cross-root NZB payloads are known. Import the first bounded special
 batch, review its exact plan and validation, and keep Plex import on hold until
@@ -367,7 +368,7 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --blob-root /opt/nzbdav/config/blobs \
   --journals-dir "$RUN/plex/journals" \
   --output "$RUN/plex/coverage" \
-  --minimum-coverage 0.90
+  --minimum-coverage 0
 
 dotnet run --project tools/NzbDavMigration -c Release -- \
   sharded-coverage-report \
@@ -377,7 +378,7 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --blob-root /opt/nzbdav/config/blobs \
   --journals-dir "$RUN/special/journals" \
   --output "$RUN/special/coverage" \
-  --minimum-coverage 0.90
+  --minimum-coverage 0
 ```
 
 The final live `LocalLinks` snapshot beneath **each** source
@@ -386,8 +387,8 @@ root is its denominator, including broken and missing source links. Review every
 both `coverage.json` and `coverage.md` reports; the counts must classify every
 final source link exactly once within its root. Calculate combined coverage as
 `(plex covered + special covered) / (plex final source + special final source)`
-from the two reports. Require both per-root reports to pass their 90% gate and
-review the combined result; neither a single-root report nor the combined ratio
+from the two reports. Report both per-root percentages and the combined result,
+and enumerate every not-imported mapped row; neither a single-root report nor the combined ratio
 is permission to register the parallel trees with Plex or Arr.
 
 To undo a reviewed batch, pause migration activity and use only its journal:
