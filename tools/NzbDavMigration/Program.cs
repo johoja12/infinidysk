@@ -91,8 +91,10 @@ internal static class NzbDavMigrationProgram
 
     private static async Task<int> CatalogueScanAsync(IReadOnlyDictionary<string, string> options)
     {
+        // Keep the WAL bounded as the article indexes grow. Large transactions
+        // spend most of their time looking up pages in the uncommitted WAL.
         await using var store = new OrphanCatalogueStore(
-            Required(options, "--database"), Required(options, "--summary"));
+            Required(options, "--database"), Required(options, "--summary"), batchSize: 5);
         await new OrphanCatalogueScanner().ScanAsync(
             Required(options, "--blob-root"), Required(options, "--inventory"), store).ConfigureAwait(false);
         return 0;

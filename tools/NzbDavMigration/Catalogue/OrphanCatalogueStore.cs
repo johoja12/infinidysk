@@ -77,6 +77,18 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
         await ExecuteTransactionControlAsync("SAVEPOINT blob_upsert", cancellationToken).ConfigureAwait(false);
         try
         {
+            // New catalogue entries have no article rows to replace. Probing the
+            // Blobs primary key avoids a full Articles scan for every new NZB
+            // while the blob-path index is deferred until the catalogue seals.
+            bool replacingExisting;
+            await using (var existing = connection.CreateCommand())
+            {
+                existing.Transaction = _transaction;
+                existing.CommandText = "SELECT 1 FROM Blobs WHERE RelativePath=$path";
+                existing.Parameters.AddWithValue("$path", blob.RelativePath);
+                replacingExisting = await existing.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null;
+            }
+
             await using (var upsert = connection.CreateCommand())
             {
                 upsert.Transaction = _transaction;
@@ -99,8 +111,9 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
                 await upsert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            await using (var delete = connection.CreateCommand())
+            if (replacingExisting)
             {
+                await using var delete = connection.CreateCommand();
                 delete.Transaction = _transaction;
                 delete.CommandText = "DELETE FROM Articles WHERE BlobPath=$path";
                 delete.Parameters.AddWithValue("$path", blob.RelativePath);
