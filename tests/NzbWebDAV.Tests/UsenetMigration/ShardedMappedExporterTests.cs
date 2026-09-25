@@ -35,6 +35,23 @@ public sealed class ShardedMappedExporterTests
     }
 
     [Fact]
+    public void ValidateSpecialAhead_RequiresCompleteSpecialRecoveryAndDistinctMappedIds()
+    {
+        var specialId = Guid.NewGuid();
+        var special = Evidence("/mnt/special", 100, 98, [specialId], [Digest('a')]);
+        var plex = Evidence("/mnt/plex", 1000, 1, [Guid.NewGuid()], [Digest('b')]);
+
+        ShardedMappedExporter.ValidateSpecialAhead(special, plex.Inventory, plex.DavItemIds);
+        Assert.Throws<InvalidDataException>(() => ShardedMappedExporter.ValidateSpecialAhead(
+            Evidence("/mnt/special", 100, 89, [specialId], [Digest('a')]),
+            plex.Inventory, plex.DavItemIds));
+        Assert.Throws<InvalidDataException>(() => ShardedMappedExporter.ValidateSpecialAhead(
+            special, plex.Inventory, new HashSet<Guid> { specialId }));
+        Assert.Throws<InvalidDataException>(() => ShardedMappedExporter.ValidateSpecialAhead(
+            special, special.Inventory, plex.DavItemIds));
+    }
+
+    [Fact]
     public async Task ExportVerified_ResumesOnlyMatchingChecksummedMappedPackages()
     {
         var fixture = Path.Join(Path.GetTempPath(), $"sharded-export-{Guid.NewGuid():N}");

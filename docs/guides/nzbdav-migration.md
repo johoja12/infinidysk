@@ -216,6 +216,35 @@ legacy blob tree used by the mapped inventory for its drift check.
 Export immutable batches. The defaults are at most 250 releases and 4 GiB of NZB
 payload bytes per batch; lower either bound to reduce queue or review pressure.
 One oversized release is isolated and explicitly marked rather than hidden.
+
+### Start the isolated scenes root before Plex recovery finishes
+
+When `/mnt/special` has a complete mapped recovery above 90% but the much larger
+`/mnt/plex` recovery is still running, `export-special-ahead-batches` can prepare
+the `scenes/` leaves from the sealed special recovery. It verifies the complete
+Plex mapped inventory, rejects shared DavItem IDs, and checks every selected
+special link against current `LocalLinks` and its original symlink target. New
+source links do not invalidate previously verified links; account for them in
+the final live coverage pass. It does not claim that Plex has passed recovery or
+that all cross-root NZB payloads are known. Import the first bounded special
+batch, review its exact plan and validation, and keep Plex import on hold until
+the regular two-root verification succeeds. Do not register `/mnt/special2`
+with Plex or Arr during this staged run.
+
+```bash
+dotnet run --project tools/NzbDavMigration -c Release -- \
+  export-special-ahead-batches \
+  --plex-inventory "$RUN/plex/initial-inventory" \
+  --special-inventory "$RUN/special/initial-inventory" \
+  --special-recovery "$RUN/special/recovery" \
+  --payload-root /path/to/the/sealed/special-payload-tree \
+  --output "$RUN/special/ahead-batches" \
+  --first-batch-releases 30
+```
+
+The output uses the same full-batch package and acknowledgement flow below.
+Store its master digest and batch sequence; do not generate a second sequence
+for the same special root while the first remains active.
 The two roots have separate master digests and batch sequences. Finish and
 acknowledge every `special` batch before connecting the first `plex` batch. For a
 20–50 file `/mnt/special2` canary, use `--first-batch-releases` and inspect the
