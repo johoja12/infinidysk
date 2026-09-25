@@ -425,6 +425,52 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         Assert.Equal("acknowledged", (await verify.NzbDavBatches.SingleAsync()).Status);
     }
 
+    [Fact]
+    public async Task AcknowledgePlan_RequiresAllSuccessfulLinksButAllowsFailedReleaseToBeListed()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var masterDigest = new string('e', 64);
+        var packagePath = await CreateFullPackageAsync("mixed-ack", masterDigest, 0, 1,
+            includeSecondRelease: true);
+        var selected = (await new NzbDavPackageReader().ReadAsync(packagePath)).Manifest.SelectedLinks;
+        var controller = CreateController(harness);
+        await controller.ConnectFull(new NzbDavFullConnectRequest(packagePath, masterDigest, 2, 2, 5, 1));
+        await harness.Store.UpdateSessionAsync(session => session.Status = "complete");
+        await using (var db = harness.Mig())
+        {
+            foreach (var (link, index) in selected.Select((link, index) => (link, index)))
+            {
+                var storeRef = $"nzbdav:release-{index + 1}";
+                db.Releases.Add(new MigrationRelease
+                {
+                    StoreRef = storeRef, StoreBasename = $"release-{index + 1}",
+                    SubmitFileName = $"release-{index + 1}.nzb",
+                    QueueFileName = $"release-{index + 1}.nzb", JobName = $"release-{index + 1}",
+                    VerdictReasons = "[]", ScannedAt = DateTime.UtcNow,
+                });
+                db.ReleaseFiles.Add(new MigrationReleaseFile
+                {
+                    StoreRef = storeRef, MetaPath = "payload", VirtualPath = $"/content/{index}.mkv",
+                    FileName = $"{index}.mkv", NormalisedName = $"{index}.mkv",
+                    SourceFileId = link.LegacyDavItemId.ToString(),
+                    FileStatus = index == 0 ? "exact" : "import-failed",
+                    NewDavItemId = index == 0 ? Guid.NewGuid().ToString() : null,
+                });
+                db.Submissions.Add(new MigrationSubmission
+                {
+                    StoreRef = storeRef, State = index == 0 ? "completed" : "failed",
+                    Error = index == 0 ? null : "RAR signature not found", UpdatedAt = DateTime.UtcNow,
+                });
+            }
+            await db.SaveChangesAsync();
+        }
+        var digest = new string('f', 64);
+        Assert.IsType<BadRequestObjectResult>(await controller.AcknowledgePlan(0,
+            new NzbDavBatchPlanAcknowledgementRequest(digest, 0, 0)));
+        Assert.IsType<OkObjectResult>(await controller.AcknowledgePlan(0,
+            new NzbDavBatchPlanAcknowledgementRequest(digest, 1, 1)));
+    }
+
     private NzbDavMigrationController CreateController(MigrationTestHarness harness)
     {
         var services = new ServiceCollection()
@@ -464,7 +510,8 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         string name,
         string masterDigest,
         int batchIndex,
-        int batchCount)
+        int batchCount,
+        bool includeSecondRelease = false)
     {
         var parent = Path.Join(_config, "migration-input");
         Directory.CreateDirectory(parent);
@@ -474,9 +521,25 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         var leaf = new NzbDavExportLeaf(leafId, "/content/a.mkv", 10, "release-1", null, null,
             NzbDavArticleIdentity.DirectKind, new string('a', 64), "ready", null);
         var output = Path.Join(parent, $"package-{name}-{Guid.NewGuid():N}");
+        var releases = new List<CanaryExportRelease> { new("release-1", null, payload, [leaf]) };
+        var links = new List<NzbDavSelectedLibraryLink>
+            { new("Migration-TV/a.mkv", "/legacy/a", leafId) };
+        if (includeSecondRelease)
+        {
+            var secondPayload = Path.Join(parent, $"{name}-second.nzb");
+            await File.WriteAllTextAsync(secondPayload, "<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\" />\n");
+            var secondId = Guid.NewGuid();
+            var secondLeaf = leaf with
+            {
+                LegacyDavItemId = secondId,
+                LegacyPath = "/content/b.mkv",
+                ParentReleaseId = "release-2",
+            };
+            releases.Add(new CanaryExportRelease("release-2", null, secondPayload, [secondLeaf]));
+            links.Add(new NzbDavSelectedLibraryLink("Migration-TV/b.mkv", "/legacy/b", secondId));
+        }
         await new CanaryPackageWriter().WriteFullBatchAsync(new CanaryExportRequest(
-            name, output, [new CanaryExportRelease("release-1", null, payload, [leaf])],
-            [new NzbDavSelectedLibraryLink("Migration-TV/a.mkv", "/legacy/a", leafId)]),
+            name, output, releases, links),
             masterDigest, batchIndex, batchCount);
         return output;
     }

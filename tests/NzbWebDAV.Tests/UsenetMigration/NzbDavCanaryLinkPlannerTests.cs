@@ -38,6 +38,30 @@ public sealed class NzbDavCanaryLinkPlannerTests : IDisposable
     }
 
     [Fact]
+    public async Task GenerateAsync_PlansOnlyExactLinksWhenTerminalFailureIsExplicitlyExcluded()
+    {
+        var exactSource = Guid.NewGuid();
+        var failedSource = Guid.NewGuid();
+        var package = await CreatePackageAsync(
+            new NzbDavSelectedLibraryLink("TV/Show/exact.mkv", "/legacy/.ids/exact", exactSource),
+            new NzbDavSelectedLibraryLink("TV/Show/failed.mkv", "/legacy/.ids/failed", failedSource));
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        await SeedAsync(harness, exactSource, failedSource, Guid.NewGuid());
+        await using var db = harness.Mig();
+        var failed = await db.ReleaseFiles.SingleAsync(file => file.SourceFileId == failedSource.ToString());
+        failed.FileStatus = "import-failed";
+        await db.SaveChangesAsync();
+
+        var result = await new NzbDavCanaryLinkPlanner().GenerateAsync(
+            db, package, 42, Path.Join(_root, "output"), new HashSet<Guid> { failedSource });
+
+        Assert.True(result.Plan.IsValid);
+        Assert.Equal(1, result.Plan.SelectedCount);
+        Assert.Equal(exactSource, Assert.Single(result.Plan.Links).LegacyDavItemId);
+        Assert.Single(await db.CanaryLinks.ToListAsync());
+    }
+
+    [Fact]
     public async Task GenerateAsync_RejectsDuplicateLibraryOutputPathsWithoutPersistingRows()
     {
         var first = Guid.NewGuid();
