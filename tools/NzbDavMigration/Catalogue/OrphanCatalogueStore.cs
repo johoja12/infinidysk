@@ -39,7 +39,10 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
                 throw new InvalidOperationException("The catalogue belongs to a different frozen input list.");
             _complete = string.Equals(status, "complete", StringComparison.Ordinal);
             if (!_complete)
+            {
+                await DropRedundantMessageIndexAsync(cancellationToken).ConfigureAwait(false);
                 await ExecutePragmaAsync("PRAGMA journal_mode=WAL;", cancellationToken).ConfigureAwait(false);
+            }
             return;
         }
 
@@ -393,9 +396,17 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
               SegmentOrdinal INTEGER NOT NULL, SegmentBytes INTEGER NOT NULL,
               PRIMARY KEY(MessageId,BlobPath,FileOrdinal,SegmentOrdinal),
               FOREIGN KEY(BlobPath) REFERENCES Blobs(RelativePath) ON DELETE CASCADE);
-            CREATE INDEX IF NOT EXISTS IX_Articles_MessageId ON Articles(MessageId);
             """;
         await schema.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task DropRedundantMessageIndexAsync(CancellationToken cancellationToken)
+    {
+        // The Articles primary key already starts with MessageId and serves the
+        // same lookups. Older partial catalogues may still carry this extra index.
+        await using var command = RequireConnection().CreateCommand();
+        command.CommandText = "DROP INDEX IF EXISTS IX_Articles_MessageId;";
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task ExecutePragmaAsync(string sql, CancellationToken cancellationToken)
