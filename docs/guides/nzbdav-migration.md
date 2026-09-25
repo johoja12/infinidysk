@@ -296,9 +296,9 @@ wait for a terminal run, and reconcile. Pause through the migration UI if
 providers or the queue become unstable; resume the same batch instead of creating
 a second submission. A reconnect of the same package digest is idempotent. The
 next batch is fenced until the current batch is terminal and every selected
-file is either an exact correlation with a validated link or a recorded terminal
-import failure. A failed NZB must not stop later mapped NZBs, but it must not
-produce a parallel link. Keep the source library authoritative for failed items.
+file has an exact validated link, a recorded terminal import failure, or a
+recorded `unmatched-target` correlation. Neither a failed nor an unmatched
+file receives a parallel link; keep the source library authoritative for both.
 
 After each terminal run, download `GET /api/migration/nzbdav/import-failures`
 and save its JSON response with a SHA-256 checksum under the matching root and
@@ -306,11 +306,15 @@ batch artifact directory **before** connecting another batch. The response
 includes each failed mapped path, legacy DavItem ID, source release ID,
 submission state, and failure reason. Maintain a cumulative list across batches;
 include unrecovered and exporter-excluded mapped rows in the final list as
-separate reasons. Do not discard a failed record merely because later batches
-continue. Reconcile the run, generate the plan for exact successes, apply and
+separate reasons. Also save `GET /api/migration/nzbdav/correlation` and its
+checksum for each batch. Its `unmatched-target` rows identify NZBs that imported
+but whose mapped file has no exact target; add them to the cumulative unlinked
+list with their correlation evidence. Do not discard these records merely
+because later batches continue. Reconcile the run, generate the plan for exact successes, apply and
 validate those links, and acknowledge with the exact applied and validated
-counts. An all-failed batch has a zero-link plan and still needs its failure
-report and acknowledgement.
+counts. A batch with no exact matches has a zero-link plan and still needs its
+failure and correlation reports and acknowledgement. Ambiguous or duplicate
+matches still block the plan for review.
 
 Use each root's own mapped and recoverable counts in its full-connect request;
 the combined count is an audit gate, not a batch-master denominator. For each
@@ -343,8 +347,8 @@ Repeat with `special/` artifacts, its mapped inventory,
 Apply checks `LocalLinks` again before each link creation and never copies links from one source tree
 to the other staging tree. Keep both staging trees out of Plex and Arr.
 
-The plan contains exact successful rows only; failed selected rows remain in
-the checksummed failure report. Apply is create-only and source-drift
+The plan contains exact successful rows only; failed and unmatched selected
+rows remain in their checksummed reports. Apply is create-only and source-drift
 fenced; retain each plan and journal as its ownership proof. Validation checks
 size and bounded beginning/middle/end reads. Do not acknowledge a batch whose
 validation has failures. The final coverage report must use actual validated

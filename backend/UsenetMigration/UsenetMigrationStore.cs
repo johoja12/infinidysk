@@ -568,9 +568,17 @@ public sealed class UsenetMigrationStore : IDisposable
                            && submission.State is "failed" or "evicted")
             .Select(item => item.SourceFileId!)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        if (exactIds.Count + terminalFailedIds.Count != selectedSourceIds.Count
-            || selectedSourceIds.Any(id => !exactIds.Contains(id) && !terminalFailedIds.Contains(id)))
-            throw new InvalidOperationException("Every selected link must have an exact match or recorded terminal import failure.");
+        var unmatchedIds = correlated
+            .Where(item => item.FileStatus == "unmatched-target" && item.NewDavItemId is null
+                           && submissions.TryGetValue(item.StoreRef, out var submission)
+                           && submission.State is "completed" or "history_cleared")
+            .Select(item => item.SourceFileId!)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (exactIds.Count + terminalFailedIds.Count + unmatchedIds.Count != selectedSourceIds.Count
+            || selectedSourceIds.Any(id => !exactIds.Contains(id)
+                                           && !terminalFailedIds.Contains(id)
+                                           && !unmatchedIds.Contains(id)))
+            throw new InvalidOperationException("Every selected link must be exact or recorded as an unlinked terminal outcome.");
         if (appliedCount != exactIds.Count || validatedCount != exactIds.Count)
             throw new InvalidOperationException("Every exact link must be applied and validated before acknowledgement.");
 
