@@ -84,8 +84,6 @@ public sealed class NzbDavMigrationController(
             || request.RecoverableCount > request.SourceLinkCount)
             throw new BadHttpRequestException("Projected source and recoverable counts are invalid.");
         var coverage = (double)request.RecoverableCount / request.SourceLinkCount;
-        if (coverage < 0.90)
-            throw new BadHttpRequestException("Projected recoverable coverage must be at least 90%.");
         if (package.Manifest.SelectedLinks.Count == 0
             || package.Manifest.SelectedLinks.Count > request.RecoverableCount)
             throw new BadHttpRequestException("The batch selection count is invalid for this recovery master.");
@@ -376,6 +374,24 @@ public sealed class NzbDavMigrationController(
         });
     });
 
+    [HttpGet("api/migration/nzbdav/import-failures")]
+    public Task<IActionResult> GetImportFailures() => GuardedAsync(async () =>
+    {
+        var session = await RequireNzbDavSessionAsync().ConfigureAwait(false);
+        if (session.Status != "complete")
+            throw new BadHttpRequestException("Wait for the import to reach a terminal state.");
+        var package = await ReadPackageAsync(session.SourcePackageRoot!).ConfigureAwait(false);
+        var failures = await LoadTerminalFailuresAsync(package).ConfigureAwait(false);
+        return Ok(new
+        {
+            status = true,
+            packageDigest = package.PackageDigest,
+            batchIndex = package.Manifest.BatchIndex,
+            failedCount = failures.Count,
+            failures,
+        });
+    });
+
     [HttpPost("api/migration/nzbdav/reconcile")]
     public Task<IActionResult> Reconcile() => GuardedAsync(async () =>
     {
@@ -402,16 +418,24 @@ public sealed class NzbDavMigrationController(
     public Task<IActionResult> GenerateCanaryPlan() => GuardedAsync(async () =>
     {
         var report = await BuildCorrelationReportAsync().ConfigureAwait(false);
-        if (report.ExactCount != report.SelectedCount
-            || report.ExclusionCount != 0
-            || report.AmbiguityCount != 0)
-            throw new BadHttpRequestException(
-                "Canary plans require an exact correlation for every selected link "
-                + $"(selected: {report.SelectedCount}, exact: {report.ExactCount}, "
-                + $"excluded: {report.ExclusionCount}, ambiguous: {report.AmbiguityCount}).");
         var session = await RequireNzbDavSessionAsync().ConfigureAwait(false);
         if (session.CurrentRunId is null)
             throw new BadHttpRequestException("The completed import has no migration run identity.");
+        var package = await ReadPackageAsync(session.SourcePackageRoot!).ConfigureAwait(false);
+        var failures = package.Manifest.SchemaVersion == NzbDavExportManifest.CurrentSchemaVersion
+            ? await LoadTerminalFailuresAsync(package).ConfigureAwait(false)
+            : [];
+        var failedIds = failures.Select(failure => failure.LegacyDavItemId).ToHashSet();
+        if (report.ExclusionCount != 0 || report.AmbiguityCount != 0
+            || report.ExactCount + failedIds.Count != report.SelectedCount
+            || report.Rows.Any(row => row.CorrelationStatus != "exact"
+                                      && (!failedIds.Contains(row.LegacyDavItemId)
+                                          || row.CorrelationStatus != "import-failed")))
+            throw new BadHttpRequestException(
+                "Plans require an exact correlation or recorded terminal import failure for every selected link "
+                + $"(selected: {report.SelectedCount}, exact: {report.ExactCount}, "
+                + $"failed: {failedIds.Count}, excluded: {report.ExclusionCount}, "
+                + $"ambiguous: {report.AmbiguityCount}).");
         var planDirectory = NzbDavCanaryPlanWriter.GetPlanDirectory(
             Path.Join(DavDatabaseContext.ConfigPath, "migration-output", "nzbdav"),
             session.CurrentRunId.Value,
@@ -420,7 +444,7 @@ public sealed class NzbDavMigrationController(
             return Conflict(new BaseApiResponse { Status = false, Error = "The immutable canary plan already exists." });
         await using var context = store.NewContext();
         var result = await new NzbDavCanaryLinkPlanner().GenerateAsync(
-            context, session.SourcePackageRoot!, session.CurrentRunId.Value, HttpContext.RequestAborted)
+            context, session.SourcePackageRoot!, session.CurrentRunId.Value, failedIds, HttpContext.RequestAborted)
             .ConfigureAwait(false);
         return Ok(new
         {
@@ -429,9 +453,32 @@ public sealed class NzbDavMigrationController(
             result.Plan.SourcePackageDigest,
             result.Plan.SelectedCount,
             result.Plan.ActionableCount,
+            failedCount = failedIds.Count,
             download = "/api/migration/nzbdav/canary-plan",
         });
     });
+
+    private async Task<IReadOnlyList<NzbDavImportFailure>> LoadTerminalFailuresAsync(NzbDavVerifiedPackage package)
+    {
+        await using var context = store.NewContext();
+        var failedSubmissions = await context.Submissions.AsNoTracking()
+            .Where(item => item.State == "failed" || item.State == "evicted")
+            .ToDictionaryAsync(item => item.StoreRef, HttpContext.RequestAborted).ConfigureAwait(false);
+        var releaseById = package.Manifest.Releases
+            .SelectMany(release => release.Leaves.Select(leaf => (leaf.LegacyDavItemId, release.SourceReleaseId)))
+            .ToDictionary(item => item.LegacyDavItemId, item => item.SourceReleaseId);
+        return package.Manifest.SelectedLinks
+            .Where(link => failedSubmissions.ContainsKey($"nzbdav:{releaseById[link.LegacyDavItemId]}"))
+            .Select(link =>
+            {
+                var releaseId = releaseById[link.LegacyDavItemId];
+                var submission = failedSubmissions[$"nzbdav:{releaseId}"];
+                return new NzbDavImportFailure(releaseId, link.LegacyDavItemId,
+                    link.LibraryRelativePath, submission.State, submission.Error);
+            })
+            .OrderBy(item => item.LibraryRelativePath, StringComparer.Ordinal)
+            .ToArray();
+    }
 
     [HttpGet("api/migration/nzbdav/canary-plan")]
     public Task<IActionResult> DownloadCanaryPlan() => GuardedAsync(async () =>
@@ -577,6 +624,12 @@ public sealed record NzbDavBatchPlanAcknowledgementRequest(
     int AppliedCount,
     int ValidatedCount);
 public sealed record NzbDavRunRequest(string? PackageDigest, int? SelectionCount);
+public sealed record NzbDavImportFailure(
+    string SourceReleaseId,
+    Guid LegacyDavItemId,
+    string LibraryRelativePath,
+    string SubmissionState,
+    string? Reason);
 public sealed record NzbDavCorrelationRow(
     string LibraryRelativePath,
     Guid LegacyDavItemId,

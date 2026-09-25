@@ -541,24 +541,38 @@ public sealed class UsenetMigrationStore : IDisposable
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             return ToBatchStatus(batch);
         }
-        if (appliedCount != batch.SelectionCount || validatedCount != batch.SelectionCount)
-            throw new InvalidOperationException("Every selected link must be applied and validated before acknowledgement.");
         if (selectedSourceIds.Count != batch.SelectionCount)
             throw new InvalidOperationException("The package selection count disagrees with the registered batch.");
 
         var correlated = await ctx.ReleaseFiles.AsNoTracking()
             .Where(item => item.SourceFileId != null && selectedSourceIds.Contains(item.SourceFileId))
-            .Select(item => new { item.SourceFileId, item.FileStatus, item.NewDavItemId })
+            .Select(item => new { item.SourceFileId, item.StoreRef, item.FileStatus, item.NewDavItemId })
             .ToListAsync(ct).ConfigureAwait(false);
+        if (correlated.Count != selectedSourceIds.Count
+            || correlated.Select(item => item.SourceFileId!).Distinct(StringComparer.OrdinalIgnoreCase).Count()
+            != selectedSourceIds.Count)
+            throw new InvalidOperationException("Every selected source file must have one correlation row.");
+        var storeRefs = correlated.Select(item => item.StoreRef).Distinct().ToArray();
+        var submissions = await ctx.Submissions.AsNoTracking()
+            .Where(item => storeRefs.Contains(item.StoreRef))
+            .ToDictionaryAsync(item => item.StoreRef, ct).ConfigureAwait(false);
         var exactIds = correlated
-            .Where(item => item.FileStatus == "exact" && item.NewDavItemId != null)
-            .GroupBy(item => item.SourceFileId!, StringComparer.OrdinalIgnoreCase)
-            .Where(group => group.Count() == 1)
-            .Select(group => group.Key)
+            .Where(item => item.FileStatus == "exact" && item.NewDavItemId != null
+                           && submissions.TryGetValue(item.StoreRef, out var submission)
+                           && submission.State is "completed" or "history_cleared")
+            .Select(item => item.SourceFileId!)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        if (exactIds.Count != selectedSourceIds.Count
-            || selectedSourceIds.Any(id => !exactIds.Contains(id)))
-            throw new InvalidOperationException("Every selected link must have one exact terminal correlation.");
+        var terminalFailedIds = correlated
+            .Where(item => item.FileStatus == "import-failed" && item.NewDavItemId is null
+                           && submissions.TryGetValue(item.StoreRef, out var submission)
+                           && submission.State is "failed" or "evicted")
+            .Select(item => item.SourceFileId!)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (exactIds.Count + terminalFailedIds.Count != selectedSourceIds.Count
+            || selectedSourceIds.Any(id => !exactIds.Contains(id) && !terminalFailedIds.Contains(id)))
+            throw new InvalidOperationException("Every selected link must have an exact match or recorded terminal import failure.");
+        if (appliedCount != exactIds.Count || validatedCount != exactIds.Count)
+            throw new InvalidOperationException("Every exact link must be applied and validated before acknowledgement.");
 
         batch.PlanDigest = planDigest;
         batch.AppliedCount = appliedCount;

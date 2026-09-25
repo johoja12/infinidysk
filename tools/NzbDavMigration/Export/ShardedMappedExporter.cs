@@ -87,9 +87,6 @@ public sealed class ShardedMappedExporter
         var combinedRows = checked(plex.Recovery.TotalLinks + special.Recovery.TotalLinks);
         var combinedRecovered = checked(plex.Recovery.RecoverableLinks + special.Recovery.RecoverableLinks);
         var combinedFraction = decimal.Divide(combinedRecovered, combinedRows);
-        if (plex.Recovery.RecoverableFraction < 0.90m || special.Recovery.RecoverableFraction < 0.90m
-            || combinedFraction < 0.90m)
-            throw new InvalidDataException("Both roots and their combined mapped rows must pass 90% exact recovery.");
         if (plex.DavItemIds.Any(special.DavItemIds.Contains)
             || plex.PayloadSha256s.Any(special.PayloadSha256s.Contains))
             throw new InvalidDataException("The roots share mapped item IDs or NZB payloads; target reuse is required.");
@@ -106,9 +103,8 @@ public sealed class ShardedMappedExporter
         IReadOnlySet<Guid> plexIds)
     {
         if (special.Inventory.SourceRoot != "/mnt/special"
-            || plexInventory.SourceRoot != "/mnt/plex"
-            || special.Recovery.RecoverableFraction < 0.90m)
-            throw new InvalidDataException("Early special export requires a complete 90% special recovery and Plex mapped inventory.");
+            || plexInventory.SourceRoot != "/mnt/plex")
+            throw new InvalidDataException("Early special export requires a complete special recovery and Plex mapped inventory.");
         if (special.DavItemIds.Any(plexIds.Contains))
             throw new InvalidDataException("The roots share mapped item IDs; target reuse is required before export.");
     }
@@ -136,9 +132,8 @@ public sealed class ShardedMappedExporter
                 item.Classification is "exact-direct" or "exact-archive")
             .Select(item => item.LegacyDavItemId.ToString("D"))
             .Order(StringComparer.Ordinal).ToArray();
-        if (selectedIds.Length < 20
-            || decimal.Divide(selectedIds.Length, special.Inventory.RowCount) < 0.90m)
-            throw new InvalidDataException("Early special export must retain at least 90% exact mapped scenes links.");
+        if (selectedIds.Length == 0)
+            throw new InvalidDataException("Early special export has no exact mapped scenes links.");
         await VerifySelectedMappingsAsync(exportable, cancellationToken).ConfigureAwait(false);
         if (skippedReleases > 0)
             await Console.Error.WriteLineAsync(

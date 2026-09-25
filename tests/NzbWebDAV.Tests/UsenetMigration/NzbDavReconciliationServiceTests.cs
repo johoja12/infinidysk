@@ -92,6 +92,38 @@ public sealed class NzbDavReconciliationServiceTests : IDisposable
         Assert.Equal(conflictingTarget, persisted.DavItemId);
     }
 
+    [Fact]
+    public async Task ReconcileAsync_RecordsTerminalImportFailureAndKeepsOtherExactMatches()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var fixture = await SeedAsync(harness);
+        await using (var db = harness.Mig())
+        {
+            var storeRef = "nzbdav:path";
+            db.MigratedReleases.Remove(await db.MigratedReleases.SingleAsync(item => item.SourceReleaseId == storeRef));
+            var submission = await db.Submissions.SingleAsync(item => item.StoreRef == storeRef);
+            submission.State = "failed";
+            submission.Error = "RAR signature not found";
+            await db.SaveChangesAsync();
+        }
+        var service = new NzbDavReconciliationService(
+            harness.Store, new NzbDavPackageReader(), fixture.BlobStore)
+        {
+            DavContextFactory = harness.DavFactory,
+        };
+
+        var result = await service.ReconcileAsync(fixture.RunId, fixture.PackageRoot);
+
+        Assert.Equal(4, result.SelectedCount);
+        Assert.Equal(2, result.ExactCount);
+        Assert.Equal(1, result.AmbiguousCount);
+        Assert.Equal(1, result.UnmatchedCount);
+        await using var verify = harness.Mig();
+        var failed = await verify.ReleaseFiles.SingleAsync(item => item.StoreRef == "nzbdav:path");
+        Assert.Equal("import-failed", failed.FileStatus);
+        Assert.Null(failed.NewDavItemId);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

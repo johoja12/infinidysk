@@ -22,8 +22,8 @@ public sealed class ShardedMappedCoverage
         decimal minimumCoverage = 0.90m,
         CancellationToken cancellationToken = default)
     {
-        if (minimumCoverage < 0.90m || minimumCoverage > 1m)
-            throw new InvalidDataException("Mapped final coverage minimum must be between 0.90 and 1.00.");
+        if (minimumCoverage < 0m || minimumCoverage > 1m)
+            throw new InvalidDataException("Mapped final coverage minimum must be between 0 and 1.00.");
         var root = await new ShardedMappedExporter().LoadRootAsync(
             inventoryDirectory, recoveryDirectory, cancellationToken).ConfigureAwait(false);
         var parent = Path.GetDirectoryName(Path.GetFullPath(outputDirectory))

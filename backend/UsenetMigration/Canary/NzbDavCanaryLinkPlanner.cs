@@ -19,12 +19,14 @@ public sealed class NzbDavCanaryLinkPlanner
         UsenetMigrationDbContext context,
         string packageRoot,
         long runId,
+        IReadOnlySet<Guid>? terminalFailedIds = null,
         CancellationToken cancellationToken = default) =>
         GenerateAsync(
             context,
             packageRoot,
             runId,
             Path.Join(DavDatabaseContext.ConfigPath, "migration-output", "nzbdav"),
+            terminalFailedIds,
             cancellationToken);
 
     internal async Task<NzbDavCanaryPlanResult> GenerateAsync(
@@ -32,6 +34,7 @@ public sealed class NzbDavCanaryLinkPlanner
         string packageRoot,
         long runId,
         string outputRoot,
+        IReadOnlySet<Guid>? terminalFailedIds = null,
         CancellationToken cancellationToken = default)
     {
         var package = await _packageReader.ReadAsync(packageRoot, cancellationToken).ConfigureAwait(false);
@@ -54,6 +57,9 @@ public sealed class NzbDavCanaryLinkPlanner
         var selectedIds = package.Manifest.SelectedLinks
             .Select(link => link.LegacyDavItemId.ToString())
             .ToArray();
+        if (terminalFailedIds is not null
+            && terminalFailedIds.Any(id => !selectedIds.Contains(id.ToString(), StringComparer.OrdinalIgnoreCase)))
+            throw new InvalidDataException("A terminal failed ID is not selected by this package.");
         var sourceFiles = await context.ReleaseFiles.AsNoTracking()
             .Where(file => file.SourceFileId != null && selectedIds.Contains(file.SourceFileId))
             .ToListAsync(cancellationToken)
@@ -83,6 +89,12 @@ public sealed class NzbDavCanaryLinkPlanner
         {
             var id = selected.LegacyDavItemId.ToString();
             sourceById.TryGetValue(id, out var source);
+            if (terminalFailedIds?.Contains(selected.LegacyDavItemId) == true)
+            {
+                if (source?.FileStatus != "import-failed" || source.NewDavItemId is not null)
+                    throw new InvalidDataException($"Failed source '{id}' has conflicting correlation state.");
+                continue;
+            }
             migratedById.TryGetValue(id, out var migrated);
             var exact = source?.FileStatus == "exact"
                         && migrated is not null;
@@ -119,7 +131,7 @@ public sealed class NzbDavCanaryLinkPlanner
             DateTimeOffset.UtcNow,
             links.Count,
             actionable,
-            links.Count == package.Manifest.SelectedLinks.Count
+            links.Count + (terminalFailedIds?.Count ?? 0) == package.Manifest.SelectedLinks.Count
             && actionable == links.Count
             && links.All(link => link.CorrelationStatus == "exact"),
             links);

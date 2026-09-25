@@ -70,6 +70,7 @@ public sealed class NzbDavReconciliationService(
             .Where(file => migratedReleases.Select(release => release.Id).Contains(file.MigratedReleaseId))
             .ToListAsync(cancellationToken).ConfigureAwait(false);
         var work = new List<ReleaseWork>();
+        var failedSourceCount = 0;
         await using var dav = DavDatabaseContexts.Create(DavContextFactory);
         var provider = new NzbDavCorrelationProvider(new DavItemArticleIdentityReader(blobStore));
         foreach (var exported in package.Manifest.Releases)
@@ -81,22 +82,37 @@ public sealed class NzbDavReconciliationService(
             if (selectedReleaseIds.Count == 0)
                 continue;
             var storeRef = $"nzbdav:{exported.SourceReleaseId}";
-            if (!migratedBySource.TryGetValue(storeRef, out var migrated)
-                || migrated.NzoId is null
-                || !Guid.TryParse(migrated.NzoId, out var importedNzoId))
-                throw new InvalidOperationException($"Run {runId} lacks imported release provenance.");
             var submission = await ledger.Submissions.AsNoTracking()
                 .SingleOrDefaultAsync(item => item.StoreRef == storeRef, cancellationToken)
                 .ConfigureAwait(false);
-            if (submission is null
-                || submission.State is not ("completed" or "history_cleared")
-                || !string.Equals(submission.NzoId, migrated.NzoId, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException($"Imported release '{storeRef}' is not terminal or changed identity.");
             var releaseSources = sourceFiles
                 .Where(file => file.StoreRef == storeRef && selectedReleaseIds.Contains(file.SourceFileId!))
                 .ToArray();
             if (releaseSources.Length != selectedReleaseIds.Count)
                 throw new InvalidDataException($"Release '{storeRef}' is missing selected source leaves.");
+            if (submission?.State is "failed" or "evicted")
+            {
+                if (migratedBySource.ContainsKey(storeRef))
+                    throw new InvalidOperationException($"Failed release '{storeRef}' has conflicting import provenance.");
+                foreach (var source in releaseSources)
+                {
+                    if (source.FileStatus == "exact" || source.NewDavItemId is not null)
+                        throw new InvalidOperationException($"Failed release '{storeRef}' has an existing exact mapping.");
+                    source.FileStatus = "import-failed";
+                    source.Flags = MergeEvidence(package.PackageDigest,
+                        JsonSerializer.Serialize(new { method = "terminal-import-failure", submission.State }));
+                }
+                failedSourceCount += releaseSources.Length;
+                continue;
+            }
+            if (!migratedBySource.TryGetValue(storeRef, out var migrated)
+                || migrated.NzoId is null
+                || !Guid.TryParse(migrated.NzoId, out var importedNzoId))
+                throw new InvalidOperationException($"Run {runId} lacks imported release provenance.");
+            if (submission is null
+                || submission.State is not ("completed" or "history_cleared")
+                || !string.Equals(submission.NzoId, migrated.NzoId, StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException($"Imported release '{storeRef}' is not terminal or changed identity.");
             var importedLeaves = await dav.Items.AsNoTracking()
                 .Where(item => item.Type == DavItem.ItemType.UsenetFile
                                && (item.NzbBlobId == importedNzoId || item.HistoryItemId == importedNzoId))
@@ -110,7 +126,7 @@ public sealed class NzbDavReconciliationService(
                 releaseSources, importedLeaves, dav, scope, cancellationToken).ConfigureAwait(false);
             work.Add(new ReleaseWork(migrated, importedNzoId, releaseSources, correlations));
         }
-        if (work.Sum(item => item.Sources.Count) != selectedIds.Count)
+        if (work.Sum(item => item.Sources.Count) + failedSourceCount != selectedIds.Count)
             throw new InvalidOperationException("Run provenance does not cover every selected package release.");
 
         ValidateExactMappings(work, existingFiles);
@@ -160,10 +176,10 @@ public sealed class NzbDavReconciliationService(
         var results = work.SelectMany(item => item.Correlations).ToArray();
         return new NzbDavReconciliationResult(
             runId,
-            results.Length,
+            selectedIds.Count,
             results.Count(result => result.Status == "exact"),
             results.Count(result => result.Status is "ambiguous" or "duplicate"),
-            results.Count(result => result.Status is not ("exact" or "ambiguous" or "duplicate")),
+            failedSourceCount + results.Count(result => result.Status is not ("exact" or "ambiguous" or "duplicate")),
             0);
     }
 
