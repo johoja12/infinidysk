@@ -199,7 +199,9 @@ bounded transactions and can be run again with the same inventory/database after
 an interruption; already completed snapshots are skipped. Do not edit or replace
 the frozen blob files while scanning. Keep the SQLite catalogue on local
 `$SCRATCH`, verify free space there, and copy a checksummed sealed copy to `$RUN`
-for recovery. Verify that the artifact share is the mounted volume 3 NFS export
+for recovery. Recovery adds a blob-path lookup index to older catalogues when
+needed, so run it against the writable local copy and retain the sealed NAS copy
+as the unchanged checkpoint. Verify that the artifact share is the mounted volume 3 NFS export
 before writing; keep backups on the separate volume 2 share. Review each root's
 inventory and recovery `manifest.json`, shard masters, and exclusions. Shards
 resume only when their row and catalogue digests still match. Export is blocked unless
