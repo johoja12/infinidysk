@@ -28,6 +28,41 @@ public sealed class OrphanCatalogueStoreTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task Resume_DropsRedundantMessageIndexWithoutLosingArticleLookups()
+    {
+        var (database, summary) = Paths();
+        await using (var store = new OrphanCatalogueStore(database, summary))
+        {
+            await store.BeginAsync(Digest('a'));
+            await store.UpsertAsync(Blob("one.nzb", Digest('1'), "release-a", "one@test"));
+        }
+
+        await using (var connection = new SqliteConnection($"Data Source={database}"))
+        {
+            await connection.OpenAsync();
+            await using var create = connection.CreateCommand();
+            create.CommandText = "CREATE INDEX IX_Articles_MessageId ON Articles(MessageId)";
+            await create.ExecuteNonQueryAsync();
+        }
+
+        await using (var resumed = new OrphanCatalogueStore(database, summary))
+        {
+            await resumed.BeginAsync(Digest('a'));
+            Assert.Equal("one.nzb", Assert.Single(await resumed.FindBlobsContainingAllAsync(["one@test"])).RelativePath);
+        }
+
+        await using var observer = new SqliteConnection($"Data Source={database};Mode=ReadOnly");
+        await observer.OpenAsync();
+        await using var indexes = observer.CreateCommand();
+        indexes.CommandText = "PRAGMA index_list(Articles)";
+        await using var reader = await indexes.ExecuteReaderAsync();
+        var names = new List<string>();
+        while (await reader.ReadAsync()) names.Add(reader.GetString(1));
+        Assert.DoesNotContain("IX_Articles_MessageId", names);
+        Assert.Contains("sqlite_autoindex_Articles_1", names);
+    }
+
+    [Fact]
     public async Task Upsert_ReplacesBlobArticlesAndGroupsDuplicatePayloads()
     {
         var (database, summary) = Paths();
