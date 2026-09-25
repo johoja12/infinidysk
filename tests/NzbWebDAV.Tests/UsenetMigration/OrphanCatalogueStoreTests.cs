@@ -44,6 +44,25 @@ public sealed class OrphanCatalogueStoreTests : IAsyncDisposable
     }
 
     [Fact]
+    public async Task Upsert_PreservesDistinctArticleValuesAcrossPreparedInserts()
+    {
+        var (database, summary) = Paths();
+        await using var store = new OrphanCatalogueStore(database, summary);
+        await store.BeginAsync(Digest('a'));
+        OrphanCatalogueArticle[] articles =
+        [
+            new("first@test", 0, 1, 123),
+            new("second@test", 0, 2, 456),
+            new("third@test", 1, 1, 789),
+        ];
+        await store.UpsertAsync(new OrphanCatalogueBlob("multi.nzb", 100, 200,
+            Digest('1'), "valid", null, Digest('3'), articles));
+
+        var reloaded = await store.ReadBlobAsync("multi.nzb");
+        Assert.Equal(articles, reloaded!.Articles);
+    }
+
+    [Fact]
     public async Task FindBlobsContainingAll_VerifiesEveryIdAfterBoundedProbe()
     {
         var (database, summary) = Paths();
