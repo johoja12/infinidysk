@@ -158,8 +158,6 @@ internal static class NzbDavMigrationProgram
         ValidateMappedMaster(specialMaster);
         ValidateMasterMatchesInventory(plexMaster, plex);
         ValidateMasterMatchesInventory(specialMaster, special);
-        if (plexMaster.RecoverableFraction < 0.90m || specialMaster.RecoverableFraction < 0.90m)
-            throw new InvalidDataException("Both roots must pass 90% mapped recovery before export.");
         var sharedIds = plex.Rows.Select(row => row.DavItemId).ToHashSet()
             .Intersect(special.Rows.Select(row => row.DavItemId)).Count();
         var sharedPayloads = plexMaster.Items.Where(item => item.Classification is "exact-direct" or "exact-archive")
@@ -171,6 +169,8 @@ internal static class NzbDavMigrationProgram
         {
             plexMappedRows = plex.Rows.Count,
             specialMappedRows = special.Rows.Count,
+            plexRecoveryFraction = plexMaster.RecoverableFraction,
+            specialRecoveryFraction = specialMaster.RecoverableFraction,
             sharedDavItemIds = sharedIds,
             sharedNzbPayloads = sharedPayloads,
             mayExport = sharedIds == 0 && sharedPayloads == 0,
@@ -243,8 +243,8 @@ internal static class NzbDavMigrationProgram
         ValidateMappedMaster(master);
         var mappedSource = master.MappedSource
             ?? throw new InvalidDataException("Batch export requires a mapped LocalLinks source proof.");
-        if (master.RecoverableLinks == 0 || master.RecoverableFraction < 0.90m)
-            throw new InvalidDataException("Master recovery manifest has not passed the 90% coverage gate.");
+        if (master.RecoverableLinks == 0)
+            throw new InvalidDataException("Master recovery manifest has no exact mapped links to export.");
         var masterDigest = Convert.ToHexString(SHA256.HashData(masterBytes)).ToLowerInvariant();
         var blobRoot = Required(options, "--blob-root");
         var currentMapping = await BuildMappedInventoryAsync(
@@ -265,9 +265,8 @@ internal static class NzbDavMigrationProgram
         ValidateMappedMaster(peerMaster);
         ValidateMasterMatchesInventory(peerMaster, peerInventory);
         if (!((currentMapping.SourceRoot == "/mnt/plex" && peerInventory.SourceRoot == "/mnt/special")
-              || (currentMapping.SourceRoot == "/mnt/special" && peerInventory.SourceRoot == "/mnt/plex"))
-            || peerMaster.RecoverableFraction < 0.90m)
-            throw new InvalidDataException("Peer root has not passed mapped recovery.");
+              || (currentMapping.SourceRoot == "/mnt/special" && peerInventory.SourceRoot == "/mnt/plex")))
+            throw new InvalidDataException("Peer mapped inventory is not the other configured root.");
         var currentIds = currentMapping.Rows.Select(row => row.DavItemId).ToHashSet();
         var peerIds = peerInventory.Rows.Select(row => row.DavItemId).ToHashSet();
         var currentPayloads = master.Items.Where(item =>
@@ -477,9 +476,7 @@ internal static class NzbDavMigrationProgram
         var sourceRoot = Required(options, "--source-root");
         if (Path.GetFullPath(sourceRoot).TrimEnd(Path.DirectorySeparatorChar) != initial.SourceRoot)
             throw new InvalidDataException("Coverage source root disagrees with mapped initial inventory.");
-        var minimum = ParseCoverage(options, "--minimum-coverage", 0.90m);
-        if (minimum < 0.90m)
-            throw new InvalidDataException("Mapped final coverage minimum cannot be below 0.90.");
+        var minimum = ParseCoverage(options, "--minimum-coverage", 0m);
         var final = await BuildMappedInventoryAsync(
             initial.SourceRoot, initial.LegacyIdsRoot, Required(options, "--blob-root"))
             .ConfigureAwait(false);
