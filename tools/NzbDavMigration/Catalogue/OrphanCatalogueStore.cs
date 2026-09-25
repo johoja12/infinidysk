@@ -107,20 +107,28 @@ public sealed class OrphanCatalogueStore : IAsyncDisposable
                 await delete.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
-            foreach (var article in blob.Articles)
+            await using (var insert = connection.CreateCommand())
             {
-                await using var insert = connection.CreateCommand();
                 insert.Transaction = _transaction;
                 insert.CommandText = """
                     INSERT INTO Articles(MessageId,BlobPath,FileOrdinal,SegmentOrdinal,SegmentBytes)
                     VALUES($message,$path,$file,$segment,$bytes)
                     """;
-                insert.Parameters.AddWithValue("$message", article.MessageId);
-                insert.Parameters.AddWithValue("$path", blob.RelativePath);
-                insert.Parameters.AddWithValue("$file", article.FileOrdinal);
-                insert.Parameters.AddWithValue("$segment", article.SegmentOrdinal);
-                insert.Parameters.AddWithValue("$bytes", article.SegmentBytes);
-                await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                var message = insert.Parameters.Add("$message", SqliteType.Text);
+                var path = insert.Parameters.Add("$path", SqliteType.Text);
+                var file = insert.Parameters.Add("$file", SqliteType.Integer);
+                var segment = insert.Parameters.Add("$segment", SqliteType.Integer);
+                var bytes = insert.Parameters.Add("$bytes", SqliteType.Integer);
+                path.Value = blob.RelativePath;
+                await insert.PrepareAsync(cancellationToken).ConfigureAwait(false);
+                foreach (var article in blob.Articles)
+                {
+                    message.Value = article.MessageId;
+                    file.Value = article.FileOrdinal;
+                    segment.Value = article.SegmentOrdinal;
+                    bytes.Value = article.SegmentBytes;
+                    await insert.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+                }
             }
             await ExecuteTransactionControlAsync("RELEASE SAVEPOINT blob_upsert", cancellationToken).ConfigureAwait(false);
         }
