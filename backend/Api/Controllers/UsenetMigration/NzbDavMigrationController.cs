@@ -426,15 +426,21 @@ public sealed class NzbDavMigrationController(
             ? await LoadTerminalFailuresAsync(package).ConfigureAwait(false)
             : [];
         var failedIds = failures.Select(failure => failure.LegacyDavItemId).ToHashSet();
+        var unmatchedIds = report.Rows
+            .Where(row => row.CorrelationStatus == "unmatched-target")
+            .Select(row => row.LegacyDavItemId).ToHashSet();
+        var unlinkedIds = failedIds.Concat(unmatchedIds).ToHashSet();
         if (report.ExclusionCount != 0 || report.AmbiguityCount != 0
-            || report.ExactCount + failedIds.Count != report.SelectedCount
+            || report.ExactCount + unlinkedIds.Count != report.SelectedCount
             || report.Rows.Any(row => row.CorrelationStatus != "exact"
-                                      && (!failedIds.Contains(row.LegacyDavItemId)
-                                          || row.CorrelationStatus != "import-failed")))
+                                      && !((row.CorrelationStatus == "import-failed"
+                                            && failedIds.Contains(row.LegacyDavItemId))
+                                           || (row.CorrelationStatus == "unmatched-target"
+                                               && unmatchedIds.Contains(row.LegacyDavItemId)))))
             throw new BadHttpRequestException(
-                "Plans require an exact correlation or recorded terminal import failure for every selected link "
+                "Plans require an exact correlation, recorded terminal import failure, or unmatched target for every selected link "
                 + $"(selected: {report.SelectedCount}, exact: {report.ExactCount}, "
-                + $"failed: {failedIds.Count}, excluded: {report.ExclusionCount}, "
+                + $"failed: {failedIds.Count}, unmatched: {unmatchedIds.Count}, excluded: {report.ExclusionCount}, "
                 + $"ambiguous: {report.AmbiguityCount}).");
         var planDirectory = NzbDavCanaryPlanWriter.GetPlanDirectory(
             Path.Join(DavDatabaseContext.ConfigPath, "migration-output", "nzbdav"),
@@ -444,7 +450,7 @@ public sealed class NzbDavMigrationController(
             return Conflict(new BaseApiResponse { Status = false, Error = "The immutable canary plan already exists." });
         await using var context = store.NewContext();
         var result = await new NzbDavCanaryLinkPlanner().GenerateAsync(
-            context, session.SourcePackageRoot!, session.CurrentRunId.Value, failedIds, HttpContext.RequestAborted)
+            context, session.SourcePackageRoot!, session.CurrentRunId.Value, unlinkedIds, HttpContext.RequestAborted)
             .ConfigureAwait(false);
         return Ok(new
         {
@@ -454,6 +460,7 @@ public sealed class NzbDavMigrationController(
             result.Plan.SelectedCount,
             result.Plan.ActionableCount,
             failedCount = failedIds.Count,
+            unmatchedCount = unmatchedIds.Count,
             download = "/api/migration/nzbdav/canary-plan",
         });
     });

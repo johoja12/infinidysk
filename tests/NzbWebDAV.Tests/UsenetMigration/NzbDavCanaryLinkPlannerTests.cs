@@ -62,6 +62,27 @@ public sealed class NzbDavCanaryLinkPlannerTests : IDisposable
     }
 
     [Fact]
+    public async Task GenerateAsync_LeavesExplicitUnmatchedTargetOutOfThePlan()
+    {
+        var exactSource = Guid.NewGuid();
+        var unmatchedSource = Guid.NewGuid();
+        var package = await CreatePackageAsync(
+            new NzbDavSelectedLibraryLink("TV/Show/exact.mkv", "/legacy/.ids/exact", exactSource),
+            new NzbDavSelectedLibraryLink("TV/Show/unmatched.mkv", "/legacy/.ids/unmatched", unmatchedSource));
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        await SeedAsync(harness, exactSource, unmatchedSource, Guid.NewGuid());
+        await using var db = harness.Mig();
+
+        var result = await new NzbDavCanaryLinkPlanner().GenerateAsync(
+            db, package, 42, Path.Join(_root, "output"), new HashSet<Guid> { unmatchedSource });
+
+        Assert.True(result.Plan.IsValid);
+        Assert.Equal(1, result.Plan.SelectedCount);
+        Assert.Equal(exactSource, Assert.Single(result.Plan.Links).LegacyDavItemId);
+        Assert.Single(await db.CanaryLinks.ToListAsync());
+    }
+
+    [Fact]
     public async Task GenerateAsync_RejectsDuplicateLibraryOutputPathsWithoutPersistingRows()
     {
         var first = Guid.NewGuid();
