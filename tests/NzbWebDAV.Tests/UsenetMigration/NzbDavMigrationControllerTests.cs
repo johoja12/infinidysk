@@ -369,6 +369,8 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
                 FileName = "a.mkv", NormalisedName = "a.mkv", SourceFileId = selected.LegacyDavItemId.ToString(),
                 FileStatus = "exact", NewDavItemId = Guid.NewGuid().ToString(),
             });
+            db.Submissions.Add(new MigrationSubmission
+                { StoreRef = "nzbdav:release-1", State = "completed", UpdatedAt = DateTime.UtcNow });
             await db.SaveChangesAsync();
         }
         Assert.IsType<OkObjectResult>(await controller.AcknowledgePlan(0, acknowledgement));
@@ -377,6 +379,50 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         Assert.Equal("acknowledged", batch.Status);
         Assert.Equal(1, batch.AppliedCount);
         Assert.Equal(1, batch.ValidatedCount);
+    }
+
+    [Fact]
+    public async Task AcknowledgePlan_AllowsRecordedTerminalImportFailureWithoutAnUnsafeLink()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var masterDigest = new string('e', 64);
+        var packagePath = await CreateFullPackageAsync("failed-ack", masterDigest, 0, 1);
+        var selected = Assert.Single((await new NzbDavPackageReader().ReadAsync(packagePath))
+            .Manifest.SelectedLinks);
+        var controller = CreateController(harness);
+        await controller.ConnectFull(new NzbDavFullConnectRequest(packagePath, masterDigest, 1, 1, 5, 1));
+        await harness.Store.UpdateSessionAsync(session => session.Status = "complete");
+        await using (var db = harness.Mig())
+        {
+            db.Releases.Add(new MigrationRelease
+            {
+                StoreRef = "nzbdav:release-1", StoreBasename = "release-1", SubmitFileName = "release.nzb",
+                QueueFileName = "release.nzb", JobName = "release", VerdictReasons = "[]",
+                ScannedAt = DateTime.UtcNow,
+            });
+            db.ReleaseFiles.Add(new MigrationReleaseFile
+            {
+                StoreRef = "nzbdav:release-1", MetaPath = "payload", VirtualPath = "/content/a.mkv",
+                FileName = "a.mkv", NormalisedName = "a.mkv", SourceFileId = selected.LegacyDavItemId.ToString(),
+                FileStatus = "import-failed",
+            });
+            db.Submissions.Add(new MigrationSubmission
+            {
+                StoreRef = "nzbdav:release-1", State = "failed", Error = "RAR signature not found",
+                UpdatedAt = DateTime.UtcNow,
+            });
+            await db.SaveChangesAsync();
+        }
+
+        var failures = Assert.IsType<OkObjectResult>(await controller.GetImportFailures());
+        using var result = JsonDocument.Parse(JsonSerializer.Serialize(failures.Value));
+        Assert.Equal(1, result.RootElement.GetProperty("failedCount").GetInt32());
+        Assert.Equal(selected.LegacyDavItemId.ToString(), result.RootElement.GetProperty("failures")[0]
+            .GetProperty("LegacyDavItemId").GetString());
+        Assert.IsType<OkObjectResult>(await controller.AcknowledgePlan(0,
+            new NzbDavBatchPlanAcknowledgementRequest(new string('f', 64), 0, 0)));
+        await using var verify = harness.Mig();
+        Assert.Equal("acknowledged", (await verify.NzbDavBatches.SingleAsync()).Status);
     }
 
     private NzbDavMigrationController CreateController(MigrationTestHarness harness)
