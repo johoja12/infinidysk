@@ -34,6 +34,7 @@ internal static class NzbDavMigrationProgram
             await Console.Error.WriteLineAsync("       NzbDavMigration verify-sharded-roots --plex-inventory DIR --special-inventory DIR --plex-recovery DIR --special-recovery DIR");
             await Console.Error.WriteLineAsync("       NzbDavMigration export-batches --master FILE --peer-master FILE --peer-inventory FILE --blob-root PATH --output DIR [--max-releases 250] [--max-payload-bytes 4294967296]");
             await Console.Error.WriteLineAsync("       NzbDavMigration export-sharded-batches --root plex|special --plex-inventory DIR --special-inventory DIR --plex-recovery DIR --special-recovery DIR --blob-root PATH --payload-root PATH --output DIR [--max-releases 250] [--first-batch-releases N] [--max-payload-bytes 4294967296]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration export-special-ahead-batches --plex-inventory DIR --special-inventory DIR --special-recovery DIR --payload-root PATH --output DIR [--first-batch-releases 30] [--max-releases 250] [--max-payload-bytes 4294967296]");
             await Console.Error.WriteLineAsync("       NzbDavMigration export --selection FILE --inventory FILE --blob-root PATH --output DIR --package-id ID");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-mapped-links --plan FILE --mapped-inventory FILE --blob-root PATH --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
@@ -62,6 +63,7 @@ internal static class NzbDavMigrationProgram
                 "verify-sharded-roots" => await VerifyShardedRootsAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "export-batches" => await ExportBatchesAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "export-sharded-batches" => await ExportShardedBatchesAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "export-special-ahead-batches" => await ExportSpecialAheadBatchesAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "export" => await ExportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "apply-links" => await ApplyLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "apply-mapped-links" => await ApplyMappedLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
@@ -217,6 +219,21 @@ internal static class NzbDavMigrationProgram
             ParsePositiveLong(options, "--max-payload-bytes", 4L * 1024 * 1024 * 1024),
             firstBatchMaxReleases)
             .ConfigureAwait(false);
+        await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new { batches = count }, ReportJsonOptions));
+        return 0;
+    }
+
+    private static async Task<int> ExportSpecialAheadBatchesAsync(IReadOnlyDictionary<string, string> options)
+    {
+        var count = await new ShardedMappedExporter().ExportSpecialAheadAsync(
+            Required(options, "--special-inventory"),
+            Required(options, "--special-recovery"),
+            Required(options, "--plex-inventory"),
+            Required(options, "--payload-root"),
+            Required(options, "--output"),
+            ParsePositiveInt(options, "--max-releases", 250),
+            ParsePositiveLong(options, "--max-payload-bytes", 4L * 1024 * 1024 * 1024),
+            ParsePositiveInt(options, "--first-batch-releases", 30)).ConfigureAwait(false);
         await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new { batches = count }, ReportJsonOptions));
         return 0;
     }

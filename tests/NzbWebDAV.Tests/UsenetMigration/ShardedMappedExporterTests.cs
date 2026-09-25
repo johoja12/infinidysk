@@ -35,6 +35,45 @@ public sealed class ShardedMappedExporterTests
     }
 
     [Fact]
+    public void ValidateSpecialAhead_RequiresCompleteSpecialRecoveryAndDistinctMappedIds()
+    {
+        var specialId = Guid.NewGuid();
+        var special = Evidence("/mnt/special", 100, 98, [specialId], [Digest('a')]);
+        var plex = Evidence("/mnt/plex", 1000, 1, [Guid.NewGuid()], [Digest('b')]);
+
+        ShardedMappedExporter.ValidateSpecialAhead(special, plex.Inventory, plex.DavItemIds);
+        Assert.Throws<InvalidDataException>(() => ShardedMappedExporter.ValidateSpecialAhead(
+            Evidence("/mnt/special", 100, 89, [specialId], [Digest('a')]),
+            plex.Inventory, plex.DavItemIds));
+        Assert.Throws<InvalidDataException>(() => ShardedMappedExporter.ValidateSpecialAhead(
+            special, plex.Inventory, new HashSet<Guid> { specialId }));
+        Assert.Throws<InvalidDataException>(() => ShardedMappedExporter.ValidateSpecialAhead(
+            special, special.Inventory, plex.DavItemIds));
+    }
+
+    [Fact]
+    public void SelectCanonicalSpecialScenes_SkipsAReleaseWhoseLegacyJobNameChangesOnSubmission()
+    {
+        var canonical = new LegacySourceRecoveryItem("scenes/good.mkv", "/legacy/good",
+            Guid.NewGuid(), "/content/scenes/good/good.mkv", "exact-direct", null,
+            "good.nzb", Digest('a'), NzbDavArticleIdentity.DirectKind, Digest('b'), 100);
+        var noncanonical = canonical with
+        {
+            LibraryRelativePath = "scenes/bad.mkv",
+            LegacyDavItemId = Guid.NewGuid(),
+            LegacyPath = "/content/scenes/bad:job/bad.mkv",
+            PayloadSha256 = Digest('c'),
+        };
+
+        var selected = ShardedMappedExporter.SelectCanonicalSpecialScenes(
+            [canonical, noncanonical], out var skipped);
+
+        Assert.Single(selected);
+        Assert.Equal(canonical.LegacyDavItemId, selected[0].LegacyDavItemId);
+        Assert.Equal(1, skipped);
+    }
+
+    [Fact]
     public async Task ExportVerified_ResumesOnlyMatchingChecksummedMappedPackages()
     {
         var fixture = Path.Join(Path.GetTempPath(), $"sharded-export-{Guid.NewGuid():N}");

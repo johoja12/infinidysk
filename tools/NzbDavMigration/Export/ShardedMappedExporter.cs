@@ -1,7 +1,9 @@
 using System.Security.Cryptography;
 using System.Text;
+using NzbDavMigration.Canary;
 using NzbDavMigration.Catalogue;
 using NzbDavMigration.Inventory;
+using NzbDavMigration.Legacy;
 using NzbDavMigration.Recovery;
 using NzbWebDAV.UsenetMigration.NzbDav;
 using NzbWebDAV.UsenetMigration.Source;
@@ -95,11 +97,130 @@ public sealed class ShardedMappedExporter
             combinedRecovered, combinedFraction);
     }
 
+    // This path lets the independent scenes library start while Plex recovery is
+    // still running. It never claims that the two complete roots have passed the
+    // full-library gate; the resulting batch sequence is limited to /mnt/special.
+    public static void ValidateSpecialAhead(
+        ShardedMappedRootEvidence special,
+        ShardedMappedInventoryManifest plexInventory,
+        IReadOnlySet<Guid> plexIds)
+    {
+        if (special.Inventory.SourceRoot != "/mnt/special"
+            || plexInventory.SourceRoot != "/mnt/plex"
+            || special.Recovery.RecoverableFraction < 0.90m)
+            throw new InvalidDataException("Early special export requires a complete 90% special recovery and Plex mapped inventory.");
+        if (special.DavItemIds.Any(plexIds.Contains))
+            throw new InvalidDataException("The roots share mapped item IDs; target reuse is required before export.");
+    }
+
+    public async Task<int> ExportSpecialAheadAsync(
+        string specialInventoryDirectory,
+        string specialRecoveryDirectory,
+        string plexInventoryDirectory,
+        string payloadRoot,
+        string outputDirectory,
+        int maxReleases = 250,
+        long maxPayloadBytes = 4L * 1024 * 1024 * 1024,
+        int firstBatchMaxReleases = 30,
+        CancellationToken cancellationToken = default)
+    {
+        var special = await LoadRootAsync(specialInventoryDirectory, specialRecoveryDirectory,
+            cancellationToken).ConfigureAwait(false);
+        var plex = await ShardedMappedInventoryWriter.ReadManifestAsync(plexInventoryDirectory,
+            cancellationToken).ConfigureAwait(false);
+        var plexAllowlist = await ShardedMappedInventoryWriter.ReadAllowlistAsync(
+            plexInventoryDirectory, plex, cancellationToken).ConfigureAwait(false);
+        ValidateSpecialAhead(special, plex, plexAllowlist.Select(row => row.DavItemId).ToHashSet());
+        var exportable = SelectCanonicalSpecialScenes(special.Items, out var skippedReleases);
+        var selectedIds = exportable.Where(item =>
+                item.Classification is "exact-direct" or "exact-archive")
+            .Select(item => item.LegacyDavItemId.ToString("D"))
+            .Order(StringComparer.Ordinal).ToArray();
+        if (selectedIds.Length < 20
+            || decimal.Divide(selectedIds.Length, special.Inventory.RowCount) < 0.90m)
+            throw new InvalidDataException("Early special export must retain at least 90% exact mapped scenes links.");
+        await VerifySelectedMappingsAsync(exportable, cancellationToken).ConfigureAwait(false);
+        if (skippedReleases > 0)
+            await Console.Error.WriteLineAsync(
+                $"Excluded {skippedReleases} recovered releases with noncanonical legacy job names.")
+                .ConfigureAwait(false);
+        var selectionDigest = Convert.ToHexString(SHA256.HashData(
+            Encoding.UTF8.GetBytes(string.Join('\n', selectedIds)))).ToLowerInvariant();
+        var provenance = string.Join(':', "special-ahead-v2", plex.RowsSha256,
+            special.Inventory.RowsSha256,
+            string.Join(':', special.Recovery.Shards.Select(shard => shard.MasterSha256)),
+            selectionDigest);
+        var masterDigest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(provenance)))
+            .ToLowerInvariant();
+        return await ExportRootVerifiedAsync(special with { Items = exportable }, "special", masterDigest,
+            payloadRoot, outputDirectory, maxReleases, maxPayloadBytes,
+            firstBatchMaxReleases, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal static LegacySourceRecoveryItem[] SelectCanonicalSpecialScenes(
+        IEnumerable<LegacySourceRecoveryItem> items,
+        out int skippedReleases)
+    {
+        var scenes = items.Where(item =>
+            item.LibraryRelativePath.StartsWith("scenes/", StringComparison.Ordinal)).ToArray();
+        var skippedPayloads = scenes.Where(item =>
+                item.Classification is "exact-direct" or "exact-archive")
+            .GroupBy(item => item.PayloadSha256, StringComparer.Ordinal)
+            .Where(group => !HasCanonicalSourceName(group))
+            .Select(group => group.Key).ToHashSet(StringComparer.Ordinal);
+        skippedReleases = skippedPayloads.Count;
+        return scenes.Where(item =>
+            item.Classification is not ("exact-direct" or "exact-archive")
+            || !skippedPayloads.Contains(item.PayloadSha256)).ToArray();
+    }
+
+    private static bool HasCanonicalSourceName(
+        IEnumerable<LegacySourceRecoveryItem> items)
+    {
+        try
+        {
+            NzbDavSourceNameResolver.FromLegacyPaths(items.Select(item => item.LegacyPath!));
+            return true;
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task VerifySelectedMappingsAsync(
+        IReadOnlyList<LegacySourceRecoveryItem> items,
+        CancellationToken cancellationToken)
+    {
+        var current = await new LegacyNzbDavReader().ReadMappedAsync("/mnt/special", cancellationToken)
+            .ConfigureAwait(false);
+        var byPath = current.Links.ToDictionary(link => link.LinkPath, StringComparer.Ordinal);
+        foreach (var item in items.Where(item =>
+                     item.Classification is "exact-direct" or "exact-archive"))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var path = CanaryPathSafety.ResolveBeneath(
+                "/mnt/special", item.LibraryRelativePath, "source library path");
+            if (!byPath.TryGetValue(path, out var link) || link.IsBroken
+                || link.DavItemId != item.LegacyDavItemId
+                || new FileInfo(path).LinkTarget != item.OriginalTarget)
+                throw new InvalidDataException("Recovered special link changed since its mapped inventory.");
+        }
+    }
+
     public async Task VerifyFreshSourceAsync(
         ShardedMappedRootEvidence root,
         string blobRoot,
         string scratchParent,
         CancellationToken cancellationToken = default)
+        => await VerifyFreshInventoryAsync(root.Inventory, blobRoot, scratchParent,
+            cancellationToken).ConfigureAwait(false);
+
+    private static async Task VerifyFreshInventoryAsync(
+        ShardedMappedInventoryManifest inventory,
+        string blobRoot,
+        string scratchParent,
+        CancellationToken cancellationToken)
     {
         var parent = Path.GetFullPath(scratchParent);
         if (!Directory.Exists(parent) || new DirectoryInfo(parent).LinkTarget is not null)
@@ -108,12 +229,12 @@ public sealed class ShardedMappedExporter
         try
         {
             var current = await new ShardedMappedInventoryWriter().WriteAsync(
-                root.Inventory.SourceRoot, root.Inventory.LegacyIdsRoot, blobRoot, scratch,
-                root.Inventory.Shards[0].RowCount, cancellationToken: cancellationToken)
+                inventory.SourceRoot, inventory.LegacyIdsRoot, blobRoot, scratch,
+                inventory.Shards[0].RowCount, cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
-            if (current.RowCount != root.Inventory.RowCount
-                || current.RowsSha256 != root.Inventory.RowsSha256
-                || current.Shards.Count != root.Inventory.Shards.Count)
+            if (current.RowCount != inventory.RowCount
+                || current.RowsSha256 != inventory.RowsSha256
+                || current.Shards.Count != inventory.Shards.Count)
                 throw new InvalidDataException("LocalLinks or source symlinks changed since mapped inventory; re-inventory.");
         }
         finally
@@ -165,6 +286,22 @@ public sealed class ShardedMappedExporter
         var masterDigest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
                 $"{rootName}:{provenance}")))
             .ToLowerInvariant();
+        return await ExportRootVerifiedAsync(root, rootName, masterDigest, payloadRoot,
+            outputDirectory, maxReleases, maxPayloadBytes, firstBatchMaxReleases,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<int> ExportRootVerifiedAsync(
+        ShardedMappedRootEvidence root,
+        string rootName,
+        string masterDigest,
+        string payloadRoot,
+        string outputDirectory,
+        int maxReleases,
+        long maxPayloadBytes,
+        int? firstBatchMaxReleases,
+        CancellationToken cancellationToken)
+    {
         var releases = new List<FullRecoveryRelease>();
         foreach (var group in root.Items.Where(item => item.Classification is "exact-direct" or "exact-archive")
                      .GroupBy(item => item.PayloadSha256, StringComparer.Ordinal))
