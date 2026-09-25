@@ -216,8 +216,28 @@ legacy blob tree used by the mapped inventory for its drift check.
 Export immutable batches. The defaults are at most 250 releases and 4 GiB of NZB
 payload bytes per batch; lower either bound to reduce queue or review pressure.
 One oversized release is isolated and explicitly marked rather than hidden.
+The two roots have separate master digests and batch sequences. Finish and
+acknowledge every `special` batch before connecting the first `plex` batch. For a
+20–50 file `/mnt/special2` canary, use `--first-batch-releases` and inspect the
+first package's selected-link count before connecting it. Adjust and re-export
+the immutable package set if that count is outside the canary range. Later
+special batches retain the normal 250-release cap.
 
 ```bash
+dotnet run --project tools/NzbDavMigration -c Release -- \
+  export-sharded-batches \
+  --root special \
+  --plex-inventory "$RUN/plex/initial-inventory" \
+  --special-inventory "$RUN/special/initial-inventory" \
+  --plex-recovery "$RUN/plex/recovery" \
+  --special-recovery "$RUN/special/recovery" \
+  --blob-root /opt/nzbdav/config/blobs \
+  --payload-root /opt/nzbdav/config/blobs \
+  --output "$RUN/special/batches" \
+  --first-batch-releases 30 \
+  --max-releases 250 \
+  --max-payload-bytes 4294967296
+
 dotnet run --project tools/NzbDavMigration -c Release -- \
   export-sharded-batches \
   --root plex \
@@ -230,31 +250,23 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --output "$RUN/plex/batches" \
   --max-releases 250 \
   --max-payload-bytes 4294967296
-
-dotnet run --project tools/NzbDavMigration -c Release -- \
-  export-sharded-batches \
-  --root special \
-  --plex-inventory "$RUN/plex/initial-inventory" \
-  --special-inventory "$RUN/special/initial-inventory" \
-  --plex-recovery "$RUN/plex/recovery" \
-  --special-recovery "$RUN/special/recovery" \
-  --blob-root /opt/nzbdav/config/blobs \
-  --payload-root /opt/nzbdav/config/blobs \
-  --output "$RUN/special/batches" \
-  --max-releases 250 \
-  --max-payload-bytes 4294967296
 ```
 
 Bind only one completed batch at a time beneath
-`/config/migration-input/...:ro`. In **Settings → System → Migration → NzbDav**,
-connect batches in increasing order, scan, submit with conservative worker/queue
-limits, wait for a terminal run, and reconcile. Pause through the migration UI if
+`/config/migration-input/...:ro`. Register each full batch with
+`POST /api/migration/nzbdav/full/connect` using its package path, master digest,
+root-specific mapped and recoverable counts, one submit worker, and queue depth
+five. The current settings page does not expose this full-batch registration
+request. Then use **Settings → System → Migration → NzbDav** to scan, submit,
+wait for a terminal run, and reconcile. Pause through the migration UI if
 providers or the queue become unstable; resume the same batch instead of creating
 a second submission. A reconnect of the same package digest is idempotent. The
 next batch is fenced until the current batch has a terminal, fully exact,
 fully-applied plan acknowledgement.
 
-For each root's batch, download its checksummed plan and apply it with that
+Use each root's own mapped and recoverable counts in its full-connect request;
+the combined count is an audit gate, not a batch-master denominator. For each
+root's batch, download its checksummed plan and apply it with that
 root's three paths. Keep batch numbers, sessions, plans, journals, and validations
 under the matching `plex/` or `special/` artifact directory; `batch-0001` in one
 root is unrelated to `batch-0001` in the other.

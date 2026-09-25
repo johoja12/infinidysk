@@ -39,6 +39,22 @@ public sealed class BatchPackagePlannerTests
         Assert.False(batches[1].IsOversizedSingleRelease);
     }
 
+    [Fact]
+    public void Partition_CanLimitOnlyTheFirstCanaryBatch()
+    {
+        var releases = Enumerable.Range(0, 7)
+            .Select(index => Release($"release-{index}", (char)('a' + index), 10))
+            .ToArray();
+
+        var batches = new BatchPackagePlanner().Partition(releases,
+            maxReleases: 4, firstBatchMaxReleases: 2);
+
+        Assert.Equal([2, 4, 1], batches.Select(batch => batch.Releases.Count));
+        Assert.Equal(7, batches.SelectMany(batch => batch.Releases).Distinct().Count());
+        Assert.Throws<ArgumentOutOfRangeException>(() => new BatchPackagePlanner().Partition(
+            releases, maxReleases: 4, firstBatchMaxReleases: 5));
+    }
+
     private static FullRecoveryRelease Release(string id, char digest, long bytes) =>
         new(id, new string(digest, 64), $"{id}.nzb", bytes, []);
 }

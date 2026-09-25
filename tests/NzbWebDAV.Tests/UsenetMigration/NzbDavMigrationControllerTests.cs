@@ -300,6 +300,37 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task FullConnect_AllowsSecondRootMasterAfterFirstIsAcknowledged()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var specialDigest = new string('a', 64);
+        var plexDigest = new string('b', 64);
+        var special = await CreateFullPackageAsync("special-root", specialDigest, 0, 1);
+        var plex = await CreateFullPackageAsync("plex-root", plexDigest, 0, 1);
+        var controller = CreateController(harness);
+
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(
+            new NzbDavFullConnectRequest(special, specialDigest, 10, 9, 5, 1)));
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(
+            new NzbDavFullConnectRequest(plex, plexDigest, 100, 95, 5, 1)));
+
+        await using (var db = harness.Mig())
+        {
+            var batch = await db.NzbDavBatches.SingleAsync();
+            batch.Status = "acknowledged";
+            await db.SaveChangesAsync();
+        }
+        await harness.Store.UpdateSessionAsync(session => session.Status = "connected");
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(
+            new NzbDavFullConnectRequest(plex, plexDigest, 100, 95, 5, 1)));
+        await using (var db = harness.Mig())
+            Assert.Equal(2, await db.NzbDavMasters.CountAsync());
+        var status = Assert.IsType<OkObjectResult>(await controller.GetFullStatus());
+        using var json = JsonDocument.Parse(JsonSerializer.Serialize(status.Value));
+        Assert.Equal(100, json.RootElement.GetProperty("sourceLinkCount").GetInt32());
+    }
+
+    [Fact]
     public async Task AcknowledgePlan_RequiresTerminalExactFullyAppliedBatch()
     {
         await using var harness = await MigrationTestHarness.CreateAsync();
