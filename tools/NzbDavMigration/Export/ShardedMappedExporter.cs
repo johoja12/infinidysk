@@ -131,19 +131,53 @@ public sealed class ShardedMappedExporter
         var plexAllowlist = await ShardedMappedInventoryWriter.ReadAllowlistAsync(
             plexInventoryDirectory, plex, cancellationToken).ConfigureAwait(false);
         ValidateSpecialAhead(special, plex, plexAllowlist.Select(row => row.DavItemId).ToHashSet());
-        var scenes = special.Items.Where(item =>
-            item.LibraryRelativePath.StartsWith("scenes/", StringComparison.Ordinal)).ToArray();
-        if (scenes.Count(item => item.Classification is "exact-direct" or "exact-archive") < 20)
+        var exportable = SelectCanonicalSpecialScenes(special.Items, out var skippedReleases);
+        if (exportable.Count(item => item.Classification is "exact-direct" or "exact-archive") < 20)
             throw new InvalidDataException("Early special export has fewer than 20 exact scenes links.");
-        await VerifySelectedMappingsAsync(scenes, cancellationToken).ConfigureAwait(false);
+        await VerifySelectedMappingsAsync(exportable, cancellationToken).ConfigureAwait(false);
+        if (skippedReleases > 0)
+            await Console.Error.WriteLineAsync(
+                $"Excluded {skippedReleases} recovered releases with noncanonical legacy job names.")
+                .ConfigureAwait(false);
         var provenance = string.Join(':', "special-ahead-v1", plex.RowsSha256,
             special.Inventory.RowsSha256,
             string.Join(':', special.Recovery.Shards.Select(shard => shard.MasterSha256)));
         var masterDigest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(provenance)))
             .ToLowerInvariant();
-        return await ExportRootVerifiedAsync(special with { Items = scenes }, "special", masterDigest,
+        return await ExportRootVerifiedAsync(special with { Items = exportable }, "special", masterDigest,
             payloadRoot, outputDirectory, maxReleases, maxPayloadBytes,
             firstBatchMaxReleases, cancellationToken).ConfigureAwait(false);
+    }
+
+    internal static LegacySourceRecoveryItem[] SelectCanonicalSpecialScenes(
+        IEnumerable<LegacySourceRecoveryItem> items,
+        out int skippedReleases)
+    {
+        var scenes = items.Where(item =>
+            item.LibraryRelativePath.StartsWith("scenes/", StringComparison.Ordinal)).ToArray();
+        var skippedPayloads = scenes.Where(item =>
+                item.Classification is "exact-direct" or "exact-archive")
+            .GroupBy(item => item.PayloadSha256, StringComparer.Ordinal)
+            .Where(group => !HasCanonicalSourceName(group))
+            .Select(group => group.Key).ToHashSet(StringComparer.Ordinal);
+        skippedReleases = skippedPayloads.Count;
+        return scenes.Where(item =>
+            item.Classification is not ("exact-direct" or "exact-archive")
+            || !skippedPayloads.Contains(item.PayloadSha256)).ToArray();
+    }
+
+    private static bool HasCanonicalSourceName(
+        IEnumerable<LegacySourceRecoveryItem> items)
+    {
+        try
+        {
+            NzbDavSourceNameResolver.FromLegacyPaths(items.Select(item => item.LegacyPath!));
+            return true;
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
     }
 
     private static async Task VerifySelectedMappingsAsync(

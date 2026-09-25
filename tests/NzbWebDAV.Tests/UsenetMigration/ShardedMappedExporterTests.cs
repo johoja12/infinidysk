@@ -52,6 +52,28 @@ public sealed class ShardedMappedExporterTests
     }
 
     [Fact]
+    public void SelectCanonicalSpecialScenes_SkipsAReleaseWhoseLegacyJobNameChangesOnSubmission()
+    {
+        var canonical = new LegacySourceRecoveryItem("scenes/good.mkv", "/legacy/good",
+            Guid.NewGuid(), "/content/scenes/good/good.mkv", "exact-direct", null,
+            "good.nzb", Digest('a'), NzbDavArticleIdentity.DirectKind, Digest('b'), 100);
+        var noncanonical = canonical with
+        {
+            LibraryRelativePath = "scenes/bad.mkv",
+            LegacyDavItemId = Guid.NewGuid(),
+            LegacyPath = "/content/scenes/bad:job/bad.mkv",
+            PayloadSha256 = Digest('c'),
+        };
+
+        var selected = ShardedMappedExporter.SelectCanonicalSpecialScenes(
+            [canonical, noncanonical], out var skipped);
+
+        Assert.Single(selected);
+        Assert.Equal(canonical.LegacyDavItemId, selected[0].LegacyDavItemId);
+        Assert.Equal(1, skipped);
+    }
+
+    [Fact]
     public async Task ExportVerified_ResumesOnlyMatchingChecksummedMappedPackages()
     {
         var fixture = Path.Join(Path.GetTempPath(), $"sharded-export-{Guid.NewGuid():N}");
