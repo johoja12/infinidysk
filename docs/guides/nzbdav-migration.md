@@ -226,7 +226,9 @@ Plex mapped inventory, rejects shared DavItem IDs, and checks every selected
 special link against current `LocalLinks` and its original symlink target. New
 source links do not invalidate previously verified links; account for them in
 the final live coverage pass. Recovered releases whose legacy job names would
-change on ID submission are counted and excluded for separate remediation.
+change on ID submission are counted and excluded for separate remediation; the
+remaining exact `scenes/` links must still cover at least 90% of the sealed
+special mapped inventory.
 It does not claim that Plex has passed recovery or
 that all cross-root NZB payloads are known. Import the first bounded special
 batch, review its exact plan and validation, and keep Plex import on hold until

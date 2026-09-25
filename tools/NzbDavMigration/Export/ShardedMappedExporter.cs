@@ -132,16 +132,24 @@ public sealed class ShardedMappedExporter
             plexInventoryDirectory, plex, cancellationToken).ConfigureAwait(false);
         ValidateSpecialAhead(special, plex, plexAllowlist.Select(row => row.DavItemId).ToHashSet());
         var exportable = SelectCanonicalSpecialScenes(special.Items, out var skippedReleases);
-        if (exportable.Count(item => item.Classification is "exact-direct" or "exact-archive") < 20)
-            throw new InvalidDataException("Early special export has fewer than 20 exact scenes links.");
+        var selectedIds = exportable.Where(item =>
+                item.Classification is "exact-direct" or "exact-archive")
+            .Select(item => item.LegacyDavItemId.ToString("D"))
+            .Order(StringComparer.Ordinal).ToArray();
+        if (selectedIds.Length < 20
+            || decimal.Divide(selectedIds.Length, special.Inventory.RowCount) < 0.90m)
+            throw new InvalidDataException("Early special export must retain at least 90% exact mapped scenes links.");
         await VerifySelectedMappingsAsync(exportable, cancellationToken).ConfigureAwait(false);
         if (skippedReleases > 0)
             await Console.Error.WriteLineAsync(
                 $"Excluded {skippedReleases} recovered releases with noncanonical legacy job names.")
                 .ConfigureAwait(false);
-        var provenance = string.Join(':', "special-ahead-v1", plex.RowsSha256,
+        var selectionDigest = Convert.ToHexString(SHA256.HashData(
+            Encoding.UTF8.GetBytes(string.Join('\n', selectedIds)))).ToLowerInvariant();
+        var provenance = string.Join(':', "special-ahead-v2", plex.RowsSha256,
             special.Inventory.RowsSha256,
-            string.Join(':', special.Recovery.Shards.Select(shard => shard.MasterSha256)));
+            string.Join(':', special.Recovery.Shards.Select(shard => shard.MasterSha256)),
+            selectionDigest);
         var masterDigest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(provenance)))
             .ToLowerInvariant();
         return await ExportRootVerifiedAsync(special with { Items = exportable }, "special", masterDigest,
