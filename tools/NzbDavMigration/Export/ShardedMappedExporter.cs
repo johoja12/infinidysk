@@ -130,6 +130,7 @@ public sealed class ShardedMappedExporter
         string outputDirectory,
         int maxReleases = 250,
         long maxPayloadBytes = 4L * 1024 * 1024 * 1024,
+        int? firstBatchMaxReleases = null,
         CancellationToken cancellationToken = default)
     {
         var scratchParent = Path.GetDirectoryName(Path.GetFullPath(outputDirectory))
@@ -139,7 +140,7 @@ public sealed class ShardedMappedExporter
         await VerifyFreshSourceAsync(pair.Special, legacyBlobRoot, scratchParent, cancellationToken)
             .ConfigureAwait(false);
         return await ExportVerifiedAsync(pair, exportPlex, payloadRoot, outputDirectory,
-            maxReleases, maxPayloadBytes, cancellationToken).ConfigureAwait(false);
+            maxReleases, maxPayloadBytes, firstBatchMaxReleases, cancellationToken).ConfigureAwait(false);
     }
 
     // Only the public export path may call this after validating both roots and live source drift.
@@ -150,14 +151,19 @@ public sealed class ShardedMappedExporter
         string outputDirectory,
         int maxReleases = 250,
         long maxPayloadBytes = 4L * 1024 * 1024 * 1024,
+        int? firstBatchMaxReleases = null,
         CancellationToken cancellationToken = default)
     {
         var root = exportPlex ? pair.Plex : pair.Special;
+        var rootName = exportPlex ? "plex" : "special";
         var provenance = string.Join(':', pair.Plex.Inventory.RowsSha256,
             string.Join(':', pair.Plex.Recovery.Shards.Select(shard => shard.MasterSha256)),
             pair.Special.Inventory.RowsSha256,
             string.Join(':', pair.Special.Recovery.Shards.Select(shard => shard.MasterSha256)));
-        var masterDigest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(provenance)))
+        // Each root owns an independent batch sequence. The pair proof is still
+        // part of both digests, so either source changing invalidates export.
+        var masterDigest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+                $"{rootName}:{provenance}")))
             .ToLowerInvariant();
         var releases = new List<FullRecoveryRelease>();
         foreach (var group in root.Items.Where(item => item.Classification is "exact-direct" or "exact-archive")
@@ -181,7 +187,8 @@ public sealed class ShardedMappedExporter
             releases.Add(new FullRecoveryRelease(group.Key, group.Key, relativePath, info.Length,
                 group.OrderBy(item => item.LibraryRelativePath, StringComparer.Ordinal).ToArray()));
         }
-        var batches = new BatchPackagePlanner().Partition(releases, maxReleases, maxPayloadBytes);
+        var batches = new BatchPackagePlanner().Partition(
+            releases, maxReleases, maxPayloadBytes, firstBatchMaxReleases);
         var output = Path.GetFullPath(outputDirectory);
         if (File.Exists(output) || (Directory.Exists(output)
             && new DirectoryInfo(output).LinkTarget is not null))

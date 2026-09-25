@@ -33,7 +33,7 @@ internal static class NzbDavMigrationProgram
             await Console.Error.WriteLineAsync("       NzbDavMigration verify-mapped-roots --plex-inventory FILE --special-inventory FILE --plex-master FILE --special-master FILE");
             await Console.Error.WriteLineAsync("       NzbDavMigration verify-sharded-roots --plex-inventory DIR --special-inventory DIR --plex-recovery DIR --special-recovery DIR");
             await Console.Error.WriteLineAsync("       NzbDavMigration export-batches --master FILE --peer-master FILE --peer-inventory FILE --blob-root PATH --output DIR [--max-releases 250] [--max-payload-bytes 4294967296]");
-            await Console.Error.WriteLineAsync("       NzbDavMigration export-sharded-batches --root plex|special --plex-inventory DIR --special-inventory DIR --plex-recovery DIR --special-recovery DIR --blob-root PATH --payload-root PATH --output DIR [--max-releases 250] [--max-payload-bytes 4294967296]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration export-sharded-batches --root plex|special --plex-inventory DIR --special-inventory DIR --plex-recovery DIR --special-recovery DIR --blob-root PATH --payload-root PATH --output DIR [--max-releases 250] [--first-batch-releases N] [--max-payload-bytes 4294967296]");
             await Console.Error.WriteLineAsync("       NzbDavMigration export --selection FILE --inventory FILE --blob-root PATH --output DIR --package-id ID");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-mapped-links --plan FILE --mapped-inventory FILE --blob-root PATH --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
@@ -206,11 +206,14 @@ internal static class NzbDavMigrationProgram
         if (root is not ("plex" or "special"))
             throw new InvalidDataException("Export root must be plex or special.");
         var pair = await LoadShardedPairAsync(options).ConfigureAwait(false);
+        var firstBatchMaxReleases = Optional(options, "--first-batch-releases") is null
+            ? (int?)null : ParsePositiveInt(options, "--first-batch-releases", 1);
         var count = await new ShardedMappedExporter().ExportAsync(
             pair, root == "plex", Required(options, "--blob-root"),
             Required(options, "--payload-root"), Required(options, "--output"),
             ParsePositiveInt(options, "--max-releases", 250),
-            ParsePositiveLong(options, "--max-payload-bytes", 4L * 1024 * 1024 * 1024))
+            ParsePositiveLong(options, "--max-payload-bytes", 4L * 1024 * 1024 * 1024),
+            firstBatchMaxReleases)
             .ConfigureAwait(false);
         await Console.Out.WriteLineAsync(JsonSerializer.Serialize(new { batches = count }, ReportJsonOptions));
         return 0;

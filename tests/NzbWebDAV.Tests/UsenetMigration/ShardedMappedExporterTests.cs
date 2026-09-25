@@ -54,16 +54,35 @@ public sealed class ShardedMappedExporterTests
                 id, "/content/tv/Movie/movie.mkv", "exact-direct", null, "mixed.nzb", payloadDigest,
                 NzbDavArticleIdentity.DirectKind, Digest('a'), 100);
             source = source with { Items = [selected] };
-            var peer = Evidence("/mnt/special", 1, 1, [Guid.NewGuid()], [Digest('b')]);
+            var peerPayloadPath = Path.Join(payloadRoot, "special.nzb");
+            await File.WriteAllTextAsync(peerPayloadPath,
+                await File.ReadAllTextAsync(payloadPath) + "\n");
+            var peerPayloadDigest = Convert.ToHexString(SHA256.HashData(
+                await File.ReadAllBytesAsync(peerPayloadPath))).ToLowerInvariant();
+            var peerId = Guid.NewGuid();
+            var peer = Evidence("/mnt/special", 1, 1, [peerId], [peerPayloadDigest]);
+            peer = peer with { Items = [new LegacySourceRecoveryItem(
+                "Show/episode.mkv", "/legacy/.ids/" + peerId, peerId,
+                "/content/tv/Show/episode.mkv", "exact-direct", null,
+                "special.nzb", peerPayloadDigest, NzbDavArticleIdentity.DirectKind,
+                Digest('b'), 100)] };
             var pair = ShardedMappedExporter.ValidatePair(source, peer);
             var output = Path.Join(fixture, "batches");
+            var peerOutput = Path.Join(fixture, "special-batches");
             var exporter = new ShardedMappedExporter();
 
             Assert.Equal(1, await exporter.ExportVerifiedAsync(pair, true, payloadRoot, output));
             Assert.Equal(1, await exporter.ExportVerifiedAsync(pair, true, payloadRoot, output));
+            Assert.Equal(1, await exporter.ExportVerifiedAsync(pair, false, payloadRoot, peerOutput));
             var package = await new NzbDavPackageReader().ReadAsync(Path.Join(output, "batch-0001"));
+            var peerPackage = await new NzbDavPackageReader().ReadAsync(
+                Path.Join(peerOutput, "batch-0001"));
             Assert.Single(package.Manifest.SelectedLinks);
             Assert.Single(package.Manifest.Releases.Single().Leaves);
+            Assert.Equal(0, package.Manifest.BatchIndex);
+            Assert.Equal(0, peerPackage.Manifest.BatchIndex);
+            Assert.NotEqual(package.Manifest.MasterManifestDigest,
+                peerPackage.Manifest.MasterManifestDigest);
 
             await File.AppendAllTextAsync(Path.Join(output, "batch-0001", "manifest.json"), " ");
             await Assert.ThrowsAsync<InvalidDataException>(() =>

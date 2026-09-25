@@ -18,10 +18,13 @@ public sealed class BatchPackagePlanner
     public IReadOnlyList<FullRecoveryBatch> Partition(
         IReadOnlyList<FullRecoveryRelease> releases,
         int maxReleases = 250,
-        long maxPayloadBytes = 4L * 1024 * 1024 * 1024)
+        long maxPayloadBytes = 4L * 1024 * 1024 * 1024,
+        int? firstBatchMaxReleases = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxReleases);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxPayloadBytes);
+        if (firstBatchMaxReleases is < 1 || firstBatchMaxReleases > maxReleases)
+            throw new ArgumentOutOfRangeException(nameof(firstBatchMaxReleases));
         var ordered = releases.OrderBy(release => release.PayloadSha256, StringComparer.Ordinal)
             .ThenBy(release => release.SourceReleaseId, StringComparer.Ordinal).ToArray();
         if (ordered.Any(release => release.PayloadBytes < 0))
@@ -41,7 +44,8 @@ public sealed class BatchPackagePlanner
                 batches.Add(new FullRecoveryBatch(batches.Count, [release], release.PayloadBytes, true));
                 continue;
             }
-            if (current.Count == maxReleases || currentBytes > maxPayloadBytes - release.PayloadBytes)
+            var releaseLimit = batches.Count == 0 ? firstBatchMaxReleases ?? maxReleases : maxReleases;
+            if (current.Count == releaseLimit || currentBytes > maxPayloadBytes - release.PayloadBytes)
                 Flush();
             current.Add(release);
             currentBytes += release.PayloadBytes;
