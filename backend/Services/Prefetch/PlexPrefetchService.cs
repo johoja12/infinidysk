@@ -4,6 +4,7 @@ using NzbWebDAV.Config;
 using NzbWebDAV.Services.Plex;
 using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models;
+using NzbWebDAV.Services.NativeCache;
 using NzbWebDAV.Utils;
 using System.Security.Cryptography;
 using System.Text;
@@ -249,7 +250,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             + (mapped.LocalPath is null ? "" : ":local")
             + (prediction ? item.WatchStateUserId is null ? ":watch-unknown" : ":unwatched" : "");
         if (imported is null) return RejectPreview(item, owner, "Mapping does not resolve to an imported media file.");
-        if (imported.FileSize is not > 0 || imported.FileSize > runtime.Settings().MaxBytesPerItem || imported.FileBlobId is null)
+        if (imported.FileSize is not > 0 || imported.FileSize > runtime.Settings().MaxBytesPerItem
+            || imported.FileSize < NativeCacheSettings.MinimumFileBytes(config) || imported.FileBlobId is null)
             return RejectPreview(item, owner, "Imported media is unavailable or exceeds the per-file warming cap.");
         return QueueImported(imported, scopedOwner, priority, item.ViewOffset, item.Duration, settings);
     }
@@ -264,7 +266,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             RequestSync();
             return false;
         }
-        if (item.FileSize is not > 0 || item.FileSize > current.MaxBytesPerItem || item.FileBlobId is null
+        if (item.FileSize is not > 0 || item.FileSize > current.MaxBytesPerItem
+            || item.FileSize < NativeCacheSettings.MinimumFileBytes(config) || item.FileBlobId is null
             || !IsOwnerEnabled(owner, current, servers)) return false;
         if (_preview is { } preview)
         {

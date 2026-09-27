@@ -77,6 +77,8 @@ public static class ConfigKeys
     public const string NativeCacheFolders = "cache.native.folders";
     public const string NativeCacheMetadataPath = "cache.native.metadata-path";
     public const string NativeCacheWriterMb = "cache.native.writer-mb";
+    public const string NativeCacheMinFileMb = "cache.native.min-file-mb";
+    public const string NativeCacheChunkMb = "cache.native.chunk-mb";
     public const string PlexServers = "plex.servers";
     public const string PlexAccounts = "plex.accounts";
     public const string SmartPrefetchSettings = "smart-prefetch.settings";
@@ -109,6 +111,7 @@ public static class ConfigKeys
     public const string MediaLibraryDir = "media.library-dir";
     public const string MediaLibraryScanDirs = "media.library-scan-dirs";
     public const string MediaLibraryEnabled = "media.library-enabled";
+    public const string MediaLibraryVideoOnly = "media.library-video-only";
     public const string MediaLibraryScanIntervalMinutes = "media.library-scan-interval-minutes";
     public const string MediaLibraryPlexServerIds = "media.library-plex-server-ids";
     public const string RepairEnable = "repair.enable";

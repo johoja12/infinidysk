@@ -17,6 +17,23 @@ public sealed class NativePrefetchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SmallWarmingChunks_KeepCommittedProgressWhenLaterCapacityRunsOut()
+    {
+        var folder = Path.Combine(_root, "bounded");
+        Directory.CreateDirectory(folder);
+        await using var store = new NativeCacheStore(Path.Combine(_root, "bounded.db"),
+            [new NativeCacheFolder { Id = "bounded", Path = folder, MinFreeBytes = 0,
+                MaxBytes = 8L * 1024 * 1024 }]);
+        var identity = new NativeCacheIdentity("chunked", "revision", 12L * 1024 * 1024);
+        await using var stream = new NativeCachedStream(store, identity,
+            _ => Task.FromResult<Stream>(new VerifiedSource(new byte[identity.Length], true)), () => true);
+
+        await Assert.ThrowsAsync<PrefetchDeferredException>(() => NativePrefetchExecutor.WarmAsync(
+            store, stream, 0, 0, _ => true, _ => { }, CancellationToken.None, chunkMb: 4));
+        Assert.Equal(NativeCacheStore.BlockSize, await store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
     public async Task PartialWarm_ReservesRequestedBlocksRatherThanEntireMovie()
     {
         var folder = Path.Combine(_root, "small");

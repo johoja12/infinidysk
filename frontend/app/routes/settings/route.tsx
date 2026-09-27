@@ -58,6 +58,8 @@ import { isWardenSettingsUpdated, WardenSettings } from "./warden/warden";
 import { isRcloneSettingsUpdated, RcloneSettings } from "./rclone/rclone";
 import { SupportSettings } from "./support/support";
 import { isLibrarySettingsUpdated, LibrarySettings } from "./library/library";
+import { NativeCacheSettings } from "./streaming/native-cache";
+import { isNativeCacheSettingsUpdated, nativeSettingsValid } from "./streaming/native-cache-model";
 import { useCallback, useMemo, useState, type Dispatch, type SetStateAction } from "react";
 import {
   useBlocker,
@@ -83,6 +85,8 @@ const defaultConfig = {
   "cache.native.folders": "[]",
   "cache.native.metadata-path": "",
   "cache.native.writer-mb": "32",
+  "cache.native.min-file-mb": "100",
+  "cache.native.chunk-mb": "64",
   "smart-prefetch.settings": "{}",
   "general.base-url": "",
   "general.trust-proxy": "false",
@@ -156,6 +160,7 @@ const defaultConfig = {
   "media.library-dir": "",
   "media.library-scan-dirs": "[]",
   "media.library-enabled": "true",
+  "media.library-video-only": "false",
   "media.library-scan-interval-minutes": "15",
   "media.library-plex-server-ids": "",
   "arr.instances": '{"RadarrInstances":[],"SonarrInstances":[],"QueueRules":[]}',
@@ -440,6 +445,7 @@ function Body(props: BodyProps) {
   const isQueueUpdated = isQueueSettingsUpdated(config, newConfig);
   const isSabnzbdUpdated = isSabnzbdSettingsUpdated(config, newConfig);
   const isStreamingUpdated = isStreamingSettingsUpdated(config, newConfig);
+  const isNativeCacheUpdated = isNativeCacheSettingsUpdated(config, newConfig);
   const isLibraryUpdated = isLibrarySettingsUpdated(config, newConfig);
   const isWebdavUpdated = isWebdavSettingsUpdated(config, newConfig);
   const isArrsUpdated = isArrsSettingsUpdated(config, newConfig);
@@ -460,6 +466,7 @@ function Body(props: BodyProps) {
     isQueueUpdated ||
     isSabnzbdUpdated ||
     isStreamingUpdated ||
+    isNativeCacheUpdated ||
     isLibraryUpdated ||
     isWebdavUpdated ||
     isArrsUpdated ||
@@ -487,19 +494,21 @@ function Body(props: BodyProps) {
             ? "Invalid SABnzbd settings"
             : isStreamingUpdated && !isStreamingSettingsValid(newConfig)
               ? "Invalid Streaming settings"
-              : isWebdavUpdated && !isWebdavSettingsValid(newConfig)
-                ? "Invalid WebDAV settings"
-                : isArrsUpdated && !isArrsSettingsValid(newConfig)
-                  ? "Invalid Arrs settings"
-                  : isIndexersUpdated && !isIndexersSettingsValid(newConfig)
-                    ? "Invalid Indexers settings"
-                    : isProfilesUpdated && !isProfilesSettingsValid(newConfig)
-                      ? "Invalid Search Profiles settings"
-                      : isRepairsUpdated && !isRepairsSettingsValid(newConfig)
-                        ? "Invalid Repairs settings"
-                        : isWatchtowerUpdated && !isWatchtowerSettingsValid(newConfig)
-                          ? "Invalid Watchtower settings"
-                          : "Save";
+              : isNativeCacheUpdated && !nativeSettingsValid(newConfig)
+                ? "Invalid Native Cache settings"
+                : isWebdavUpdated && !isWebdavSettingsValid(newConfig)
+                  ? "Invalid WebDAV settings"
+                  : isArrsUpdated && !isArrsSettingsValid(newConfig)
+                    ? "Invalid Arrs settings"
+                    : isIndexersUpdated && !isIndexersSettingsValid(newConfig)
+                      ? "Invalid Indexers settings"
+                      : isProfilesUpdated && !isProfilesSettingsValid(newConfig)
+                        ? "Invalid Search Profiles settings"
+                        : isRepairsUpdated && !isRepairsSettingsValid(newConfig)
+                          ? "Invalid Repairs settings"
+                          : isWatchtowerUpdated && !isWatchtowerSettingsValid(newConfig)
+                            ? "Invalid Watchtower settings"
+                            : "Save";
   const saveButtonVariant =
     saveButtonLabel === "Save" ? "primary" : saveButtonLabel === "Saved" ? "success" : "secondary";
   const isSaveButtonDisabled = saveButtonLabel !== "Save";
@@ -677,6 +686,15 @@ function Body(props: BodyProps) {
                 persistConfigPatch={persistConfigPatch}
                 effectiveArticleBudgetBytes={props.inFlightArticleBudgetBytes}
               />
+            )}
+            {activeTab === "native-cache" && (
+              <SettingsPage>
+                <SettingsIntro>
+                  Choose a cache mode and manage Native Cache storage, limits, and folder
+                  operations. Storage changes require a restart.
+                </SettingsIntro>
+                <NativeCacheSettings config={newConfig} setNewConfig={setNewConfig} />
+              </SettingsPage>
             )}
             {activeTab === "library" && (
               <LibrarySettings
