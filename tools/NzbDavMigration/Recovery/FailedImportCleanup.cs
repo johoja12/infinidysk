@@ -82,8 +82,8 @@ internal static class FailedImportCleanup
             || report.BatchIndex != package.Manifest.BatchIndex
             || report.FailedCount != report.Failures.Count)
             throw new InvalidDataException("Import failure report does not match the verified package.");
-        if (report.Failures.Any(row => row.SubmissionState != "failed"))
-            throw new InvalidDataException("Only confirmed failed submissions can be cleaned up; review evicted releases separately.");
+        if (report.Failures.Any(row => row.SubmissionState is not ("failed" or "evicted")))
+            throw new InvalidDataException("Failure report contains an unsupported submission state.");
 
         var currentReport = await destinationHttp.GetFromJsonAsync<FailedImportReport>(
             failuresUri, JsonOptions, ct)
@@ -125,7 +125,10 @@ internal static class FailedImportCleanup
         if (clients.Length == 0)
             throw new InvalidDataException("No enabled Radarr or Sonarr instance was supplied.");
 
-        var entries = report.Failures.Select(row => new FailedImportCleanupEntry(
+        // Eviction does not prove an import failed. Preserve those items for manual
+        // reconciliation while cleaning the confirmed failures in the same report.
+        var entries = report.Failures.Where(row => row.SubmissionState == "failed")
+            .Select(row => new FailedImportCleanupEntry(
             row.LegacyDavItemId,
             Path.Join(canonicalSourceRoot, row.LibraryRelativePath),
             "planned")).ToList();

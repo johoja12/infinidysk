@@ -334,7 +334,8 @@ requires exactly one Radarr or Sonarr media-file match. For each confirmed
 matching Arr file record, and requests a movie or episode search. All selected
 mapped files in a failed release are covered. `evicted` submissions require
 manual reconciliation because disappearance from the queue and history does not
-prove an import failure.
+prove an import failure. If one report contains both states, the command cleans
+the confirmed failures and leaves evicted items untouched.
 
 Keep NzbDav library mapping changes paused during cleanup. The command checks
 every candidate before the first deletion. Give it an Arr root that matches the
