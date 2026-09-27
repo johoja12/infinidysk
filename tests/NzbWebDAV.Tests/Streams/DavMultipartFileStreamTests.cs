@@ -313,6 +313,7 @@ public class DavMultipartFileStreamTests
             Assert.Equal(5, await stream.ReadAsync(buffer, requestCts.Token));
             Assert.Equal([0, 1, 2, 3, 4], buffer);
             Assert.Equal(0, await stream.ReadAsync(new byte[1], requestCts.Token));
+            Assert.DoesNotContain("two", client.RequestedSegmentIds);
         }
         finally
         {

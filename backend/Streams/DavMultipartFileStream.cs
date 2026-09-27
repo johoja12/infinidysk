@@ -236,16 +236,25 @@ public class DavMultipartFileStream : FastReadOnlyStream, ICacheReadEvidence
             ? NzbWebDAV.WebDav.Requests.RangeContext.GetReadBudget()
             : null);
         var budget = finiteBudget is > 0 ? new FiniteMultipartBudget(finiteBudget.Value) : null;
+        var responseBudget = NativeCacheReadContext.ReadBudget
+            ?? NzbWebDAV.WebDav.Requests.RangeContext.GetReadBudget();
+        // Short, fully mapped archive volumes caused repeated cold-start pauses
+        // at their boundaries. Larger volumes did not benefit in the live A/B
+        // test and can compete with the current reader for provider permits.
+        var prefetchNextPart = !meta.IsLazy && meta.FileParts.Length > 1 &&
+            meta.FileParts.All(part => part.FilePartByteRange.Count is > 0 and <= 64L * 1024 * 1024);
         _expectedReadEndExclusive = budget is null
             ? null
             : rangeStart + Math.Min(finiteBudget!.Value, _length - rangeStart);
 
         if (rangeStart == 0)
-            return new CombinedStream(EnumerateFromPart(0, 0, budget, ct));
+            return new CombinedStream(EnumerateFromPart(0, 0, budget, ct),
+                prefetchNextPart: prefetchNextPart, prefetchReadBudget: responseBudget);
 
         var (filePartIndex, filePartOffset) = SeekFilePart(meta, rangeStart);
         return new CombinedStream(EnumerateFromPart(
-            filePartIndex, rangeStart - filePartOffset, budget, ct));
+            filePartIndex, rangeStart - filePartOffset, budget, ct),
+            prefetchNextPart: prefetchNextPart, prefetchReadBudget: responseBudget);
     }
 
     // Resolve trailing volumes up to (and including) the one that contains
@@ -430,8 +439,7 @@ public class DavMultipartFileStream : FastReadOnlyStream, ICacheReadEvidence
                 SeekOffsetWithinPart = extraOffset,
                 DeclaredVolumeLength = effectivePartLength,
                 IsEncrypted = _mpf.Metadata.AesParams is not null,
-            },
-            finiteBudget is null ? null : bytes => finiteBudget.Consume(bytes));
+            });
     }
 
     internal static long GetEffectivePartLength(DavMultipartFile.FilePart part) =>
@@ -465,19 +473,21 @@ public class DavMultipartFileStream : FastReadOnlyStream, ICacheReadEvidence
             budget, ct).ConfigureAwait(false);
     }
 
-    private sealed class FiniteMultipartBudget(long remaining)
+    private sealed class FiniteMultipartBudget(long remainingToSchedule)
     {
-        public bool IsSatisfied => remaining <= 0;
+        public bool IsSatisfied => remainingToSchedule <= 0;
 
         public long GetPartContribution(long availableBytes)
         {
-            if (availableBytes <= 0 || remaining <= 0)
+            if (availableBytes <= 0 || remainingToSchedule <= 0)
                 return 0;
 
-            return Math.Min(remaining, availableBytes);
+            // Reserve a part's range before a lookahead may open the next one.
+            // Charging on consumption would assign both parts the same bytes.
+            var contribution = Math.Min(remainingToSchedule, availableBytes);
+            remainingToSchedule -= contribution;
+            return contribution;
         }
-
-        public void Consume(long bytes) => remaining = Math.Max(0, remaining - bytes);
     }
 
     protected override void Dispose(bool disposing)
