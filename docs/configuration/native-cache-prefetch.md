@@ -28,10 +28,16 @@ backup or a guarantee that uncached Usenet source bytes remain available.
 
 ## Configure cache mode and folders
 
-Use **Settings → Streaming → Native cache**. Select Off, Segment, or Native.
+Use **Settings → Native Cache** [since unreleased](https://github.com/johoja12/infinidysk/issues/76){ .nzbdav-since }. Select Off, Segment, or Native.
 Settings show configured and active modes separately until a restart activates the
 change. A Native failure falls back to ordinary source streaming, never to Segment.
 Explicit mode changes retain inactive cache files for rollback.
+
+### Cache sizing [since unreleased](https://github.com/johoja12/infinidysk/issues/75){ .nzbdav-since }
+
+**Minimum file size to cache** defaults to 100 MiB. Files below the threshold stream directly from the source during playback and are ineligible for background warming. Set it to 0 to admit smaller files. **Cache chunk size** defaults to 64 MiB (4–256 MiB in 4 MiB steps). New entries use separate chunk files of this size; each chunk contains independently verified 4 MiB blocks so playback can still fill on demand without reading a whole chunk. Background warming reserves one chunk at a time. Existing entries retain their recorded layout and stay readable when the setting changes. Save either setting and restart to apply it to new cache entries. An environment-owned `NZBDAV_CONFIG__CACHE__NATIVE__MIN_FILE_MB` or `NZBDAV_CONFIG__CACHE__NATIVE__CHUNK_MB` value is shown read-only in Settings. These are advanced controls; the setup wizard does not ask for them.
+
+The NzbDav fork also shows cache enablement, write-provenance logs, clear-all, and folder controls on its Native Cache page. InfiniDysk already provides mode selection, folder management, and clear operations. The fork's write-provenance switch is a diagnostic for its legacy implementation and is not carried over. Existing InfiniDysk entries use a single sparse data file; new entries record their chunk size in the manifest and catalogue. Changing the setting never rewrites an existing entry.
 
 ## Browse native cache [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
 

@@ -36,7 +36,9 @@ public sealed class LibraryCatalogScanner(
         while (!stoppingToken.IsCancellationRequested)
         {
             var rootSelection = string.Join("\n",
-                new[] { configManager.GetLibraryDir() ?? "" }.Concat(configManager.GetMediaLibraryScanDirs()));
+                new[] { configManager.GetLibraryDir() ?? "" }
+                    .Concat(configManager.GetMediaLibraryScanDirs())
+                    .Append(configManager.IsMediaLibraryVideoOnly().ToString()));
             if (!string.Equals(rootSelection, lastRootSelection, StringComparison.Ordinal))
             {
                 lastRootSelection = rootSelection;
@@ -73,6 +75,7 @@ public sealed class LibraryCatalogScanner(
             LastScanWarning = "Library directory is not configured.";
             return;
         }
+        var videoOnly = configManager.IsMediaLibraryVideoOnly();
 
         var mountDir = configManager.GetRcloneMountDir();
         var primaryRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(libraryRoot));
@@ -97,6 +100,7 @@ public sealed class LibraryCatalogScanner(
             foreach (var (isPrimary, rootPath) in roots)
             {
                 discovered.AddRange(SymlinkAndStrmUtil.GetAllSymlinksAndStrms(rootPath)
+                    .Where(info => !videoOnly || MediaLibraryVideoFilter.IsVideoLink(info))
                     .Select(info => info switch
                     {
                         SymlinkAndStrmUtil.SymlinkInfo s => (isPrimary, rootPath, s.SymlinkPath, s.TargetPath, false),

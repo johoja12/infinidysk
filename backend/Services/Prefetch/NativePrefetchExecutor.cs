@@ -29,6 +29,8 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
             ?? throw new ArgumentException("The imported media file no longer exists.");
         if (item.FileSize is not > 0 || item.FileSize > settings.MaxBytesPerItem)
             throw new ArgumentException("The media length is unavailable or exceeds the per-file warming cap.");
+        if (item.FileSize < NativeCacheSettings.MinimumFileBytes(config))
+            throw new ArgumentException("The media file is below the configured Native Cache minimum size.");
         var factory = scope.ServiceProvider.GetRequiredService<IDavContentStreamFactory>();
         await using var wireBudget = new PrefetchWireBudget(jobs, () => Settings().DailyByteBudget, ct);
         using var attribution = wireBudget.Enter();
@@ -50,7 +52,8 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         }
         await WarmAsync(native.Store, cached, job.Start, job.Length,
             async _ => CanContinue() && await wireBudget.PrepareReadAsync(ct).ConfigureAwait(false),
-            bytes => jobs.Progress(job.Id, cached.Identity.Generation, bytes), wireBudget.Token, CanContinue).ConfigureAwait(false);
+            bytes => jobs.Progress(job.Id, cached.Identity.Generation, bytes), wireBudget.Token,
+            CanContinue, native.ActiveSettings?.ChunkMb ?? 64).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is not OutOfMemoryException && (wireBudget.Exceeded || jobs.WireBudgetBlocked) && !ct.IsCancellationRequested)
         {
@@ -60,14 +63,18 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         }
     }
     public static Task WarmAsync(NativeCacheStore store, NativeCachedStream stream, long start, long length,
-        Func<long, bool> spend, Action<long> progress, CancellationToken ct)
-        => WarmAsync(store, stream, start, length, bytes => new ValueTask<bool>(spend(bytes)), progress, ct);
+        Func<long, bool> spend, Action<long> progress, CancellationToken ct, int chunkMb = 64)
+        => WarmAsync(store, stream, start, length, bytes => new ValueTask<bool>(spend(bytes)),
+            progress, ct, chunkMb: chunkMb);
 
     public static async Task WarmAsync(NativeCacheStore store, NativeCachedStream stream, long start, long length,
-        Func<long, ValueTask<bool>> spend, Action<long> progress, CancellationToken ct, Func<bool>? canContinue = null)
+        Func<long, ValueTask<bool>> spend, Action<long> progress, CancellationToken ct,
+        Func<bool>? canContinue = null, int chunkMb = 64)
     {
         if (start < 0 || start >= stream.Length || length < 0 || length > stream.Length - start)
             throw new ArgumentException("The warm range is outside the media file.");
+        if (chunkMb is < 4 or > 256 || chunkMb % 4 != 0)
+            throw new ArgumentOutOfRangeException(nameof(chunkMb));
         var end = length == 0 ? stream.Length : start + length;
         var position = start / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize;
         var alignedEnd = end % NativeCacheStore.BlockSize == 0 ? end
@@ -83,23 +90,31 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
             progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
             return;
         }
-        using var reservation = await store.ReserveWarmAsync(stream.Identity, missing, ct).ConfigureAwait(false)
-            ?? throw new PrefetchDeferredException("No writable folder has enough unreserved capacity for this media.");
         var probe = new byte[1];
         while (position < end)
         {
-            position = await store.FindNextMissingOffsetAsync(stream.Identity, position, end, ct).ConfigureAwait(false);
-            if (position >= end) break;
-            ct.ThrowIfCancellationRequested();
-            if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed; verified coverage must be rechecked.");
-            var count = Math.Min(NativeCacheStore.BlockSize, stream.Length - position);
-            if (!await spend(count).ConfigureAwait(false)) throw new PrefetchDeferredException("Daily warming budget exhausted or foreground playback has priority.");
-            stream.Position = position;
-            if (await stream.ReadAsync(probe, ct).ConfigureAwait(false) != 1 || !stream.LastReadCacheable || !stream.IsSourceCurrent
-                || await store.FindNextMissingOffsetAsync(stream.Identity, position, Math.Min(position + count, end), ct).ConfigureAwait(false) == position)
-                throw new PrefetchDeferredException("Source bytes were not verified or the cache could not commit this range.", countsAsFailure: true);
-            progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
-            position = Math.Min(position + count, end);
+            var chunkEnd = Math.Min(alignedEnd, position + chunkMb * 1024L * 1024L);
+            var chunkMissing = await store.GetMissingRangeBytesAsync(stream.Identity, position, chunkEnd, ct).ConfigureAwait(false);
+            if (chunkMissing == 0) { position = chunkEnd; continue; }
+            using (var reservation = await store.ReserveWarmAsync(stream.Identity, chunkMissing, ct).ConfigureAwait(false)
+                ?? throw new PrefetchDeferredException("No writable folder has enough unreserved capacity for this warming chunk."))
+            {
+                while (position < chunkEnd)
+                {
+                    position = await store.FindNextMissingOffsetAsync(stream.Identity, position, chunkEnd, ct).ConfigureAwait(false);
+                    if (position >= chunkEnd) break;
+                    ct.ThrowIfCancellationRequested();
+                    if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed; verified coverage must be rechecked.");
+                    var count = Math.Min(NativeCacheStore.BlockSize, stream.Length - position);
+                    if (!await spend(count).ConfigureAwait(false)) throw new PrefetchDeferredException("Daily warming budget exhausted or foreground playback has priority.");
+                    stream.Position = position;
+                    if (await stream.ReadAsync(probe, ct).ConfigureAwait(false) != 1 || !stream.LastReadCacheable || !stream.IsSourceCurrent
+                        || await store.FindNextMissingOffsetAsync(stream.Identity, position, Math.Min(position + count, chunkEnd), ct).ConfigureAwait(false) == position)
+                        throw new PrefetchDeferredException("Source bytes were not verified or the cache could not commit this range.", countsAsFailure: true);
+                    progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
+                    position = Math.Min(position + count, chunkEnd);
+                }
+            }
         }
         if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed before completion.");
         progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));

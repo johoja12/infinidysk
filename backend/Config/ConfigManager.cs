@@ -679,6 +679,7 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
                 case ConfigKeys.WardenBackboneScope:
                 case ConfigKeys.RepairEnable:
                 case ConfigKeys.MediaLibraryEnabled:
+                case ConfigKeys.MediaLibraryVideoOnly:
                 case ConfigKeys.RepairPar2Enabled:
                 case ConfigKeys.RepairPar2PreferredOverArr:
                 case ConfigKeys.RepairHealthcheckAging:
@@ -1048,6 +1049,9 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
 
     public bool IsMediaLibraryEnabled() =>
         !bool.TryParse(GetConfigValue(ConfigKeys.MediaLibraryEnabled), out var enabled) || enabled;
+
+    public bool IsMediaLibraryVideoOnly() =>
+        bool.TryParse(GetConfigValue(ConfigKeys.MediaLibraryVideoOnly), out var videoOnly) && videoOnly;
 
     public TimeSpan GetMediaLibraryScanInterval() => TimeSpan.FromMinutes(
         MediaLibraryOptions.ParseScanInterval(GetConfigValue(ConfigKeys.MediaLibraryScanIntervalMinutes)));

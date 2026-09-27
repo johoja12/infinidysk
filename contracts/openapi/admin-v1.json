@@ -576,6 +576,62 @@
         ],
         "type": "object"
       },
+      "LibraryBrowseFileRowDto": {
+        "properties": {
+          "cachePercentage": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          },
+          "category": {
+            "type": "string"
+          },
+          "episode": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          },
+          "item": {
+            "$ref": "#/components/schemas/LibraryCatalogItemDto"
+          },
+          "quality": {
+            "type": "string"
+          },
+          "season": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          },
+          "title": {
+            "type": [
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "cachePercentage",
+          "category",
+          "episode",
+          "item",
+          "quality",
+          "season",
+          "title"
+        ],
+        "type": "object"
+      },
       "LibraryBrowseGroupDto": {
         "properties": {
           "attentionCount": {
@@ -659,6 +715,15 @@
               }
             ]
           },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/LibraryBrowseFileRowDto"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "groups": {
             "items": {
               "$ref": "#/components/schemas/LibraryBrowseGroupDto"
@@ -704,6 +769,15 @@
           },
           "plexStatus": {
             "$ref": "#/components/schemas/PlexLibraryMetadataStatus"
+          },
+          "totalFiles": {
+            "default": 0,
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
           },
           "totalGroups": {
             "format": "int32",

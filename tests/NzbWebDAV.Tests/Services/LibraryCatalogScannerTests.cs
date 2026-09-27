@@ -62,6 +62,41 @@ public sealed class LibraryCatalogScannerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task VideoOnly_ExcludesNonVideoLinksAndRestoresThemWhenDisabled()
+    {
+        var video = Path.Join(_libraryRoot, "video.mkv");
+        var subtitle = Path.Join(_libraryRoot, "subtitle.srt");
+        await File.WriteAllTextAsync(video, "video");
+        await File.WriteAllTextAsync(subtitle, "subtitle");
+        File.CreateSymbolicLink(Path.Join(_libraryRoot, "linked.mkv"), video);
+        File.CreateSymbolicLink(Path.Join(_libraryRoot, "linked.srt"), subtitle);
+        await File.WriteAllTextAsync(Path.Join(_libraryRoot, "movie.strm"), "https://media.test/film.mkv");
+        await File.WriteAllTextAsync(Path.Join(_libraryRoot, "subtitle.strm"), "https://media.test/subtitle.srt");
+        var config = new ConfigManager();
+        config.UpdateValues([
+            new ConfigItem { ConfigName = ConfigKeys.MediaLibraryDir, ConfigValue = _libraryRoot },
+            new ConfigItem { ConfigName = ConfigKeys.MediaLibraryVideoOnly, ConfigValue = "true" },
+        ]);
+        var factory = _provider.GetRequiredService<IDbContextFactory<DavDatabaseContext>>();
+        var scanner = new LibraryCatalogScanner(config, factory);
+
+        await scanner.ReconcileOnceAsync(CancellationToken.None);
+        await using (var context = factory.CreateDbContext())
+        {
+            var paths = await context.LinkMaps.Select(map => map.LinkPath).ToListAsync();
+            Assert.Equal(2, paths.Count);
+            Assert.Contains("linked.mkv", paths);
+            Assert.Contains("movie.strm", paths);
+        }
+
+        config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.MediaLibraryVideoOnly, ConfigValue = "false" }]);
+        await scanner.ReconcileOnceAsync(CancellationToken.None);
+        await using var restored = factory.CreateDbContext();
+        Assert.Equal(4, await restored.LinkMaps.CountAsync());
+        Assert.True(File.Exists(subtitle));
+    }
+
+    [Fact]
     public async Task DisabledLibrary_DoesNotScanOrMarkExistingMappingsStale()
     {
         var target = Path.Join(_libraryRoot, "real.mkv");

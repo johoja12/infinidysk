@@ -39,10 +39,13 @@ public sealed record LibraryCatalogResult(
 public sealed record LibraryBrowseQuery
 {
     public string? Search { get; init; }
-    public string Category { get; init; } = "shows"; // shows|movies|unmatched
+    public string Category { get; init; } = "shows"; // all|shows|movies|unmatched
+    public string View { get; init; } = "groups"; // groups|files
     public string TypeFilter { get; init; } = "all"; // all|internal|external|broken
     public string Quality { get; init; } = "all"; // all|4k|1080p|720p|sd|unknown
     public string Cache { get; init; } = "all"; // all|any|complete|empty|unavailable
+    public string MatchFilter { get; init; } = "all"; // all|matched|unmatched
+    public int? SeasonFilter { get; init; }
     public int Page { get; init; } = 1;
     public int PageSize { get; init; } = 12;
     public string? GroupKey { get; init; }
@@ -66,6 +69,15 @@ public sealed record LibraryBrowseFileDto(
     string Quality,
     int? CachePercentage);
 
+public sealed record LibraryBrowseFileRowDto(
+    LibraryCatalogItemDto Item,
+    string? Title,
+    int? Season,
+    int? Episode,
+    string Category,
+    string Quality,
+    int? CachePercentage);
+
 public sealed record LibraryBrowseExpandedGroupDto(
     string Key,
     int Page,
@@ -85,4 +97,6 @@ public sealed record LibraryBrowseResult(
     LibraryBrowseExpandedGroupDto? ExpandedGroup,
     DateTimeOffset? IndexScannedAt,
     string? IndexWarning,
-    PlexLibraryMetadataStatus PlexStatus);
+    PlexLibraryMetadataStatus PlexStatus,
+    IReadOnlyList<LibraryBrowseFileRowDto>? Files = null,
+    int TotalFiles = 0);

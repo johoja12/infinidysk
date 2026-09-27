@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models;
 using NzbWebDAV.MediaLibrary;
+using NzbWebDAV.Utils;
 
 namespace NzbWebDAV.Services.Library;
 
@@ -10,7 +11,7 @@ namespace NzbWebDAV.Services.Library;
 /// <c>DavItem.Id</c>, size = the DavItem file size) plus one row per external
 /// symlink link path. Search spans item name/path and mapping link/target.
 /// </summary>
-public sealed class LibraryCatalogService(DavDatabaseContext context)
+public sealed class LibraryCatalogService(DavDatabaseContext context, bool videoOnly = false)
 {
     public async Task<LibraryCatalogResult> QueryAsync(
         LibraryCatalogQuery query,
@@ -36,6 +37,8 @@ public sealed class LibraryCatalogService(DavDatabaseContext context)
         CancellationToken ct, string? search = null)
     {
         var maps = await context.LinkMaps.AsNoTracking().ToListAsync(ct).ConfigureAwait(false);
+        if (videoOnly)
+            maps = maps.Where(map => MediaLibraryVideoFilter.IsVideoLink(map.LinkPath, map.TargetText)).ToList();
 
         var items = context.Items.AsNoTracking()
             .Where(i => i.Type == DavItem.ItemType.UsenetFile
@@ -53,6 +56,9 @@ public sealed class LibraryCatalogService(DavDatabaseContext context)
             .Select(i => new { Item = i })
             .ToListAsync(ct)
             .ConfigureAwait(false);
+        if (videoOnly)
+            internalRows = internalRows.Where(row => FilenameUtil.IsVideoFile(row.Item.Name)
+                && !row.Item.Name.EndsWith(".strm", StringComparison.OrdinalIgnoreCase)).ToList();
 
         var internalIds = internalRows.Select(r => r.Item.Id).ToHashSet();
         var mappingsByItem = maps
@@ -78,7 +84,8 @@ public sealed class LibraryCatalogService(DavDatabaseContext context)
             var dto = ToExternalDto(group.ToList());
             dtos.Add(dto);
         }
-        return dtos;
+        return videoOnly && !string.IsNullOrEmpty(search)
+            ? dtos.Where(dto => MatchesSearch(dto, search)).ToList() : dtos;
     }
 
     internal Task<List<DavItem>> LoadItemsByIdsAsync(IReadOnlyCollection<Guid> ids, CancellationToken ct) =>

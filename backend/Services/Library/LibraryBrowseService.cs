@@ -13,6 +13,7 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
     NativeCacheService? nativeCache = null)
 {
     private const int GroupFilePageSize = 50;
+    private const int TablePageSize = 50;
     public async Task<LibraryBrowseResult> QueryAsync(
         LibraryBrowseQuery query,
         LibraryCatalogScanner? scanner = null,
@@ -45,8 +46,6 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
             }
         }
         var matched = all
-            .Where(i => string.IsNullOrWhiteSpace(query.Search)
-                || LibraryCatalogService.MatchesSearch(i, query.Search.Trim()))
             .Where(i => query.TypeFilter switch
             {
                 "internal" => i.Kind == "internal",
@@ -63,6 +62,8 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
                     ? currentCoverage.GetValueOrDefault(id.ToString("N"), 0) : null;
                 return new ClassifiedItem(i, Classify(i, plex), plex, cachePercentage);
             })
+            .Where(i => string.IsNullOrWhiteSpace(query.Search) ||
+                MatchesSearch(i, query.Search.Trim()))
             .Where(i => query.Cache switch
             {
                 "any" => i.CachePercentage > 0,
@@ -72,6 +73,35 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
                 _ => true,
             })
             .ToList();
+
+        if (query.View == "files")
+        {
+            var selectedFiles = matched.Where(i => (query.Category == "all" ||
+                i.Identity.Category == query.Category) &&
+                (query.MatchFilter == "all" ||
+                    (query.MatchFilter == "matched" ? i.PlexMatch is not null : i.PlexMatch is null)) &&
+                (query.SeasonFilter is null || i.PlexMatch?.Season == query.SeasonFilter))
+                .OrderBy(i => i.Identity.Title, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(i => i.PlexMatch?.Season ?? int.MaxValue)
+                .ThenBy(i => i.PlexMatch?.Episode ?? int.MaxValue)
+                .ThenBy(i => i.Item.DisplayName, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            var filePage = Math.Clamp(query.Page, 1,
+                Math.Max(1, (selectedFiles.Count + TablePageSize - 1) / TablePageSize));
+            var files = selectedFiles.Skip((filePage - 1) * TablePageSize).Take(TablePageSize)
+                .Select(i => new LibraryBrowseFileRowDto(i.Item,
+                    i.PlexMatch is null ? null :
+                        i.Identity.Category == "shows" ? i.PlexMatch.ShowName : i.PlexMatch.Title,
+                    i.PlexMatch?.Season, i.PlexMatch?.Episode, i.Identity.Category,
+                    QualityFromName(i.Item.DisplayName), i.CachePercentage))
+                .ToList();
+            return new LibraryBrowseResult([], 0, filePage, TablePageSize,
+                matched.Count, matched.Count(i => IsHealthy(i.Item)),
+                matched.Count(i => NeedsAttention(i.Item)),
+                plexMetadata.Status.Ready ? matched.Count(i => i.Identity.Category == "unmatched") : 0,
+                null, scanner?.LastSuccessfulScanAt, scanner?.LastScanWarning, plexMetadata.Status,
+                files, selectedFiles.Count);
+        }
 
         var selected = plexMetadata.Status.Ready
             ? matched.Where(i => i.Identity.Category == query.Category)
@@ -131,6 +161,15 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
 
     private static bool NeedsAttention(LibraryCatalogItemDto item) =>
         item.Health is "attention" or "unmapped";
+
+    private static bool MatchesSearch(ClassifiedItem item, string search) =>
+        LibraryCatalogService.MatchesSearch(item.Item, search)
+        || (item.PlexMatch?.ShowName?.Contains(search, StringComparison.OrdinalIgnoreCase) ?? false)
+        || (item.PlexMatch?.Title.Contains(search, StringComparison.OrdinalIgnoreCase) ?? false)
+        || (item.PlexMatch?.Season is { } season &&
+            ($"Season {season}".Contains(search, StringComparison.OrdinalIgnoreCase) ||
+             (item.PlexMatch.Episode is { } episode &&
+              $"S{season:00}E{episode:00}".Contains(search, StringComparison.OrdinalIgnoreCase))));
 
     internal static string QualityFromName(string name)
     {

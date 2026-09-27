@@ -19,6 +19,9 @@ const page: LibraryPageData = {
   query: {
     q: "",
     category: "movies",
+    view: "groups",
+    match: "all",
+    season: null,
     type: "all",
     quality: "all",
     cache: "all",
@@ -61,6 +64,46 @@ const page: LibraryPageData = {
 
 describe("Library accordion", () => {
   afterEach(cleanup);
+
+  it("shows the file table with a visible movie switch and title column", async () => {
+    const tablePage: LibraryPageData = {
+      ...page,
+      query: { ...page.query, view: "files", category: "all" },
+      browse: {
+        ...page.browse,
+        groups: [],
+        totalGroups: 0,
+        pageSize: 50,
+        totalFiles: 1,
+        files: [
+          {
+            item,
+            title: "Film",
+            season: null,
+            episode: null,
+            category: "movies",
+            quality: "1080p",
+            cachePercentage: 75,
+          },
+        ],
+      },
+    };
+    const router = createMemoryRouter(
+      [
+        {
+          path: "/library",
+          loader: () => tablePage,
+          element: <Library {...({ loaderData: tablePage } as Parameters<typeof Library>[0])} />,
+        },
+      ],
+      { initialEntries: ["/library?view=files&category=all"] },
+    );
+    render(<RouterProvider router={router} />);
+    expect(await screen.findByRole("columnheader", { name: "Show / movie title" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "Movies" })).toBeTruthy();
+    expect(screen.getByRole("cell", { name: "Film" })).toBeTruthy();
+    expect(screen.getAllByRole("cell", { name: "—" })).toHaveLength(2);
+  });
 
   it("loads files inline without changing the location", async () => {
     const router = createMemoryRouter(

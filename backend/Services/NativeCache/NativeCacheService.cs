@@ -29,7 +29,7 @@ public sealed class NativeCacheService : IAsyncDisposable
     internal Task InitializationCompletion => Task.WhenAll(_initialization, _cleanup);
 
     public NativeCacheService(ConfigManager config, IBlobStore blobs, RepairPatchStore repairs)
-        : this(config, blobs, repairs, settings => new NativeCacheStore(Path.Combine(settings.MetadataPath, "catalogue.db"), settings.Folders)) { }
+        : this(config, blobs, repairs, settings => new NativeCacheStore(Path.Combine(settings.MetadataPath, "catalogue.db"), settings.Folders, settings.ChunkMb)) { }
 
     internal NativeCacheService(ConfigManager config, IBlobStore blobs, RepairPatchStore repairs,
         Func<NativeCacheSettings, NativeCacheStore> storeFactory)
@@ -104,6 +104,12 @@ public sealed class NativeCacheService : IAsyncDisposable
         if (InitializationPending) await WaitForInitializationAsync(cancellationToken).ConfigureAwait(false);
         ObjectDisposedException.ThrowIf(_disposed, this);
         var store = Store;
+        if (ActiveSettings is { } settings && item.FileSize is { } fileSize &&
+            fileSize < settings.MinFileMb * 1024L * 1024L)
+        {
+            if (requireNative) throw new InvalidOperationException("File is below the configured Native Cache minimum size.");
+            return await open(cancellationToken).ConfigureAwait(false);
+        }
         if (store is null || _bufferSlots is null || item.FileBlobId is not { } blobId || item.FileSize is not > 0)
         {
             if (requireNative) throw new InvalidOperationException("Native cache admission is unavailable; no source bytes were requested.");

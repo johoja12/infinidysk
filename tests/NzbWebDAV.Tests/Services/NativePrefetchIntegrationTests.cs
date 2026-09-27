@@ -33,6 +33,7 @@ public sealed class NativePrefetchIntegrationTests
             var config = new ConfigManager();
             config.UpdateValues([
                 new ConfigItem { ConfigName = ConfigKeys.CacheMode, ConfigValue = "native" },
+                new ConfigItem { ConfigName = ConfigKeys.NativeCacheMinFileMb, ConfigValue = "0" },
                 new ConfigItem { ConfigName = ConfigKeys.NativeCacheFolders, ConfigValue = JsonSerializer.Serialize(new[] { new NativeCacheFolder { Id = "disk", Path = Path.Combine(root, "media"), MinFreeBytes = 0 } }) }
             ]);
             await using var connection = new SqliteConnection("Data Source=:memory:");

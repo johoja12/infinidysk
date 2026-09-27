@@ -41,6 +41,7 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
         Environment.SetEnvironmentVariable("CONFIG_PATH", _root);
         _config = new ConfigManager();
         Set(ConfigKeys.CacheMode, "native");
+        Set(ConfigKeys.NativeCacheMinFileMb, "0");
         Set(ConfigKeys.NativeCacheFolders, JsonSerializer.Serialize(new[] { new NativeCacheFolder { Id = "disk", Path = Path.Combine(_root, "media"), MinFreeBytes = 0 } }));
         Set(ConfigKeys.PlexServers, JsonSerializer.Serialize(new[] { _server }));
         _blobs = new FileBlobStore();
