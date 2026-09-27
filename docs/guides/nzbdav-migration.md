@@ -367,6 +367,13 @@ completed journal entry is skipped on retry. If an external request has an
 uncertain outcome, the journal stops the retry at that item so its source and
 Arr state can be reconciled before another deletion or search.
 
+For an already acknowledged batch, use its saved terminal failure report with
+`--historical-correlation FILE --historical-acknowledgement FILE` and omit
+`--wait-for-terminal`. The command verifies those archived records against the
+checksummed package and still checks the current NzbDav link and exact Arr file
+before each deletion. It rejects incomplete or reconstructed reports that lack
+the package digest and submission state.
+
 Use each root's own mapped and recoverable counts in its full-connect request;
 the combined count is an audit gate, not a batch-master denominator. For each
 root's batch, download its checksummed plan and apply it with that

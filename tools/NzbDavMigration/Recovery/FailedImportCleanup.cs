@@ -19,6 +19,17 @@ internal sealed record FailedImportReport(
     int FailedCount,
     IReadOnlyList<FailedImportRow> Failures);
 
+internal sealed record ArchivedCorrelation(
+    bool Status, string PackageDigest, int SelectedCount, int ExactCount,
+    IReadOnlyList<ArchivedCorrelationRow> Rows);
+
+internal sealed record ArchivedCorrelationRow(
+    Guid LegacyDavItemId, string LibraryRelativePath, string CorrelationStatus);
+
+internal sealed record ArchivedAcknowledgement(
+    bool Status, int BatchIndex, string State, int SelectionCount,
+    int AppliedCount, int ValidatedCount);
+
 internal sealed record FailedImportRow(
     string SourceReleaseId,
     Guid LegacyDavItemId,
@@ -60,6 +71,8 @@ internal static class FailedImportCleanup
         string legacyUrl,
         string journalPath,
         bool waitForTerminal,
+        string? historicalCorrelationPath = null,
+        string? historicalAcknowledgementPath = null,
         CancellationToken ct = default)
     {
         var apiKey = Environment.GetEnvironmentVariable("NZBDAV_MIGRATION_LEGACY_API_KEY");
@@ -74,6 +87,11 @@ internal static class FailedImportCleanup
         destinationHttp.DefaultRequestHeaders.Add("x-api-key", infinidyskApiKey);
         var destinationUri = new Uri(infinidyskUrl.TrimEnd('/') + "/", UriKind.Absolute);
         var failuresUri = new Uri(destinationUri, "api/migration/nzbdav/import-failures");
+        var historical = historicalCorrelationPath is not null
+            || historicalAcknowledgementPath is not null;
+        if (historical && (historicalCorrelationPath is null
+                           || historicalAcknowledgementPath is null || waitForTerminal))
+            throw new InvalidDataException("Historical cleanup needs both archived correlation and acknowledgement, without waiting for a current batch.");
         if (waitForTerminal)
             await WaitForTerminalAndSaveReportAsync(
                 destinationHttp, failuresUri, package.PackageDigest, reportPath, ct).ConfigureAwait(false);
@@ -85,15 +103,42 @@ internal static class FailedImportCleanup
         if (report.Failures.Any(row => row.SubmissionState is not ("failed" or "evicted")))
             throw new InvalidDataException("Failure report contains an unsupported submission state.");
 
-        var currentReport = await destinationHttp.GetFromJsonAsync<FailedImportReport>(
-            failuresUri, JsonOptions, ct)
-            .ConfigureAwait(false);
-        if (currentReport is not { Status: true } || currentReport.PackageDigest != report.PackageDigest
-            || currentReport.BatchIndex != report.BatchIndex
-            || currentReport.FailedCount != report.FailedCount
-            || currentReport.Failures.OrderBy(row => row.LegacyDavItemId)
-                .SequenceEqual(report.Failures.OrderBy(row => row.LegacyDavItemId)) == false)
-            throw new InvalidDataException("Saved failure report is no longer the current terminal batch report.");
+        if (historical)
+        {
+            var correlation = await ReadPrivateJsonAsync<ArchivedCorrelation>(
+                historicalCorrelationPath!, ct).ConfigureAwait(false);
+            var acknowledgement = await ReadPrivateJsonAsync<ArchivedAcknowledgement>(
+                historicalAcknowledgementPath!, ct).ConfigureAwait(false);
+            var selectedLinks = package.Manifest.SelectedLinks;
+            if (!correlation.Status || correlation.PackageDigest != package.PackageDigest
+                || correlation.SelectedCount != selectedLinks.Count
+                || correlation.Rows.Count != selectedLinks.Count
+                || correlation.Rows.Select(row => row.LegacyDavItemId).Distinct().Count() != selectedLinks.Count
+                || !acknowledgement.Status || acknowledgement.BatchIndex != package.Manifest.BatchIndex
+                || acknowledgement.State != "acknowledged"
+                || acknowledgement.SelectionCount != selectedLinks.Count
+                || acknowledgement.AppliedCount != correlation.ExactCount
+                || acknowledgement.ValidatedCount != correlation.ExactCount)
+                throw new InvalidDataException("Archived batch evidence does not match the verified package.");
+            var byId = selectedLinks.ToDictionary(link => link.LegacyDavItemId);
+            if (correlation.Rows.Any(row => !byId.TryGetValue(row.LegacyDavItemId, out var link)
+                || link.LibraryRelativePath != row.LibraryRelativePath)
+                || report.Failures.Any(row => !correlation.Rows.Any(match =>
+                    match.LegacyDavItemId == row.LegacyDavItemId
+                    && match.CorrelationStatus == "import-failed")))
+                throw new InvalidDataException("Archived correlation does not prove the reported import failures.");
+        }
+        else
+        {
+            var currentReport = await destinationHttp.GetFromJsonAsync<FailedImportReport>(
+                failuresUri, JsonOptions, ct).ConfigureAwait(false);
+            if (currentReport is not { Status: true } || currentReport.PackageDigest != report.PackageDigest
+                || currentReport.BatchIndex != report.BatchIndex
+                || currentReport.FailedCount != report.FailedCount
+                || currentReport.Failures.OrderBy(row => row.LegacyDavItemId)
+                    .SequenceEqual(report.Failures.OrderBy(row => row.LegacyDavItemId)) == false)
+                throw new InvalidDataException("Saved failure report is no longer the current terminal batch report.");
+        }
 
         var expected = package.Manifest.Releases
             .SelectMany(release => release.Leaves.Select(leaf => (release.SourceReleaseId, leaf.LegacyDavItemId)))
