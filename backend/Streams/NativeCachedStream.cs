@@ -223,7 +223,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 // verified. Thereafter fill whole blocks: repeated tiny source
                 // reads starve the NNTP batch pipeline on sustained transfers.
                 var target = !_servedBytes && _bufferCount == 0
-                    ? Math.Min(expected, bufferOffset + destination.Length)
+                    ? Math.Min(expected, bufferOffset + Math.Min(destination.Length, 64 * 1024))
                     : expected;
                 while (_bufferCount < target)
                 {

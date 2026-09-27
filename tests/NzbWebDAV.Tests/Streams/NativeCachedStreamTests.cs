@@ -177,19 +177,20 @@ public sealed class NativeCachedStreamTests : IDisposable
         await using (var stream = new NativeCachedStream(store, id,
             _ => Task.FromResult<Stream>(new TrackedSource(bytes, reads)), () => true))
         {
-            var first = new byte[64 * 1024];
-            Assert.Equal(first.Length, await stream.ReadAsync(first));
-            Assert.Equal(bytes.AsSpan(0, first.Length).ToArray(), first);
-            Assert.Equal([(0, first.Length)], reads);
+            var first = new byte[NativeCacheStore.BlockSize];
+            var firstCount = await stream.ReadAsync(first);
+            Assert.Equal(64 * 1024, firstCount);
+            Assert.Equal(bytes.AsSpan(0, firstCount).ToArray(), first.AsSpan(0, firstCount).ToArray());
+            Assert.Equal([(0, firstCount)], reads);
             Assert.Equal(0, await store.GetCoverageAsync(id));
             var second = new byte[64 * 1024];
             Assert.Equal(second.Length, await stream.ReadAsync(second));
-            Assert.Equal(bytes.AsSpan(first.Length, second.Length).ToArray(), second);
-            Assert.Equal([(0, first.Length), (first.Length, bytes.Length - first.Length)], reads);
+            Assert.Equal(bytes.AsSpan(firstCount, second.Length).ToArray(), second);
+            Assert.Equal([(0, firstCount), (firstCount, bytes.Length - firstCount)], reads);
             Assert.Equal(bytes.Length, await store.GetCoverageAsync(id));
-            var rest = new byte[bytes.Length - first.Length - second.Length];
+            var rest = new byte[bytes.Length - firstCount - second.Length];
             await stream.ReadExactlyAsync(rest);
-            Assert.Equal(bytes.AsSpan(first.Length + second.Length).ToArray(), rest);
+            Assert.Equal(bytes.AsSpan(firstCount + second.Length).ToArray(), rest);
         }
         Assert.Equal(bytes.Length, await store.GetCoverageAsync(id));
     }
