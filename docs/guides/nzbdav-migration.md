@@ -373,6 +373,8 @@ For an already acknowledged batch, use its saved terminal failure report with
 checksummed package and still checks the current NzbDav link and exact Arr file
 before each deletion. It rejects incomplete or reconstructed reports that lack
 the package digest and submission state.
+Use `--preflight-only true` to check the whole candidate set and write the
+planned journal without deleting anything; rerun without that option to apply.
 
 Use each root's own mapped and recoverable counts in its full-connect request;
 the combined count is an audit gate, not a batch-master denominator. For each

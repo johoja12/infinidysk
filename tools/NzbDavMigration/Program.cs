@@ -43,7 +43,7 @@ internal static class NzbDavMigrationProgram
             await Console.Error.WriteLineAsync("       NzbDavMigration mapped-coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --blob-root PATH --master FILE_OR_DIR --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration sharded-coverage-report --inventory DIR --recovery DIR --blob-root PATH --library-root PATH --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration rollback-links --journal FILE");
-            await Console.Error.WriteLineAsync("       NzbDavMigration cleanup-failed-imports --failures FILE --package DIR --mapped-inventory DIR --source-root PATH --arr-root PATH --arr-config FILE --infinidysk-url URL --legacy-url URL --journal FILE [--wait-for-terminal true | --historical-correlation FILE --historical-acknowledgement FILE] (requires NZBDAV_MIGRATION_LEGACY_DB, NZBDAV_MIGRATION_LEGACY_API_KEY, and INFINIDYSK_MIGRATION_API_KEY)");
+            await Console.Error.WriteLineAsync("       NzbDavMigration cleanup-failed-imports --failures FILE --package DIR --mapped-inventory DIR --source-root PATH --arr-root PATH --arr-config FILE --infinidysk-url URL --legacy-url URL --journal FILE [--wait-for-terminal true | --historical-correlation FILE --historical-acknowledgement FILE] [--preflight-only true] (requires NZBDAV_MIGRATION_LEGACY_DB, NZBDAV_MIGRATION_LEGACY_API_KEY, and INFINIDYSK_MIGRATION_API_KEY)");
             await Console.Error.WriteLineAsync("       NzbDavMigration validate-links --journal FILE --output FILE [--ffprobe PATH] [--max-read-bytes N] [--timeout-seconds N]");
             await Console.Error.WriteLineAsync("       NzbDavMigration benchmark-links --selection FILE --plan FILE --output DIR --legacy-url URL --legacy-route KIND --infinidysk-url URL --infinidysk-route KIND [--legacy-root /mnt/plex] [--infinidysk-root /mnt/plex2] [--legacy-cache-root PATH] [--infinidysk-cache-root PATH] [--timeout-seconds N]");
             return args.Length == 0 ? 2 : 0;
@@ -100,7 +100,8 @@ internal static class NzbDavMigrationProgram
             Required(options, "--journal"),
             bool.Parse(Optional(options, "--wait-for-terminal") ?? "false"),
             Optional(options, "--historical-correlation"),
-            Optional(options, "--historical-acknowledgement")).ConfigureAwait(false);
+            Optional(options, "--historical-acknowledgement"),
+            bool.Parse(Optional(options, "--preflight-only") ?? "false")).ConfigureAwait(false);
         return 0;
     }
 

@@ -73,6 +73,7 @@ internal static class FailedImportCleanup
         bool waitForTerminal,
         string? historicalCorrelationPath = null,
         string? historicalAcknowledgementPath = null,
+        bool preflightOnly = false,
         CancellationToken ct = default)
     {
         var apiKey = Environment.GetEnvironmentVariable("NZBDAV_MIGRATION_LEGACY_API_KEY");
@@ -234,6 +235,8 @@ internal static class FailedImportCleanup
                     $"Expected one Radarr/Sonarr media file with search targets for {row.LibraryRelativePath}; found {matches.Count}.");
             actions.Add((item, matches[0].Client, matches[0].Match));
         }
+
+        if (preflightOnly) return;
 
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
         http.DefaultRequestHeaders.Add("x-api-key", apiKey);
