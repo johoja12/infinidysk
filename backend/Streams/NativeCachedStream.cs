@@ -91,7 +91,13 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         return count == expected && _generationIsCurrent();
     }
 
-    public override async ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default)
+    public override ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default) =>
+        ReadCoreAsync(destination, cancellationToken, completeBlock: false);
+
+    internal ValueTask<int> ReadWarmProbeAsync(Memory<byte> destination, CancellationToken cancellationToken) =>
+        ReadCoreAsync(destination, cancellationToken, completeBlock: true);
+
+    private async ValueTask<int> ReadCoreAsync(Memory<byte> destination, CancellationToken cancellationToken, bool completeBlock)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         LastReadCacheable = false;
@@ -222,7 +228,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 // Return the first response chunk as soon as its source bytes are
                 // verified. Thereafter fill whole blocks: repeated tiny source
                 // reads starve the NNTP batch pipeline on sustained transfers.
-                var target = !_servedBytes && _bufferCount == 0
+                var target = !completeBlock && !_servedBytes && _bufferCount == 0
                     ? Math.Min(expected, bufferOffset + Math.Min(destination.Length, 64 * 1024))
                     : expected;
                 while (_bufferCount < target)

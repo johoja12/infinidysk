@@ -196,6 +196,24 @@ public sealed class NativeCachedStreamTests : IDisposable
     }
 
     [Fact]
+    public async Task WarmProbe_FillsAndCommitsWholeBlockBeforeReturningOneByte()
+    {
+        await using var store = CreateStore();
+        var bytes = new byte[NativeCacheStore.BlockSize];
+        new Random(84).NextBytes(bytes);
+        var reads = new List<(long Offset, int Count)>();
+        var id = new NativeCacheIdentity("warm-probe", "v1", bytes.Length);
+        await using var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(new TrackedSource(bytes, reads)), () => true);
+        var probe = new byte[1];
+
+        Assert.Equal(1, await stream.ReadWarmProbeAsync(probe, CancellationToken.None));
+        Assert.Equal(bytes[0], probe[0]);
+        Assert.Equal([(0, NativeCacheStore.BlockSize)], reads);
+        Assert.Equal(bytes.Length, await store.GetCoverageAsync(id));
+    }
+
+    [Fact]
     public async Task ColdUnalignedSeek_ReadsRequestedOffsetWithoutFetchingEarlierBytes()
     {
         await using var store = CreateStore();
