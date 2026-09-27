@@ -549,6 +549,9 @@ class BackendClient {
     if (query.q) qs.set("q", query.q);
     if (query.group) qs.set("group", query.group);
     qs.set("category", query.category ?? "shows");
+    qs.set("view", query.view ?? "groups");
+    qs.set("match", query.match ?? "all");
+    if (query.season !== undefined) qs.set("season", String(query.season));
     qs.set("type", query.type ?? "all");
     qs.set("quality", query.quality ?? "all");
     qs.set("cache", query.cache ?? "all");
@@ -1010,6 +1013,21 @@ const libraryBrowseResponseSchema = z.object({
   attentionItems: z.number().int(),
   unmatchedItems: z.number().int(),
   expandedGroup: libraryBrowseExpandedGroupSchema.nullable().optional(),
+  files: z
+    .array(
+      z.object({
+        item: libraryCatalogItemSchema,
+        title: z.string().nullable(),
+        season: z.number().int().nullable(),
+        episode: z.number().int().nullable(),
+        category: z.enum(["shows", "movies", "unmatched"]),
+        quality: z.enum(["4k", "1080p", "720p", "sd", "unknown"]),
+        cachePercentage: z.number().int().nullable(),
+      }),
+    )
+    .nullable()
+    .optional(),
+  totalFiles: z.number().int().optional(),
   indexScannedAt: z.string().nullable().optional(),
   indexWarning: z.string().nullable().optional(),
   plexStatus: z.object({
@@ -1025,7 +1043,10 @@ export type LibraryBrowseResponse = z.infer<typeof libraryBrowseResponseSchema>;
 
 export type LibraryBrowseQuery = {
   q?: string;
-  category?: "shows" | "movies" | "unmatched";
+  category?: "all" | "shows" | "movies" | "unmatched";
+  view?: "groups" | "files";
+  match?: "all" | "matched" | "unmatched";
+  season?: number;
   type?: "all" | "internal" | "external" | "broken";
   quality?: "all" | "4k" | "1080p" | "720p" | "sd" | "unknown";
   cache?: "all" | "any" | "complete" | "empty" | "unavailable";

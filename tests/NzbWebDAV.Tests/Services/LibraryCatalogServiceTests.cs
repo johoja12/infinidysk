@@ -74,6 +74,30 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task VideoOnly_FiltersInternalAndExternalCatalogItems()
+    {
+        foreach (var name in new[] { "film.mkv", "notes.nfo" })
+            _context.Items.Add(DavItem.New(Guid.NewGuid(), DavItem.ContentFolder, name, 100,
+                DavItem.ItemType.UsenetFile, DavItem.ItemSubType.NzbFile,
+                null, null, null, null));
+        _context.LinkMaps.Add(new LibraryLinkMap
+        {
+            Id = Guid.NewGuid(), LinkPath = "photos/art.jpg", TargetText = "/nas/art.jpg",
+            MappingType = LibraryMappingType.External, Status = LibraryLinkStatus.Valid,
+            LastSeenUtc = DateTime.UtcNow,
+        });
+        await _context.SaveChangesAsync();
+        _context.ChangeTracker.Clear();
+
+        var allFiles = await new LibraryCatalogService(_context).QueryAsync(new LibraryCatalogQuery());
+        var videoOnly = await new LibraryCatalogService(_context, videoOnly: true)
+            .QueryAsync(new LibraryCatalogQuery());
+
+        Assert.Equal(3, allFiles.TotalCount);
+        Assert.Equal("film.mkv", Assert.Single(videoOnly.Items).DisplayName);
+    }
+
+    [Fact]
     public async Task Query_ExternalOnlyLink_ReturnsExternalRowWithoutDavItemId()
     {
         _context.LinkMaps.Add(new LibraryLinkMap
@@ -152,6 +176,24 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
         });
         Assert.Equal(10, second.ExpandedGroup!.Items.Count);
         Assert.Equal("S01E51", second.ExpandedGroup.Items[0].Episode);
+
+        var filePage = await service.QueryAsync(new LibraryBrowseQuery
+        {
+            View = "files", Category = "all", Page = 2,
+        });
+        Assert.Equal(61, filePage.TotalFiles);
+        Assert.Equal(11, filePage.Files!.Count);
+        Assert.Equal(10, filePage.Files.Count(row => row.Title == "Example Show"));
+        Assert.Equal(1, filePage.Files.Count(row => row.Title == "Other Show"));
+
+        var filteredFiles = await service.QueryAsync(new LibraryBrowseQuery
+        {
+            View = "files", Category = "shows", Search = "Episode 60", SeasonFilter = 1,
+            MatchFilter = "matched",
+        });
+        var filtered = Assert.Single(filteredFiles.Files!);
+        Assert.Equal(60, filtered.Episode);
+        Assert.Equal("Example Show", filtered.Title);
     }
 
     [Fact]
@@ -187,6 +229,15 @@ public sealed class LibraryCatalogServiceTests : IAsyncLifetime
         Assert.Equal("Arrival (2016)", movie.Title);
         Assert.Equal(2, movies.TotalItems);
         Assert.Equal(1, movies.UnmatchedItems);
+
+        var movieFiles = await service.QueryAsync(new LibraryBrowseQuery
+        {
+            View = "files", Category = "movies",
+        });
+        var movieFile = Assert.Single(movieFiles.Files!);
+        Assert.Equal("Arrival", movieFile.Title);
+        Assert.Null(movieFile.Season);
+        Assert.Null(movieFile.Episode);
 
         var unmatched = await service.QueryAsync(new LibraryBrowseQuery
         {

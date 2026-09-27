@@ -14,6 +14,7 @@ afterEach(() => {
 
 const initial = {
   "media.library-enabled": "true",
+  "media.library-video-only": "false",
   "media.library-dir": "/mnt/media",
   "media.library-scan-dirs": "[]",
   "media.library-scan-interval-minutes": "15",
@@ -30,6 +31,21 @@ function Harness() {
 }
 
 describe("Media Library settings", () => {
+  it("lets operators enable video-only indexing", async () => {
+    plexRequest.mockResolvedValue({
+      servers: [],
+      ready: false,
+      syncedAt: null,
+      entryCount: 0,
+      warning: null,
+      syncing: false,
+    });
+    const user = userEvent.setup();
+    render(<Harness />);
+    await user.click(screen.getByLabelText("Index video files only"));
+    expect(screen.getByTestId("config").textContent).toContain('"media.library-video-only":"true"');
+  });
+
   it("defaults source selection to every enabled server", () => {
     const servers = [
       { id: "home", enabled: true },

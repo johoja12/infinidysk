@@ -16,7 +16,8 @@ import { LibraryFileModal, type LibraryModalFeedback } from "./file-modal";
 import { MediaPreview } from "~/components/media-preview";
 import { plexRequest } from "~/utils/plex-request";
 
-type Category = "shows" | "movies" | "unmatched";
+type Category = "all" | "shows" | "movies" | "unmatched";
+type View = "files" | "groups";
 type MappingFilter = "all" | "internal" | "external" | "broken";
 type QualityFilter = "all" | "4k" | "1080p" | "720p" | "sd" | "unknown";
 type CacheFilter = "all" | "any" | "complete" | "empty" | "unavailable";
@@ -25,6 +26,9 @@ export type LibraryPageData = {
   query: {
     q: string;
     category: Category;
+    view: View;
+    match: "all" | "matched" | "unmatched";
+    season: number | null;
     type: MappingFilter;
     quality: QualityFilter;
     cache: CacheFilter;
@@ -38,7 +42,11 @@ export type LibraryPageData = {
 };
 
 function parseCategory(value: string | null): Category {
-  return value === "movies" || value === "unmatched" ? value : "shows";
+  return value === "shows" || value === "movies" || value === "unmatched" ? value : "all";
+}
+
+function parseView(value: string | null): View {
+  return value === "groups" ? "groups" : "files";
 }
 
 function parseType(value: string | null): MappingFilter {
@@ -78,7 +86,25 @@ export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPage
   const url = new URL(request.url);
   const query = {
     q: url.searchParams.get("q")?.trim() ?? "",
-    category: parseCategory(url.searchParams.get("category")),
+    category:
+      parseView(url.searchParams.get("view")) === "groups" &&
+      parseCategory(url.searchParams.get("category")) === "all"
+        ? "shows"
+        : parseCategory(url.searchParams.get("category")),
+    view: parseView(url.searchParams.get("view")),
+    match:
+      url.searchParams.get("match") === "matched" || url.searchParams.get("match") === "unmatched"
+        ? (url.searchParams.get("match") as "matched" | "unmatched")
+        : ("all" as const),
+    season: (() => {
+      const value = Number(url.searchParams.get("season"));
+      return url.searchParams.has("season") &&
+        Number.isInteger(value) &&
+        value >= 0 &&
+        value <= 1000
+        ? value
+        : null;
+    })(),
     type: parseType(url.searchParams.get("type")),
     quality: parseQuality(url.searchParams.get("quality")),
     cache: parseCache(url.searchParams.get("cache")),
@@ -89,6 +115,9 @@ export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPage
   const browse = await backendClient.getLibraryBrowse({
     ...(query.q ? { q: query.q } : {}),
     category: query.category,
+    view: query.view,
+    match: query.match,
+    ...(query.season !== null ? { season: query.season } : {}),
     type: query.type,
     quality: query.quality,
     cache: query.cache,
@@ -98,7 +127,7 @@ export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPage
   });
   const { frontendBackendApiKey } = getFrontendRuntimeConfig();
   const previewUrls: Record<string, string> = {};
-  for (const { item } of browse.expandedGroup?.items ?? []) {
+  for (const { item } of [...(browse.expandedGroup?.items ?? []), ...(browse.files ?? [])]) {
     if (item.kind === "internal" && item.contentPath && item.davItemId) {
       const relative = item.contentPath.startsWith("/")
         ? item.contentPath.slice(1)
@@ -151,6 +180,7 @@ function indexAge(value: string | null | undefined): string {
 }
 
 const categories: { value: Category; label: string }[] = [
+  { value: "all", label: "All media" },
   { value: "shows", label: "TV shows" },
   { value: "movies", label: "Movies" },
   { value: "unmatched", label: "Unmatched" },
@@ -319,6 +349,7 @@ export default function Library({ loaderData }: Route.ComponentProps) {
   const selectedPreviewUrl =
     selected?.davItemId != null ? (expandedPreviewUrls[selected.davItemId] ?? null) : null;
   const totalPages = Math.max(1, Math.ceil(browse.totalGroups / browse.pageSize));
+  const filePages = Math.max(1, Math.ceil((browse.totalFiles ?? 0) / browse.pageSize));
 
   return (
     <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 py-8 md:px-6">
@@ -378,11 +409,70 @@ export default function Library({ loaderData }: Route.ComponentProps) {
         />
       </div>
 
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-base-content/15">
+        <nav className="flex gap-1 overflow-x-auto" aria-label="Media type">
+          {categories
+            .filter(({ value }) => query.view === "files" || value !== "all")
+            .map(({ value, label }) => (
+              <Link
+                key={value}
+                to={withParams(searchParams, {
+                  category: value,
+                  page: null,
+                  group: null,
+                  groupPage: null,
+                })}
+                aria-current={query.category === value ? "page" : undefined}
+                className={`border-b-2 px-4 py-3 text-sm font-semibold transition-colors ${
+                  query.category === value
+                    ? "border-primary text-primary"
+                    : "border-transparent text-base-content/60 hover:text-base-content"
+                }`}
+              >
+                {label}
+                {value === "unmatched" && browse.plexStatus.ready
+                  ? ` (${browse.unmatchedItems})`
+                  : ""}
+              </Link>
+            ))}
+        </nav>
+        <nav className="flex gap-2 pb-2 text-sm" aria-label="Library view">
+          <Link
+            to={withParams(searchParams, {
+              view: "files",
+              page: null,
+              group: null,
+              groupPage: null,
+            })}
+            aria-current={query.view === "files" ? "page" : undefined}
+            className={query.view === "files" ? "btn btn-sm btn-primary" : "btn btn-sm btn-outline"}
+          >
+            File table
+          </Link>
+          <Link
+            to={withParams(searchParams, {
+              view: "groups",
+              category: query.category === "all" ? "shows" : query.category,
+              page: null,
+              group: null,
+              groupPage: null,
+            })}
+            aria-current={query.view === "groups" ? "page" : undefined}
+            className={
+              query.view === "groups" ? "btn btn-sm btn-primary" : "btn btn-sm btn-outline"
+            }
+          >
+            Grouped browse
+          </Link>
+        </nav>
+      </div>
+
       <Form
         method="get"
         className="flex flex-wrap items-end gap-3 rounded-xl border border-base-content/10 bg-base-200 p-4"
       >
         <input type="hidden" name="category" value={query.category} />
+        <input type="hidden" name="view" value={query.view} />
         <label className="min-w-48 flex-1 text-xs font-semibold text-base-content/70">
           Search media and paths
           <Input
@@ -405,6 +495,34 @@ export default function Library({ loaderData }: Route.ComponentProps) {
             <option value="broken">Broken links</option>
           </select>
         </label>
+        {query.view === "files" && (
+          <>
+            <label className="text-xs font-semibold text-base-content/70">
+              Match
+              <select
+                name="match"
+                defaultValue={query.match}
+                className="select mt-1 block select-bordered"
+              >
+                <option value="all">All matches</option>
+                <option value="matched">Matched</option>
+                <option value="unmatched">Unmatched</option>
+              </select>
+            </label>
+            <label className="text-xs font-semibold text-base-content/70">
+              Season
+              <Input
+                name="season"
+                type="number"
+                min={0}
+                max={1000}
+                defaultValue={query.season ?? ""}
+                placeholder="Any"
+                className="mt-1 w-24"
+              />
+            </label>
+          </>
+        )}
         <label className="text-xs font-semibold text-base-content/70">
           Quality
           <select
@@ -441,227 +559,308 @@ export default function Library({ loaderData }: Route.ComponentProps) {
         file revision{nativeCacheActive ? "." : "; Native Cache is inactive."}
       </p>
 
-      <nav className="flex gap-1 border-b border-base-content/15" aria-label="Media type">
-        {categories.map(({ value, label }) => (
-          <Link
-            key={value}
-            to={withParams(searchParams, {
-              category: value,
-              page: null,
-              group: null,
-              groupPage: null,
-            })}
-            aria-current={query.category === value ? "page" : undefined}
-            className={`border-b-2 px-4 py-3 text-sm font-semibold transition-colors ${
-              query.category === value
-                ? "border-primary text-primary"
-                : "border-transparent text-base-content/60 hover:text-base-content"
-            }`}
-          >
-            {label}
-            {value === "unmatched" && browse.plexStatus.ready ? ` (${browse.unmatchedItems})` : ""}
-          </Link>
-        ))}
-      </nav>
-
-      <div className="flex items-center justify-between gap-4">
-        <h2 className="text-lg font-semibold">
-          {categories.find((category) => category.value === query.category)?.label}
-        </h2>
-        <span className="text-xs text-base-content/55">
-          {browse.totalGroups.toLocaleString()} groups · page {browse.page} of {totalPages}
-        </span>
-      </div>
-      {browse.groups.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-base-content/20 bg-base-200 p-10 text-center">
-          <p className="font-semibold">
-            {browse.plexStatus.ready
-              ? "No media matches these filters."
-              : "Plex matching has not completed yet."}
-          </p>
-          <p className="mt-1 text-sm text-base-content/60">
-            {browse.plexStatus.ready
-              ? "Try a different search or mapping filter."
-              : "Use Sync Plex now to match your library files."}
-          </p>
-        </div>
-      ) : (
-        <div className="flex flex-col gap-3">
-          {browse.groups.map((group) => {
-            const open = expandedKey === group.key;
-            return (
-              <section
-                key={group.key}
-                className="overflow-hidden rounded-xl border border-base-content/10 bg-base-200"
-              >
-                <button
-                  type="button"
-                  onClick={() => (open ? setExpandedKey(null) : loadGroup(group.key))}
-                  aria-expanded={open}
-                  aria-controls={`library-group-${browse.groups.indexOf(group)}`}
-                  className="flex w-full items-center gap-4 p-4 text-left transition-colors hover:bg-base-content/5"
-                >
-                  <span className="flex h-14 w-12 shrink-0 items-center justify-center rounded-lg bg-primary/15 text-xl font-bold text-primary">
-                    {group.category === "shows" ? "TV" : group.category === "movies" ? "▶" : "?"}
-                  </span>
-                  <span className="min-w-0 flex-1">
-                    <strong className="block truncate text-base">{group.title}</strong>
-                    <span className="mt-1 block text-xs text-base-content/60">
-                      {group.itemCount.toLocaleString()} {group.itemCount === 1 ? "file" : "files"}
-                    </span>
-                  </span>
-                  <span className="hidden items-center gap-2 text-xs sm:flex">
-                    {group.quality ? (
-                      <Badge>
-                        {group.quality === "4k"
-                          ? "4K"
-                          : group.quality === "unknown"
-                            ? "Quality unknown"
-                            : group.quality}
-                      </Badge>
-                    ) : null}
-                    {group.itemCount === 1 ? (
-                      <span className="text-base-content/65">
-                        Cache{" "}
-                        {group.cachePercentage == null
-                          ? "unavailable"
-                          : `${group.cachePercentage}%`}
-                      </span>
-                    ) : null}
-                    {group.healthyCount > 0 && <Badge>{group.healthyCount} valid</Badge>}
-                    {group.attentionCount > 0 && (
-                      <Badge>{group.attentionCount} need attention</Badge>
-                    )}
-                  </span>
-                  <span className="text-xl text-base-content/50" aria-hidden="true">
-                    {open ? "⌄" : "›"}
-                  </span>
-                </button>
-                {open ? (
-                  <div
-                    id={`library-group-${browse.groups.indexOf(group)}`}
-                    className="border-t border-base-content/10 bg-base-300/45 px-4 py-2"
+      {query.view === "files" ? (
+        <>
+          <div className="flex items-center justify-between gap-4">
+            <h2 className="text-lg font-semibold">
+              {categories.find((category) => category.value === query.category)?.label} files
+            </h2>
+            <span className="text-xs text-base-content/55">
+              {(browse.totalFiles ?? 0).toLocaleString()} files · page {browse.page} of {filePages}
+            </span>
+          </div>
+          <div className="overflow-x-auto rounded-xl border border-base-content/10 bg-base-200">
+            <table className="table table-sm w-full min-w-[960px]">
+              <thead>
+                <tr>
+                  <th>File / path</th>
+                  <th>Show / movie title</th>
+                  <th>Season</th>
+                  <th>Episode</th>
+                  <th>Type</th>
+                  <th>Size</th>
+                  <th>Mapping</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(browse.files ?? []).map((row) => (
+                  <tr
+                    key={
+                      row.item.davItemId ?? row.item.mappings[0]?.linkPath ?? row.item.displayName
+                    }
                   >
-                    {!expandedGroup ? (
-                      <p role="status" className="py-4 text-sm text-base-content/60">
-                        Loading files…
-                      </p>
-                    ) : null}
-                    {expandedGroup?.items.map(
-                      ({ item, season, episode, quality, cachePercentage }) => (
-                        <div
-                          key={item.davItemId ?? item.mappings[0]?.linkPath ?? item.displayName}
-                          className="border-b border-base-content/10 py-3 last:border-b-0"
-                        >
-                          <div className="flex flex-wrap items-center gap-3">
-                            {episode ? (
-                              <span className="w-16 shrink-0 font-mono text-xs font-bold text-primary">
-                                {episode}
-                              </span>
-                            ) : null}
-                            <div className="min-w-48 flex-1">
-                              <button
-                                type="button"
-                                className="link text-left font-semibold"
-                                onClick={() => openModal(item)}
-                              >
-                                {item.displayName}
-                              </button>
-                              <p className="truncate text-xs text-base-content/50">
-                                {season ? `${season} · ` : ""}
-                                {item.contentPath ?? item.mappings[0]?.linkPath ?? "External link"}
-                              </p>
+                    <td className="max-w-64">
+                      <button
+                        type="button"
+                        className="link block max-w-64 truncate text-left font-medium"
+                        title={row.item.displayName}
+                        onClick={() => openModal(row.item)}
+                      >
+                        {row.item.displayName}
+                      </button>
+                      <span
+                        className="block max-w-64 truncate text-xs text-base-content/50"
+                        title={row.item.contentPath ?? row.item.mappings[0]?.linkPath ?? ""}
+                      >
+                        {row.item.contentPath ?? row.item.mappings[0]?.linkPath ?? "—"}
+                      </span>
+                    </td>
+                    <td>{row.title ?? <span className="text-base-content/45">Unmatched</span>}</td>
+                    <td>{row.season == null ? "—" : row.season}</td>
+                    <td>{row.episode == null ? "—" : row.episode}</td>
+                    <td>
+                      {row.category === "shows"
+                        ? "TV"
+                        : row.category === "movies"
+                          ? "Movie"
+                          : "Unmatched"}
+                    </td>
+                    <td>{row.item.size == null ? "—" : formatFileSize(row.item.size)}</td>
+                    <td>
+                      <Badge>{row.item.health}</Badge>
+                    </td>
+                    <td>
+                      <button
+                        type="button"
+                        className="btn btn-xs btn-outline"
+                        onClick={() => openModal(row.item)}
+                      >
+                        Details
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {!browse.files?.length && (
+              <p className="p-8 text-center text-sm text-base-content/60">
+                {browse.plexStatus.ready
+                  ? "No files match these filters."
+                  : "Plex matching is pending; files without a match remain visible under All media."}
+              </p>
+            )}
+          </div>
+          {(browse.totalFiles ?? 0) > browse.pageSize && (
+            <Pagination
+              page={browse.page}
+              total={filePages}
+              previous={withParams(searchParams, { page: String(browse.page - 1) })}
+              next={withParams(searchParams, { page: String(browse.page + 1) })}
+              label="Files"
+            />
+          )}
+        </>
+      ) : (
+        <>
+          <div className="flex items-center justify-between gap-4">
+            <h2 className="text-lg font-semibold">
+              {categories.find((category) => category.value === query.category)?.label}
+            </h2>
+            <span className="text-xs text-base-content/55">
+              {browse.totalGroups.toLocaleString()} groups · page {browse.page} of {totalPages}
+            </span>
+          </div>
+          {browse.groups.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-base-content/20 bg-base-200 p-10 text-center">
+              <p className="font-semibold">
+                {browse.plexStatus.ready
+                  ? "No media matches these filters."
+                  : "Plex matching has not completed yet."}
+              </p>
+              <p className="mt-1 text-sm text-base-content/60">
+                {browse.plexStatus.ready
+                  ? "Try a different search or mapping filter."
+                  : "Use Sync Plex now to match your library files."}
+              </p>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-3">
+              {browse.groups.map((group) => {
+                const open = expandedKey === group.key;
+                return (
+                  <section
+                    key={group.key}
+                    className="overflow-hidden rounded-xl border border-base-content/10 bg-base-200"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => (open ? setExpandedKey(null) : loadGroup(group.key))}
+                      aria-expanded={open}
+                      aria-controls={`library-group-${browse.groups.indexOf(group)}`}
+                      className="flex w-full items-center gap-4 p-4 text-left transition-colors hover:bg-base-content/5"
+                    >
+                      <span className="flex h-14 w-12 shrink-0 items-center justify-center rounded-lg bg-primary/15 text-xl font-bold text-primary">
+                        {group.category === "shows"
+                          ? "TV"
+                          : group.category === "movies"
+                            ? "▶"
+                            : "?"}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <strong className="block truncate text-base">{group.title}</strong>
+                        <span className="mt-1 block text-xs text-base-content/60">
+                          {group.itemCount.toLocaleString()}{" "}
+                          {group.itemCount === 1 ? "file" : "files"}
+                        </span>
+                      </span>
+                      <span className="hidden items-center gap-2 text-xs sm:flex">
+                        {group.quality ? (
+                          <Badge>
+                            {group.quality === "4k"
+                              ? "4K"
+                              : group.quality === "unknown"
+                                ? "Quality unknown"
+                                : group.quality}
+                          </Badge>
+                        ) : null}
+                        {group.itemCount === 1 ? (
+                          <span className="text-base-content/65">
+                            Cache{" "}
+                            {group.cachePercentage == null
+                              ? "unavailable"
+                              : `${group.cachePercentage}%`}
+                          </span>
+                        ) : null}
+                        {group.healthyCount > 0 && <Badge>{group.healthyCount} valid</Badge>}
+                        {group.attentionCount > 0 && (
+                          <Badge>{group.attentionCount} need attention</Badge>
+                        )}
+                      </span>
+                      <span className="text-xl text-base-content/50" aria-hidden="true">
+                        {open ? "⌄" : "›"}
+                      </span>
+                    </button>
+                    {open ? (
+                      <div
+                        id={`library-group-${browse.groups.indexOf(group)}`}
+                        className="border-t border-base-content/10 bg-base-300/45 px-4 py-2"
+                      >
+                        {!expandedGroup ? (
+                          <p role="status" className="py-4 text-sm text-base-content/60">
+                            Loading files…
+                          </p>
+                        ) : null}
+                        {expandedGroup?.items.map(
+                          ({ item, season, episode, quality, cachePercentage }) => (
+                            <div
+                              key={item.davItemId ?? item.mappings[0]?.linkPath ?? item.displayName}
+                              className="border-b border-base-content/10 py-3 last:border-b-0"
+                            >
+                              <div className="flex flex-wrap items-center gap-3">
+                                {episode ? (
+                                  <span className="w-16 shrink-0 font-mono text-xs font-bold text-primary">
+                                    {episode}
+                                  </span>
+                                ) : null}
+                                <div className="min-w-48 flex-1">
+                                  <button
+                                    type="button"
+                                    className="link text-left font-semibold"
+                                    onClick={() => openModal(item)}
+                                  >
+                                    {item.displayName}
+                                  </button>
+                                  <p className="truncate text-xs text-base-content/50">
+                                    {season ? `${season} · ` : ""}
+                                    {item.contentPath ??
+                                      item.mappings[0]?.linkPath ??
+                                      "External link"}
+                                  </p>
+                                </div>
+                                <span className="text-xs text-base-content/70">
+                                  {item.size != null ? formatFileSize(item.size) : "—"}
+                                </span>
+                                <Badge>
+                                  {quality === "4k"
+                                    ? "4K"
+                                    : quality === "unknown"
+                                      ? "Quality unknown"
+                                      : quality}
+                                </Badge>
+                                <span className="text-xs text-base-content/65">
+                                  Cache{" "}
+                                  {cachePercentage == null ? "unavailable" : `${cachePercentage}%`}
+                                </span>
+                                <Badge>{item.health}</Badge>
+                                <button
+                                  type="button"
+                                  className="btn btn-sm btn-outline"
+                                  onClick={() => openModal(item)}
+                                >
+                                  Details
+                                </button>
+                              </div>
+                              <details className="mt-2 text-xs text-base-content/65">
+                                <summary className="cursor-pointer">
+                                  {item.mappingCount}{" "}
+                                  {item.mappingCount === 1 ? "mapping" : "mappings"}
+                                </summary>
+                                <ul className="mt-2 space-y-1 pl-4">
+                                  {item.mappings.map((mapping) => (
+                                    <li key={mapping.linkPath} className="break-all">
+                                      <Badge>{mapping.status}</Badge> {mapping.linkPath} →{" "}
+                                      {mapping.targetText}
+                                    </li>
+                                  ))}
+                                </ul>
+                              </details>
                             </div>
-                            <span className="text-xs text-base-content/70">
-                              {item.size != null ? formatFileSize(item.size) : "—"}
-                            </span>
-                            <Badge>
-                              {quality === "4k"
-                                ? "4K"
-                                : quality === "unknown"
-                                  ? "Quality unknown"
-                                  : quality}
-                            </Badge>
-                            <span className="text-xs text-base-content/65">
-                              Cache{" "}
-                              {cachePercentage == null ? "unavailable" : `${cachePercentage}%`}
-                            </span>
-                            <Badge>{item.health}</Badge>
+                          ),
+                        )}
+                        {expandedGroup && expandedGroup.totalItems > expandedGroup.pageSize ? (
+                          <div className="flex items-center justify-between py-3 text-sm">
                             <button
                               type="button"
-                              className="btn btn-sm btn-outline"
-                              onClick={() => openModal(item)}
+                              className="btn btn-sm"
+                              disabled={expandedGroup.page <= 1 || groupFetcher.state !== "idle"}
+                              onClick={() => loadGroup(group.key, expandedGroup.page - 1)}
                             >
-                              Details
+                              Previous files
+                            </button>
+                            <span>
+                              Page {expandedGroup.page} of{" "}
+                              {Math.ceil(expandedGroup.totalItems / expandedGroup.pageSize)}
+                            </span>
+                            <button
+                              type="button"
+                              className="btn btn-sm"
+                              disabled={
+                                expandedGroup.page * expandedGroup.pageSize >=
+                                  expandedGroup.totalItems || groupFetcher.state !== "idle"
+                              }
+                              onClick={() => loadGroup(group.key, expandedGroup.page + 1)}
+                            >
+                              Next files
                             </button>
                           </div>
-                          <details className="mt-2 text-xs text-base-content/65">
-                            <summary className="cursor-pointer">
-                              {item.mappingCount} {item.mappingCount === 1 ? "mapping" : "mappings"}
-                            </summary>
-                            <ul className="mt-2 space-y-1 pl-4">
-                              {item.mappings.map((mapping) => (
-                                <li key={mapping.linkPath} className="break-all">
-                                  <Badge>{mapping.status}</Badge> {mapping.linkPath} →{" "}
-                                  {mapping.targetText}
-                                </li>
-                              ))}
-                            </ul>
-                          </details>
-                        </div>
-                      ),
-                    )}
-                    {expandedGroup && expandedGroup.totalItems > expandedGroup.pageSize ? (
-                      <div className="flex items-center justify-between py-3 text-sm">
-                        <button
-                          type="button"
-                          className="btn btn-sm"
-                          disabled={expandedGroup.page <= 1 || groupFetcher.state !== "idle"}
-                          onClick={() => loadGroup(group.key, expandedGroup.page - 1)}
-                        >
-                          Previous files
-                        </button>
-                        <span>
-                          Page {expandedGroup.page} of{" "}
-                          {Math.ceil(expandedGroup.totalItems / expandedGroup.pageSize)}
-                        </span>
-                        <button
-                          type="button"
-                          className="btn btn-sm"
-                          disabled={
-                            expandedGroup.page * expandedGroup.pageSize >=
-                              expandedGroup.totalItems || groupFetcher.state !== "idle"
-                          }
-                          onClick={() => loadGroup(group.key, expandedGroup.page + 1)}
-                        >
-                          Next files
-                        </button>
+                        ) : null}
                       </div>
                     ) : null}
-                  </div>
-                ) : null}
-              </section>
-            );
-          })}
-        </div>
+                  </section>
+                );
+              })}
+            </div>
+          )}
+          {browse.totalGroups > browse.pageSize ? (
+            <Pagination
+              page={browse.page}
+              total={totalPages}
+              previous={withParams(searchParams, {
+                page: String(browse.page - 1),
+                group: null,
+                groupPage: null,
+              })}
+              next={withParams(searchParams, {
+                page: String(browse.page + 1),
+                group: null,
+                groupPage: null,
+              })}
+              label="Groups"
+            />
+          ) : null}
+        </>
       )}
-      {browse.totalGroups > browse.pageSize ? (
-        <Pagination
-          page={browse.page}
-          total={totalPages}
-          previous={withParams(searchParams, {
-            page: String(browse.page - 1),
-            group: null,
-            groupPage: null,
-          })}
-          next={withParams(searchParams, {
-            page: String(browse.page + 1),
-            group: null,
-            groupPage: null,
-          })}
-          label="Groups"
-        />
-      ) : null}
 
       {fetcher.data?.status === false ? (
         <Alert variant="danger" role="alert">
@@ -672,16 +871,26 @@ export default function Library({ loaderData }: Route.ComponentProps) {
         <LibraryFileModal
           item={selected}
           quality={
+            (browse.files ?? []).find(
+              ({ item }) =>
+                item.davItemId === selected.davItemId && item.displayName === selected.displayName,
+            )?.quality ??
             expandedGroup?.items.find(
               ({ item }) =>
                 item.davItemId === selected.davItemId && item.displayName === selected.displayName,
-            )?.quality ?? "unknown"
+            )?.quality ??
+            "unknown"
           }
           cachePercentage={
+            (browse.files ?? []).find(
+              ({ item }) =>
+                item.davItemId === selected.davItemId && item.displayName === selected.displayName,
+            )?.cachePercentage ??
             expandedGroup?.items.find(
               ({ item }) =>
                 item.davItemId === selected.davItemId && item.displayName === selected.displayName,
-            )?.cachePercentage ?? null
+            )?.cachePercentage ??
+            null
           }
           details={details}
           detailsLoading={detailsLoading}

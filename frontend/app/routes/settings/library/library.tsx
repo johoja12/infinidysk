@@ -27,6 +27,7 @@ type PlexStatus = {
 };
 const KEYS = [
   "media.library-enabled",
+  "media.library-video-only",
   "media.library-dir",
   "media.library-scan-dirs",
   "media.library-scan-interval-minutes",
@@ -258,6 +259,30 @@ export function LibrarySettings({ config, savedConfig, setNewConfig }: Props) {
               </p>
             </div>
           </ManagedSetting>
+        </SettingsCard>
+        <SettingsCard
+          icon="movie"
+          title="Video files only"
+          description="Limit the Media Library catalog to supported video formats."
+        >
+          <ManagedSetting configKey="media.library-video-only">
+            <Toggle
+              id="media-library-video-only"
+              checked={config["media.library-video-only"] === "true"}
+              className="cursor-pointer gap-2 p-0"
+              onChange={(event) =>
+                setNewConfig((current) => ({
+                  ...current,
+                  "media.library-video-only": String(event.target.checked),
+                }))
+              }
+              label={<span className="text-sm font-medium">Index video files only</span>}
+            />
+          </ManagedSetting>
+          <p className="text-xs text-base-content/60">
+            Applies to new library links and catalog results after the next scan. Subtitles, images,
+            and other files remain on disk. Turn this off and scan again to show them.
+          </p>
         </SettingsCard>
         <SettingsCard
           icon="schedule"

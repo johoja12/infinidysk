@@ -1,19 +1,20 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.DependencyInjection;
 using NzbWebDAV.Database;
+using NzbWebDAV.Config;
 using NzbWebDAV.Services.Library;
 
 namespace NzbWebDAV.Api.Controllers.GetLibraryCatalog;
 
 [ApiController]
 [Route("api/get-library-catalog")]
-public class GetLibraryCatalogController(DavDatabaseClient dbClient) : GetOnlyApiController
+public class GetLibraryCatalogController(DavDatabaseClient dbClient, ConfigManager config) : GetOnlyApiController
 {
     protected override async Task<IActionResult> HandleRequest()
     {
         var request = new GetLibraryCatalogRequest(HttpContext);
         var scanner = HttpContext.RequestServices.GetService<LibraryCatalogScanner>();
-        var service = new LibraryCatalogService(dbClient.Ctx);
+        var service = new LibraryCatalogService(dbClient.Ctx, config.IsMediaLibraryVideoOnly());
         var result = await service
             .QueryAsync(request.Query, scanner, request.CancellationToken)
             .ConfigureAwait(false);
