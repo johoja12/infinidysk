@@ -15,6 +15,7 @@ public abstract class BaseStoreStreamFile(HttpContext context, ConfigManager con
     : BaseStoreReadonlyItem, IDetachedStreamSource
 {
     public virtual DavItem? DavItem => null;
+    public virtual DavItem.ItemSubType? ItemSubType => DavItem?.SubType;
     public virtual SharedContentIdentity ContentIdentity =>
         new(UniqueKey, DavItem?.FileBlobId, FileSize);
     protected ConfigManager Config => configManager;

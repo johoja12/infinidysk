@@ -95,7 +95,7 @@ public sealed class SharedStreamRegistry : IAsyncDisposable, IDisposable
         var rangeBytes = closedRange
             ? endOffset!.Value - startOffset + 1
             : Math.Max(0, fileSize - startOffset);
-        var createEligible = !closedRange || rangeBytes > _config.GetSharedStreamsSmallRangeMaxBytes();
+        var createEligible = !closedRange || rangeBytes > _config.GetSharedStreamsSmallRangeMaxBytes(source.ItemSubType);
         if (!createEligible)
         {
             _tracker.RecordSharedAttachMiss(

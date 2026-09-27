@@ -14,7 +14,20 @@ public class SharedStreamsConfigTests
         Assert.Equal(3, config.GetSharedStreamsMaxEntriesPerFile());
         Assert.Equal(32, config.GetSharedStreamsRingMb());
         Assert.Equal(10, config.GetSharedStreamsGraceSeconds());
-        Assert.Equal(32, config.GetSharedStreamsSmallRangeMaxMb());
+        Assert.Equal(16, config.GetSharedStreamsSmallRangeMaxMb());
+        Assert.Equal(32, config.GetSharedStreamsSmallRangeMaxMb(DavItem.ItemSubType.NzbFile));
+        Assert.Equal(16, config.GetSharedStreamsSmallRangeMaxMb(DavItem.ItemSubType.MultipartFile));
+    }
+
+    [Fact]
+    public void ExplicitSmallRangeLimit_OverridesBothFileTypeDefaults()
+    {
+        var config = new ConfigManager();
+        config.UpdateValues([
+            new ConfigItem { ConfigName = ConfigKeys.UsenetSharedStreamsSmallRangeMaxMb, ConfigValue = "8" },
+        ]);
+        Assert.Equal(8, config.GetSharedStreamsSmallRangeMaxMb(DavItem.ItemSubType.NzbFile));
+        Assert.Equal(8, config.GetSharedStreamsSmallRangeMaxMb(DavItem.ItemSubType.MultipartFile));
     }
 
     [Theory]

@@ -23,5 +23,6 @@ public interface IDetachedStreamSource
 {
     long FileSize { get; }
     SharedContentIdentity ContentIdentity { get; }
+    DavItem.ItemSubType? ItemSubType => null;
     Task<DetachedStreamLease> GetDetachedReadableStreamAsync(CancellationToken cancellationToken);
 }
