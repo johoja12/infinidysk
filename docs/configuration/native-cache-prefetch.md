@@ -140,9 +140,11 @@ ranges. **Customized** means at least one policy value differs from those defaul
 Prefetch or removing selected Plex users, hubs, or collections.
 
 The normal view also shows compact Plex connection status. Library/user/source
-selection is available under **Plex libraries and sources**, and queue inspection,
-policy preview, manual warming, and retry controls are under **Prefetch activity**.
-Both sections stay collapsed until needed so the everyday setup remains limited to
+selection is available under **Plex libraries and sources**. Open the separate
+**Smart Prefetch** page from the sidebar for live queue activity and recent warming
+history. Its **Advanced warming controls** section contains policy preview, manual
+warming, and retry controls. The Settings activity section links to that page.
+The Settings sections stay collapsed until needed so the everyday setup remains limited to
 Enable, Movies, TV episodes, and the daily GB budget.
 
 Choose a saved server and watching profile, then expand **Movies** or **TV**. Switch

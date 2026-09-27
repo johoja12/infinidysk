@@ -9,6 +9,7 @@ export const NAV_FEATURE_IDS = [
   "explore",
   "library",
   "native-cache",
+  "smart-prefetch",
   "health",
   "logs",
   "search",

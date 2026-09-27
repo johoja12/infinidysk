@@ -96,6 +96,12 @@ export function LeftNavigation({
         ]
       : []),
     { target: "/native-cache", icon: "storage", label: "Native Cache", featureId: "native-cache" },
+    {
+      target: "/smart-prefetch",
+      icon: "auto_awesome",
+      label: "Smart Prefetch",
+      featureId: "smart-prefetch",
+    },
     { target: "/health", icon: "health_and_safety", label: "Health", featureId: "health" },
     { target: "/logs", icon: "description", label: "Logs", featureId: "logs" },
     { target: "/search", icon: "search", label: "Search", featureId: "search" },
