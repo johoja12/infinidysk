@@ -283,7 +283,7 @@ describe("BackendClient", () => {
     expect(result.plexStatus.ready).toBe(true);
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe(
-      "http://backend/api/get-library-browse?q=Example&group=shows%2FExample&category=shows&type=internal&quality=1080p&cache=any&page=1&groupPage=1",
+      "http://backend/api/get-library-browse?q=Example&group=shows%2FExample&category=shows&view=groups&match=all&type=internal&quality=1080p&cache=any&page=1&groupPage=1",
     );
     expect(init?.method).toBe("GET");
   });
