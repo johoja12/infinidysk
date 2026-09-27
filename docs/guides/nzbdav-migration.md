@@ -298,7 +298,8 @@ a second submission. A reconnect of the same package digest is idempotent. The
 next batch is fenced until the current batch is terminal and every selected
 file has an exact validated link, a recorded terminal import failure, or a
 recorded `unmatched-target` correlation. Neither a failed nor an unmatched
-file receives a parallel link; keep the source library authoritative for both.
+file receives a parallel link. Keep unmatched source files in the legacy
+library; run the failed-import cleanup below for confirmed failures.
 
 After each terminal run, download `GET /api/migration/nzbdav/import-failures`
 and save its JSON response with a SHA-256 checksum under the matching root and
@@ -310,11 +311,60 @@ separate reasons. Also save `GET /api/migration/nzbdav/correlation` and its
 checksum for each batch. Its `unmatched-target` rows identify NZBs that imported
 but whose mapped file has no exact target; add them to the cumulative unlinked
 list with their correlation evidence. Do not discard these records merely
-because later batches continue. Reconcile the run, generate the plan for exact successes, apply and
+because later batches continue. Clean up confirmed failed imports as described
+below, then reconcile the run, generate the plan for exact successes, apply and
 validate those links, and acknowledge with the exact applied and validated
 counts. A batch with no exact matches has a zero-link plan and still needs its
 failure and correlation reports and acknowledgement. Ambiguous or duplicate
 matches still block the plan for review.
+
+### Clean up confirmed failed imports
+
+Start `cleanup-failed-imports` with `--wait-for-terminal true` after connecting
+and scanning a batch, before submitting it. The command waits for the terminal
+failure report, saves it with a SHA-256 sidecar, and then performs cleanup.
+Keep the command running through the batch. Alternatively, save the report
+manually and run the same command without `--wait-for-terminal` after the batch
+is terminal. Run cleanup before connecting another batch. It re-reads the
+current terminal report from
+InfiniDysk, verifies the checksummed package and mapped inventory, confirms
+that each legacy NzbDav item still owns exactly the expected library link, and
+requires exactly one Radarr or Sonarr media-file match. For each confirmed
+`failed` submission it calls NzbDav's supported file-delete API, removes the
+matching Arr file record, and requests a movie or episode search. All selected
+mapped files in a failed release are covered. `evicted` submissions require
+manual reconciliation because disappearance from the queue and history does not
+prove an import failure.
+
+Keep NzbDav library mapping changes paused during cleanup. The command checks
+every candidate before the first deletion. Give it an Arr root that matches the
+paths *Arr stores for the source library. Supply enabled Radarr/Sonarr instances
+in a private JSON file with `radarrInstances` and `sonarrInstances` arrays whose
+entries contain `host`, `apiKey`, and `enabled`. Keep the file and all three API
+keys out of shell history and reports. The legacy database credential remains
+SELECT-only; deletion goes through NzbDav's API.
+
+```bash
+dotnet run --project tools/NzbDavMigration -c Release -- \
+  cleanup-failed-imports \
+  --failures "$RUN/plex/batches/batch-0001/import-failures.json" \
+  --package "$RUN/plex/batches/batch-0001/package" \
+  --mapped-inventory "$RUN/plex/initial-inventory" \
+  --source-root /mnt/plex \
+  --arr-root /mnt/plex \
+  --arr-config /path/to/private/arr-instances.json \
+  --infinidysk-url http://127.0.0.1:8080 \
+  --legacy-url http://127.0.0.1:LEGACY_PORT \
+  --journal "$RUN/plex/batches/batch-0001/failed-cleanup-journal.json" \
+  --wait-for-terminal true
+```
+
+Set `NZBDAV_MIGRATION_LEGACY_DB`, `NZBDAV_MIGRATION_LEGACY_API_KEY`, and
+`INFINIDYSK_MIGRATION_API_KEY` in the process environment before running it.
+Use the equivalent `special/` artifacts and root for a special batch. A
+completed journal entry is skipped on retry. If an external request has an
+uncertain outcome, the journal stops the retry at that item so its source and
+Arr state can be reconciled before another deletion or search.
 
 Use each root's own mapped and recoverable counts in its full-connect request;
 the combined count is an audit gate, not a batch-master denominator. For each
