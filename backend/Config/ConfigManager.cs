@@ -1384,7 +1384,7 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
         GetClampedInt(ConfigKeys.UsenetSharedStreamsGraceSeconds, 10, 0, 60);
 
     public int GetSharedStreamsSmallRangeMaxMb() =>
-        GetClampedInt(ConfigKeys.UsenetSharedStreamsSmallRangeMaxMb, 16, 1, 256);
+        GetClampedInt(ConfigKeys.UsenetSharedStreamsSmallRangeMaxMb, 32, 1, 256);
 
     public long GetSharedStreamsSmallRangeMaxBytes() =>
         (long)GetSharedStreamsSmallRangeMaxMb() * 1024L * 1024L;

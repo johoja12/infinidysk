@@ -208,7 +208,7 @@ stream per request.
 | Max regions per file | `usenet.shared-streams.max-entries-per-file` | `3` | Separate streams for far-apart offsets of the same file (1–8) |
 | Ring size (MiB) | `usenet.shared-streams.ring-mb` | `32` | Recently fetched bytes late joiners can read without refetching (4–256) |
 | Grace period (seconds) | `usenet.shared-streams.grace-seconds` | `10` | Keep a stream warm after the last reader disconnects (0–60) |
-| Small-range skip (MiB) | `usenet.shared-streams.small-range-max-mb` | `16` | Closed ranges at or below this size stay private unless they already overlap a live stream (1–256) |
+| Small-range skip (MiB) | `usenet.shared-streams.small-range-max-mb` | `32` | Closed ranges at or below this size stay private unless they already overlap a live stream (1–256) |
 
 HEAD requests never join a shared stream. Unsatisfiable ranges still return
 416 before any stream is opened. A declined attach uses today's private-stream

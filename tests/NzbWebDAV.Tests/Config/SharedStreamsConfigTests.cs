@@ -14,7 +14,7 @@ public class SharedStreamsConfigTests
         Assert.Equal(3, config.GetSharedStreamsMaxEntriesPerFile());
         Assert.Equal(32, config.GetSharedStreamsRingMb());
         Assert.Equal(10, config.GetSharedStreamsGraceSeconds());
-        Assert.Equal(16, config.GetSharedStreamsSmallRangeMaxMb());
+        Assert.Equal(32, config.GetSharedStreamsSmallRangeMaxMb());
     }
 
     [Theory]
