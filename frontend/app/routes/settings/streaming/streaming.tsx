@@ -980,7 +980,7 @@ export function StreamingSettings({
               inputMode="numeric"
               id="shared-streams-ring-mb-input"
               aria-describedby="shared-streams-ring-mb-help"
-              placeholder="16 (32 for NZB)"
+              placeholder="32"
               value={config["usenet.shared-streams.ring-mb"] ?? ""}
               onChange={(e) =>
                 setNewConfig({
@@ -1055,7 +1055,7 @@ export function StreamingSettings({
               inputMode="numeric"
               id="shared-streams-small-range-max-mb-input"
               aria-describedby="shared-streams-small-range-max-mb-help"
-              placeholder="32"
+              placeholder="16 (32 for NZB)"
               value={config["usenet.shared-streams.small-range-max-mb"] ?? ""}
               onChange={(e) =>
                 setNewConfig({
