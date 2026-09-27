@@ -63,6 +63,20 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     public int ActiveConnections => _live - _idleConnections.Count;
     public int AvailableConnections => Math.Max(0, EffectiveMaxConnections - ActiveConnections);
     internal bool IsDisposed => Volatile.Read(ref _disposed) == 1;
+    /// <summary>
+    /// True from a failed TCP/TLS/AUTHINFO open until a later open succeeds or the failure pacing
+    /// window (5 s to 60 s) lapses. Read-start warm-up leaves such a provider alone.
+    /// </summary>
+    internal bool IsHandshakeBackoffActive =>
+        Volatile.Read(ref _consecutiveHandshakeFailures) > 0
+        && GetTimestampMilliseconds() < Volatile.Read(ref _replacementPacingUntilMs);
+
+    internal void RecordWarmHandshakeFailure()
+    {
+        Interlocked.Increment(ref _handshakeFailures);
+        var consecutiveFailures = Interlocked.Increment(ref _consecutiveHandshakeFailures);
+        ArmReplacementPacing(GetHandshakeFailureBackoffMs(consecutiveFailures));
+    }
 
     /// <summary>
     /// Raised after live/idle/effective-max counts change. This is post-state telemetry:
@@ -86,6 +100,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     private readonly string _connectionOpenProvider;
     private readonly Action<Exception, bool>? _onWarmConnectionFailure;
     private readonly ProviderCircuitBreaker? _circuitBreaker;
+    private readonly Func<TimeSpan>? _warmFloorOpenTimeout;
 
     /* --------------------------------- state --------------------------------------- */
 
@@ -93,6 +108,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     private readonly PrioritizedSemaphore _gate;
     private readonly SemaphoreSlim _handshakeGate = new(MaxConcurrentHandshakes, MaxConcurrentHandshakes);
     private readonly CancellationTokenSource _sweepCts = new();
+    private readonly CancellationTokenSource _disposeCts = new();
     private readonly Task _sweeperTask; // keeps timer alive
     private readonly Lock _lifecycleLock = new();
     private TaskCompletionSource _connectionAvailability = CreateAvailabilitySignal();
@@ -101,6 +117,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     private int _pendingConnectionCreations;
     private int _handshakeOperations;
     private int _disposed; // 0 == false, 1 == true
+    private int _retired;
     private int _effectiveMaxConnections;
     private int? _learnedConnectionLimit;
     private long _nextReplacementHandshakeAtMs;
@@ -149,7 +166,8 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         Func<TimeSpan>? connectionOpenTimeout = null,
         string? connectionOpenProvider = null,
         Action<Exception, bool>? onWarmConnectionFailure = null,
-        ProviderCircuitBreaker? circuitBreaker = null)
+        ProviderCircuitBreaker? circuitBreaker = null,
+        Func<TimeSpan>? warmFloorOpenTimeout = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxConnections);
 
@@ -179,6 +197,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         _connectionOpenProvider = connectionOpenProvider ?? _diagnosticName;
         _onWarmConnectionFailure = onWarmConnectionFailure;
         _circuitBreaker = circuitBreaker;
+        _warmFloorOpenTimeout = warmFloorOpenTimeout;
         _gate = new PrioritizedSemaphore(maxConnections, maxConnections, priorityOdds);
         _sweeperTask = Task.Run(SweepLoop); // background idle-reaper
     }
@@ -198,7 +217,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     {
         if (openTimeout is not null
             && !callerCancellationToken.IsCancellationRequested
-            && !_sweepCts.IsCancellationRequested)
+            && !_disposeCts.IsCancellationRequested)
         {
             throw new ConnectionOpenTimeoutException(
                 _connectionOpenProvider,
@@ -379,7 +398,8 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         long? acquisitionStarted = null,
         TimeSpan? acquisitionWaitTimeout = null,
         ProviderCircuitBreaker.AcquisitionLease? acquisition = null,
-        bool retireIdleForFreshProbe = false
+        bool retireIdleForFreshProbe = false,
+        TimeSpan? openTimeoutOverride = null
     )
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -388,12 +408,12 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             : null;
         acquisition ??= ownedAcquisition;
         using var waiting = acquisitionWaitToken is { } suppliedWaitToken
-            ? CancellationTokenSource.CreateLinkedTokenSource(suppliedWaitToken, _sweepCts.Token)
+            ? CancellationTokenSource.CreateLinkedTokenSource(suppliedWaitToken, _disposeCts.Token)
             : acquisition is { } admitted
                 ? CancellationTokenSource.CreateLinkedTokenSource(
-                    cancellationToken, _sweepCts.Token, admitted.CircuitCancellationToken)
+                    cancellationToken, _disposeCts.Token, admitted.CircuitCancellationToken)
                 : CancellationTokenSource.CreateLinkedTokenSource(
-                    cancellationToken, _sweepCts.Token);
+                    cancellationToken, _disposeCts.Token);
         var waitToken = waiting.Token;
         if (acquisitionWaitToken is null
             && acquisitionWaitTimeout is { } waitTimeout
@@ -411,7 +431,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         void ThrowIfAcquisitionWaitCancelled(string phase)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            _sweepCts.Token.ThrowIfCancellationRequested();
+            _disposeCts.Token.ThrowIfCancellationRequested();
             acquisition?.ThrowIfRejected();
             if (waitToken.IsCancellationRequested && acquisitionWaitTimeout is { } timeout)
                 throw new ProviderTransferAdmissionTimeoutException(
@@ -496,7 +516,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         // Need a fresh connection. Pace handshakes so a cold burst of borrowers
         // does not open dozens of TLS sessions in parallel. While waiting, other
         // connections may return to the idle stack — prefer those over a new handshake.
-        var openTimeout = _connectionOpenTimeout?.Invoke();
+        var openTimeout = openTimeoutOverride ?? _connectionOpenTimeout?.Invoke();
         var openStarted = Stopwatch.GetTimestamp();
         long? factoryStarted = null;
         var openPhase = "HandshakeQueue";
@@ -612,11 +632,11 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                 openPhase = "Factory";
                 factoryStarted = Stopwatch.GetTimestamp();
                 factoryLifetime = CancellationTokenSource.CreateLinkedTokenSource(
-                    cancellationToken, _sweepCts.Token);
+                    cancellationToken, _disposeCts.Token);
                 if (openTimeout is { } timeout)
                     factoryLifetime.CancelAfter(timeout);
                 factoryTask = _factory(factoryLifetime.Token).AsTask();
-                conn = _connectionOpenTimeout is null
+                conn = openTimeout is null
                     ? await factoryTask.ConfigureAwait(false)
                     : await factoryTask.WaitAsync(factoryLifetime.Token).ConfigureAwait(false);
             }
@@ -634,7 +654,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 #pragma warning disable CA2025 // The late-completion observer retains cleanup ownership until the factory stops.
                     _ = ObserveLateFactoryCompletionAsync(
                         factoryTask, creationReserved, handshakeOwned: true,
-                        cancellationReason: _sweepCts.IsCancellationRequested ? "pool shutdown"
+                        cancellationReason: _disposeCts.IsCancellationRequested ? "pool shutdown"
                             : cancellationToken.IsCancellationRequested ? "caller cancellation"
                             : "connection-open deadline expired");
 #pragma warning restore CA2025
@@ -898,7 +918,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
 #pragma warning disable CA2025 // The late-completion observer retains cleanup ownership until the factory stops.
                         _ = ObserveLateFactoryCompletionAsync(
                             factoryTask, creationReserved: true, handshakeOwned: true,
-                            cancellationReason: _sweepCts.IsCancellationRequested ? "pool shutdown"
+                            cancellationReason: _disposeCts.IsCancellationRequested ? "pool shutdown"
                                 : cancellationToken.IsCancellationRequested ? "caller cancellation"
                                 : "connection-open deadline expired");
 #pragma warning restore CA2025
@@ -1580,7 +1600,8 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                            preferIdle: false,
                            cancellationToken: cancellationToken,
                            acquisitionStarted: acquisitionStarted,
-                           acquisitionWaitTimeout: TransferAdmissionFailoverContext.DefaultWaitTimeout)
+                           acquisitionWaitTimeout: TransferAdmissionFailoverContext.DefaultWaitTimeout,
+                           openTimeoutOverride: _warmFloorOpenTimeout?.Invoke())
                            .ConfigureAwait(false))
                 {
                     // Returning the lock to the pool establishes one idle warm connection.
@@ -1590,10 +1611,24 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             {
                 return;
             }
+            catch (Exception e) when (e is CircuitAdmissionRejectedException
+                or ProviderTransferAdmissionTimeoutException)
+            {
+                // Circuit admission and local acquisition waits are not provider failures.
+                return;
+            }
             catch (Exception e) when (e is not OutOfMemoryException)
             {
-                // Do not spin on a provider that is unavailable at startup. The next
-                // sweep retries the floor; connection-limit learning still applies.
+                // Do not spin: report a genuine open failure like explicit warm-up does,
+                // then leave the retry to the next sweep.
+                if (e is not OperationCanceledException
+                    && !cancellationToken.IsCancellationRequested
+                    && !IsDisposed)
+                {
+                    NotifyWarmConnectionFailure(
+                        e,
+                        e is ConnectionOpenTimeoutException timeout && timeout.FactoryStarted);
+                }
                 return;
             }
         }
@@ -1605,6 +1640,12 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
     {
         if (conn is IDisposable d)
             d.Dispose();
+    }
+
+    internal void Retire()
+    {
+        if (Interlocked.Exchange(ref _retired, 1) == 0)
+            _sweepCts.Cancel();
     }
 
     /* -------------------------- IAsyncDisposable ---------------------------------- */
@@ -1622,6 +1663,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             OnConnectionPoolChanged = null;
         }
 
+        await _disposeCts.CancelAsync().ConfigureAwait(false);
         await _sweepCts.CancelAsync().ConfigureAwait(false);
 
         try
@@ -1640,6 +1682,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         lock (_lifecycleLock)
         {
             _sweepCts.Dispose();
+            _disposeCts.Dispose();
             _gate.Dispose();
             if (Volatile.Read(ref _handshakeOperations) == 0)
                 _handshakeGate.Dispose();

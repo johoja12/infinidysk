@@ -25,6 +25,7 @@ public sealed class EffectiveStreamingConfigManifestTests
         Assert.Equal(30, document.Streaming.ReadTimeoutSeconds);
         Assert.Equal(60, document.Streaming.WriteTimeoutSeconds);
         Assert.Equal(8, document.Streaming.SegmentTimeoutSeconds);
+        Assert.Equal(5, document.Streaming.ConnectionOpenTimeoutSeconds);
         Assert.Equal(config.GetMaxDownloadConnections(), document.Connections.EffectiveTotalDownloadLimit);
         Assert.False(document.Connections.PerStreamModeEnabled);
         Assert.True(document.Connections.WarmConnectionsEnabled);
@@ -131,6 +132,39 @@ public sealed class EffectiveStreamingConfigManifestTests
         Assert.DoesNotContain("sentinel-strm-key", json);
         Assert.DoesNotContain("NZBDAV_CONFIG", json);
         Assert.DoesNotContain("usenet.segment-cache.path", json);
+    }
+
+    [Fact]
+    public void DisabledProvider_HasZeroEffectiveWarmConnectionFloor()
+    {
+        var config = new ConfigManager();
+        config.UpdateValues(
+        [
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.UsenetProviders,
+                ConfigValue = JsonSerializer.Serialize(new UsenetProviderConfig
+                {
+                    Providers =
+                    [
+                        new UsenetProviderConfig.ConnectionDetails
+                        {
+                            Type = ProviderType.Disabled,
+                            Host = "nntp.example",
+                            Port = 563,
+                            UseSsl = true,
+                            User = "user",
+                            Pass = "pass",
+                            MaxConnections = 50,
+                        },
+                    ],
+                }),
+            },
+        ]);
+
+        var document = EffectiveStreamingConfigManifest.Create(config);
+
+        Assert.Equal(0, Assert.Single(document.Providers).WarmConnectionFloor);
     }
 
     [Fact]

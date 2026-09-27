@@ -82,7 +82,10 @@ public sealed class MultiProviderNntpClientYencValidationTests
         file.Segments.Add(new NzbSegment { Bytes = 3, MessageId = "first", Number = 2 });
         file.Segments.Add(new NzbSegment
         {
-            Bytes = 3, MessageId = "last", Number = 8, FallbackMessageIds = ["alternate"],
+            Bytes = 3,
+            MessageId = "last",
+            Number = 8,
+            FallbackMessageIds = ["alternate"],
         });
 
         using (YencFileValidationContext.BeginSizeProbe(file))
@@ -114,6 +117,21 @@ public sealed class MultiProviderNntpClientYencValidationTests
         });
 
         Assert.Equal(17, YencFileValidationContext.CurrentExpectedTotalParts);
+    }
+
+    [Fact]
+    public void ValidationContext_Streaming_NormalizesBracketedIdsAndPrefersPrimaryIds()
+    {
+        using var validation = YencFileValidationContext.BeginStreaming(
+            ["<first>", "second"], [["second"], ["<alternate>"]]);
+        var context = Assert.IsType<YencFileValidationContext>(YencFileValidationContext.Current);
+
+        Assert.Equal(("<first>", (int?)2, (int?)null), context.GetRequestDetails("second"));
+        Assert.Equal(("<first>", (int?)2, (int?)null), context.GetRequestDetails("alternate"));
+        Assert.Equal(("<first>", (int?)1, (int?)null), context.GetRequestDetails("first"));
+        Assert.Equal(("<first>", (int?)1, (int?)null), context.GetRequestDetails("<first>"));
+        Assert.True(YencFileValidationContext.MatchesExpectedFile(
+            CreateHeader(1, 402) with { FileSize = 6_100_269, PartSize = 768_000 }, "first"));
     }
 
     [Theory]
@@ -195,6 +213,92 @@ public sealed class MultiProviderNntpClientYencValidationTests
 
         Assert.Equal([1, 2, 3, 4, 5, 6, 7, 8, 9], output.ToArray());
         Assert.True(primary.BodyRequestCount >= 3);
+        Assert.Equal(0, backup.BodyRequestCount);
+    }
+
+    [Theory]
+    [InlineData("s1", 1, 402, 6_100_269L, 0L, 768_000L, true)]
+    [InlineData("s9", 9, 402, 6_100_269L, 6_144_000L, 768_000L, true)]
+    [InlineData("s261", 261, 737, 9_863_319L, 199_680_000L, 5_000L, true)]
+    [InlineData("s2", 1, 402, 6_100_269L, 0L, 768_000L, false)]
+    [InlineData("s2", 2, 402, 6_100_269L, 700_000L, 768_000L, false)]
+    [InlineData("s1", 1, 931, 714_968_000L, 0L, 768_000L, false)]
+    [InlineData("s1", 557, 931, 318_803_968L, 187_525_120L, 768_000L, false)]
+    [InlineData(null, 1, 402, 6_100_269L, 0L, 768_000L, false)]
+    public void MatchesExpectedFile_AcceptsOnlySelfContradictoryTotalAtRequestedPosition(
+        string? requestedId, int partNumber, int totalParts, long fileSize, long partOffset, long partSize,
+        bool expected)
+    {
+        var segmentIds = Enumerable.Range(1, 261).Select(index => $"s{index}").ToArray();
+        using var validation = YencFileValidationContext.BeginStreaming(segmentIds, null);
+        var header = CreateHeader(partNumber, totalParts) with
+        {
+            FileSize = fileSize,
+            PartOffset = partOffset,
+            PartSize = partSize,
+        };
+
+        Assert.Equal(expected, YencFileValidationContext.MatchesExpectedFile(header, requestedId));
+    }
+
+    [Fact]
+    public void MatchesExpectedFile_WithoutSegmentIdentity_KeepsStrictTotalValidation()
+    {
+        using var validation = YencFileValidationContext.Begin(261);
+        var header = CreateHeader(1, 402) with { FileSize = 6_100_269, PartSize = 768_000 };
+
+        Assert.False(YencFileValidationContext.MatchesExpectedFile(header, "s1"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NzbFileStream_ObfuscatedYencTotals_StreamFromPrimaryProvider(bool seekFirst)
+    {
+        var segments = new Dictionary<string, byte[]>
+        {
+            ["first"] = [1, 2, 3],
+            ["second"] = [4, 5, 6],
+            ["third"] = [7, 8, 9],
+        };
+        var headers = segments.Keys.Select((segmentId, index) => (segmentId, index)).ToDictionary(
+            entry => entry.segmentId,
+            entry => CreateHeader(entry.index + 1, totalParts: 402) with
+            {
+                FileSize = 5,
+                PartOffset = entry.index * 3,
+            });
+        using var primary = new FakeNntpClient(segments, useCachedYencStreams: true, yencHeaders: headers);
+        using var backup = new FakeNntpClient(segments, useCachedYencStreams: true);
+        using var client = CreateProviderClient(primary, backup);
+        var previousBudget = NzbWebDAV.WebDav.Requests.RangeContext.GetReadBudget();
+        NzbWebDAV.WebDav.Requests.RangeContext.SetReadBudget(seekFirst ? 1 : previousBudget);
+        try
+        {
+            await using var stream = new NzbFileStream(
+                segments.Keys.ToArray(), fileSize: 9, client,
+                articleBufferSize: seekFirst ? 0 : 4,
+                usePipelinedBodyRequests: !seekFirst);
+            if (seekFirst)
+            {
+                stream.Seek(4, SeekOrigin.Begin);
+                var buffer = new byte[1];
+                Assert.Equal(1, await stream.ReadAsync(buffer));
+                Assert.Equal(5, buffer[0]);
+            }
+            else
+            {
+                using var output = new MemoryStream();
+                await stream.CopyToAsync(output);
+                Assert.Equal([1, 2, 3, 4, 5, 6, 7, 8, 9], output.ToArray());
+            }
+        }
+        finally
+        {
+            NzbWebDAV.WebDav.Requests.RangeContext.SetReadBudget(previousBudget);
+        }
+
+        Assert.True(primary.BodyRequestCount >= 1);
         Assert.Equal(0, backup.BodyRequestCount);
     }
 

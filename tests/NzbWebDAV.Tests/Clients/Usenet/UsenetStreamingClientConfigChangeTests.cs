@@ -12,6 +12,105 @@ namespace NzbWebDAV.Tests.Clients.Usenet;
 
 public class UsenetStreamingClientConfigChangeTests
 {
+    [Theory]
+    [InlineData(1, 10)]
+    [InlineData(3, 10)]
+    [InlineData(10, 10)]
+    [InlineData(15, 15)]
+    public void ResolveWarmFloorOpenTimeout_IsAtLeastTenSeconds(int configuredSeconds, int expectedSeconds)
+    {
+        var resolved = UsenetStreamingClient.ResolveWarmFloorOpenTimeout(TimeSpan.FromSeconds(configuredSeconds));
+
+        Assert.Equal(TimeSpan.FromSeconds(expectedSeconds), resolved);
+    }
+
+    [Fact]
+    public void DisabledProvider_OpensNoWarmConnections_WhileWarmConnectionsEnabled()
+    {
+        var config = new ConfigManager();
+        config.UpdateValues([ProviderItem(ProviderType.Disabled, maxConnections: 50, nickname: "disabled-remote")]);
+        Assert.True(config.IsWarmConnectionsEnabled());
+
+        using var metricsWriter = new MetricsWriter();
+        using var client = CreateStreamingClient(config, metricsWriter);
+
+        var provider = Assert.Single(client.GetProviderClientsForTests());
+        Assert.Equal(ProviderType.Disabled, provider.ProviderType);
+        Assert.Equal(0, provider.WarmConnectionFloor);
+
+        var snapshot = Assert.Single(client.GetProviderConnectionSnapshots());
+        Assert.Equal(0, snapshot.LiveConnections);
+        Assert.Equal(0, snapshot.IdleConnections);
+    }
+
+    [Theory]
+    [InlineData(ProviderType.Pooled, 2)]
+    [InlineData(ProviderType.BackupAndStats, 2)]
+    [InlineData(ProviderType.BackupOnly, 2)]
+    [InlineData(ProviderType.Disabled, 0)]
+    public void ResolveWarmConnectionFloor_SkipsOnlyDisabledProviders(ProviderType type, int expectedFloor)
+    {
+        var config = new ConfigManager();
+        Assert.True(config.IsWarmConnectionsEnabled());
+
+        var floor = UsenetStreamingClient.ResolveWarmConnectionFloor(config, MakeProvider(type, maxConnections: 50));
+
+        Assert.Equal(expectedFloor, floor);
+    }
+
+    [Theory]
+    [InlineData(1, 1)]
+    [InlineData(2, 2)]
+    [InlineData(12, 2)]
+    [InlineData(50, 2)]
+    public void GetWarmConnectionsFloor_DefaultsToTwoCappedByProviderWidth(int maxConnections, int expectedFloor)
+    {
+        var config = new ConfigManager();
+
+        Assert.Equal(expectedFloor, config.GetWarmConnectionsFloor(maxConnections));
+    }
+
+    [Theory]
+    [InlineData("6", 50, 6)]
+    [InlineData("99", 50, 50)]
+    [InlineData("0", 50, 1)]
+    [InlineData("-3", 50, 1)]
+    public void GetWarmConnectionsFloor_ExplicitValueIsClampedToProviderWidth(
+        string configured, int maxConnections, int expectedFloor)
+    {
+        var config = new ConfigManager();
+        config.UpdateValues(
+        [
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.UsenetWarmConnectionsFloor,
+                ConfigValue = configured,
+            },
+        ]);
+
+        Assert.Equal(expectedFloor, config.GetWarmConnectionsFloor(maxConnections));
+    }
+
+    [Theory]
+    [InlineData(ProviderType.Pooled)]
+    [InlineData(ProviderType.Disabled)]
+    public void ResolveWarmConnectionFloor_ReturnsZeroWhenWarmConnectionsDisabled(ProviderType type)
+    {
+        var config = new ConfigManager();
+        config.UpdateValues(
+        [
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.UsenetWarmConnectionsEnabled,
+                ConfigValue = "false",
+            },
+        ]);
+
+        var floor = UsenetStreamingClient.ResolveWarmConnectionFloor(config, MakeProvider(type, maxConnections: 50));
+
+        Assert.Equal(0, floor);
+    }
+
     [Fact]
     public void ProviderSave_DoesNotActivatePendingCacheMode()
     {
@@ -126,7 +225,10 @@ public class UsenetStreamingClientConfigChangeTests
             new StreamTraceBuffer(100),
             new ActiveReadRegistry());
 
-    private static ConfigItem ProviderItem() =>
+    private static ConfigItem ProviderItem(
+        ProviderType type = ProviderType.Pooled,
+        int maxConnections = 2,
+        string nickname = "timeout-lifecycle") =>
         new()
         {
             ConfigName = ConfigKeys.UsenetProviders,
@@ -136,16 +238,28 @@ public class UsenetStreamingClientConfigChangeTests
                 [
                     new UsenetProviderConfig.ConnectionDetails
                     {
-                        Type = ProviderType.Pooled,
+                        Type = type,
                         Host = "nntp.example",
                         Port = 563,
                         UseSsl = true,
                         User = "u",
                         Pass = "p",
-                        MaxConnections = 2,
-                        Nickname = "timeout-lifecycle",
+                        MaxConnections = maxConnections,
+                        Nickname = nickname,
                     },
                 ],
             }),
+        };
+
+    private static UsenetProviderConfig.ConnectionDetails MakeProvider(ProviderType type, int maxConnections) =>
+        new()
+        {
+            Type = type,
+            Host = "nntp.example",
+            Port = 563,
+            UseSsl = true,
+            User = "u",
+            Pass = "p",
+            MaxConnections = maxConnections,
         };
 }
