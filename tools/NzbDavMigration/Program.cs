@@ -43,6 +43,7 @@ internal static class NzbDavMigrationProgram
             await Console.Error.WriteLineAsync("       NzbDavMigration mapped-coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --blob-root PATH --master FILE_OR_DIR --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration sharded-coverage-report --inventory DIR --recovery DIR --blob-root PATH --library-root PATH --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration rollback-links --journal FILE");
+            await Console.Error.WriteLineAsync("       NzbDavMigration cleanup-failed-imports --failures FILE --package DIR --mapped-inventory DIR --source-root PATH --arr-root PATH --arr-config FILE --infinidysk-url URL --legacy-url URL --journal FILE [--wait-for-terminal true] (requires NZBDAV_MIGRATION_LEGACY_DB, NZBDAV_MIGRATION_LEGACY_API_KEY, and INFINIDYSK_MIGRATION_API_KEY)");
             await Console.Error.WriteLineAsync("       NzbDavMigration validate-links --journal FILE --output FILE [--ffprobe PATH] [--max-read-bytes N] [--timeout-seconds N]");
             await Console.Error.WriteLineAsync("       NzbDavMigration benchmark-links --selection FILE --plan FILE --output DIR --legacy-url URL --legacy-route KIND --infinidysk-url URL --infinidysk-route KIND [--legacy-root /mnt/plex] [--infinidysk-root /mnt/plex2] [--legacy-cache-root PATH] [--infinidysk-cache-root PATH] [--timeout-seconds N]");
             return args.Length == 0 ? 2 : 0;
@@ -72,6 +73,7 @@ internal static class NzbDavMigrationProgram
                 "mapped-coverage-report" => await MappedCoverageReportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "sharded-coverage-report" => await ShardedCoverageReportAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "rollback-links" => await RollbackLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
+                "cleanup-failed-imports" => await CleanupFailedImportsAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "validate-links" => await ValidateLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 "benchmark-links" => await BenchmarkLinksAsync(ParseOptions(args[1..])).ConfigureAwait(false),
                 _ => throw new InvalidDataException($"Unknown command '{args[0]}'."),
@@ -82,6 +84,22 @@ internal static class NzbDavMigrationProgram
             await Console.Error.WriteLineAsync(exception.Message);
             return 1;
         }
+    }
+
+    private static async Task<int> CleanupFailedImportsAsync(IReadOnlyDictionary<string, string> options)
+    {
+        await FailedImportCleanup.RunAsync(
+            Required(options, "--failures"),
+            Required(options, "--package"),
+            Required(options, "--mapped-inventory"),
+            Required(options, "--source-root"),
+            Required(options, "--arr-root"),
+            Required(options, "--arr-config"),
+            Required(options, "--infinidysk-url"),
+            Required(options, "--legacy-url"),
+            Required(options, "--journal"),
+            bool.Parse(Optional(options, "--wait-for-terminal") ?? "false")).ConfigureAwait(false);
+        return 0;
     }
 
     private static async Task<int> CatalogueListAsync(IReadOnlyDictionary<string, string> options)

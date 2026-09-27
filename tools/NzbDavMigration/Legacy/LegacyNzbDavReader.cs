@@ -236,6 +236,50 @@ public sealed class LegacyNzbDavReader : ILegacyMappedBatchReader
             throw new InvalidDataException("Planned source link is no longer a unique, unbroken LocalLinks mapping.");
     }
 
+    public async Task AssertOnlyMappedLinkAsync(
+        Guid davItemId,
+        string expectedPath,
+        CancellationToken cancellationToken = default)
+    {
+        var connectionString = Environment.GetEnvironmentVariable(ConnectionEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(connectionString))
+            throw new InvalidOperationException($"{ConnectionEnvironmentVariable} is required.");
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginReadOnlyTransactionAsync(connection, cancellationToken)
+            .ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            "SELECT \"LinkPath\", \"IsBroken\" FROM \"LocalLinks\" WHERE \"DavItemId\" = @id",
+            connection, transaction);
+        command.Parameters.AddWithValue("id", davItemId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
+            || reader.GetString(0) != expectedPath || reader.GetBoolean(1)
+            || await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            throw new InvalidDataException("The NzbDav item no longer owns exactly the planned library link.");
+    }
+
+    public async Task AssertMappedLinkAbsentAsync(
+        Guid davItemId,
+        string linkPath,
+        CancellationToken cancellationToken = default)
+    {
+        var connectionString = Environment.GetEnvironmentVariable(ConnectionEnvironmentVariable);
+        if (string.IsNullOrWhiteSpace(connectionString))
+            throw new InvalidOperationException($"{ConnectionEnvironmentVariable} is required.");
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        await using var transaction = await BeginReadOnlyTransactionAsync(connection, cancellationToken)
+            .ConfigureAwait(false);
+        await using var command = new NpgsqlCommand(
+            "SELECT 1 FROM \"LocalLinks\" WHERE \"DavItemId\" = @id OR \"LinkPath\" = @path LIMIT 1",
+            connection, transaction);
+        command.Parameters.AddWithValue("id", davItemId);
+        command.Parameters.AddWithValue("path", linkPath);
+        if (await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not null)
+            throw new InvalidDataException("Legacy NzbDav still has the deleted item's library mapping.");
+    }
+
     private static async Task<NpgsqlTransaction> BeginReadOnlyTransactionAsync(
         NpgsqlConnection connection,
         CancellationToken cancellationToken)
