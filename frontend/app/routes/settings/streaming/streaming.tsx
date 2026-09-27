@@ -1069,8 +1069,8 @@ export function StreamingSettings({
               id="shared-streams-small-range-max-mb-help"
             >
               Closed ranges at or below this size use a private stream unless they already overlap a
-              live shared stream (1–256 MiB). Defaults: 32 MiB for direct NZB files and 16 MiB
-              for other files. An entered value applies to all file types.
+              live shared stream (1–256 MiB). Defaults: 32 MiB for direct NZB files and 16 MiB for
+              other files. An entered value applies to all file types.
             </p>
           </div>
         </ManagedSetting>
