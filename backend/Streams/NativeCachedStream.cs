@@ -92,12 +92,12 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     }
 
     public override ValueTask<int> ReadAsync(Memory<byte> destination, CancellationToken cancellationToken = default) =>
-        ReadCoreAsync(destination, cancellationToken, completeBlock: false);
+        ReadCoreAsync(destination, completeBlock: false, cancellationToken);
 
     internal ValueTask<int> ReadWarmProbeAsync(Memory<byte> destination, CancellationToken cancellationToken) =>
-        ReadCoreAsync(destination, cancellationToken, completeBlock: true);
+        ReadCoreAsync(destination, completeBlock: true, cancellationToken);
 
-    private async ValueTask<int> ReadCoreAsync(Memory<byte> destination, CancellationToken cancellationToken, bool completeBlock)
+    private async ValueTask<int> ReadCoreAsync(Memory<byte> destination, bool completeBlock, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         LastReadCacheable = false;
