@@ -1383,11 +1383,12 @@ public class ConfigManager : IConfigReader, IConfigUpdater, IConfigChangeSource
     public int GetSharedStreamsGraceSeconds() =>
         GetClampedInt(ConfigKeys.UsenetSharedStreamsGraceSeconds, 10, 0, 60);
 
-    public int GetSharedStreamsSmallRangeMaxMb() =>
-        GetClampedInt(ConfigKeys.UsenetSharedStreamsSmallRangeMaxMb, 16, 1, 256);
+    public int GetSharedStreamsSmallRangeMaxMb(DavItem.ItemSubType? itemSubType = null) =>
+        GetClampedInt(ConfigKeys.UsenetSharedStreamsSmallRangeMaxMb,
+            itemSubType == DavItem.ItemSubType.NzbFile ? 32 : 16, 1, 256);
 
-    public long GetSharedStreamsSmallRangeMaxBytes() =>
-        (long)GetSharedStreamsSmallRangeMaxMb() * 1024L * 1024L;
+    public long GetSharedStreamsSmallRangeMaxBytes(DavItem.ItemSubType? itemSubType = null) =>
+        (long)GetSharedStreamsSmallRangeMaxMb(itemSubType) * 1024L * 1024L;
 
     private int GetClampedInt(string key, int defaultValue, int min, int max)
     {

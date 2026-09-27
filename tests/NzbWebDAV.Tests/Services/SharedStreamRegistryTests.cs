@@ -57,6 +57,26 @@ public class SharedStreamRegistryTests
     }
 
     [Fact]
+    public async Task ThirtyTwoMiBRange_UsesPrivateForNzbButSharedForMultipartByDefault()
+    {
+        var config = Config((ConfigKeys.UsenetSharedStreamsRingMb, "4"));
+        var payload = Payload(33 * 1024 * 1024);
+        var nzb = new MemoryStreamSource(payload, itemSubType: DavItem.ItemSubType.NzbFile);
+        var multipart = new MemoryStreamSource(payload, itemSubType: DavItem.ItemSubType.MultipartFile);
+        var (registry, tracker, _) = CreateRegistry(config);
+        await using var registryDispose = registry;
+        const long rangeEnd = 32L * 1024 * 1024 - 1;
+
+        Assert.Null(await registry.TryAttachAsync(
+            "/nzb.mkv", 0, rangeEnd, nzb.FileSize, nzb, NoFallback, CancellationToken.None));
+        var attached = await registry.TryAttachAsync(
+            "/multipart.mkv", 0, rangeEnd, multipart.FileSize, multipart, NoFallback, CancellationToken.None);
+        Assert.NotNull(attached);
+        await attached!.Stream.DisposeAsync();
+        Assert.Equal(1, tracker.Snapshot().SharedEntriesCreated);
+    }
+
+    [Fact]
     public async Task OpeningEntry_CountsTowardCaps_AndIsNotAttachable()
     {
         var opened = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -338,12 +358,14 @@ public class SharedStreamRegistryTests
 
     private sealed class MemoryStreamSource(
         byte[] data,
-        Func<CancellationToken, Task>? beforeOpen = null) : IDetachedStreamSource
+        Func<CancellationToken, Task>? beforeOpen = null,
+        DavItem.ItemSubType? itemSubType = null) : IDetachedStreamSource
     {
         private readonly string _uniqueKey = Guid.NewGuid().ToString();
         public byte[] Data => data;
         public long FileSize => data.Length;
         public SharedContentIdentity ContentIdentity => new(_uniqueKey, null, FileSize);
+        public DavItem.ItemSubType? ItemSubType => itemSubType;
         public int OpenCount;
 
         public async Task<DetachedStreamLease> GetDetachedReadableStreamAsync(CancellationToken cancellationToken)

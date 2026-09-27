@@ -16,6 +16,11 @@ internal enum StreamStartupPhase
     RemainderFactoryFailed,
     PrefixDiscard,
     RemainderWait,
+    NativeIdentity,
+    NativeCacheProbe,
+    NativeSourceFirstRead,
+    NativeFill,
+    NativeSeekBypass,
 }
 
 /// <summary>
@@ -63,6 +68,11 @@ internal static class StreamStartupTrace
         StreamStartupPhase.RemainderFactoryFailed => "remainder-factory-failed",
         StreamStartupPhase.PrefixDiscard => "prefix-discard",
         StreamStartupPhase.RemainderWait => "remainder-wait",
+        StreamStartupPhase.NativeIdentity => "native-identity",
+        StreamStartupPhase.NativeCacheProbe => "native-cache-probe",
+        StreamStartupPhase.NativeSourceFirstRead => "native-source-first-read",
+        StreamStartupPhase.NativeFill => "native-fill",
+        StreamStartupPhase.NativeSeekBypass => "native-seek-bypass",
         _ => throw new ArgumentOutOfRangeException(nameof(phase), phase, "Unknown startup phase."),
     };
 }

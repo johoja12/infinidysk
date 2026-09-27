@@ -1055,7 +1055,7 @@ export function StreamingSettings({
               inputMode="numeric"
               id="shared-streams-small-range-max-mb-input"
               aria-describedby="shared-streams-small-range-max-mb-help"
-              placeholder="16"
+              placeholder="16 (32 for NZB)"
               value={config["usenet.shared-streams.small-range-max-mb"] ?? ""}
               onChange={(e) =>
                 setNewConfig({
@@ -1069,7 +1069,8 @@ export function StreamingSettings({
               id="shared-streams-small-range-max-mb-help"
             >
               Closed ranges at or below this size use a private stream unless they already overlap a
-              live shared stream (1–256 MiB, default 16).
+              live shared stream (1–256 MiB). Defaults: 32 MiB for direct NZB files and 16 MiB for
+              other files. An entered value applies to all file types.
             </p>
           </div>
         </ManagedSetting>

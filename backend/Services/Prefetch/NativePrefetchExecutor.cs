@@ -108,7 +108,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
                     var count = Math.Min(NativeCacheStore.BlockSize, stream.Length - position);
                     if (!await spend(count).ConfigureAwait(false)) throw new PrefetchDeferredException("Daily warming budget exhausted or foreground playback has priority.");
                     stream.Position = position;
-                    if (await stream.ReadAsync(probe, ct).ConfigureAwait(false) != 1 || !stream.LastReadCacheable || !stream.IsSourceCurrent
+                    if (await stream.ReadWarmProbeAsync(probe, ct).ConfigureAwait(false) != 1 || !stream.LastReadCacheable || !stream.IsSourceCurrent
                         || await store.FindNextMissingOffsetAsync(stream.Identity, position, Math.Min(position + count, chunkEnd), ct).ConfigureAwait(false) == position)
                         throw new PrefetchDeferredException("Source bytes were not verified or the cache could not commit this range.", countsAsFailure: true);
                     progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
