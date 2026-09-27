@@ -6,6 +6,7 @@ using NzbWebDAV.Streams;
 using System.Security.Cryptography;
 using Microsoft.Data.Sqlite;
 using Serilog;
+using System.Diagnostics;
 
 namespace NzbWebDAV.Services.NativeCache;
 
@@ -123,7 +124,10 @@ public sealed class NativeCacheService : IAsyncDisposable
         IDisposable? admission = admitted ? new AdmissionLease(_bufferSlots, watch) : watch;
         try
         {
+            var identityStarted = Stopwatch.GetTimestamp();
             var current = await GetCurrentIdentityAsync(item, blobId, watch, cancellationToken).ConfigureAwait(false);
+            StreamStartupTrace.TryRecord(StreamStartupPhase.NativeIdentity,
+                elapsed: Stopwatch.GetElapsedTime(identityStarted));
             if (current is { } cached)
             {
                 if (!admitted)

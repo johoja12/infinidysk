@@ -166,6 +166,70 @@ public sealed class NativeCachedStreamTests : IDisposable
         Assert.Equal(3, await hit.ReadAsync(new byte[3]));
     }
 
+    [Fact]
+    public async Task ColdAlignedRead_ReturnsPrefixBeforeTheRestOfTheBlock_ThenPublishesVerifiedFill()
+    {
+        await using var store = CreateStore();
+        var bytes = new byte[NativeCacheStore.BlockSize];
+        new Random(81).NextBytes(bytes);
+        var reads = new List<(long Offset, int Count)>();
+        var id = new NativeCacheIdentity("incremental", "v1", bytes.Length);
+        await using (var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(new TrackedSource(bytes, reads)), () => true))
+        {
+            var first = new byte[64 * 1024];
+            Assert.Equal(first.Length, await stream.ReadAsync(first));
+            Assert.Equal(bytes.AsSpan(0, first.Length).ToArray(), first);
+            Assert.Equal([(0, first.Length)], reads);
+            Assert.Equal(0, await store.GetCoverageAsync(id));
+            var second = new byte[64 * 1024];
+            Assert.Equal(second.Length, await stream.ReadAsync(second));
+            Assert.Equal(bytes.AsSpan(first.Length, second.Length).ToArray(), second);
+            Assert.Equal([(0, first.Length), (first.Length, bytes.Length - first.Length)], reads);
+            Assert.Equal(bytes.Length, await store.GetCoverageAsync(id));
+            var rest = new byte[bytes.Length - first.Length - second.Length];
+            await stream.ReadExactlyAsync(rest);
+            Assert.Equal(bytes.AsSpan(first.Length + second.Length).ToArray(), rest);
+        }
+        Assert.Equal(bytes.Length, await store.GetCoverageAsync(id));
+    }
+
+    [Fact]
+    public async Task ColdUnalignedSeek_ReadsRequestedOffsetWithoutFetchingEarlierBytes()
+    {
+        await using var store = CreateStore();
+        var bytes = new byte[NativeCacheStore.BlockSize + 37];
+        new Random(82).NextBytes(bytes);
+        var reads = new List<(long Offset, int Count)>();
+        var id = new NativeCacheIdentity("seek", "v1", bytes.Length);
+        await using var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(new TrackedSource(bytes, reads)), () => true);
+        stream.Position = NativeCacheStore.BlockSize / 2;
+        var first = new byte[64 * 1024];
+        Assert.Equal(first.Length, await stream.ReadAsync(first));
+        Assert.Equal(bytes.AsSpan((int)stream.Position - first.Length, first.Length).ToArray(), first);
+        Assert.Equal([(NativeCacheStore.BlockSize / 2, first.Length)], reads);
+        Assert.Equal(0, await store.GetCoverageAsync(id));
+    }
+
+    [Fact]
+    public async Task VerifiedFill_KeepsProofContextAcrossBlockBoundary()
+    {
+        await using var store = CreateStore();
+        var bytes = new byte[NativeCacheStore.BlockSize + 7];
+        new Random(83).NextBytes(bytes);
+        var id = new NativeCacheIdentity("proof-context", "v1", bytes.Length);
+        var source = new ContextAwareSource(bytes);
+        await using var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(source), () => true);
+        var actual = new byte[bytes.Length];
+        await stream.ReadExactlyAsync(actual);
+        Assert.Equal(bytes, actual);
+        Assert.Equal(bytes.Length, await store.GetCoverageAsync(id));
+        Assert.All(source.PositionsInProofContext, Assert.True);
+        Assert.All(source.ReadsInProofContext, Assert.True);
+    }
+
     [Theory]
     [InlineData(false, true)]
     [InlineData(true, false)]
@@ -289,6 +353,28 @@ public sealed class NativeCachedStreamTests : IDisposable
             var count = await base.ReadAsync(buffer, cancellationToken);
             reads.Add((offset, count));
             return count;
+        }
+    }
+
+    private sealed class ContextAwareSource(byte[] bytes) : MemoryStream(bytes), ICacheReadEvidence
+    {
+        public bool LastReadCacheable => true;
+        public List<bool> PositionsInProofContext { get; } = [];
+        public List<bool> ReadsInProofContext { get; } = [];
+        public override long Position
+        {
+            get => base.Position;
+            set
+            {
+                PositionsInProofContext.Add(NativeCacheReadContext.IsActive);
+                base.Position = value;
+            }
+        }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            ReadsInProofContext.Add(NativeCacheReadContext.IsActive);
+            return base.ReadAsync(buffer, cancellationToken);
         }
     }
 
