@@ -1233,6 +1233,7 @@ export type HealthCheckQueueItem = {
   releaseDate: string | null;
   lastHealthCheck: string | null;
   nextHealthCheck: string | null;
+  countsTowardUncheckedCount: boolean;
   progress?: number | null;
 };
 
@@ -1300,8 +1301,10 @@ export type OverviewStatsResponse = {
   };
   throughput: ThroughputPoint[];
   throughputBucketSizeMs: number;
+  peakFetchBytesPerSec?: number;
   totalArticles: number;
   totalClientArticles: number;
+  totalQueueArticles: number;
   totalMisses: number;
   totalErrors: number;
   totalBytesFetched: number;
@@ -1452,6 +1455,7 @@ export type ThroughputPoint = {
   bucket: number;
   articles: number;
   clientArticles: number;
+  queueArticles: number;
   misses: number;
   errors: number;
   bytesServed: number;
@@ -1474,6 +1478,10 @@ export type ProviderRow = {
   errors: number;
   retries: number;
   speedMbPerSec?: number | null | undefined;
+  peakMbPerSec?: number | null;
+  activeAverageMbPerSec?: number | null;
+  peakSpeedSpark?: (number | null)[];
+  sampledSpeedSeries?: ProviderSampledSpeedPoint[];
   speedSpark?: number[];
   speedSeries?: ProviderSpeedPoint[];
   avgDurationMs: number;
@@ -1488,6 +1496,13 @@ export type ProviderRow = {
   tripCount?: number | undefined;
   failureCount?: number | undefined;
   articleMissCount?: number | undefined;
+  providerType?: string | undefined;
+};
+
+export type ProviderSampledSpeedPoint = {
+  bucket: number;
+  peakMbPerSec: number | null;
+  activeAverageMbPerSec: number | null;
 };
 
 export type ProviderCircuitBreakerRow = {
@@ -1498,6 +1513,7 @@ export type ProviderCircuitBreakerRow = {
   cooldownRemainingSeconds?: number | null | undefined;
   lastFailureReason?: string | null | undefined;
   tripCount?: number;
+  consecutiveTrips?: number;
   failureCount?: number;
   articleMissCount?: number;
 };
@@ -1546,6 +1562,7 @@ export type ActiveReadsMessage = {
 export type ActiveRead = {
   id: string;
   fileName: string;
+  parentDirectoryName?: string | null;
   path: string;
   startedAt: number;
   lastActivityAt: number;

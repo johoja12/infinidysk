@@ -22,7 +22,7 @@ Add one or more accounts. Each provider supports:
 | Transfer Connections | Hard cap for concurrent `BODY` / `ARTICLE` work | blank = legacy shared pool |
 | Metadata Capacity | Read-only base-to-burst range calculated from the two limits | shown when Transfer Connections is set |
 | Pipeline depth | Per-provider override when pipelining on | blank = global `8` |
-| Type | Disabled / Pool Connections / Backup Only | Pool |
+| Type | Disabled / Pool Connections / Backup Only. A disabled provider is never contacted — no connections are opened or kept warm | Pool |
 | Use SSL | TLS for NNTP | on |
 | Skip TLS certificate verification | Accept an invalid provider certificate | off |
 | Data Cap | Block-account limit; auto-pauses near ~95% | uncapped |
@@ -142,7 +142,7 @@ mechanics and the header indicator.
 | Control | Config key | Default | Effect |
 |---------|------------|---------|--------|
 | Warm connections | `usenet.warm-connections.enabled` | on | Keep pre-connected sockets ready per provider |
-| Warm floor | `usenet.warm-connections.floor` | auto | Idle sockets kept ready per provider; auto derives one sixth of Max Connections, clamped to 1–8 |
+| Warm floor | `usenet.warm-connections.floor` | `2` | Idle sockets kept ready per provider, capped at Max Connections. Before 1.5.0 the default derived one sixth of Max Connections, clamped to 1–8 |
 
 Changes take effect on the next provider save or restart — connection pools are not
 rebuilt when these keys change alone.

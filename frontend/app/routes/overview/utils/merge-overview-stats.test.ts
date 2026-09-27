@@ -13,6 +13,30 @@ function partial(
 }
 
 describe("mergeOverviewStats", () => {
+  it("applies live provider type changes and keeps the HTTP value when the live row omits it", () => {
+    const pooled = {
+      provider: "provider-1",
+      providerType: "Pooled",
+      articles: 5,
+      bytesFetched: 100,
+      errors: 0,
+      retries: 0,
+      avgDurationMs: 0,
+      errorRate: 0,
+      spark: [],
+    };
+    const breaker = { provider: "provider-1", circuitState: "closed" as const };
+
+    expect(
+      mergeProviderCircuitBreakers([pooled], [{ ...breaker, providerType: "BackupOnly" }])[0]
+        ?.providerType,
+    ).toBe("BackupOnly");
+    expect(
+      mergeProviderCircuitBreakers([{ ...pooled, providerType: "BackupOnly" }], [breaker])[0]
+        ?.providerType,
+    ).toBe("BackupOnly");
+  });
+
   it("merges window section without wiping static data", () => {
     const withStatic = mergeOverviewStats(
       EMPTY_OVERVIEW_STATS,
@@ -38,6 +62,7 @@ describe("mergeOverviewStats", () => {
         includedSections: ["window"],
         totalArticles: 99,
         totalClientArticles: 30,
+        totalQueueArticles: 20,
         totalMisses: 40,
         totalErrors: 2,
         throughput: [
@@ -45,6 +70,7 @@ describe("mergeOverviewStats", () => {
             bucket: 1,
             articles: 5,
             clientArticles: 3,
+            queueArticles: 1,
             misses: 2,
             errors: 0,
             bytesServed: 10,
@@ -62,10 +88,12 @@ describe("mergeOverviewStats", () => {
 
     expect(withWindow.totalArticles).toBe(99);
     expect(withWindow.totalClientArticles).toBe(30);
+    expect(withWindow.totalQueueArticles).toBe(20);
     expect(withWindow.totalMisses).toBe(40);
     expect(withWindow.totalErrors).toBe(2);
     expect(withWindow.throughput).toHaveLength(1);
     expect(withWindow.throughput[0]?.clientArticles).toBe(3);
+    expect(withWindow.throughput[0]?.queueArticles).toBe(1);
     expect(withWindow.catalogue.fileCount).toBe(42);
     expect(withWindow.indexers).toHaveLength(1);
     expect(withWindow.includedSections).toEqual(expect.arrayContaining(["static", "window"]));
@@ -81,6 +109,7 @@ describe("mergeOverviewStats", () => {
             bucket: 1,
             articles: 5,
             clientArticles: 4,
+            queueArticles: 0,
             misses: 1,
             errors: 0,
             bytesServed: 10,

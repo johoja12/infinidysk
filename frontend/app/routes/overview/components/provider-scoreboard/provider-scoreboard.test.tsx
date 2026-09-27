@@ -11,6 +11,9 @@ const provider = (speedMbPerSec: number | null): ProviderRow => ({
   errors: 0,
   retries: 0,
   speedMbPerSec,
+  peakMbPerSec: speedMbPerSec,
+  activeAverageMbPerSec: speedMbPerSec == null ? null : speedMbPerSec / 2,
+  peakSpeedSpark: speedMbPerSec == null ? [] : [speedMbPerSec],
   speedSpark: speedMbPerSec == null ? [] : [speedMbPerSec],
   avgDurationMs: 100,
   errorRate: 0,
@@ -18,7 +21,75 @@ const provider = (speedMbPerSec: number | null): ProviderRow => ({
 });
 
 describe("ProviderScoreboard", () => {
-  it("shows sustained speed and an em dash when speed is unavailable", () => {
+  it("does not mark pooled or disabled providers as backups", () => {
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <ProviderScoreboard
+          providers={[
+            { ...provider(1), provider: "pooled", providerType: "Pooled" },
+            { ...provider(1), provider: "disabled", providerType: "Disabled" },
+            { ...provider(1), provider: "unknown", providerType: undefined },
+          ]}
+          window="1h"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(markup).not.toContain(">Backup<");
+  });
+
+  it("marks backup-only providers with a Backup badge and role tooltip", () => {
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <ProviderScoreboard
+          providers={[{ ...provider(1), providerType: "BackupOnly" }]}
+          window="1h"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(markup).toContain(">Backup<");
+    expect(markup).toContain("Role: Backup only");
+  });
+
+  it("marks backup-and-stats providers with a Backup badge and distinct role tooltip", () => {
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <ProviderScoreboard
+          providers={[{ ...provider(1), providerType: "BackupAndStats" }]}
+          window="1h"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(markup).toContain(">Backup<");
+    expect(markup).toContain("Role: Backup and stats");
+  });
+
+  it("keeps the backup badge separate from the circuit badge", () => {
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <ProviderScoreboard
+          providers={[
+            {
+              ...provider(1),
+              providerType: "BackupOnly",
+              circuitState: "open",
+              cooldownRemainingSeconds: 12,
+            },
+          ]}
+          window="1h"
+        />
+      </MemoryRouter>,
+    );
+
+    expect(markup).toContain(">Backup<");
+    expect(markup).toContain("Tripped · 12s");
+    expect(markup.indexOf(">Backup<")).toBeLessThan(markup.indexOf("Tripped"));
+    expect(markup).toContain("status-error");
+  });
+
+  it("shows peak and active average, with an em dash when unavailable", () => {
     const active = renderToStaticMarkup(
       <MemoryRouter>
         <ProviderScoreboard providers={[provider(12.34)]} window="1h" />
@@ -32,15 +103,49 @@ describe("ProviderScoreboard", () => {
 
     expect(active).toContain(">MB/s<");
     expect(active).toContain(">12.3<");
-    expect(active).toContain("not wall-clock aggregate bandwidth");
+    expect(active).toContain(">Peak<");
+    expect(active).toContain(">Active avg<");
+    expect(active).toContain(">6.2<");
+    expect(active).toContain("wholly idle intervals are excluded");
     expect(active).toContain('aria-label="Article share: 100%"');
     expect(idle).toContain(">—<");
+  });
+
+  it("does not relabel legacy request-duration estimates as sampled rates", () => {
+    const legacy = { ...provider(null), speedMbPerSec: 99.9 };
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <ProviderScoreboard providers={[legacy]} window="1h" />
+      </MemoryRouter>,
+    );
+    expect(markup).not.toContain(">99.9<");
+    expect(markup).toContain(">—<");
+  });
+
+  it("connects sparse throughput activity to the zero baseline like retries", () => {
+    const active = {
+      ...provider(4),
+      peakSpeedSpark: [null, 4, null],
+    };
+    const markup = renderToStaticMarkup(
+      <MemoryRouter>
+        <ProviderScoreboard providers={[active]} window="1h" />
+      </MemoryRouter>,
+    );
+
+    expect(markup).toContain(
+      'd="M0.0,20.0 L55.0,2.0 L110.0,20.0" fill="none" stroke="var(--color-secondary)"',
+    );
+    expect(markup).toContain(">4.0<");
+    expect(markup).toContain(">2.0<");
   });
 
   it("places the speed chart after the horizontal scroll wrapper", () => {
     const selected = {
       ...provider(2),
-      speedSeries: [{ bucket: 1_700_000_000_000, speedMbPerSec: 2.25, bytesFetched: 4_000 }],
+      sampledSpeedSeries: [
+        { bucket: 1_700_000_000_000, peakMbPerSec: 2.25, activeAverageMbPerSec: 1.5 },
+      ],
     };
     const markup = renderToStaticMarkup(
       <MemoryRouter>

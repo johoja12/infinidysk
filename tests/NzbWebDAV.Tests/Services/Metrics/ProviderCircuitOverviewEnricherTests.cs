@@ -1,3 +1,4 @@
+using System.Text.Json;
 using NzbWebDAV.Clients.Usenet.Models;
 using NzbWebDAV.Models;
 using NzbWebDAV.Services.Metrics;
@@ -31,9 +32,9 @@ public class ProviderCircuitOverviewEnricherTests
         var snapshots = new List<ProviderCircuitRuntimeSnapshot>
         {
             new(KeyA, "news.example", ProviderType.Pooled, new ProviderCircuitBreakerSnapshot(
-                ProviderCircuitState.Open, 42, "3 failures in 3-sample window", 1, 3, 0)),
+                ProviderCircuitState.Open, 42, "3 failures in 3-sample window", 1, 1, 3, 0)),
             new(KeyB, "backup.example", ProviderType.BackupOnly, new ProviderCircuitBreakerSnapshot(
-                ProviderCircuitState.Closed, null, null, 0, 0, 2)),
+                ProviderCircuitState.Closed, null, null, 0, 0, 0, 2)),
         };
         var labels = new Dictionary<string, string?>
         {
@@ -48,6 +49,7 @@ public class ProviderCircuitOverviewEnricherTests
         Assert.Equal("open", primary.CircuitState);
         Assert.Equal(42, primary.CooldownRemainingSeconds);
         Assert.Equal(10, primary.Articles);
+        Assert.Equal("Pooled", primary.ProviderType);
         Assert.Equal([0L, 1L], primary.ErrorSpark);
         Assert.Equal([2L, 0L], primary.RetrySpark);
         var seriesPoint = Assert.Single(primary.SpeedSeries);
@@ -60,6 +62,54 @@ public class ProviderCircuitOverviewEnricherTests
         Assert.Equal(0, backup.Articles);
         Assert.Equal("Backup", backup.Nickname);
         Assert.Equal(2, backup.ArticleMissCount);
+        Assert.Equal("BackupOnly", backup.ProviderType);
         Assert.Empty(backup.SpeedSeries);
+    }
+
+    [Fact]
+    public void EnrichProviders_UsesRuntimeProviderTypeForRole()
+    {
+        var providers = new List<ProviderOverviewRow> { new() { Provider = KeyA, Articles = 5 } };
+        var snapshots = new List<ProviderCircuitRuntimeSnapshot>
+        {
+            new(KeyA, "news.example", ProviderType.BackupAndStats, new ProviderCircuitBreakerSnapshot(
+                ProviderCircuitState.Closed, null, null, 0, 0, 0, 0)),
+            new(KeyB, "disabled.example", ProviderType.Disabled, new ProviderCircuitBreakerSnapshot(
+                ProviderCircuitState.Closed, null, null, 0, 0, 0, 0)),
+        };
+
+        var enriched = ProviderCircuitOverviewEnricher.EnrichProviders(providers, snapshots, new Dictionary<string, string?>());
+
+        var backup = enriched.Single(p => p.Provider == KeyA);
+        Assert.Equal("BackupAndStats", backup.ProviderType);
+        Assert.Equal(5, backup.Articles);
+        Assert.Equal("Disabled", enriched.Single(p => p.Provider == KeyB).ProviderType);
+    }
+
+    [Fact]
+    public void EnrichProviders_LeavesProviderTypeNullWithoutRuntimeSnapshot()
+    {
+        var enriched = ProviderCircuitOverviewEnricher.EnrichProviders(
+            [new ProviderOverviewRow { Provider = KeyA }],
+            [],
+            new Dictionary<string, string?>());
+
+        Assert.Null(Assert.Single(enriched).ProviderType);
+    }
+
+    [Fact]
+    public void ToLivePayload_IncludesConsecutiveTrips()
+    {
+        var snapshots = new List<ProviderCircuitRuntimeSnapshot>
+        {
+            new(KeyA, "news.example", ProviderType.Pooled, new ProviderCircuitBreakerSnapshot(
+                ProviderCircuitState.Open, 42, "connection refused", 5, 3, 8, 0)),
+        };
+
+        var payload = Assert.Single(ProviderCircuitOverviewEnricher.ToLivePayload(
+            snapshots, new Dictionary<string, string?> { [KeyA] = "Primary" }));
+        var json = JsonSerializer.SerializeToElement(payload);
+
+        Assert.Equal(3, json.GetProperty("consecutiveTrips").GetInt64());
     }
 }

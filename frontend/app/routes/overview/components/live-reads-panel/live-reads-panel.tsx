@@ -23,8 +23,9 @@ const HISTORY_LIMIT = 60;
 
 /**
  * Live "right now" panel — full-width rows refreshed via the ActiveReads WS
- * topic. Sizes to the first snapshot of reads, then freezes that height until
- * the next page load so later sessions scroll instead of stretching the card.
+ * topic. The card grows and shrinks with the current reads; past the list's
+ * height cap, rows scroll instead of stretching the card. Once its top scrolls
+ * above the reading area, its height stays fixed until the top returns.
  * When `paused`, the subscription is disabled so layout edit borders stay stable.
  */
 export function LiveReadsPanel({
@@ -36,7 +37,6 @@ export function LiveReadsPanel({
 }) {
   const [rows, setRows] = useState<LiveReadRow[]>([]);
   const [mockCount, setMockCount] = useState<number | null>(null);
-  const [snapshotReady, setSnapshotReady] = useState(false);
   // Track previous bytesRead per session for live MiB/s computation.
   const prevRef = useRef<Map<string, { bytes: number; at: number; rate: number }>>(new Map());
   // Per-session rate samples for the sparkline, keyed by session id.
@@ -47,7 +47,6 @@ export function LiveReadsPanel({
     if (count == null) return;
     setMockCount(count);
     setRows(mockLiveReadRows(count));
-    setSnapshotReady(true);
   }, []);
 
   useWebsocketTopic(
@@ -82,7 +81,6 @@ export function LiveReadsPanel({
         prevRef.current = next;
         historyRef.current = nextHistory;
         setRows(nextRows);
-        setSnapshotReady(true);
       } catch {
         /* ignore */
       }
@@ -90,54 +88,28 @@ export function LiveReadsPanel({
     { enabled: !paused && mockCount == null },
   );
 
-  return <LiveReadsPanelContent rows={rows} snapshotReady={snapshotReady} summary={summary} />;
+  return <LiveReadsPanelContent rows={rows} summary={summary} paused={paused} />;
 }
 
 export function LiveReadsPanelContent({
   rows,
-  snapshotReady = true,
   summary,
+  paused = false,
 }: {
   rows: LiveReadRow[];
-  snapshotReady?: boolean;
   summary?: ReactNode;
+  paused?: boolean;
 }) {
   const displayedRows = [...rows].sort((a, b) => b.read.startedAt - a.read.startedAt);
-  const cardRef = useRef<HTMLElement>(null);
-  const [lockedHeight, setLockedHeight] = useState<number | null>(null);
-
-  useLayoutEffect(() => {
-    if (!snapshotReady || lockedHeight != null) return;
-    const card = cardRef.current;
-    if (!card) return;
-
-    const lockFromCard = (): boolean => {
-      const height = card.getBoundingClientRect().height;
-      if (height < 1) return false;
-      setLockedHeight(height);
-      return true;
-    };
-
-    if (lockFromCard()) return;
-
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => {
-      if (lockFromCard()) observer.disconnect();
-    });
-    observer.observe(card);
-    return () => observer.disconnect();
-  }, [snapshotReady, lockedHeight]);
-
-  const heightLocked = lockedHeight != null;
+  const cardRef = useScrollHeightLock(paused);
 
   return (
     <section
       ref={cardRef}
       id="active-reads"
-      className={`card w-full min-w-0 scroll-mt-20 border border-base-content/10 bg-base-100 shadow-sm${heightLocked ? " overflow-hidden" : ""}`}
-      style={heightLocked ? { height: lockedHeight } : undefined}
+      className="card box-border w-full min-w-0 scroll-mt-20 overflow-hidden border border-base-content/10 bg-base-100 shadow-sm"
     >
-      <div className="card-body flex h-full min-h-0 flex-col gap-3 p-4">
+      <div className="card-body yes-scrollbar flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-4">
         <div className="flex shrink-0 items-center gap-2.5">
           <span className="status status-success animate-pulse" aria-hidden="true" />
           <h3 className="card-title m-0 text-base">Right now</h3>
@@ -151,17 +123,11 @@ export function LiveReadsPanelContent({
         {summary && <div className="shrink-0 border-b border-base-content/10 pb-3">{summary}</div>}
 
         {rows.length === 0 ? (
-          <p className="m-0 text-sm text-base-content/50">
+          <p className="m-0 shrink-0 text-sm text-base-content/50">
             No files are being read right now. Open a mounted file to see live progress here.
           </p>
         ) : (
-          <ul
-            className={
-              heightLocked
-                ? "yes-scrollbar m-0 min-h-0 w-full min-w-0 flex-1 list-none divide-y divide-base-content/10 overflow-x-hidden overflow-y-auto py-0 pr-4 pl-0"
-                : "m-0 w-full min-w-0 list-none divide-y divide-base-content/10 overflow-x-hidden py-0 pr-4 pl-0"
-            }
-          >
+          <ul className="yes-scrollbar m-0 max-h-80 min-h-0 w-full min-w-0 list-none divide-y divide-base-content/10 overflow-x-hidden overflow-y-auto py-0 pr-4 pl-0 [scrollbar-gutter:stable]">
             {displayedRows.map(({ read, rate, history }) => (
               <ReadRow key={read.id} read={read} rate={rate} history={history} />
             ))}
@@ -170,6 +136,70 @@ export function LiveReadsPanelContent({
       </div>
     </section>
   );
+}
+
+function useScrollHeightLock(disabled: boolean) {
+  const cardRef = useRef<HTMLElement>(null);
+  const synchronizeRef = useRef<(() => void) | null>(null);
+
+  useLayoutEffect(() => {
+    const card = cardRef.current;
+    if (!card || disabled) return;
+    const scrollRoot = card.closest("main");
+    const scrollTarget = scrollRoot ?? window;
+    let lastHeight: number | null = null;
+    let lastWidth: number | null = null;
+
+    const naturalHeight = () => {
+      const height = Number.parseFloat(getComputedStyle(card).height);
+      return Number.isFinite(height) && height > 0 ? height : card.getBoundingClientRect().height;
+    };
+
+    const synchronize = () => {
+      let bounds = card.getBoundingClientRect();
+      if (bounds.height <= 0 || bounds.width <= 0) return;
+      const rootBounds = scrollRoot?.getBoundingClientRect();
+      const rootTop = (rootBounds?.top ?? 0) + (scrollRoot?.clientTop ?? 0);
+      const rootBottom = rootBounds?.bottom ?? window.innerHeight;
+      const above = bounds.top < rootTop;
+
+      if (lastWidth !== null && lastWidth !== bounds.width) {
+        card.style.height = "";
+        bounds = card.getBoundingClientRect();
+        if (lastHeight !== null) lastHeight = naturalHeight();
+      }
+      lastWidth = bounds.width;
+
+      if (above) {
+        if (lastHeight !== null) card.style.height = `${Math.ceil(lastHeight)}px`;
+      } else {
+        card.style.height = "";
+        if (bounds.top < rootBottom) lastHeight = naturalHeight();
+      }
+    };
+
+    synchronizeRef.current = synchronize;
+    synchronize();
+    scrollTarget.addEventListener("scroll", synchronize, { passive: true });
+    window.addEventListener("resize", synchronize);
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(synchronize);
+    observer?.observe(card);
+    if (scrollRoot) observer?.observe(scrollRoot);
+
+    return () => {
+      scrollTarget.removeEventListener("scroll", synchronize);
+      window.removeEventListener("resize", synchronize);
+      observer?.disconnect();
+      synchronizeRef.current = null;
+      card.style.height = "";
+    };
+  }, [disabled]);
+
+  useLayoutEffect(() => {
+    synchronizeRef.current?.();
+  });
+
+  return cardRef;
 }
 
 function ReadRow({
@@ -181,7 +211,7 @@ function ReadRow({
   rate: number;
   history: number[];
 }) {
-  const display = displayNameForRead(r.fileName, r.path);
+  const display = displayNameForRead(r.fileName, r.path, r.parentDirectoryName);
   // Use the latest read position (what the player is requesting right now) —
   // not cumulative bytes transferred — so the bar reflects actual playback
   // location, immune to seeks/replays.
@@ -201,7 +231,7 @@ function ReadRow({
       <div className="flex min-w-0 flex-col gap-1 lg:flex-row lg:items-center lg:gap-x-4">
         <Tooltip
           className="min-w-0 overflow-hidden lg:flex-1"
-          content={display.isReleaseFallback ? `${r.path}\n(obfuscated file name)` : r.path}
+          content={`${display.name}\n${r.path}`}
         >
           <span className="block truncate text-xs font-bold text-base-content">{display.name}</span>
         </Tooltip>
