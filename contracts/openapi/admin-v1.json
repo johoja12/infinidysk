@@ -1055,6 +1055,15 @@
               "string"
             ]
           },
+          "unvalidatedExactSourceIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "validatedCount": {
             "format": "int32",
             "pattern": "^-?(?:0|[1-9]\\d*)$",

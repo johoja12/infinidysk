@@ -1,0 +1,19 @@
+[Unit]
+Description=Resume guarded InfiniDysk Plex migration batches
+After=network-online.target docker.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/python3 /opt/infinidysk-migration/run-plex-import-v3.py
+Restart=on-failure
+RestartSec=120s
+RestartPreventExitStatus=78
+TimeoutStartSec=0
+Nice=19
+CPUQuota=50%
+IOWeight=10
+
+[Install]
+WantedBy=multi-user.target
