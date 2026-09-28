@@ -634,7 +634,10 @@ if __name__ == "__main__":
         log(f"STOPPED SAFELY: {type(error).__name__}: {error}")
         if any(marker in str(error) for marker in (
             "uncertain external outcome", "reconcile before resuming",
-            "existing migration evidence differs", "already active")):
+            "existing migration evidence differs", "already active",
+            "Expected one Radarr/Sonarr media file",
+            "no longer matches the sealed mapped inventory",
+            "source symlink changed", "Validation evidence does not match")):
             sys.exit(78)
         raise
     finally:
