@@ -509,6 +509,7 @@ public sealed class UsenetMigrationStore : IDisposable
         string planDigest,
         int appliedCount,
         int validatedCount,
+        IReadOnlyCollection<string> unvalidatedExactSourceIds,
         CancellationToken ct = default)
     {
         await using var ctx = ContextFactory();
@@ -579,8 +580,13 @@ public sealed class UsenetMigrationStore : IDisposable
                                            && !terminalFailedIds.Contains(id)
                                            && !unmatchedIds.Contains(id)))
             throw new InvalidOperationException("Every selected link must be exact or recorded as an unlinked terminal outcome.");
-        if (appliedCount != exactIds.Count || validatedCount != exactIds.Count)
-            throw new InvalidOperationException("Every exact link must be applied and validated before acknowledgement.");
+        var unvalidated = unvalidatedExactSourceIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (unvalidated.Count != unvalidatedExactSourceIds.Count
+            || unvalidated.Any(id => !exactIds.Contains(id))
+            || appliedCount != exactIds.Count
+            || validatedCount != exactIds.Count - unvalidated.Count)
+            throw new InvalidOperationException(
+                "Every exact link must be applied and either validated or explicitly recorded as unreadable before acknowledgement.");
 
         batch.PlanDigest = planDigest;
         batch.AppliedCount = appliedCount;

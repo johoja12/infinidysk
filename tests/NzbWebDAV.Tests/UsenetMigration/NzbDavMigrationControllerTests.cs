@@ -426,6 +426,52 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task AcknowledgePlan_RecordsOneExplicitUnreadableExactLink()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var masterDigest = new string('e', 64);
+        var packagePath = await CreateFullPackageAsync("unreadable-ack", masterDigest, 0, 1);
+        var selected = Assert.Single((await new NzbDavPackageReader().ReadAsync(packagePath))
+            .Manifest.SelectedLinks);
+        var controller = CreateController(harness);
+        await controller.ConnectFull(new NzbDavFullConnectRequest(packagePath, masterDigest, 1, 1, 5, 1));
+        await harness.Store.UpdateSessionAsync(session => session.Status = "complete");
+        await using (var db = harness.Mig())
+        {
+            db.Releases.Add(new MigrationRelease
+            {
+                StoreRef = "nzbdav:release-1", StoreBasename = "release-1", SubmitFileName = "release.nzb",
+                QueueFileName = "release.nzb", JobName = "release", VerdictReasons = "[]",
+                ScannedAt = DateTime.UtcNow,
+            });
+            db.ReleaseFiles.Add(new MigrationReleaseFile
+            {
+                StoreRef = "nzbdav:release-1", MetaPath = "payload", VirtualPath = "/content/a.mkv",
+                FileName = "a.mkv", NormalisedName = "a.mkv", SourceFileId = selected.LegacyDavItemId.ToString(),
+                FileStatus = "exact", NewDavItemId = Guid.NewGuid().ToString(),
+            });
+            db.Submissions.Add(new MigrationSubmission
+            {
+                StoreRef = "nzbdav:release-1", State = "completed", UpdatedAt = DateTime.UtcNow,
+            });
+            await db.SaveChangesAsync();
+        }
+        var digest = new string('f', 64);
+        Assert.IsType<BadRequestObjectResult>(await controller.AcknowledgePlan(0,
+            new NzbDavBatchPlanAcknowledgementRequest(digest, 1, 0)));
+        Assert.IsType<BadRequestObjectResult>(await controller.AcknowledgePlan(0,
+            new NzbDavBatchPlanAcknowledgementRequest(digest, 1, 0, [Guid.NewGuid().ToString()])));
+        Assert.IsType<OkObjectResult>(await controller.AcknowledgePlan(0,
+            new NzbDavBatchPlanAcknowledgementRequest(digest, 1, 0,
+                [selected.LegacyDavItemId.ToString()])));
+        await using var verify = harness.Mig();
+        var batch = await verify.NzbDavBatches.SingleAsync();
+        Assert.Equal("acknowledged", batch.Status);
+        Assert.Equal(1, batch.AppliedCount);
+        Assert.Equal(0, batch.ValidatedCount);
+    }
+
+    [Fact]
     public async Task AcknowledgePlan_AllowsCompletedImportWithUnmatchedTargetToRemainUnlinked()
     {
         await using var harness = await MigrationTestHarness.CreateAsync();
