@@ -322,7 +322,7 @@ internal static class FailedImportCleanup
         var planDigest = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(planPath, ct)
             .ConfigureAwait(false))).ToLowerInvariant();
         if (!p.GetProperty("isValid").GetBoolean()
-            || p.GetProperty("selectedCount").GetInt32() != package.Manifest.SelectedLinks.Count
+            || p.GetProperty("selectedCount").GetInt32() != p.GetProperty("links").GetArrayLength()
             || p.GetProperty("sourcePackageDigest").GetString() != package.PackageDigest
             || j.GetProperty("planSha256").GetString() != planDigest
             || Path.GetFullPath(j.GetProperty("planPath").GetString()!) != Path.GetFullPath(planPath)
