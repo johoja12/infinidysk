@@ -75,6 +75,9 @@ internal static class FailedImportCleanup
         string? historicalAcknowledgementPath = null,
         bool preflightOnly = false,
         bool skipChangedHistoricalSources = false,
+        string? validationPlanPath = null,
+        string? validationJournalPath = null,
+        string? validationResultsPath = null,
         CancellationToken ct = default)
     {
         var apiKey = Environment.GetEnvironmentVariable("NZBDAV_MIGRATION_LEGACY_API_KEY");
@@ -91,6 +94,11 @@ internal static class FailedImportCleanup
         var failuresUri = new Uri(destinationUri, "api/migration/nzbdav/import-failures");
         var historical = historicalCorrelationPath is not null
             || historicalAcknowledgementPath is not null;
+        var validation = validationPlanPath is not null || validationJournalPath is not null
+            || validationResultsPath is not null;
+        if (validation && (historical || waitForTerminal || validationPlanPath is null
+                           || validationJournalPath is null || validationResultsPath is null))
+            throw new InvalidDataException("Validation cleanup requires a plan, apply journal, and validation results without historical or terminal-report mode.");
         if (historical && (historicalCorrelationPath is null
                            || historicalAcknowledgementPath is null || waitForTerminal))
             throw new InvalidDataException("Historical cleanup needs both archived correlation and acknowledgement, without waiting for a current batch.");
@@ -107,7 +115,12 @@ internal static class FailedImportCleanup
         if (report.Failures.Any(row => row.SubmissionState is not ("failed" or "evicted")))
             throw new InvalidDataException("Failure report contains an unsupported submission state.");
 
-        if (historical)
+        if (validation)
+        {
+            await AssertValidationFailuresAsync(package, report, validationPlanPath!,
+                validationJournalPath!, validationResultsPath!, ct).ConfigureAwait(false);
+        }
+        else if (historical)
         {
             var correlation = await ReadPrivateJsonAsync<ArchivedCorrelation>(
                 historicalCorrelationPath!, ct).ConfigureAwait(false);
@@ -295,6 +308,55 @@ internal static class FailedImportCleanup
     }
 
     private sealed record LegacyDeleteResult(int Deleted, int Failed);
+
+    private static async Task AssertValidationFailuresAsync(
+        NzbDavVerifiedPackage package, FailedImportReport report, string planPath,
+        string applyJournalPath, string validationResultsPath, CancellationToken ct)
+    {
+        using var plan = JsonDocument.Parse(await File.ReadAllTextAsync(planPath, ct).ConfigureAwait(false));
+        using var journal = JsonDocument.Parse(await File.ReadAllTextAsync(applyJournalPath, ct).ConfigureAwait(false));
+        using var validations = JsonDocument.Parse(await File.ReadAllTextAsync(validationResultsPath, ct).ConfigureAwait(false));
+        var p = plan.RootElement;
+        var j = journal.RootElement;
+        var rows = validations.RootElement.EnumerateArray().ToArray();
+        var planDigest = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(planPath, ct)
+            .ConfigureAwait(false))).ToLowerInvariant();
+        if (p.GetProperty("sourcePackageDigest").GetString() != package.PackageDigest
+            || j.GetProperty("planSha256").GetString() != planDigest
+            || Path.GetFullPath(j.GetProperty("planPath").GetString()!) != Path.GetFullPath(planPath)
+            || j.GetProperty("links").GetArrayLength() != rows.Length)
+            throw new InvalidDataException("Validation evidence does not match the verified package and applied plan.");
+        var planned = p.GetProperty("links").EnumerateArray()
+            .Where(item => item.GetProperty("applyStatus").GetString() == "planned")
+            .ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
+        var applied = j.GetProperty("links").EnumerateArray()
+            .ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
+        var byPath = rows.ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
+        if (planned.Count != applied.Count || applied.Count != byPath.Count
+            || report.Failures.Count == 0
+            || report.Failures.Count != rows.Count(item => !item.GetProperty("success").GetBoolean()))
+            throw new InvalidDataException("Validation results do not cover the exact applied links.");
+        foreach (var (path, link) in applied)
+        {
+            if (!planned.TryGetValue(path, out var source) || !byPath.TryGetValue(path, out var result)
+                || link.GetProperty("status").GetString() != "applied"
+                || source.GetProperty("correlationStatus").GetString() != "exact"
+                || link.GetProperty("observedSourceTarget").GetString() != source.GetProperty("originalLegacyTarget").GetString()
+                || link.GetProperty("targetPath").GetString() != Path.Join(
+                    j.GetProperty("targetRoot").GetString()!, source.GetProperty("newRelativeTarget").GetString()!)
+                || link.GetProperty("expectedFileSize").GetInt64() != source.GetProperty("expectedFileSize").GetInt64())
+                throw new InvalidDataException($"Validation evidence disagrees for '{path}'.");
+            if (result.GetProperty("success").GetBoolean()) continue;
+            var id = source.GetProperty("legacyDavItemId").GetGuid();
+            if (!report.Failures.Any(item => item.LegacyDavItemId == id
+                && item.LibraryRelativePath == path && item.SubmissionState == "failed"
+                && !string.IsNullOrWhiteSpace(item.Reason)))
+                throw new InvalidDataException($"Unrecorded validation failure for '{path}'.");
+        }
+        if (report.Failures.Any(item => !byPath.TryGetValue(item.LibraryRelativePath, out var result)
+            || result.GetProperty("success").GetBoolean()))
+            throw new InvalidDataException("Failure report contains a link that passed validation.");
+    }
 
     private static async Task<ArrMediaFileMatch?> FindMediaFileWithRetryAsync(
         ArrClient client, string path, CancellationToken ct)

@@ -416,10 +416,18 @@ to the other staging tree. Keep both staging trees out of Plex and Arr.
 The plan contains exact successful rows only; failed and unmatched selected
 rows remain in their checksummed reports. Apply is create-only and source-drift
 fenced; retain each plan and journal as its ownership proof. Validation checks
-size and bounded beginning/middle/end reads. Do not acknowledge a batch whose
-validation has failures. The final coverage report must use actual validated
-links rather than the pre-import recoverable projection; attach the cumulative
-not-imported list for every remaining mapped source row.
+size and bounded beginning/middle/end reads. If an exact imported target stays
+unreadable after bounded retries, retain the original validation report, retry
+reports, and resolved report. Run `cleanup-validation-failures` with the verified
+package, exact plan, apply journal, and resolved validation report; it checks
+their relationship before removing the legacy NzbDav item and matching Arr file
+and requesting a new search. Exclude only those failed paths from live promotion.
+Pass their exact source IDs as `unvalidatedExactSourceIds` when acknowledging the
+batch, with `validatedCount` equal to the number actually validated. Do not
+acknowledge until the cleanup journal is complete and every other exact link
+was validated and promoted. Keep rejected links in the cumulative not-imported
+report. The final coverage report must use actual validated links rather than
+the pre-import recoverable projection.
 
 After the first pass, generate coverage against each root's initial snapshot
 and a fresh live mapped source snapshot. The report classifies added, removed,
