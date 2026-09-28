@@ -334,7 +334,8 @@ requires exactly one Radarr or Sonarr media-file match. For each confirmed
 matching Arr file record, and requests a movie or episode search. All selected
 mapped files in a failed release are covered. `evicted` submissions require
 manual reconciliation because disappearance from the queue and history does not
-prove an import failure.
+prove an import failure. If one report contains both states, the command cleans
+the confirmed failures and leaves evicted items untouched.
 
 Keep NzbDav library mapping changes paused during cleanup. The command checks
 every candidate before the first deletion. Give it an Arr root that matches the
@@ -365,6 +366,21 @@ Use the equivalent `special/` artifacts and root for a special batch. A
 completed journal entry is skipped on retry. If an external request has an
 uncertain outcome, the journal stops the retry at that item so its source and
 Arr state can be reconciled before another deletion or search.
+
+For an already acknowledged batch, use its saved terminal failure report with
+`--historical-correlation FILE --historical-acknowledgement FILE` and omit
+`--wait-for-terminal`. The command verifies those archived records against the
+checksummed package and still checks the current NzbDav link and exact Arr file
+before each deletion. It rejects incomplete reports that lack the package digest
+and submission state. If an early batch's report was reconstructed, preserve
+the original reports and verify the reconstruction against its plan, package,
+acknowledged ledger, and absence of migrated releases before using this mode.
+Use `--preflight-only true` to check the whole candidate set and write the
+planned journal without deleting anything; rerun without that option to apply.
+For archived batches whose source links may have changed since acknowledgement,
+`--skip-changed-historical-sources true` records changed mappings or symlinks as
+`skipped_source_changed` in the journal and continues with still exact failures.
+Reconcile every skipped item separately; the command never deletes it.
 
 Use each root's own mapped and recoverable counts in its full-connect request;
 the combined count is an audit gate, not a batch-master denominator. For each

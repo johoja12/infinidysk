@@ -19,6 +19,17 @@ internal sealed record FailedImportReport(
     int FailedCount,
     IReadOnlyList<FailedImportRow> Failures);
 
+internal sealed record ArchivedCorrelation(
+    bool Status, string PackageDigest, int SelectedCount, int ExactCount,
+    IReadOnlyList<ArchivedCorrelationRow> Rows);
+
+internal sealed record ArchivedCorrelationRow(
+    Guid LegacyDavItemId, string LibraryRelativePath, string CorrelationStatus);
+
+internal sealed record ArchivedAcknowledgement(
+    bool Status, int BatchIndex, string State, int SelectionCount,
+    int AppliedCount, int ValidatedCount);
+
 internal sealed record FailedImportRow(
     string SourceReleaseId,
     Guid LegacyDavItemId,
@@ -60,6 +71,10 @@ internal static class FailedImportCleanup
         string legacyUrl,
         string journalPath,
         bool waitForTerminal,
+        string? historicalCorrelationPath = null,
+        string? historicalAcknowledgementPath = null,
+        bool preflightOnly = false,
+        bool skipChangedHistoricalSources = false,
         CancellationToken ct = default)
     {
         var apiKey = Environment.GetEnvironmentVariable("NZBDAV_MIGRATION_LEGACY_API_KEY");
@@ -74,6 +89,13 @@ internal static class FailedImportCleanup
         destinationHttp.DefaultRequestHeaders.Add("x-api-key", infinidyskApiKey);
         var destinationUri = new Uri(infinidyskUrl.TrimEnd('/') + "/", UriKind.Absolute);
         var failuresUri = new Uri(destinationUri, "api/migration/nzbdav/import-failures");
+        var historical = historicalCorrelationPath is not null
+            || historicalAcknowledgementPath is not null;
+        if (historical && (historicalCorrelationPath is null
+                           || historicalAcknowledgementPath is null || waitForTerminal))
+            throw new InvalidDataException("Historical cleanup needs both archived correlation and acknowledgement, without waiting for a current batch.");
+        if (skipChangedHistoricalSources && !historical)
+            throw new InvalidDataException("Changed-source skipping is only available for archived batches.");
         if (waitForTerminal)
             await WaitForTerminalAndSaveReportAsync(
                 destinationHttp, failuresUri, package.PackageDigest, reportPath, ct).ConfigureAwait(false);
@@ -82,18 +104,45 @@ internal static class FailedImportCleanup
             || report.BatchIndex != package.Manifest.BatchIndex
             || report.FailedCount != report.Failures.Count)
             throw new InvalidDataException("Import failure report does not match the verified package.");
-        if (report.Failures.Any(row => row.SubmissionState != "failed"))
-            throw new InvalidDataException("Only confirmed failed submissions can be cleaned up; review evicted releases separately.");
+        if (report.Failures.Any(row => row.SubmissionState is not ("failed" or "evicted")))
+            throw new InvalidDataException("Failure report contains an unsupported submission state.");
 
-        var currentReport = await destinationHttp.GetFromJsonAsync<FailedImportReport>(
-            failuresUri, JsonOptions, ct)
-            .ConfigureAwait(false);
-        if (currentReport is not { Status: true } || currentReport.PackageDigest != report.PackageDigest
-            || currentReport.BatchIndex != report.BatchIndex
-            || currentReport.FailedCount != report.FailedCount
-            || currentReport.Failures.OrderBy(row => row.LegacyDavItemId)
-                .SequenceEqual(report.Failures.OrderBy(row => row.LegacyDavItemId)) == false)
-            throw new InvalidDataException("Saved failure report is no longer the current terminal batch report.");
+        if (historical)
+        {
+            var correlation = await ReadPrivateJsonAsync<ArchivedCorrelation>(
+                historicalCorrelationPath!, ct).ConfigureAwait(false);
+            var acknowledgement = await ReadPrivateJsonAsync<ArchivedAcknowledgement>(
+                historicalAcknowledgementPath!, ct).ConfigureAwait(false);
+            var selectedLinks = package.Manifest.SelectedLinks;
+            if (!correlation.Status || correlation.PackageDigest != package.PackageDigest
+                || correlation.SelectedCount != selectedLinks.Count
+                || correlation.Rows.Count != selectedLinks.Count
+                || correlation.Rows.Select(row => row.LegacyDavItemId).Distinct().Count() != selectedLinks.Count
+                || !acknowledgement.Status || acknowledgement.BatchIndex != package.Manifest.BatchIndex
+                || acknowledgement.State != "acknowledged"
+                || acknowledgement.SelectionCount != selectedLinks.Count
+                || acknowledgement.AppliedCount != correlation.ExactCount
+                || acknowledgement.ValidatedCount != correlation.ExactCount)
+                throw new InvalidDataException("Archived batch evidence does not match the verified package.");
+            var byId = selectedLinks.ToDictionary(link => link.LegacyDavItemId);
+            if (correlation.Rows.Any(row => !byId.TryGetValue(row.LegacyDavItemId, out var link)
+                || link.LibraryRelativePath != row.LibraryRelativePath)
+                || report.Failures.Any(row => !correlation.Rows.Any(match =>
+                    match.LegacyDavItemId == row.LegacyDavItemId
+                    && match.CorrelationStatus == "import-failed")))
+                throw new InvalidDataException("Archived correlation does not prove the reported import failures.");
+        }
+        else
+        {
+            var currentReport = await destinationHttp.GetFromJsonAsync<FailedImportReport>(
+                failuresUri, JsonOptions, ct).ConfigureAwait(false);
+            if (currentReport is not { Status: true } || currentReport.PackageDigest != report.PackageDigest
+                || currentReport.BatchIndex != report.BatchIndex
+                || currentReport.FailedCount != report.FailedCount
+                || currentReport.Failures.OrderBy(row => row.LegacyDavItemId)
+                    .SequenceEqual(report.Failures.OrderBy(row => row.LegacyDavItemId)) == false)
+                throw new InvalidDataException("Saved failure report is no longer the current terminal batch report.");
+        }
 
         var expected = package.Manifest.Releases
             .SelectMany(release => release.Leaves.Select(leaf => (release.SourceReleaseId, leaf.LegacyDavItemId)))
@@ -125,7 +174,10 @@ internal static class FailedImportCleanup
         if (clients.Length == 0)
             throw new InvalidDataException("No enabled Radarr or Sonarr instance was supplied.");
 
-        var entries = report.Failures.Select(row => new FailedImportCleanupEntry(
+        // Eviction does not prove an import failed. Preserve those items for manual
+        // reconciliation while cleaning the confirmed failures in the same report.
+        var entries = report.Failures.Where(row => row.SubmissionState == "failed")
+            .Select(row => new FailedImportCleanupEntry(
             row.LegacyDavItemId,
             Path.Join(canonicalSourceRoot, row.LibraryRelativePath),
             "planned")).ToList();
@@ -149,9 +201,9 @@ internal static class FailedImportCleanup
 
         var legacyReader = new LegacyNzbDavReader();
         var actions = new List<(FailedImportCleanupEntry Entry, ArrClient Client, ArrMediaFileMatch Match)>();
-        foreach (var item in journal.Entries)
+        foreach (var item in journal.Entries.ToArray())
         {
-            if (item.Stage == "completed") continue;
+            if (item.Stage is "completed" or "skipped_source_changed") continue;
             if (item.Stage is "source_deleting" or "arr_cleanup_started")
                 throw new InvalidOperationException(
                     $"Cleanup of {item.DavItemId} has an uncertain external outcome; reconcile it before resuming.");
@@ -167,18 +219,28 @@ internal static class FailedImportCleanup
                 throw new InvalidDataException("Failed item no longer matches the sealed mapped inventory.");
             if (item.Stage == "planned")
             {
-                await legacyReader.AssertOnlyMappedLinkAsync(item.DavItemId, item.SourcePath, ct)
-                    .ConfigureAwait(false);
-                var actualTarget = new FileInfo(item.SourcePath).LinkTarget;
-                if (actualTarget != link.OriginalTarget)
-                    throw new InvalidDataException("Failed item source symlink changed since export.");
+                try
+                {
+                    await legacyReader.AssertOnlyMappedLinkAsync(item.DavItemId, item.SourcePath, ct)
+                        .ConfigureAwait(false);
+                    var actualTarget = new FileInfo(item.SourcePath).LinkTarget;
+                    if (actualTarget != link.OriginalTarget)
+                        throw new InvalidDataException("Failed item source symlink changed since export.");
+                }
+                catch (InvalidDataException) when (skipChangedHistoricalSources)
+                {
+                    await SetStageAsync(journalPath, journal, item, "skipped_source_changed", ct)
+                        .ConfigureAwait(false);
+                    continue;
+                }
             }
 
             var arrPath = Path.Join(canonicalArrRoot, row.LibraryRelativePath);
             var matches = new List<(ArrClient Client, ArrMediaFileMatch Match)>();
             foreach (var client in clients)
             {
-                var match = await client.FindMediaFileAsync(arrPath, ct).ConfigureAwait(false);
+                var match = await FindMediaFileWithRetryAsync(client, arrPath, ct)
+                    .ConfigureAwait(false);
                 if (match is not null) matches.Add((client, match));
             }
             if (matches.Count != 1 || matches[0].Match.MediaIds.Count == 0)
@@ -186,6 +248,11 @@ internal static class FailedImportCleanup
                     $"Expected one Radarr/Sonarr media file with search targets for {row.LibraryRelativePath}; found {matches.Count}.");
             actions.Add((item, matches[0].Client, matches[0].Match));
         }
+
+        Console.WriteLine($"Cleanup preflight: confirmed={entries.Count}, actionable={actions.Count}, " +
+            $"sourceChanged={journal.Entries.Count(entry => entry.Stage == "skipped_source_changed")}");
+
+        if (preflightOnly) return;
 
         using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
         http.DefaultRequestHeaders.Add("x-api-key", apiKey);
@@ -228,6 +295,23 @@ internal static class FailedImportCleanup
     }
 
     private sealed record LegacyDeleteResult(int Deleted, int Failed);
+
+    private static async Task<ArrMediaFileMatch?> FindMediaFileWithRetryAsync(
+        ArrClient client, string path, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await client.FindMediaFileAsync(path, ct).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (attempt < 4 && !ct.IsCancellationRequested
+                && exception is IOException or HttpRequestException or TaskCanceledException)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(attempt * 2), ct).ConfigureAwait(false);
+            }
+        }
+    }
 
     private static async Task WaitForTerminalAndSaveReportAsync(
         HttpClient http,
