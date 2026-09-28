@@ -117,7 +117,7 @@ internal static class FailedImportCleanup
 
         if (validation)
         {
-            await AssertValidationFailuresAsync(package, report, validationPlanPath!,
+            await AssertValidationFailuresAsync(package, report, sourceRoot, validationPlanPath!,
                 validationJournalPath!, validationResultsPath!, ct).ConfigureAwait(false);
         }
         else if (historical)
@@ -310,7 +310,7 @@ internal static class FailedImportCleanup
     private sealed record LegacyDeleteResult(int Deleted, int Failed);
 
     private static async Task AssertValidationFailuresAsync(
-        NzbDavVerifiedPackage package, FailedImportReport report, string planPath,
+        NzbDavVerifiedPackage package, FailedImportReport report, string sourceRoot, string planPath,
         string applyJournalPath, string validationResultsPath, CancellationToken ct)
     {
         using var plan = JsonDocument.Parse(await File.ReadAllTextAsync(planPath, ct).ConfigureAwait(false));
@@ -321,9 +321,12 @@ internal static class FailedImportCleanup
         var rows = validations.RootElement.EnumerateArray().ToArray();
         var planDigest = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(planPath, ct)
             .ConfigureAwait(false))).ToLowerInvariant();
-        if (p.GetProperty("sourcePackageDigest").GetString() != package.PackageDigest
+        if (!p.GetProperty("isValid").GetBoolean()
+            || p.GetProperty("selectedCount").GetInt32() != package.Manifest.SelectedLinks.Count
+            || p.GetProperty("sourcePackageDigest").GetString() != package.PackageDigest
             || j.GetProperty("planSha256").GetString() != planDigest
             || Path.GetFullPath(j.GetProperty("planPath").GetString()!) != Path.GetFullPath(planPath)
+            || j.GetProperty("sourceRoot").GetString() != Path.GetFullPath(sourceRoot).TrimEnd(Path.DirectorySeparatorChar)
             || j.GetProperty("links").GetArrayLength() != rows.Length)
             throw new InvalidDataException("Validation evidence does not match the verified package and applied plan.");
         var planned = p.GetProperty("links").EnumerateArray()
@@ -332,7 +335,8 @@ internal static class FailedImportCleanup
         var applied = j.GetProperty("links").EnumerateArray()
             .ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
         var byPath = rows.ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
-        if (planned.Count != applied.Count || applied.Count != byPath.Count
+        if (planned.Count != p.GetProperty("actionableCount").GetInt32()
+            || planned.Count != applied.Count || applied.Count != byPath.Count
             || report.Failures.Count == 0
             || report.Failures.Count != rows.Count(item => !item.GetProperty("success").GetBoolean()))
             throw new InvalidDataException("Validation results do not cover the exact applied links.");
@@ -341,6 +345,10 @@ internal static class FailedImportCleanup
             if (!planned.TryGetValue(path, out var source) || !byPath.TryGetValue(path, out var result)
                 || link.GetProperty("status").GetString() != "applied"
                 || source.GetProperty("correlationStatus").GetString() != "exact"
+                || link.GetProperty("sourceLinkPath").GetString() != Path.Join(
+                    j.GetProperty("sourceRoot").GetString()!, path)
+                || link.GetProperty("linkPath").GetString() != Path.Join(
+                    j.GetProperty("libraryRoot").GetString()!, path)
                 || link.GetProperty("observedSourceTarget").GetString() != source.GetProperty("originalLegacyTarget").GetString()
                 || link.GetProperty("targetPath").GetString() != Path.Join(
                     j.GetProperty("targetRoot").GetString()!, source.GetProperty("newRelativeTarget").GetString()!)
