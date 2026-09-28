@@ -1049,6 +1049,15 @@
               "string"
             ]
           },
+          "missingSourceIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "planDigest": {
             "type": [
               "null",

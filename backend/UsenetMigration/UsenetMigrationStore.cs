@@ -510,6 +510,7 @@ public sealed class UsenetMigrationStore : IDisposable
         int appliedCount,
         int validatedCount,
         IReadOnlyCollection<string> unvalidatedExactSourceIds,
+        IReadOnlyCollection<string> missingSourceIds,
         CancellationToken ct = default)
     {
         await using var ctx = ContextFactory();
@@ -581,12 +582,15 @@ public sealed class UsenetMigrationStore : IDisposable
                                            && !unmatchedIds.Contains(id)))
             throw new InvalidOperationException("Every selected link must be exact or recorded as an unlinked terminal outcome.");
         var unvalidated = unvalidatedExactSourceIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var missing = missingSourceIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (unvalidated.Count != unvalidatedExactSourceIds.Count
             || unvalidated.Any(id => !exactIds.Contains(id))
-            || appliedCount != exactIds.Count
-            || validatedCount != exactIds.Count - unvalidated.Count)
+            || missing.Count != missingSourceIds.Count
+            || missing.Any(id => !exactIds.Contains(id) || unvalidated.Contains(id))
+            || appliedCount != exactIds.Count - missing.Count
+            || validatedCount != appliedCount - unvalidated.Count)
             throw new InvalidOperationException(
-                "Every exact link must be applied and either validated or explicitly recorded as unreadable before acknowledgement.");
+                "Every exact link must be applied and validated, recorded as unreadable, or explicitly recorded as a missing source before acknowledgement.");
 
         batch.PlanDigest = planDigest;
         batch.AppliedCount = appliedCount;

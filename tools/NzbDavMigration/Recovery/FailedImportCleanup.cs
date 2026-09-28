@@ -2,6 +2,7 @@ using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using NzbDavMigration.Canary;
 using NzbDavMigration.Inventory;
 using NzbDavMigration.Legacy;
 using NzbWebDAV.Clients.RadarrSonarr;
@@ -327,19 +328,31 @@ internal static class FailedImportCleanup
             || j.GetProperty("planSha256").GetString() != planDigest
             || Path.GetFullPath(j.GetProperty("planPath").GetString()!) != Path.GetFullPath(planPath)
             || j.GetProperty("sourceRoot").GetString() != Path.GetFullPath(sourceRoot).TrimEnd(Path.DirectorySeparatorChar)
-            || j.GetProperty("links").GetArrayLength() != rows.Length)
+            || j.GetProperty("links").EnumerateArray().Count(item =>
+                item.GetProperty("status").GetString() == "applied") != rows.Length)
             throw new InvalidDataException("Validation evidence does not match the verified package and applied plan.");
         var planned = p.GetProperty("links").EnumerateArray()
             .Where(item => item.GetProperty("applyStatus").GetString() == "planned")
             .ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
-        var applied = j.GetProperty("links").EnumerateArray()
+        var journalLinks = j.GetProperty("links").EnumerateArray().ToArray();
+        var applied = journalLinks.Where(item => item.GetProperty("status").GetString() == "applied")
+            .ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
+        var missing = journalLinks.Where(item => item.GetProperty("status").GetString() == "source-missing")
             .ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
         var byPath = rows.ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
         if (planned.Count != p.GetProperty("actionableCount").GetInt32()
-            || planned.Count != applied.Count || applied.Count != byPath.Count
+            || planned.Count != applied.Count + missing.Count || applied.Count != byPath.Count
+            || journalLinks.Length != applied.Count + missing.Count
             || report.Failures.Count == 0
             || report.Failures.Count != rows.Count(item => !item.GetProperty("success").GetBoolean()))
             throw new InvalidDataException("Validation results do not cover the exact applied links.");
+        foreach (var (path, link) in missing)
+        {
+            if (!planned.ContainsKey(path)
+                || CanaryPathSafety.PathExistsNoFollow(link.GetProperty("sourceLinkPath").GetString()!)
+                || CanaryPathSafety.PathExistsNoFollow(link.GetProperty("linkPath").GetString()!))
+                throw new InvalidDataException($"Missing source evidence changed for '{path}'.");
+        }
         foreach (var (path, link) in applied)
         {
             if (!planned.TryGetValue(path, out var source) || !byPath.TryGetValue(path, out var result)

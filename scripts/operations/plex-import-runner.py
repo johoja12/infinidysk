@@ -462,19 +462,36 @@ def process_batch(batch_index, stage_name, destination, manifest):
     journal = JOURNAL_DIR / f"batch-{batch_index + 1:04d}.json"
     validated_path = JOURNAL_DIR / f"batch-{batch_index + 1:04d}-validated.json"
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
-    if not journal.exists():
+    prior = json.loads(journal.read_text()) if journal.exists() else {"links": []}
+    prior_applied = {row["libraryRelativePath"] for row in prior["links"]
+                     if row.get("status") == "applied"}
+    missing_paths = [row["libraryRelativePath"] for row in plan["links"]
+                     if row.get("correlationStatus") == "exact"
+                     and row.get("applyStatus") == "planned"
+                     and row["libraryRelativePath"] not in prior_applied
+                     and not os.path.lexists(os.path.join(LIBRARY_ROOT, row["libraryRelativePath"]))]
+    missing_file = report_dir / "missing-source-paths.json"
+    if missing_paths:
+        write_json_once(missing_file, missing_paths)
+    if not journal.exists() or len(prior_applied) + len(missing_paths) != exact_count:
         run_tool(f"id64-plex-apply-{batch_index + 1:04d}-20260927", [
             "apply-sharded-links", "--plan", str(plan_path), "--mapped-inventory", str(INVENTORY),
             "--source-root", LIBRARY_ROOT, "--library-root", TARGET_LIBRARY,
-            "--target-root", TARGET_ROOT, "--journal", str(journal)])
+            "--target-root", TARGET_ROOT, "--journal", str(journal),
+            *(["--missing-source-paths", str(missing_file)] if missing_paths else [])])
     journal_data = json.loads(journal.read_text())
     if journal_data.get("planSha256") != digest or journal_data.get("sourceRoot") != LIBRARY_ROOT \
             or journal_data.get("libraryRoot") != TARGET_LIBRARY \
             or journal_data.get("targetRoot") != TARGET_ROOT:
         raise RuntimeError("persisted apply journal does not match this plan and library roots")
     applied = sum(1 for item in journal_data.get("links", []) if item.get("status") == "applied")
-    if applied != exact_count:
-        raise RuntimeError(f"batch {batch_index + 1} applied {applied} of {exact_count} exact links")
+    missing = [item for item in journal_data.get("links", [])
+               if item.get("status") == "source-missing"]
+    if applied + len(missing) != exact_count or len(journal_data.get("links", [])) != exact_count:
+        raise RuntimeError(f"batch {batch_index + 1} accounted for {applied + len(missing)} of {exact_count} exact links")
+    missing_by_path = {row["libraryRelativePath"]: row["legacyDavItemId"]
+                       for row in plan["links"] if row.get("applyStatus") == "planned"}
+    missing_ids = [missing_by_path[row["libraryRelativePath"]] for row in missing]
     if not validated_path.exists():
         run_tool(f"id64-plex-validate-{batch_index + 1:04d}-20260927", [
             "validate-links", "--journal", str(journal), "--output", str(validated_path),
@@ -484,16 +501,27 @@ def process_batch(batch_index, stage_name, destination, manifest):
     validations, resolved_path = retry_failed_validations(batch_index, journal, validated_path)
     validated = sum(1 for item in validations if item.get("success") is True)
     failures_validation = [item for item in validations if item.get("success") is not True]
-    if validated + len(failures_validation) != exact_count:
+    if validated + len(failures_validation) != applied:
         raise RuntimeError(f"batch {batch_index + 1} validation coverage disagrees with the exact plan")
     validation_rejects = []
-    promotion_journal = journal
+    excluded_paths = {row["libraryRelativePath"] for row in missing}
     if failures_validation:
         validation_rejects = cleanup_unreadable_links(
             batch_index, destination, manifest, report_dir, plan_path, journal,
             resolved_path, failures_validation)
-        promotion_journal = filtered_journal(batch_index, journal,
-            {row["libraryRelativePath"] for row in failures_validation})
+        excluded_paths.update(row["libraryRelativePath"] for row in failures_validation)
+    promotion_journal = filtered_journal(batch_index, journal, excluded_paths) if excluded_paths else journal
+    if missing:
+        with (report_dir / "missing-source-not-imported.csv").open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["batchIndex", "libraryRelativePath",
+                                                      "legacyDavItemId", "status", "reason"])
+            writer.writeheader()
+            for row in missing:
+                writer.writerow({"batchIndex": batch_index,
+                                 "libraryRelativePath": row["libraryRelativePath"],
+                                 "legacyDavItemId": missing_by_path[row["libraryRelativePath"]],
+                                 "status": "source-missing",
+                                 "reason": "Source library link disappeared after the immutable plan was created"})
     if validated:
         PROMOTION_DIR.mkdir(parents=True, exist_ok=True)
         promotion_record = PROMOTION_DIR / f"batch-{batch_index + 1:04d}.json"
@@ -513,11 +541,16 @@ def process_batch(batch_index, stage_name, destination, manifest):
         if promotion_counts["changed"] + promotion_counts["already"] != validated:
             raise RuntimeError(f"batch {batch_index + 1} live promotion did not cover {validated} links")
         log(f"batch {batch_index + 1}/{BATCH_COUNT} live links promoted: {validated}")
+    for row in missing:
+        relative = row["libraryRelativePath"]
+        if os.path.lexists(os.path.join(LIBRARY_ROOT, relative)) or os.path.lexists(
+                os.path.join(TARGET_LIBRARY, relative)):
+            raise RuntimeError(f"missing source evidence changed before acknowledgement: {relative}")
     ack = request(f"/api/migration/nzbdav/full/batches/{batch_index}/acknowledge-plan", "POST", {
         "planDigest": digest, "appliedCount": applied, "validatedCount": validated,
-        "unvalidatedExactSourceIds": validation_rejects})
+        "unvalidatedExactSourceIds": validation_rejects, "missingSourceIds": missing_ids})
     save_json(report_dir / "acknowledgement.json", ack)
-    log(f"batch {batch_index + 1}/{BATCH_COUNT} acknowledged: selected={len(manifest['selectedLinks'])}, validated={validated}, unreadable={len(validation_rejects)}, not-imported={len(excluded) + len(validation_rejects)}")
+    log(f"batch {batch_index + 1}/{BATCH_COUNT} acknowledged: selected={len(manifest['selectedLinks'])}, validated={validated}, unreadable={len(validation_rejects)}, missing-source={len(missing)}, not-imported={len(excluded) + len(validation_rejects) + len(missing)}")
     shutil.rmtree(destination)
 
 
@@ -542,6 +575,7 @@ def write_final_report():
         add(REPORTS / f"batch-{index + 1:04d}" / "not-imported.csv", None)
     for index in range(BATCH_COUNT):
         add(REPORTS / f"batch-{index + 1:04d}" / "validation-not-imported.csv", None)
+        add(REPORTS / f"batch-{index + 1:04d}" / "missing-source-not-imported.csv", None)
     tmp = output.with_suffix(".csv.tmp")
     with tmp.open("w", newline="", encoding="utf-8") as stream:
         fields = ["batchIndex", "libraryRelativePath", "legacyDavItemId", "status", "reason"]
@@ -637,7 +671,9 @@ if __name__ == "__main__":
             "existing migration evidence differs", "already active",
             "Expected one Radarr/Sonarr media file",
             "no longer matches the sealed mapped inventory",
-            "source symlink changed", "Validation evidence does not match")):
+            "source symlink changed", "Planned source link",
+            "Excluded source is present", "missing source evidence changed",
+            "accounted for", "Validation evidence does not match")):
             sys.exit(78)
         raise
     finally:

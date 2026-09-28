@@ -186,6 +186,7 @@ public sealed class NzbDavMigrationController(
                 request.AppliedCount,
                 request.ValidatedCount,
                 request.UnvalidatedExactSourceIds ?? [],
+                request.MissingSourceIds ?? [],
                 HttpContext.RequestAborted).ConfigureAwait(false);
             return Ok(new
             {
@@ -631,7 +632,8 @@ public sealed record NzbDavBatchPlanAcknowledgementRequest(
     string? PlanDigest,
     int AppliedCount,
     int ValidatedCount,
-    IReadOnlyList<string>? UnvalidatedExactSourceIds = null);
+    IReadOnlyList<string>? UnvalidatedExactSourceIds = null,
+    IReadOnlyList<string>? MissingSourceIds = null);
 public sealed record NzbDavRunRequest(string? PackageDigest, int? SelectionCount);
 public sealed record NzbDavImportFailure(
     string SourceReleaseId,
