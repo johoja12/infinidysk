@@ -201,7 +201,7 @@ internal static class FailedImportCleanup
 
         var legacyReader = new LegacyNzbDavReader();
         var actions = new List<(FailedImportCleanupEntry Entry, ArrClient Client, ArrMediaFileMatch Match)>();
-        foreach (var item in journal.Entries)
+        foreach (var item in journal.Entries.ToArray())
         {
             if (item.Stage is "completed" or "skipped_source_changed") continue;
             if (item.Stage is "source_deleting" or "arr_cleanup_started")
