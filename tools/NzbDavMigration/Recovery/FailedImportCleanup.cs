@@ -74,6 +74,7 @@ internal static class FailedImportCleanup
         string? historicalCorrelationPath = null,
         string? historicalAcknowledgementPath = null,
         bool preflightOnly = false,
+        bool skipChangedHistoricalSources = false,
         CancellationToken ct = default)
     {
         var apiKey = Environment.GetEnvironmentVariable("NZBDAV_MIGRATION_LEGACY_API_KEY");
@@ -93,6 +94,8 @@ internal static class FailedImportCleanup
         if (historical && (historicalCorrelationPath is null
                            || historicalAcknowledgementPath is null || waitForTerminal))
             throw new InvalidDataException("Historical cleanup needs both archived correlation and acknowledgement, without waiting for a current batch.");
+        if (skipChangedHistoricalSources && !historical)
+            throw new InvalidDataException("Changed-source skipping is only available for archived batches.");
         if (waitForTerminal)
             await WaitForTerminalAndSaveReportAsync(
                 destinationHttp, failuresUri, package.PackageDigest, reportPath, ct).ConfigureAwait(false);
@@ -200,7 +203,7 @@ internal static class FailedImportCleanup
         var actions = new List<(FailedImportCleanupEntry Entry, ArrClient Client, ArrMediaFileMatch Match)>();
         foreach (var item in journal.Entries)
         {
-            if (item.Stage == "completed") continue;
+            if (item.Stage is "completed" or "skipped_source_changed") continue;
             if (item.Stage is "source_deleting" or "arr_cleanup_started")
                 throw new InvalidOperationException(
                     $"Cleanup of {item.DavItemId} has an uncertain external outcome; reconcile it before resuming.");
@@ -216,11 +219,20 @@ internal static class FailedImportCleanup
                 throw new InvalidDataException("Failed item no longer matches the sealed mapped inventory.");
             if (item.Stage == "planned")
             {
-                await legacyReader.AssertOnlyMappedLinkAsync(item.DavItemId, item.SourcePath, ct)
-                    .ConfigureAwait(false);
-                var actualTarget = new FileInfo(item.SourcePath).LinkTarget;
-                if (actualTarget != link.OriginalTarget)
-                    throw new InvalidDataException("Failed item source symlink changed since export.");
+                try
+                {
+                    await legacyReader.AssertOnlyMappedLinkAsync(item.DavItemId, item.SourcePath, ct)
+                        .ConfigureAwait(false);
+                    var actualTarget = new FileInfo(item.SourcePath).LinkTarget;
+                    if (actualTarget != link.OriginalTarget)
+                        throw new InvalidDataException("Failed item source symlink changed since export.");
+                }
+                catch (InvalidDataException) when (skipChangedHistoricalSources)
+                {
+                    await SetStageAsync(journalPath, journal, item, "skipped_source_changed", ct)
+                        .ConfigureAwait(false);
+                    continue;
+                }
             }
 
             var arrPath = Path.Join(canonicalArrRoot, row.LibraryRelativePath);
@@ -236,6 +248,9 @@ internal static class FailedImportCleanup
                     $"Expected one Radarr/Sonarr media file with search targets for {row.LibraryRelativePath}; found {matches.Count}.");
             actions.Add((item, matches[0].Client, matches[0].Match));
         }
+
+        Console.WriteLine($"Cleanup preflight: confirmed={entries.Count}, actionable={actions.Count}, " +
+            $"sourceChanged={journal.Entries.Count(entry => entry.Stage == "skipped_source_changed")}");
 
         if (preflightOnly) return;
 

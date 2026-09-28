@@ -375,6 +375,10 @@ before each deletion. It rejects incomplete or reconstructed reports that lack
 the package digest and submission state.
 Use `--preflight-only true` to check the whole candidate set and write the
 planned journal without deleting anything; rerun without that option to apply.
+For archived batches whose source links may have changed since acknowledgement,
+`--skip-changed-historical-sources true` records changed mappings or symlinks as
+`skipped_source_changed` in the journal and continues with still exact failures.
+Reconcile every skipped item separately; the command never deletes it.
 
 Use each root's own mapped and recoverable counts in its full-connect request;
 the combined count is an audit gate, not a batch-master denominator. For each
