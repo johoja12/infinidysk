@@ -371,8 +371,10 @@ For an already acknowledged batch, use its saved terminal failure report with
 `--historical-correlation FILE --historical-acknowledgement FILE` and omit
 `--wait-for-terminal`. The command verifies those archived records against the
 checksummed package and still checks the current NzbDav link and exact Arr file
-before each deletion. It rejects incomplete or reconstructed reports that lack
-the package digest and submission state.
+before each deletion. It rejects incomplete reports that lack the package digest
+and submission state. If an early batch's report was reconstructed, preserve
+the original reports and verify the reconstruction against its plan, package,
+acknowledged ledger, and absence of migrated releases before using this mode.
 Use `--preflight-only true` to check the whole candidate set and write the
 planned journal without deleting anything; rerun without that option to apply.
 For archived batches whose source links may have changed since acknowledgement,
