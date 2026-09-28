@@ -195,6 +195,18 @@ item IDs, sync, pause/resume, cancel/retry, and priority changes; priority never
 foreground admission. Progress represents verified committed whole-file coverage,
 not bytes merely read from providers or the size of one requested range.
 
+When application shutdown begins, warming stops taking new jobs and interrupts
+active work without treating it as a source failure or spending a retry attempt.
+Verified bytes remain cached. After restart, enabled Plex policies rebuild their
+work; restored manual requests remain paused until resumed.
+
+A failed job requires **Retry** from the Smart Prefetch activity page. Retry
+rechecks existing cached blocks and fills missing ranges; it does not clear the
+cache. Jobs that failed on an older release retain their failed state until
+explicitly retried. Genuine failures include a safe category and exception type,
+with a matching job/item diagnostic in backend logs. Raw exception messages are
+omitted because they may contain private paths or provider credentials.
+
 The daily cap accounts provider BODY payload lines, including yEnc framing and
 retried payload, rather than just final media bytes. It excludes NNTP status lines,
 the terminating dot, and TCP/TLS overhead; it is not an exact network-interface
