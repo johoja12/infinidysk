@@ -227,7 +227,8 @@ internal static class FailedImportCleanup
             var matches = new List<(ArrClient Client, ArrMediaFileMatch Match)>();
             foreach (var client in clients)
             {
-                var match = await client.FindMediaFileAsync(arrPath, ct).ConfigureAwait(false);
+                var match = await FindMediaFileWithRetryAsync(client, arrPath, ct)
+                    .ConfigureAwait(false);
                 if (match is not null) matches.Add((client, match));
             }
             if (matches.Count != 1 || matches[0].Match.MediaIds.Count == 0)
@@ -279,6 +280,23 @@ internal static class FailedImportCleanup
     }
 
     private sealed record LegacyDeleteResult(int Deleted, int Failed);
+
+    private static async Task<ArrMediaFileMatch?> FindMediaFileWithRetryAsync(
+        ArrClient client, string path, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await client.FindMediaFileAsync(path, ct).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (attempt < 4 && !ct.IsCancellationRequested
+                && exception is IOException or HttpRequestException or TaskCanceledException)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(attempt * 2), ct).ConfigureAwait(false);
+            }
+        }
+    }
 
     private static async Task WaitForTerminalAndSaveReportAsync(
         HttpClient http,
