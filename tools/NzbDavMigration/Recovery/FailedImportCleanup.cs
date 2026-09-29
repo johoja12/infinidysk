@@ -76,6 +76,7 @@ internal static class FailedImportCleanup
         string? historicalAcknowledgementPath = null,
         bool preflightOnly = false,
         bool skipChangedHistoricalSources = false,
+        bool skipChangedCurrentSources = false,
         string? validationPlanPath = null,
         string? validationJournalPath = null,
         string? validationResultsPath = null,
@@ -105,6 +106,8 @@ internal static class FailedImportCleanup
             throw new InvalidDataException("Historical cleanup needs both archived correlation and acknowledgement, without waiting for a current batch.");
         if (skipChangedHistoricalSources && !historical)
             throw new InvalidDataException("Changed-source skipping is only available for archived batches.");
+        if (skipChangedCurrentSources && (historical || validation))
+            throw new InvalidDataException("Current changed-source skipping requires a terminal import batch.");
         if (waitForTerminal)
             await WaitForTerminalAndSaveReportAsync(
                 destinationHttp, failuresUri, package.PackageDigest, reportPath, ct).ConfigureAwait(false);
@@ -241,7 +244,7 @@ internal static class FailedImportCleanup
                     if (actualTarget != link.OriginalTarget)
                         throw new InvalidDataException("Failed item source symlink changed since export.");
                 }
-                catch (InvalidDataException) when (skipChangedHistoricalSources)
+                catch (InvalidDataException) when (skipChangedHistoricalSources || skipChangedCurrentSources)
                 {
                     await SetStageAsync(journalPath, journal, item, "skipped_source_changed", ct)
                         .ConfigureAwait(false);
@@ -276,11 +279,20 @@ internal static class FailedImportCleanup
             var item = action.Entry;
             if (item.Stage == "planned")
             {
-                await legacyReader.AssertOnlyMappedLinkAsync(item.DavItemId, item.SourcePath, ct)
-                    .ConfigureAwait(false);
-                if (new FileInfo(item.SourcePath).LinkTarget
-                    != selected[item.DavItemId].OriginalTarget)
-                    throw new InvalidDataException("Failed item source symlink changed during cleanup.");
+                try
+                {
+                    await legacyReader.AssertOnlyMappedLinkAsync(item.DavItemId, item.SourcePath, ct)
+                        .ConfigureAwait(false);
+                    if (new FileInfo(item.SourcePath).LinkTarget
+                        != selected[item.DavItemId].OriginalTarget)
+                        throw new InvalidDataException("Failed item source symlink changed during cleanup.");
+                }
+                catch (InvalidDataException) when (skipChangedHistoricalSources || skipChangedCurrentSources)
+                {
+                    await SetStageAsync(journalPath, journal, item, "skipped_source_changed", ct)
+                        .ConfigureAwait(false);
+                    continue;
+                }
                 await SetStageAsync(journalPath, journal, item, "source_deleting", ct).ConfigureAwait(false);
                 using var response = await http.PostAsJsonAsync(
                     new Uri(baseUri, "api/stats/delete-files"),
