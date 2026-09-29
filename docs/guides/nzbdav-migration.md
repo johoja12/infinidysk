@@ -429,6 +429,14 @@ was validated and promoted. Keep rejected links in the cumulative not-imported
 report. The final coverage report must use actual validated links rather than
 the pre-import recoverable projection.
 
+If an exact source symlink disappears after the immutable plan was created,
+resume a partial apply journal with an explicit list of missing source paths.
+The apply tool records each absent path as `source-missing` only while both the
+source and staged destination are absent. Validate and promote the applied
+links, report the missing paths, and pass their source IDs as `missingSourceIds`
+when acknowledging. The applied count excludes these paths. A changed symlink
+or an existing destination remains a stop condition for review.
+
 After the first pass, generate coverage against each root's initial snapshot
 and a fresh live mapped source snapshot. The report classifies added, removed,
 broken, and changed mappings without dropping new rows from the denominator.

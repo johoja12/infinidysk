@@ -73,6 +73,26 @@ internal static class CanaryPathSafety
         }
     }
 
+    public static void EnsureExistingParentsWithoutLinks(string root, string leafPath)
+    {
+        var relative = Path.GetRelativePath(root, Path.GetDirectoryName(leafPath)!);
+        if (relative == ".") return;
+        var current = root;
+        foreach (var component in relative.Split(Path.DirectorySeparatorChar))
+        {
+            current = Path.Join(current, component);
+            var info = new DirectoryInfo(current);
+            if (!info.Exists)
+            {
+                if (PathExistsNoFollow(current))
+                    throw new IOException($"Canary output parent is not a directory: {current}");
+                return;
+            }
+            if (info.LinkTarget is not null || info.Attributes.HasFlag(FileAttributes.ReparsePoint))
+                throw new InvalidDataException($"Canary output parent is a symbolic link: {current}");
+        }
+    }
+
     public static bool PathExistsNoFollow(string path)
     {
         try

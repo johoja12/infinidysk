@@ -120,6 +120,32 @@ public sealed class CanaryLinkApplierTests : IDisposable
     }
 
     [Fact]
+    public async Task ApplyAsync_RecordsExplicitlyMissingSourceWithoutCreatingLink()
+    {
+        var fixture = await CreateFixtureAsync("TV/episode.mkv");
+        File.Delete(fixture.SourceLinkPath);
+
+        var journal = await fixture.Applier.ApplyAsync(
+            fixture.PlanPath, fixture.SourceRoot, fixture.LibraryRoot, fixture.TargetRoot,
+            fixture.JournalPath, missingSourcePaths: new HashSet<string> { "TV/episode.mkv" });
+
+        Assert.Equal("source-missing", Assert.Single(journal.Links).Status);
+        Assert.False(CanaryPathSafety.PathExistsNoFollow(Path.Join(fixture.LibraryRoot, "TV", "episode.mkv")));
+        var validations = await new CanaryValidator().ValidateAsync(fixture.JournalPath);
+        Assert.Empty(validations);
+    }
+
+    [Fact]
+    public async Task ApplyAsync_RefusesToExcludePresentSource()
+    {
+        var fixture = await CreateFixtureAsync("TV/episode.mkv");
+
+        await Assert.ThrowsAsync<InvalidDataException>(() => fixture.Applier.ApplyAsync(
+            fixture.PlanPath, fixture.SourceRoot, fixture.LibraryRoot, fixture.TargetRoot,
+            fixture.JournalPath, missingSourcePaths: new HashSet<string> { "TV/episode.mkv" }));
+    }
+
+    [Fact]
     public async Task ApplyAsync_RevalidatesSourceImmediatelyBeforeCreate()
     {
         var fixture = await CreateFixtureAsync("TV/episode.mkv");

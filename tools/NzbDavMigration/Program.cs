@@ -38,7 +38,7 @@ internal static class NzbDavMigrationProgram
             await Console.Error.WriteLineAsync("       NzbDavMigration export --selection FILE --inventory FILE --blob-root PATH --output DIR --package-id ID");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-links --plan FILE --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
             await Console.Error.WriteLineAsync("       NzbDavMigration apply-mapped-links --plan FILE --mapped-inventory FILE --blob-root PATH --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
-            await Console.Error.WriteLineAsync("       NzbDavMigration apply-sharded-links --plan FILE --mapped-inventory DIR --source-root PATH --library-root PATH --target-root PATH [--journal FILE]");
+            await Console.Error.WriteLineAsync("       NzbDavMigration apply-sharded-links --plan FILE --mapped-inventory DIR --source-root PATH --library-root PATH --target-root PATH [--journal FILE] [--missing-source-paths FILE]");
             await Console.Error.WriteLineAsync("       NzbDavMigration coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --master FILE_OR_DIR --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration mapped-coverage-report --source-root PATH --library-root PATH --initial-inventory FILE --blob-root PATH --master FILE_OR_DIR --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
             await Console.Error.WriteLineAsync("       NzbDavMigration sharded-coverage-report --inventory DIR --recovery DIR --blob-root PATH --library-root PATH --journals-dir DIR --output DIR [--minimum-coverage 0.90]");
@@ -463,12 +463,24 @@ internal static class NzbDavMigrationProgram
         }
         var journal = Optional(options, "--journal")
                       ?? Path.Join(Path.GetDirectoryName(Path.GetFullPath(planPath))!, "apply-journal.json");
+        HashSet<string>? missingSourcePaths = null;
+        if (Optional(options, "--missing-source-paths") is { } exclusionsPath)
+        {
+            if (!File.Exists(exclusionsPath) || new FileInfo(exclusionsPath).LinkTarget is not null)
+                throw new FileNotFoundException("Missing-source exclusions must be a regular file.", exclusionsPath);
+            var paths = await ReadJsonAsync<string[]>(exclusionsPath).ConfigureAwait(false)
+                        ?? throw new InvalidDataException("Missing-source exclusions are empty.");
+            missingSourcePaths = paths.ToHashSet(StringComparer.Ordinal);
+            if (missingSourcePaths.Count != paths.Length)
+                throw new InvalidDataException("Missing-source exclusions contain duplicates.");
+        }
         var reader = new LegacyNzbDavReader();
         await new CanaryLinkApplier(CanaryPathSafety.IsLocalMount,
             verifyMapping: (planned, path, cancellationToken) =>
                 reader.AssertMappedLinkAsync(path, planned.LegacyDavItemId, cancellationToken))
             .ApplyAsync(planPath, sourceRoot, Required(options, "--library-root"),
-                Required(options, "--target-root"), journal).ConfigureAwait(false);
+                Required(options, "--target-root"), journal,
+                missingSourcePaths: missingSourcePaths).ConfigureAwait(false);
         await Console.Out.WriteLineAsync(journal);
         return 0;
     }

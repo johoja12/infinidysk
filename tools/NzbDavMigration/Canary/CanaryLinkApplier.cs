@@ -28,6 +28,7 @@ public sealed class CanaryLinkApplier
         string libraryRoot,
         string targetRoot,
         string journalPath,
+        IReadOnlySet<string>? missingSourcePaths = null,
         CancellationToken cancellationToken = default)
     {
         var source = CanaryPathSafety.ResolveRoot(sourceRoot, "Source library root");
@@ -54,6 +55,11 @@ public sealed class CanaryLinkApplier
             throw new InvalidDataException("Existing journal belongs to a different plan or root set.");
         await CanaryJournalStore.WriteAsync(journalPath, journal, cancellationToken).ConfigureAwait(false);
 
+        var plannedPaths = verified.Plan.Links.Where(link => link.NewRelativeTarget is not null)
+            .Select(link => link.LibraryRelativePath).ToHashSet(StringComparer.Ordinal);
+        if (missingSourcePaths is not null && missingSourcePaths.Any(path => !plannedPaths.Contains(path)))
+            throw new InvalidDataException("Missing-source exclusions must belong to the exact plan.");
+
         foreach (var planned in verified.Plan.Links.Where(link => link.NewRelativeTarget is not null))
         {
             if (planned.CorrelationStatus != "exact" || planned.ApplyStatus != "planned")
@@ -62,12 +68,42 @@ public sealed class CanaryLinkApplier
                 source, planned.LibraryRelativePath, "source library path");
             var linkPath = CanaryPathSafety.ResolveBeneath(library, planned.LibraryRelativePath, "library path");
             var targetPath = CanaryPathSafety.ResolveBeneath(target, planned.NewRelativeTarget!, "target path");
+            var existingJournal = journal.Links.SingleOrDefault(link =>
+                link.LibraryRelativePath == planned.LibraryRelativePath);
+            if (missingSourcePaths?.Contains(planned.LibraryRelativePath) == true)
+            {
+                CanaryPathSafety.EnsureParentsExistWithoutLinks(source, sourceLinkPath);
+                CanaryPathSafety.EnsureExistingParentsWithoutLinks(library, linkPath);
+                if (CanaryPathSafety.PathExistsNoFollow(sourceLinkPath)
+                    || CanaryPathSafety.PathExistsNoFollow(linkPath)
+                    || existingJournal is not null && (existingJournal.Status != "source-missing"
+                        || existingJournal.SourceLinkPath != sourceLinkPath
+                        || existingJournal.ObservedSourceTarget != planned.OriginalLegacyTarget
+                        || existingJournal.LinkPath != linkPath
+                        || existingJournal.TargetPath != targetPath
+                        || existingJournal.ExpectedFileSize != planned.ExpectedFileSize))
+                    throw new InvalidDataException("Excluded source is present or has an existing apply result.");
+                if (existingJournal is null)
+                {
+                    journal.Links.Add(new CanaryApplyJournalLink
+                    {
+                        LibraryRelativePath = planned.LibraryRelativePath,
+                        SourceLinkPath = sourceLinkPath,
+                        ObservedSourceTarget = planned.OriginalLegacyTarget,
+                        LinkPath = linkPath,
+                        TargetPath = targetPath,
+                        ExpectedFileSize = planned.ExpectedFileSize,
+                        Status = "source-missing",
+                    });
+                    await CanaryJournalStore.WriteAsync(journalPath, journal, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                continue;
+            }
             if (_verifyMapping is not null)
                 await _verifyMapping(planned, sourceLinkPath, cancellationToken).ConfigureAwait(false);
             VerifySourceLink(source, sourceLinkPath, planned.OriginalLegacyTarget);
             VerifyTarget(targetPath, planned.ExpectedFileSize);
-            var existingJournal = journal.Links.SingleOrDefault(link =>
-                link.LibraryRelativePath == planned.LibraryRelativePath);
             if (CanaryPathSafety.PathExistsNoFollow(linkPath))
             {
                 var info = new FileInfo(linkPath);
