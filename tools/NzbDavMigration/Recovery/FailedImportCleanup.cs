@@ -254,11 +254,18 @@ internal static class FailedImportCleanup
 
             var arrPath = Path.Join(canonicalArrRoot, row.LibraryRelativePath);
             var matches = new List<(ArrClient Client, ArrMediaFileMatch Match)>();
-            foreach (var client in clients)
+            for (var attempt = 1; attempt <= 4; attempt++)
             {
-                var match = await FindMediaFileWithRetryAsync(client, arrPath, ct)
-                    .ConfigureAwait(false);
-                if (match is not null) matches.Add((client, match));
+                matches.Clear();
+                foreach (var client in clients)
+                {
+                    var match = await FindMediaFileWithRetryAsync(client, arrPath, ct)
+                        .ConfigureAwait(false);
+                    if (match is not null) matches.Add((client, match));
+                }
+                if (matches.Count > 0 || attempt == 4) break;
+                // *Arr can briefly report no file while its library index refreshes.
+                await Task.Delay(TimeSpan.FromSeconds(attempt * 2), ct).ConfigureAwait(false);
             }
             if (matches.Count != 1 || matches[0].Match.MediaIds.Count == 0)
                 throw new InvalidDataException(
