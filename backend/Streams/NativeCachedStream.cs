@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Diagnostics;
 using Microsoft.Data.Sqlite;
 using NzbWebDAV.Services.NativeCache;
+using NzbWebDAV.WebDav.Requests;
 using UsenetSharp.Streams;
 
 namespace NzbWebDAV.Streams;
@@ -9,6 +10,7 @@ namespace NzbWebDAV.Streams;
 /// <summary>Final-byte, lazy-source read-through stream. Never interprets sparse holes as data.</summary>
 public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence, IStreamGenerationEvidence
 {
+    private const int SourceWindowBytes = 4 * NativeCacheStore.BlockSize;
     private readonly NativeCacheStore _store;
     private readonly NativeCacheIdentity _identity;
     private readonly Func<CancellationToken, Task<Stream>> _openSource;
@@ -22,6 +24,8 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     private readonly NativeCacheStatistics? _statistics;
     private NativeCacheStatistics.NativeCacheTransfer? _transfer;
     private Stream? _source;
+    private long _sourceWindowEnd = -1;
+    private long? _responseEnd;
     private byte[]? _buffer;
     private long _bufferStart = -1;
     private int _bufferCount;
@@ -103,6 +107,9 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         LastReadCacheable = false;
         cancellationToken.ThrowIfCancellationRequested();
         if (destination.IsEmpty || _position == Length) return 0;
+        var responseBudget = RangeContext.GetReadBudget();
+        _responseEnd ??= _position + Math.Min(Length - _position,
+            responseBudget is > 0 ? responseBudget.Value : Length - _position);
         if (!_untrackedSource && !_generationIsCurrent())
         {
             if (_servedBytes) throw new IOException("Media source changed during this response. Retry the range against the current source.");
@@ -184,7 +191,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 {
                     _bufferFromCache = false;
                     _source ??= await _openSource(cancellationToken).ConfigureAwait(false);
-                    PositionSourceForFill(_source, blockStart);
+                    PositionSourceForFill(_source, blockStart, completeBlock);
                     _bufferCount = 0;
                     _bufferVerified = true;
                     _fillStarted = Stopwatch.GetTimestamp();
@@ -316,15 +323,29 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         catch (Exception exception) when (exception is IOException or SqliteException or UnauthorizedAccessException) { }
     }
 
-    private static void PositionSourceForFill(Stream source, long position)
+    private void PositionSourceForFill(Stream source, long position, bool completeBlock)
     {
-        using var context = new NativeCacheReadContext();
+        // Keep the NNTP pipeline alive across integrity blocks. Seeking even to
+        // the current offset in proof context tears down its finite segment plan.
+        if (source.Position == position && position < _sourceWindowEnd) return;
+        var windowBytes = _background || completeBlock ? NativeCacheStore.BlockSize : SourceWindowBytes;
+        var remaining = Math.Min(Length - position, windowBytes);
+        if (_responseEnd is { } responseEnd && responseEnd > position)
+        {
+            // Integrity admission needs the whole final block, even for a short
+            // HTTP range, but must not prefetch an additional window past it.
+            var requested = Math.Min(remaining, responseEnd - position);
+            var rounded = ((requested - 1) / NativeCacheStore.BlockSize + 1) * NativeCacheStore.BlockSize;
+            remaining = Math.Min(remaining, rounded);
+        }
+        _sourceWindowEnd = position + remaining;
+        using var context = new NativeCacheReadContext(remaining);
         source.Position = position;
     }
 
-    private static async ValueTask<int> ReadSourceForFillAsync(Stream source, Memory<byte> destination, CancellationToken cancellationToken)
+    private async ValueTask<int> ReadSourceForFillAsync(Stream source, Memory<byte> destination, CancellationToken cancellationToken)
     {
-        using var context = new NativeCacheReadContext();
+        using var context = new NativeCacheReadContext(_sourceWindowEnd - source.Position);
         return await source.ReadAsync(destination, cancellationToken).ConfigureAwait(false);
     }
 
@@ -387,6 +408,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
 
     private async ValueTask<int> ReadSourceRangeAsync(Memory<byte> destination, CancellationToken cancellationToken)
     {
+        _sourceWindowEnd = -1;
         _source ??= await _openSource(cancellationToken).ConfigureAwait(false);
         if (_source.Position != _position) _source.Position = _position;
         var start = _position;
@@ -420,6 +442,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         };
         if (position < 0 || position > Length) throw new ArgumentOutOfRangeException(nameof(offset));
         LastReadCacheable = false;
+        if (position != _position) _responseEnd = null;
         return _position = position;
     }
 

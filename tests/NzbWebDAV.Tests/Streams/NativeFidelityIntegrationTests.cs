@@ -1,4 +1,5 @@
 using NzbWebDAV.Models;
+using NzbWebDAV.Database.Models;
 using NzbWebDAV.Services.NativeCache;
 using NzbWebDAV.Streams;
 using NzbWebDAV.Tests.Fakes;
@@ -7,6 +8,72 @@ namespace NzbWebDAV.Tests.Streams;
 
 public sealed class NativeFidelityIntegrationTests
 {
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task SequentialCacheBlocks_KeepSegmentPipelineWithoutRefetchingBoundaries(bool multipart, bool cancelEarly)
+    {
+        var directory = Directory.CreateTempSubdirectory("native-pipeline-");
+        try
+        {
+            const int segmentSize = 1024 * 1024;
+            var ids = Enumerable.Range(0, 12).Select(i => $"segment-{i}").ToArray();
+            var data = ids.Select((id, i) => (id, bytes: Enumerable.Repeat((byte)i, segmentSize).ToArray()))
+                .ToDictionary(pair => pair.id, pair => pair.bytes);
+            var ranges = Enumerable.Range(0, ids.Length)
+                .Select(i => new LongRange((long)(multipart ? i % 6 : i) * segmentSize,
+                    (long)((multipart ? i % 6 : i) + 1) * segmentSize)).ToArray();
+            using var client = new FakeNntpClient(data, useCachedYencStreams: true,
+                segmentRanges: ids.Zip(ranges).ToDictionary(pair => pair.First, pair => pair.Second));
+            await using var store = new NativeCacheStore(Path.Combine(directory.FullName, "index.db"),
+                [new NativeCacheFolder { Path = directory.FullName, MinFreeBytes = 0 }]);
+            var identity = new NativeCacheIdentity("pipeline", "v1", (long)ids.Length * segmentSize);
+            var readSegments = cancelEarly ? 4 : ids.Length;
+            Stream OpenSource() => multipart
+                ? new DavMultipartFileStream(new DavMultipartFile
+                {
+                    Id = Guid.NewGuid(),
+                    Metadata = new DavMultipartFile.Meta
+                    {
+                        FileParts = Enumerable.Range(0, 2).Select(part => new DavMultipartFile.FilePart
+                        {
+                            SegmentIds = ids.Skip(part * 6).Take(6).ToArray(),
+                            SegmentIdByteRange = new LongRange(0, 6L * segmentSize),
+                            FilePartByteRange = new LongRange(0, 6L * segmentSize),
+                            SegmentByteRanges = ranges.Skip(part * 6).Take(6).ToArray(),
+                            SegmentByteRangesTrusted = true,
+                        }).ToArray(),
+                    },
+                }, client, 40, resolver: null, usePipelinedBodyRequests: true)
+                : new NzbFileStream(ids, identity.Length, client, 40, ranges,
+                    usePipelinedBodyRequests: true, segmentByteRangesTrusted: true);
+            await using (var stream = new NativeCachedStream(store, identity,
+                _ => Task.FromResult(OpenSource()), () => true))
+            {
+                using var cancellation = new CancellationTokenSource();
+                var actual = new byte[segmentSize];
+                for (var i = 0; i < readSegments; i++)
+                {
+                    await stream.ReadExactlyAsync(actual, cancellation.Token);
+                    Assert.Equal(data[ids[i]], actual);
+                }
+                if (cancelEarly)
+                {
+                    cancellation.Cancel();
+                    await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                        () => stream.ReadAsync(actual, cancellation.Token).AsTask());
+                }
+            }
+            Assert.Equal((long)readSegments * segmentSize, await store.GetCoverageAsync(identity));
+            Assert.InRange(client.BodyRequestCounts.Count, readSegments, ids.Length);
+            Assert.All(client.BodyRequestCounts.Values, count => Assert.Equal(1, count));
+            Assert.Equal(client.BodyRequestCount, client.CompletionCallbackCount);
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
     [Fact]
     public async Task ThreeSpeculativeHoles_DoNotPoisonReadablePlayerPrefix()
     {

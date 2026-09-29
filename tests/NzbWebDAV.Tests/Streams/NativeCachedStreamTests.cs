@@ -1,5 +1,6 @@
 using NzbWebDAV.Services.NativeCache;
 using NzbWebDAV.Streams;
+using NzbWebDAV.WebDav.Requests;
 
 namespace NzbWebDAV.Tests.Streams;
 
@@ -249,6 +250,106 @@ public sealed class NativeCachedStreamTests : IDisposable
         Assert.All(source.ReadsInProofContext, Assert.True);
     }
 
+    [Fact]
+    public async Task SequentialColdBlocks_ReuseBoundedSourceWindow_AndPublishEachBlock()
+    {
+        await using var store = CreateStore();
+        var block = NativeCacheStore.BlockSize;
+        var bytes = new byte[5 * block];
+        new Random(85).NextBytes(bytes);
+        var source = new WindowedProofSource(bytes);
+        var id = new NativeCacheIdentity("sequential-window", "v1", bytes.Length);
+        await using var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(source), () => true);
+        var actual = new byte[block];
+        for (var i = 0; i < 5; i++)
+        {
+            await stream.ReadExactlyAsync(actual);
+            Assert.Equal(bytes.AsSpan(i * block, block).ToArray(), actual);
+            Assert.Equal((i + 1L) * block, await store.GetCoverageAsync(id));
+        }
+        Assert.Equal([(0L, 4L * block), (4L * block, (long)block)], source.Windows);
+    }
+
+    [Fact]
+    public async Task FiniteRange_ReadAheadStopsAtFinalIntegrityBlock()
+    {
+        await using var store = CreateStore();
+        var block = NativeCacheStore.BlockSize;
+        var source = new WindowedProofSource(new byte[8 * block]);
+        var id = new NativeCacheIdentity("finite-window", "v1", source.Length);
+        await using var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(source), () => true);
+        stream.Position = block;
+        RangeContext.SetReadBudget(4L * block + 1);
+        try
+        {
+            await stream.ReadExactlyAsync(new byte[4 * block + 1]);
+            Assert.Equal([(1L * block, 4L * block), (5L * block, (long)block)], source.Windows);
+            Assert.Equal(5L * block, await store.GetCoverageAsync(id));
+        }
+        finally { RangeContext.SetReadBudget(null); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Warming_DoesNotPrefetchBeyondTheAdmittedBlock(bool background)
+    {
+        await using var store = CreateStore();
+        var block = NativeCacheStore.BlockSize;
+        var source = new WindowedProofSource(new byte[5 * block]);
+        await using var stream = new NativeCachedStream(store, new("warming-window", "v1", source.Length),
+            _ => Task.FromResult<Stream>(source), () => true, background: background);
+        if (background) await stream.ReadExactlyAsync(new byte[2 * block]);
+        else
+        {
+            await stream.ReadWarmProbeAsync(new byte[1], CancellationToken.None);
+            stream.Position = block;
+            await stream.ReadWarmProbeAsync(new byte[1], CancellationToken.None);
+        }
+        Assert.Equal([(0L, (long)block), ((long)block, (long)block)], source.Windows);
+    }
+
+    [Fact]
+    public async Task CacheHitGap_RepositionsSourceRatherThanServingSkippedBytes()
+    {
+        await using var store = CreateStore();
+        var block = NativeCacheStore.BlockSize;
+        var bytes = new byte[3 * block];
+        new Random(86).NextBytes(bytes);
+        var source = new WindowedProofSource(bytes);
+        var id = new NativeCacheIdentity("gap-window", "v1", bytes.Length);
+        Assert.True(await store.WriteBlockAsync(id, block, bytes.AsMemory(block, block)));
+        await using var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(source), () => true);
+        var actual = new byte[bytes.Length];
+        await stream.ReadExactlyAsync(actual);
+        Assert.Equal(bytes, actual);
+        Assert.Equal([(0L, 3L * block), (2L * block, (long)block)], source.Windows);
+    }
+
+    [Fact]
+    public async Task UnalignedPrefix_EntersProofWindowAtNextBlock()
+    {
+        await using var store = CreateStore();
+        var block = NativeCacheStore.BlockSize;
+        var bytes = new byte[3 * block];
+        new Random(87).NextBytes(bytes);
+        var source = new ContextAwareSource(bytes);
+        var id = new NativeCacheIdentity("unaligned-window", "v1", bytes.Length);
+        await using var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(source), () => true);
+        stream.Position = block - 64 * 1024;
+        var actual = new byte[2 * block + 64 * 1024];
+        await stream.ReadExactlyAsync(actual);
+        Assert.Equal(bytes.AsSpan(block - 64 * 1024).ToArray(), actual);
+        Assert.Equal(2L * block, await store.GetCoverageAsync(id));
+        Assert.Equal([false, true], source.PositionsInProofContext);
+        Assert.False(source.ReadsInProofContext[0]);
+        Assert.All(source.ReadsInProofContext.Skip(1), Assert.True);
+    }
+
     [Theory]
     [InlineData(false, true)]
     [InlineData(true, false)]
@@ -372,6 +473,31 @@ public sealed class NativeCachedStreamTests : IDisposable
             var count = await base.ReadAsync(buffer, cancellationToken);
             reads.Add((offset, count));
             return count;
+        }
+    }
+
+    private sealed class WindowedProofSource(byte[] bytes) : MemoryStream(bytes), ICacheReadEvidence
+    {
+        private long _windowEnd;
+        public bool LastReadCacheable => true;
+        public List<(long Offset, long Budget)> Windows { get; } = [];
+        public override long Position
+        {
+            get => base.Position;
+            set
+            {
+                var budget = NativeCacheReadContext.ReadBudget
+                    ?? throw new InvalidOperationException("Source positioned outside proof context.");
+                Windows.Add((value, budget));
+                _windowEnd = value + budget;
+                base.Position = value;
+            }
+        }
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            Assert.True(NativeCacheReadContext.IsActive);
+            if (Position >= _windowEnd) throw new IOException("Finite source window exhausted.");
+            return base.ReadAsync(buffer[..(int)Math.Min(buffer.Length, _windowEnd - Position)], cancellationToken);
         }
     }
 
