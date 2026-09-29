@@ -471,8 +471,10 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         Assert.Equal(0, batch.ValidatedCount);
     }
 
-    [Fact]
-    public async Task AcknowledgePlan_AllowsExactSourceThatDisappearedAfterPlanning()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AcknowledgePlan_AllowsExactSourceThatBecameUnavailableAfterPlanning(bool replaced)
     {
         await using var harness = await MigrationTestHarness.CreateAsync();
         var masterDigest = new string('e', 64);
@@ -507,9 +509,13 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
             new NzbDavBatchPlanAcknowledgementRequest(digest, 0, 0)));
         Assert.IsType<BadRequestObjectResult>(await controller.AcknowledgePlan(0,
             new NzbDavBatchPlanAcknowledgementRequest(digest, 0, 0, null, [Guid.NewGuid().ToString()])));
+        Assert.IsType<BadRequestObjectResult>(await controller.AcknowledgePlan(0,
+            new NzbDavBatchPlanAcknowledgementRequest(digest, 0, 0, null,
+                [selected.LegacyDavItemId.ToString()], [selected.LegacyDavItemId.ToString()])));
         Assert.IsType<OkObjectResult>(await controller.AcknowledgePlan(0,
             new NzbDavBatchPlanAcknowledgementRequest(digest, 0, 0, null,
-                [selected.LegacyDavItemId.ToString()])));
+                replaced ? null : [selected.LegacyDavItemId.ToString()],
+                replaced ? [selected.LegacyDavItemId.ToString()] : null)));
         await using var verify = harness.Mig();
         var batch = await verify.NzbDavBatches.SingleAsync();
         Assert.Equal("acknowledged", batch.Status);

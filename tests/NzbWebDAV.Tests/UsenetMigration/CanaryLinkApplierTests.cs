@@ -146,6 +146,33 @@ public sealed class CanaryLinkApplierTests : IDisposable
     }
 
     [Fact]
+    public async Task ApplyAsync_RecordsReplacedSourceWithoutOverwritingIt()
+    {
+        var fixture = await CreateFixtureAsync("TV/episode.mkv");
+        var replacement = Path.Join(fixture.TargetRoot, ".ids", "new-item");
+        File.Delete(fixture.SourceLinkPath);
+        File.CreateSymbolicLink(fixture.SourceLinkPath, replacement);
+        var exclusions = new Dictionary<string, string> { ["TV/episode.mkv"] = replacement };
+
+        var journal = await fixture.Applier.ApplyAsync(
+            fixture.PlanPath, fixture.SourceRoot, fixture.LibraryRoot, fixture.TargetRoot,
+            fixture.JournalPath, replacedSourcePaths: exclusions);
+
+        var entry = Assert.Single(journal.Links);
+        Assert.Equal("source-replaced", entry.Status);
+        Assert.Equal(replacement, entry.ReplacementSourceTarget);
+        Assert.Equal(replacement, new FileInfo(fixture.SourceLinkPath).LinkTarget);
+        Assert.False(CanaryPathSafety.PathExistsNoFollow(Path.Join(fixture.LibraryRoot, "TV", "episode.mkv")));
+        Assert.Empty(await new CanaryValidator().ValidateAsync(fixture.JournalPath));
+
+        File.Delete(fixture.SourceLinkPath);
+        File.CreateSymbolicLink(fixture.SourceLinkPath, Path.Join(fixture.TargetRoot, ".ids", "other-item"));
+        await Assert.ThrowsAsync<InvalidDataException>(() => fixture.Applier.ApplyAsync(
+            fixture.PlanPath, fixture.SourceRoot, fixture.LibraryRoot, fixture.TargetRoot,
+            fixture.JournalPath, replacedSourcePaths: exclusions));
+    }
+
+    [Fact]
     public async Task ApplyAsync_RevalidatesSourceImmediatelyBeforeCreate()
     {
         var fixture = await CreateFixtureAsync("TV/episode.mkv");

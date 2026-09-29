@@ -18,6 +18,7 @@ public sealed class CanaryApplyJournalLink
     public string LibraryRelativePath { get; set; } = "";
     public string SourceLinkPath { get; set; } = "";
     public string ObservedSourceTarget { get; set; } = "";
+    public string? ReplacementSourceTarget { get; set; }
     public string LinkPath { get; set; } = "";
     public string TargetPath { get; set; } = "";
     public long ExpectedFileSize { get; set; }

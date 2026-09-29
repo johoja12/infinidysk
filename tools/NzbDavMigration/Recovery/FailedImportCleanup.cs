@@ -358,10 +358,12 @@ internal static class FailedImportCleanup
             .ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
         var missing = journalLinks.Where(item => item.GetProperty("status").GetString() == "source-missing")
             .ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
+        var replaced = journalLinks.Where(item => item.GetProperty("status").GetString() == "source-replaced")
+            .ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
         var byPath = rows.ToDictionary(item => item.GetProperty("libraryRelativePath").GetString()!, StringComparer.Ordinal);
         if (planned.Count != p.GetProperty("actionableCount").GetInt32()
-            || planned.Count != applied.Count + missing.Count || applied.Count != byPath.Count
-            || journalLinks.Length != applied.Count + missing.Count
+            || planned.Count != applied.Count + missing.Count + replaced.Count || applied.Count != byPath.Count
+            || journalLinks.Length != applied.Count + missing.Count + replaced.Count
             || report.Failures.Count == 0
             || report.Failures.Count != rows.Count(item => !item.GetProperty("success").GetBoolean()))
             throw new InvalidDataException("Validation results do not cover the exact applied links.");
@@ -371,6 +373,16 @@ internal static class FailedImportCleanup
                 || CanaryPathSafety.PathExistsNoFollow(link.GetProperty("sourceLinkPath").GetString()!)
                 || CanaryPathSafety.PathExistsNoFollow(link.GetProperty("linkPath").GetString()!))
                 throw new InvalidDataException($"Missing source evidence changed for '{path}'.");
+        }
+        foreach (var (path, link) in replaced)
+        {
+            var sourcePath = link.GetProperty("sourceLinkPath").GetString()!;
+            var replacementTarget = link.GetProperty("replacementSourceTarget").GetString();
+            if (!planned.ContainsKey(path)
+                || string.IsNullOrWhiteSpace(replacementTarget)
+                || new FileInfo(sourcePath).LinkTarget != replacementTarget
+                || CanaryPathSafety.PathExistsNoFollow(link.GetProperty("linkPath").GetString()!))
+                throw new InvalidDataException($"Replaced source evidence changed for '{path}'.");
         }
         foreach (var (path, link) in applied)
         {

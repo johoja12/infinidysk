@@ -27,7 +27,7 @@ public sealed class CanaryValidator
         var operationTimeout = timeout ?? TimeSpan.FromSeconds(10);
         var journal = await CanaryJournalStore.ReadAsync(journalPath, cancellationToken).ConfigureAwait(false)
                       ?? throw new FileNotFoundException("Canary apply journal is missing.", journalPath);
-        if (journal.Links.Any(link => link.Status is not ("applied" or "source-missing")))
+        if (journal.Links.Any(link => link.Status is not ("applied" or "source-missing" or "source-replaced")))
             throw new InvalidDataException("Canary apply journal contains an unfinished link.");
         var results = new List<CanaryValidationResult>();
         foreach (var link in journal.Links.Where(item => item.Status == "applied"))
