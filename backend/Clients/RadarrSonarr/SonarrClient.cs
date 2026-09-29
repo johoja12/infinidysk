@@ -248,10 +248,11 @@ public class SonarrClient(string host, string apiKey) : ArrClient(host, apiKey)
 
     private async Task<int?> GetSeriesId(string symlinkOrStrmPath, CancellationToken ct)
     {
+        var parentPaths = PathUtil.GetAllParentDirectories(symlinkOrStrmPath).ToArray();
         // get series-id from cache
         string? cachedSeriesPath = null;
         var cachedSeriesId = 0;
-        foreach (var parentPath in PathUtil.GetAllParentDirectories(symlinkOrStrmPath))
+        foreach (var parentPath in parentPaths.Reverse())
         {
             if (!SeriesPathToSeriesIdCache.TryGetValue((Host, parentPath), out cachedSeriesId))
                 continue;
@@ -264,18 +265,23 @@ public class SonarrClient(string host, string apiKey) : ArrClient(host, apiKey)
         if (cachedSeriesPath != null)
         {
             var series = await GetSeriesOrNull(cachedSeriesId, ct).ConfigureAwait(false);
-            if (series?.Path != null && symlinkOrStrmPath.StartsWith(series.Path, StringComparison.Ordinal))
+            if (series?.Path != null && parentPaths.Contains(series.Path, StringComparer.Ordinal))
                 return cachedSeriesId;
             SeriesPathToSeriesIdCache.TryRemove((Host, cachedSeriesPath), out _);
         }
 
         // otherwise, fetch all series and repopulate the cache
         int? result = null;
+        var matchedPathLength = -1;
         foreach (var series in await GetAllSeries(ct).ConfigureAwait(false))
         {
             SeriesPathToSeriesIdCache[(Host, series.Path!)] = series.Id;
-            if (symlinkOrStrmPath.StartsWith(series.Path!, StringComparison.Ordinal))
+            if (series.Path != null && series.Path.Length > matchedPathLength
+                && parentPaths.Contains(series.Path, StringComparer.Ordinal))
+            {
                 result = series.Id;
+                matchedPathLength = series.Path.Length;
+            }
         }
 
         // return the found series-id

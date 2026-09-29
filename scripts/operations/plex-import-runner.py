@@ -311,6 +311,8 @@ def cleanup_failure_args(batch_index, package, report_dir, historical=False, pre
         args.extend(("--historical-correlation", str(report_dir / "correlation.json"),
                      "--historical-acknowledgement", str(report_dir / "acknowledgement.json"),
                      "--skip-changed-historical-sources", "true"))
+    else:
+        args.extend(("--skip-changed-current-sources", "true"))
     if preflight:
         args.extend(("--preflight-only", "true"))
     return args

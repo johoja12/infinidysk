@@ -390,6 +390,26 @@ public class RadarrSonarrClientTests
     }
 
     [Fact]
+    public async Task SonarrFindMediaFile_DoesNotChooseSiblingSeriesWithSharedNamePrefix()
+    {
+        const string seriesPath = "/library/tv/House of the Dragon";
+        const string filePath = seriesPath + "/Season 3/House of the Dragon S03E08.mkv";
+        using var httpClient = new HttpClient(CreateHandler(
+            ("GET /api/v3/series", JsonResponse("""[{"id":484,"path":"/library/tv/House of the Dragon"},{"id":660,"path":"/library/tv/House"}]""")),
+            ("GET /api/v3/episodefile?seriesId=484",
+                JsonResponse($"[{{\"id\":85001,\"seriesId\":484,\"path\":\"{filePath}\"}}]")),
+            ("GET /api/v3/episode?episodeFileId=85001",
+                JsonResponse("""[{"id":308,"seriesId":484}]"""))));
+        var client = new TestSonarrClient(httpClient);
+
+        var match = await client.FindMediaFileAsync(filePath);
+
+        Assert.NotNull(match);
+        Assert.Equal(85001, match.FileId);
+        Assert.Equal([308], match.MediaIds);
+    }
+
+    [Fact]
     public async Task GetQueueCountAsync_HonorsCancellationToken()
     {
         using var httpClient = new HttpClient(new HangUntilCancelledHandler());
