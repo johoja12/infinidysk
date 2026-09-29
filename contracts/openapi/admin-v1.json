@@ -1064,6 +1064,15 @@
               "string"
             ]
           },
+          "replacedSourceIds": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "unvalidatedExactSourceIds": {
             "items": {
               "type": "string"

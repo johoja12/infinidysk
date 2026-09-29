@@ -434,8 +434,16 @@ resume a partial apply journal with an explicit list of missing source paths.
 The apply tool records each absent path as `source-missing` only while both the
 source and staged destination are absent. Validate and promote the applied
 links, report the missing paths, and pass their source IDs as `missingSourceIds`
-when acknowledging. The applied count excludes these paths. A changed symlink
-or an existing destination remains a stop condition for review.
+when acknowledging. The applied count excludes these paths.
+
+If Sonarr or Radarr replaces a planned NzbDav link with an InfiniDysk link,
+record the exact replacement target in `--replaced-source-paths`. The apply
+tool checks that the old NzbDav item no longer owns the path, leaves the new
+link untouched, and records `source-replaced`. Keep this path out of live
+promotion, report it, and pass its original source ID as `replacedSourceIds`
+when acknowledging. The replacement must remain unchanged through
+acknowledgement. Other changed symlinks and existing staged destinations
+remain stop conditions for review.
 
 After the first pass, generate coverage against each root's initial snapshot
 and a fresh live mapped source snapshot. The report classifies added, removed,
