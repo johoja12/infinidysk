@@ -467,20 +467,33 @@ def process_batch(batch_index, stage_name, destination, manifest):
     prior = json.loads(journal.read_text()) if journal.exists() else {"links": []}
     prior_applied = {row["libraryRelativePath"] for row in prior["links"]
                      if row.get("status") == "applied"}
-    missing_paths = [row["libraryRelativePath"] for row in plan["links"]
+    pending_links = [row for row in plan["links"]
                      if row.get("correlationStatus") == "exact"
                      and row.get("applyStatus") == "planned"
-                     and row["libraryRelativePath"] not in prior_applied
-                     and not os.path.lexists(os.path.join(LIBRARY_ROOT, row["libraryRelativePath"]))]
+                     and row["libraryRelativePath"] not in prior_applied]
+    missing_paths = [row["libraryRelativePath"] for row in pending_links
+                     if not os.path.lexists(os.path.join(LIBRARY_ROOT, row["libraryRelativePath"]))]
+    replaced_paths = {}
+    for row in pending_links:
+        source = os.path.join(LIBRARY_ROOT, row["libraryRelativePath"])
+        if not os.path.islink(source):
+            continue
+        current_target = os.readlink(source)
+        if current_target != row["originalLegacyTarget"] and current_target.startswith(TARGET_ROOT + "/.ids/"):
+            replaced_paths[row["libraryRelativePath"]] = current_target
     missing_file = report_dir / "missing-source-paths.json"
     if missing_paths:
         write_json_once(missing_file, missing_paths)
-    if not journal.exists() or len(prior_applied) + len(missing_paths) != exact_count:
+    replaced_file = report_dir / "replaced-source-paths.json"
+    if replaced_paths:
+        write_json_once(replaced_file, replaced_paths)
+    if not journal.exists() or len(prior_applied) + len(missing_paths) + len(replaced_paths) != exact_count:
         run_tool(f"id64-plex-apply-{batch_index + 1:04d}-20260927", [
             "apply-sharded-links", "--plan", str(plan_path), "--mapped-inventory", str(INVENTORY),
             "--source-root", LIBRARY_ROOT, "--library-root", TARGET_LIBRARY,
             "--target-root", TARGET_ROOT, "--journal", str(journal),
-            *(["--missing-source-paths", str(missing_file)] if missing_paths else [])])
+            *(["--missing-source-paths", str(missing_file)] if missing_paths else []),
+            *(["--replaced-source-paths", str(replaced_file)] if replaced_paths else [])])
     journal_data = json.loads(journal.read_text())
     if journal_data.get("planSha256") != digest or journal_data.get("sourceRoot") != LIBRARY_ROOT \
             or journal_data.get("libraryRoot") != TARGET_LIBRARY \
@@ -489,11 +502,14 @@ def process_batch(batch_index, stage_name, destination, manifest):
     applied = sum(1 for item in journal_data.get("links", []) if item.get("status") == "applied")
     missing = [item for item in journal_data.get("links", [])
                if item.get("status") == "source-missing"]
-    if applied + len(missing) != exact_count or len(journal_data.get("links", [])) != exact_count:
-        raise RuntimeError(f"batch {batch_index + 1} accounted for {applied + len(missing)} of {exact_count} exact links")
+    replaced = [item for item in journal_data.get("links", [])
+                if item.get("status") == "source-replaced"]
+    if applied + len(missing) + len(replaced) != exact_count or len(journal_data.get("links", [])) != exact_count:
+        raise RuntimeError(f"batch {batch_index + 1} accounted for {applied + len(missing) + len(replaced)} of {exact_count} exact links")
     missing_by_path = {row["libraryRelativePath"]: row["legacyDavItemId"]
                        for row in plan["links"] if row.get("applyStatus") == "planned"}
     missing_ids = [missing_by_path[row["libraryRelativePath"]] for row in missing]
+    replaced_ids = [missing_by_path[row["libraryRelativePath"]] for row in replaced]
     if not validated_path.exists():
         run_tool(f"id64-plex-validate-{batch_index + 1:04d}-20260927", [
             "validate-links", "--journal", str(journal), "--output", str(validated_path),
@@ -506,7 +522,7 @@ def process_batch(batch_index, stage_name, destination, manifest):
     if validated + len(failures_validation) != applied:
         raise RuntimeError(f"batch {batch_index + 1} validation coverage disagrees with the exact plan")
     validation_rejects = []
-    excluded_paths = {row["libraryRelativePath"] for row in missing}
+    excluded_paths = {row["libraryRelativePath"] for row in missing + replaced}
     if failures_validation:
         validation_rejects = cleanup_unreadable_links(
             batch_index, destination, manifest, report_dir, plan_path, journal,
@@ -524,6 +540,17 @@ def process_batch(batch_index, stage_name, destination, manifest):
                                  "legacyDavItemId": missing_by_path[row["libraryRelativePath"]],
                                  "status": "source-missing",
                                  "reason": "Source library link disappeared after the immutable plan was created"})
+    if replaced:
+        with (report_dir / "replaced-source-not-imported.csv").open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["batchIndex", "libraryRelativePath",
+                                                       "legacyDavItemId", "status", "reason"])
+            writer.writeheader()
+            for row in replaced:
+                writer.writerow({"batchIndex": batch_index,
+                                 "libraryRelativePath": row["libraryRelativePath"],
+                                 "legacyDavItemId": missing_by_path[row["libraryRelativePath"]],
+                                 "status": "source-replaced",
+                                 "reason": "Source library link was replaced after the immutable plan was created"})
     if validated:
         PROMOTION_DIR.mkdir(parents=True, exist_ok=True)
         promotion_record = PROMOTION_DIR / f"batch-{batch_index + 1:04d}.json"
@@ -548,11 +575,18 @@ def process_batch(batch_index, stage_name, destination, manifest):
         if os.path.lexists(os.path.join(LIBRARY_ROOT, relative)) or os.path.lexists(
                 os.path.join(TARGET_LIBRARY, relative)):
             raise RuntimeError(f"missing source evidence changed before acknowledgement: {relative}")
+    for row in replaced:
+        relative = row["libraryRelativePath"]
+        source = os.path.join(LIBRARY_ROOT, relative)
+        if not os.path.islink(source) or os.readlink(source) != row["replacementSourceTarget"] \
+                or os.path.lexists(os.path.join(TARGET_LIBRARY, relative)):
+            raise RuntimeError(f"replaced source evidence changed before acknowledgement: {relative}")
     ack = request(f"/api/migration/nzbdav/full/batches/{batch_index}/acknowledge-plan", "POST", {
         "planDigest": digest, "appliedCount": applied, "validatedCount": validated,
-        "unvalidatedExactSourceIds": validation_rejects, "missingSourceIds": missing_ids})
+        "unvalidatedExactSourceIds": validation_rejects, "missingSourceIds": missing_ids,
+        "replacedSourceIds": replaced_ids})
     save_json(report_dir / "acknowledgement.json", ack)
-    log(f"batch {batch_index + 1}/{BATCH_COUNT} acknowledged: selected={len(manifest['selectedLinks'])}, validated={validated}, unreadable={len(validation_rejects)}, missing-source={len(missing)}, not-imported={len(excluded) + len(validation_rejects) + len(missing)}")
+    log(f"batch {batch_index + 1}/{BATCH_COUNT} acknowledged: selected={len(manifest['selectedLinks'])}, validated={validated}, unreadable={len(validation_rejects)}, missing-source={len(missing)}, replaced-source={len(replaced)}, not-imported={len(excluded) + len(validation_rejects) + len(missing) + len(replaced)}")
     shutil.rmtree(destination)
 
 
@@ -578,6 +612,7 @@ def write_final_report():
     for index in range(BATCH_COUNT):
         add(REPORTS / f"batch-{index + 1:04d}" / "validation-not-imported.csv", None)
         add(REPORTS / f"batch-{index + 1:04d}" / "missing-source-not-imported.csv", None)
+        add(REPORTS / f"batch-{index + 1:04d}" / "replaced-source-not-imported.csv", None)
     tmp = output.with_suffix(".csv.tmp")
     with tmp.open("w", newline="", encoding="utf-8") as stream:
         fields = ["batchIndex", "libraryRelativePath", "legacyDavItemId", "status", "reason"]

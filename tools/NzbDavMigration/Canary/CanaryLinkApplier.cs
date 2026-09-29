@@ -7,6 +7,7 @@ public sealed class CanaryLinkApplier
     private readonly Func<string, bool> _isLocalMount;
     private readonly Action<string>? _beforeCreate;
     private readonly Func<NzbDavCanaryPlanLink, string, CancellationToken, Task>? _verifyMapping;
+    private readonly Func<NzbDavCanaryPlanLink, string, CancellationToken, Task>? _verifyReplacement;
 
     public CanaryLinkApplier() : this(CanaryPathSafety.IsLocalMount)
     {
@@ -15,11 +16,13 @@ public sealed class CanaryLinkApplier
     internal CanaryLinkApplier(
         Func<string, bool> isLocalMount,
         Action<string>? beforeCreate = null,
-        Func<NzbDavCanaryPlanLink, string, CancellationToken, Task>? verifyMapping = null)
+        Func<NzbDavCanaryPlanLink, string, CancellationToken, Task>? verifyMapping = null,
+        Func<NzbDavCanaryPlanLink, string, CancellationToken, Task>? verifyReplacement = null)
     {
         _isLocalMount = isLocalMount;
         _beforeCreate = beforeCreate;
         _verifyMapping = verifyMapping;
+        _verifyReplacement = verifyReplacement;
     }
 
     public async Task<CanaryApplyJournal> ApplyAsync(
@@ -29,6 +32,7 @@ public sealed class CanaryLinkApplier
         string targetRoot,
         string journalPath,
         IReadOnlySet<string>? missingSourcePaths = null,
+        IReadOnlyDictionary<string, string>? replacedSourcePaths = null,
         CancellationToken cancellationToken = default)
     {
         var source = CanaryPathSafety.ResolveRoot(sourceRoot, "Source library root");
@@ -59,6 +63,9 @@ public sealed class CanaryLinkApplier
             .Select(link => link.LibraryRelativePath).ToHashSet(StringComparer.Ordinal);
         if (missingSourcePaths is not null && missingSourcePaths.Any(path => !plannedPaths.Contains(path)))
             throw new InvalidDataException("Missing-source exclusions must belong to the exact plan.");
+        if (replacedSourcePaths is not null && replacedSourcePaths.Keys.Any(path => !plannedPaths.Contains(path)
+            || missingSourcePaths?.Contains(path) == true))
+            throw new InvalidDataException("Replaced-source exclusions must belong to the exact plan and be distinct from missing sources.");
 
         foreach (var planned in verified.Plan.Links.Where(link => link.NewRelativeTarget is not null))
         {
@@ -70,6 +77,45 @@ public sealed class CanaryLinkApplier
             var targetPath = CanaryPathSafety.ResolveBeneath(target, planned.NewRelativeTarget!, "target path");
             var existingJournal = journal.Links.SingleOrDefault(link =>
                 link.LibraryRelativePath == planned.LibraryRelativePath);
+            if (replacedSourcePaths?.TryGetValue(planned.LibraryRelativePath, out var replacementTarget) == true)
+            {
+                CanaryPathSafety.EnsureParentsExistWithoutLinks(source, sourceLinkPath);
+                CanaryPathSafety.EnsureExistingParentsWithoutLinks(library, linkPath);
+                var sourceInfo = new FileInfo(sourceLinkPath);
+                sourceInfo.Refresh();
+                if (string.IsNullOrWhiteSpace(replacementTarget)
+                    || replacementTarget == planned.OriginalLegacyTarget
+                    || !replacementTarget.StartsWith(Path.Join(target, ".ids") + Path.DirectorySeparatorChar,
+                        StringComparison.Ordinal)
+                    || sourceInfo.LinkTarget != replacementTarget
+                    || CanaryPathSafety.PathExistsNoFollow(linkPath)
+                    || existingJournal is not null && (existingJournal.Status != "source-replaced"
+                        || existingJournal.ReplacementSourceTarget != replacementTarget
+                        || existingJournal.SourceLinkPath != sourceLinkPath
+                        || existingJournal.ObservedSourceTarget != planned.OriginalLegacyTarget
+                        || existingJournal.LinkPath != linkPath
+                        || existingJournal.TargetPath != targetPath
+                        || existingJournal.ExpectedFileSize != planned.ExpectedFileSize))
+                    throw new InvalidDataException("Replaced source or destination changed since exclusion was recorded.");
+                if (_verifyReplacement is not null)
+                    await _verifyReplacement(planned, sourceLinkPath, cancellationToken).ConfigureAwait(false);
+                if (existingJournal is null)
+                {
+                    journal.Links.Add(new CanaryApplyJournalLink
+                    {
+                        LibraryRelativePath = planned.LibraryRelativePath,
+                        SourceLinkPath = sourceLinkPath,
+                        ObservedSourceTarget = planned.OriginalLegacyTarget,
+                        ReplacementSourceTarget = replacementTarget,
+                        LinkPath = linkPath,
+                        TargetPath = targetPath,
+                        ExpectedFileSize = planned.ExpectedFileSize,
+                        Status = "source-replaced",
+                    });
+                    await CanaryJournalStore.WriteAsync(journalPath, journal, cancellationToken).ConfigureAwait(false);
+                }
+                continue;
+            }
             if (missingSourcePaths?.Contains(planned.LibraryRelativePath) == true)
             {
                 CanaryPathSafety.EnsureParentsExistWithoutLinks(source, sourceLinkPath);
