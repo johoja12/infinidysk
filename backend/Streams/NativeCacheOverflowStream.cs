@@ -1,3 +1,4 @@
+using NzbWebDAV.Exceptions;
 using NzbWebDAV.Services.NativeCache;
 using UsenetSharp.Streams;
 
@@ -24,7 +25,7 @@ internal sealed class NativeCacheOverflowStream(NativeCacheStore store, NativeCa
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (destination.IsEmpty || _position == Length) return 0;
-        if (!current()) throw new IOException("Media source changed during this response. Retry the range.");
+        if (!current()) throw new MediaSourceChangedException("Media source changed during this response. Retry the range.");
         // This slot is reserved inside the configured budget. Idle overflow streams
         // retain no buffers, and warming cannot consume the reserved hit capacity.
         if (!await slots.WaitAsync(TimeSpan.FromSeconds(1), cancellationToken).ConfigureAwait(false))
@@ -37,14 +38,14 @@ internal sealed class NativeCacheOverflowStream(NativeCacheStore store, NativeCa
             for (var block = start / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize;
                 block < start + read; block += NativeCacheStore.BlockSize)
                 if (block != _lastSourceBlock) { statistics.Miss(); _lastSourceBlock = block; }
-            if (!current()) throw new IOException("Media source changed during this response. Retry the range.");
+            if (!current()) throw new MediaSourceChangedException("Media source changed during this response. Retry the range.");
             _position += read;
             return read;
         }
         await using var stream = new NativeCachedStream(store, identity, open, current,
             new SlotLease(slots), statistics: statistics) { Position = _position };
         var count = await stream.ReadAsync(destination, cancellationToken).ConfigureAwait(false);
-        if (!current()) throw new IOException("Media source changed during this response. Retry the range.");
+        if (!current()) throw new MediaSourceChangedException("Media source changed during this response. Retry the range.");
         _position += count;
         return count;
     }

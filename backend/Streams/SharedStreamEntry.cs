@@ -112,7 +112,7 @@ internal sealed class SharedStreamEntry : IAsyncDisposable
         catch (Exception exception) when (exception is not OutOfMemoryException) { /* Unknown validity fails closed. */ }
         if (Interlocked.Exchange(ref _generationFailed, 1) == 0)
         {
-            _ring.SetFailure(new IOException("Media source changed during shared delivery. Retry the current source."));
+            _ring.SetFailure(new MediaSourceChangedException("Media source changed during shared delivery. Retry the current source."));
             lock (_lock)
             {
                 _reapReason = SharedStreamReapReason.Failure;

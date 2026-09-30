@@ -2043,7 +2043,9 @@ public class MultiProviderNntpClient(
         if (ex.TryGetCausingException<UsenetArticleNotFoundException>(out _))
             return SegmentFetch.FetchStatus.Missing;
 
-        if (ex.TryGetCausingException<TimeoutException>(out _))
+        if (ex.TryGetCausingException<TimeoutException>(out _) ||
+            ex.TryGetCausingException<ConnectionOpenTimeoutException>(out _) ||
+            ex.TryGetCausingException<ProviderTransferAdmissionTimeoutException>(out _))
             return SegmentFetch.FetchStatus.Timeout;
 
         // yEnc decode failures escape as InvalidDataException, which derives from
