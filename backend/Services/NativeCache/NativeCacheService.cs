@@ -178,6 +178,18 @@ public sealed class NativeCacheService : IAsyncDisposable
             cached.Identity.Generation, item.CreatedAt, ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// The cache identity of the item's current source revision, without admitting a buffer or
+    /// opening the source. Null when the cache is inactive or the revision is unknown or changing.
+    /// </summary>
+    public async Task<NativeCacheIdentity?> GetCurrentCacheIdentityAsync(DavItem item, CancellationToken cancellationToken = default)
+    {
+        if (Store is null || item.FileBlobId is not { } blobId || item.FileSize is not > 0) return null;
+        using var watch = ContentRevisionTracker.Watch(blobId);
+        var current = await GetCurrentIdentityAsync(item, blobId, watch, cancellationToken).ConfigureAwait(false);
+        return current is { } cached && watch.IsCurrent && cached.Revision.IsCurrent ? cached.Identity : null;
+    }
+
     public async Task<int?> GetCurrentCoverageAsync(DavItem item, CancellationToken cancellationToken = default)
     {
         var store = Store;

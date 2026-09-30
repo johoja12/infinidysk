@@ -93,7 +93,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
                 foreach (var read in reads.Snapshot().Where(read => read.QualifiesForWarming(DateTimeOffset.UtcNow)).Take(32))
                 {
                     var item = await ResolveDavAsync(database, read.Path, deadline.Token).ConfigureAwait(false);
-                    if (item is not null) QueueImported(item, "read", 5, 0, 0, settings);
+                    if (item is not null) await QueueImportedAsync(item, "read", 5, 0, 0, settings, deadline.Token).ConfigureAwait(false);
                 }
             }
             if (preview is null) LastSuccess = DateTimeOffset.UtcNow;
@@ -253,10 +253,11 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         if (imported.FileSize is not > 0 || imported.FileSize > runtime.Settings().MaxBytesPerItem
             || imported.FileSize < NativeCacheSettings.MinimumFileBytes(config) || imported.FileBlobId is null)
             return RejectPreview(item, owner, "Imported media is unavailable or exceeds the per-file warming cap.");
-        return QueueImported(imported, scopedOwner, priority, item.ViewOffset, item.Duration, settings);
+        return await QueueImportedAsync(imported, scopedOwner, priority, item.ViewOffset, item.Duration, settings, ct).ConfigureAwait(false);
     }
 
-    private bool QueueImported(DavItem item, string owner, int priority, long viewOffset, long duration, PrefetchSettings settings)
+    private async Task<bool> QueueImportedAsync(DavItem item, string owner, int priority, long viewOffset, long duration,
+        PrefetchSettings settings, CancellationToken ct)
     {
         var current = runtime.Settings();
         var servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers));
@@ -281,16 +282,26 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         }
         var cooldownKey = "queued:" + item.Id.ToString("N") + ":" + owner;
         if (_last.TryGetValue(cooldownKey, out var previous) && DateTimeOffset.UtcNow - previous < TimeSpan.FromMinutes(current.CooldownMinutes)) return true;
+        var ranges = PrefetchPolicy.Ranges(item.FileSize.Value, viewOffset, duration, current, minimum: false);
+        IReadOnlyList<(long Start, long Length)> minimumRanges = current.MinimumWarmEnabled && !current.FullFileWarming
+            ? PrefetchPolicy.Ranges(item.FileSize.Value, 0, 0, current, minimum: true) : [];
+        // Hub and history refreshes rediscover the same media every interval. When a completed warm
+        // already verified this revision within the intent window, a new job would only re-read
+        // the whole cached file, so treat the intent as satisfied.
+        if (await runtime.IsRecentlyWarmAsync(item, [.. ranges, .. minimumRanges], ct).ConfigureAwait(false))
+        {
+            Due(cooldownKey, TimeSpan.Zero, force: true);
+            return true;
+        }
         var accepted = false;
-        foreach (var range in PrefetchPolicy.Ranges(item.FileSize.Value, viewOffset, duration, current, minimum: false))
+        foreach (var range in ranges)
         {
             try { runtime.Jobs!.Enqueue(item.Id, owner, priority, range.Start, range.Length); accepted = true; }
             catch (ArgumentException) { return accepted; }
         }
-        if (current.MinimumWarmEnabled && !current.FullFileWarming)
-            foreach (var range in PrefetchPolicy.Ranges(item.FileSize.Value, 0, 0, current, minimum: true))
-                try { runtime.Jobs!.Enqueue(item.Id, owner + ":minimum", priority - 5, range.Start, range.Length); }
-                catch (ArgumentException) { break; }
+        foreach (var range in minimumRanges)
+            try { runtime.Jobs!.Enqueue(item.Id, owner + ":minimum", priority - 5, range.Start, range.Length); }
+            catch (ArgumentException) { break; }
         if (accepted) Due(cooldownKey, TimeSpan.Zero, force: true);
         return accepted;
     }

@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using NzbWebDAV.Config;
+using NzbWebDAV.Database.Models;
 using NzbWebDAV.Services.NativeCache;
 
 namespace NzbWebDAV.Services.Prefetch;
@@ -54,6 +55,27 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
                 InitializationError = "Prefetch metadata could not initialize. Check local cache metadata storage and permissions.";
             }
         }
+    }
+
+    /// <summary>
+    /// True when routine warming of these ranges would only re-verify cache that a completed warm of the
+    /// item's current revision verified within the intent window. Manual requests do not consult this.
+    /// </summary>
+    public async Task<bool> IsRecentlyWarmAsync(DavItem item, IReadOnlyList<(long Start, long Length)> ranges, CancellationToken ct)
+    {
+        if (Jobs is not { } jobs || native.Store is not { } store || ranges.Count == 0) return false;
+        try
+        {
+            var identity = await native.GetCurrentCacheIdentityAsync(item, ct).ConfigureAwait(false);
+            if (identity is null) return false;
+            var since = DateTimeOffset.UtcNow.AddHours(-Settings().IntentTtlHours);
+            return await NativePrefetchExecutor.IsRecentlyWarmAsync(store, jobs, identity, item.Id, ranges, since, ct).ConfigureAwait(false);
+        }
+        // The skip is only an optimization: an unreadable revision or catalogue warms normally,
+        // where the executor reports genuine metadata failures.
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+            or Microsoft.Data.Sqlite.SqliteException or NzbWebDAV.Exceptions.CorruptedBlobPayloadException)
+        { return false; }
     }
 
     public PrefetchSettings Settings()

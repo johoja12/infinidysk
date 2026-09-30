@@ -54,6 +54,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
             async _ => CanContinue() && await wireBudget.PrepareReadAsync(ct).ConfigureAwait(false),
             bytes => jobs.Progress(job.Id, cached.Identity.Generation, bytes), wireBudget.Token,
             CanContinue, native.ActiveSettings?.ChunkMb ?? 64).ConfigureAwait(false);
+        jobs.RecordVerified(job.ItemId, cached.Identity.Generation, job.Start, job.Length);
         }
         catch (Exception exception) when (exception is not OutOfMemoryException && (wireBudget.Exceeded || jobs.WireBudgetBlocked) && !ct.IsCancellationRequested)
         {
@@ -76,9 +77,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         if (chunkMb is < 4 or > 256 || chunkMb % 4 != 0)
             throw new ArgumentOutOfRangeException(nameof(chunkMb));
         var end = length == 0 ? stream.Length : start + length;
-        var position = start / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize;
-        var alignedEnd = end % NativeCacheStore.BlockSize == 0 ? end
-            : end + Math.Min(NativeCacheStore.BlockSize - end % NativeCacheStore.BlockSize, stream.Length - end);
+        var (position, alignedEnd) = AlignedRange(start, length, stream.Length);
         if (canContinue?.Invoke() == false) throw new PrefetchDeferredException("Warming is paused or foreground playback has priority.");
         var initialMissing = await store.GetMissingRangeBytesAsync(stream.Identity, position, alignedEnd, ct).ConfigureAwait(false);
         await store.RestartPartialWarmAsync(stream.Identity, initialMissing, ct).ConfigureAwait(false);
@@ -118,6 +117,36 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         }
         if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed before completion.");
         progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
+    }
+
+    /// <summary>The requested range widened to whole integrity blocks; a length of 0 means "to the end of the file".</summary>
+    public static (long Start, long End) AlignedRange(long start, long length, long fileLength)
+    {
+        var end = length == 0 ? fileLength : start + length;
+        var alignedStart = start / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize;
+        var alignedEnd = end % NativeCacheStore.BlockSize == 0 ? end
+            : end + Math.Min(NativeCacheStore.BlockSize - end % NativeCacheStore.BlockSize, fileLength - end);
+        return (alignedStart, alignedEnd);
+    }
+
+    /// <summary>
+    /// True when warming these ranges would only re-read cache that a completed warm already verified:
+    /// every range is fully catalogued for the current generation and was verified since <paramref name="since"/>.
+    /// A different generation (changed source) never matches, so it is warmed normally.
+    /// </summary>
+    public static async Task<bool> IsRecentlyWarmAsync(NativeCacheStore store, PrefetchJobStore jobs, NativeCacheIdentity identity,
+        Guid itemId, IEnumerable<(long Start, long Length)> ranges, DateTimeOffset since, CancellationToken ct)
+    {
+        var any = false;
+        foreach (var (start, length) in ranges)
+        {
+            if (start < 0 || length < 0 || start >= identity.Length || length > identity.Length - start) return false;
+            if (!jobs.WasVerifiedSince(itemId, identity.Generation, start, length, since)) return false;
+            var (alignedStart, alignedEnd) = AlignedRange(start, length, identity.Length);
+            if (await store.GetMissingRangeBytesAsync(identity, alignedStart, alignedEnd, ct).ConfigureAwait(false) != 0) return false;
+            any = true;
+        }
+        return any;
     }
 
     private static async Task VerifyExistingRangesAsync(NativeCacheStore store, NativeCachedStream stream,
