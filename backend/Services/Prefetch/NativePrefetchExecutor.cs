@@ -50,10 +50,12 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
                 && item.FileSize <= current.MaxBytesPerItem
                 && (!current.PauseDuringPlayback || activeReads.Snapshot().Count == 0 && playback?.HasActivePlayback != true);
         }
+        // A manual request is an explicit ask to prove the cache, so it hashes every block.
+        var sampling = jobs.HasOwner(job.Id, "manual") ? null : VerificationSample.ForRun(DateTimeOffset.UtcNow);
         await WarmAsync(native.Store, cached, job.Start, job.Length,
             async _ => CanContinue() && await wireBudget.PrepareReadAsync(ct).ConfigureAwait(false),
             bytes => jobs.Progress(job.Id, cached.Identity.Generation, bytes), wireBudget.Token,
-            CanContinue, native.ActiveSettings?.ChunkMb ?? 64).ConfigureAwait(false);
+            CanContinue, native.ActiveSettings?.ChunkMb ?? 64, sampling).ConfigureAwait(false);
         jobs.RecordVerified(job.ItemId, cached.Identity.Generation, job.Start, job.Length);
         }
         catch (Exception exception) when (exception is not OutOfMemoryException && (wireBudget.Exceeded || jobs.WireBudgetBlocked) && !ct.IsCancellationRequested)
@@ -70,7 +72,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
 
     public static async Task WarmAsync(NativeCacheStore store, NativeCachedStream stream, long start, long length,
         Func<long, ValueTask<bool>> spend, Action<long> progress, CancellationToken ct,
-        Func<bool>? canContinue = null, int chunkMb = 64)
+        Func<bool>? canContinue = null, int chunkMb = 64, VerificationSample? sampling = null)
     {
         if (start < 0 || start >= stream.Length || length < 0 || length > stream.Length - start)
             throw new ArgumentException("The warm range is outside the media file.");
@@ -81,7 +83,10 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         if (canContinue?.Invoke() == false) throw new PrefetchDeferredException("Warming is paused or foreground playback has priority.");
         var initialMissing = await store.GetMissingRangeBytesAsync(stream.Identity, position, alignedEnd, ct).ConfigureAwait(false);
         await store.RestartPartialWarmAsync(stream.Identity, initialMissing, ct).ConfigureAwait(false);
-        await VerifyExistingRangesAsync(store, stream, position, alignedEnd, canContinue, progress, ct).ConfigureAwait(false);
+        // A damaged sampled block suggests more damage nearby, so that run falls back to hashing every block.
+        if (await VerifyExistingRangesAsync(store, stream, position, alignedEnd, canContinue, progress, sampling, ct).ConfigureAwait(false)
+            && sampling is not null)
+            await VerifyExistingRangesAsync(store, stream, position, alignedEnd, canContinue, progress, null, ct).ConfigureAwait(false);
         var missing = await store.GetMissingRangeBytesAsync(stream.Identity, position, alignedEnd, ct).ConfigureAwait(false);
         if (missing == 0)
         {
@@ -149,26 +154,40 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         return any;
     }
 
-    private static async Task VerifyExistingRangesAsync(NativeCacheStore store, NativeCachedStream stream,
-        long start, long end, Func<bool>? canContinue, Action<long> progress, CancellationToken ct)
+    /// <summary>
+    /// Hashes the job's catalogued blocks, or only a <paramref name="sampling"/> of them.
+    /// Returns true when a block failed and was invalidated for refill.
+    /// </summary>
+    private static async Task<bool> VerifyExistingRangesAsync(NativeCacheStore store, NativeCachedStream stream,
+        long start, long end, Func<bool>? canContinue, Action<long> progress, VerificationSample? sampling, CancellationToken ct)
     {
         // Catalogue coverage is a snapshot. It cannot prove the mounted data still
         // exists or matches its committed hash. Validate only this job's blocks,
         // with bounded catalogue pages and the stream's existing buffer admission.
-        // Progress reports the bytes checked so far; a large cached file otherwise shows
-        // no movement for the whole pass.
+        // Progress reports the catalogued bytes walked so far; a large cached file otherwise
+        // shows no movement for the whole pass.
         const long progressInterval = 64L * 1024 * 1024;
-        var verified = 0L;
+        var blockCount = (end - start + NativeCacheStore.BlockSize - 1) / NativeCacheStore.BlockSize;
+        var checkedBytes = 0L;
         var reported = 0L;
+        var failed = false;
         var after = start - 1;
         while (true)
         {
             var ranges = await store.ListVerifiedRangesAsync(stream.Identity.Key, after, 100, ct).ConfigureAwait(false);
-            if (ranges.Count == 0) return;
+            if (ranges.Count == 0) return failed;
             foreach (var range in ranges)
             {
-                if (range.Offset >= end) return;
+                if (range.Offset >= end) return failed;
                 ct.ThrowIfCancellationRequested();
+                if (range.Offset >= start && sampling is not null
+                    && !sampling.Includes((range.Offset - start) / NativeCacheStore.BlockSize, blockCount))
+                {
+                    checkedBytes += range.Count;
+                    if (checkedBytes - reported >= progressInterval) { progress(checkedBytes); reported = checkedBytes; }
+                    after = range.Offset;
+                    continue;
+                }
                 if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed before cache verification.");
                 if (canContinue?.Invoke() == false)
                     throw new PrefetchDeferredException("Warming is paused or foreground playback has priority.");
@@ -180,14 +199,43 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
                     if (!stream.IsSourceCurrent || await store.FindNextMissingOffsetAsync(stream.Identity,
                         range.Offset, range.Offset + range.Count, ct).ConfigureAwait(false) != range.Offset)
                         throw new PrefetchDeferredException("Cached storage is unavailable; completion could not be verified.");
+                    failed = true;
                 }
                 else
                 {
-                    verified += range.Count;
-                    if (reported == 0 || verified - reported >= progressInterval) { progress(verified); reported = verified; }
+                    checkedBytes += range.Count;
+                    if (reported == 0 || checkedBytes - reported >= progressInterval) { progress(checkedBytes); reported = checkedBytes; }
                 }
                 after = range.Offset;
             }
         }
+    }
+}
+
+/// <summary>
+/// The cached blocks a routine recheck hashes instead of every block: the head and tail that
+/// playback reaches first, plus a bounded evenly strided sample whose starting offset rotates
+/// daily so successive rechecks cover different blocks. Playback still hashes every block it
+/// serves, so an unsampled bad block is caught and refetched when it is read.
+/// </summary>
+public sealed record VerificationSample(long Seed)
+{
+    public const int HeadBlocks = 4;
+    public const int TailBlocks = 2;
+    public const int StridedPercent = 2;
+    public const int MinStridedBlocks = 16;
+    public const int MaxStridedBlocks = 128;
+
+    public static VerificationSample ForRun(DateTimeOffset now) => new(now.ToUnixTimeSeconds() / 86400);
+
+    public bool Includes(long blockIndex, long blockCount)
+    {
+        if (blockIndex < 0 || blockIndex >= blockCount) return false;
+        if (blockIndex < HeadBlocks || blockIndex >= blockCount - TailBlocks) return true;
+        var strided = Math.Clamp((blockCount * StridedPercent + 99) / 100, MinStridedBlocks, MaxStridedBlocks);
+        var stride = Math.Max(1, blockCount / strided);
+        var first = (long)((ulong)Seed % (ulong)stride);
+        var step = blockIndex - first;
+        return step >= 0 && step % stride == 0 && step / stride < strided;
     }
 }

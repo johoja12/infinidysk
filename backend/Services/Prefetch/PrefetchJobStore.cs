@@ -212,6 +212,15 @@ public sealed class PrefetchJobStore : IDisposable
         Execute("INSERT OR IGNORE INTO Owners(Id,Owner) VALUES($id,$owner)", ("$id", id), ("$owner", owner));
     }
 
+    public bool HasOwner(string id, string owner)
+    {
+        lock (_gate)
+        {
+            using var command = Command("SELECT 1 FROM Owners WHERE Id=$id AND Owner=$owner", ("$id", id), ("$owner", owner));
+            return command.ExecuteScalar() is not null;
+        }
+    }
+
     public bool IsRunning(string id)
     {
         lock (_gate) return ReadOne("SELECT * FROM Jobs WHERE Id=$id", ("$id", id))?.State == "running";

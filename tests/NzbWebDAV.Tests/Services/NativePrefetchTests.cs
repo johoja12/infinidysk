@@ -240,6 +240,99 @@ public sealed class NativePrefetchTests : IAsyncLifetime
         Assert.False(await NativePrefetchExecutor.IsRecentlyWarmAsync(_store, jobs, current, item, [], since, CancellationToken.None));
     }
 
+    [Fact]
+    public void VerificationSample_AlwaysIncludesHeadAndTailAndBoundsTheStridedSample()
+    {
+        var sample = new VerificationSample(0);
+        const long blocks = 3000; // About 12 GB of 4 MiB blocks.
+        var included = Enumerable.Range(0, (int)blocks).Where(index => sample.Includes(index, blocks)).ToList();
+
+        Assert.All(Enumerable.Range(0, VerificationSample.HeadBlocks), index => Assert.Contains(index, included));
+        Assert.Contains((int)blocks - 1, included);
+        Assert.Contains((int)blocks - VerificationSample.TailBlocks, included);
+        Assert.InRange(included.Count, VerificationSample.MinStridedBlocks,
+            VerificationSample.HeadBlocks + VerificationSample.TailBlocks + VerificationSample.MaxStridedBlocks);
+        const long huge = 100_000; // About 400 GB: the strided sample stays capped.
+        Assert.InRange(Enumerable.Range(0, (int)huge).LongCount(index => sample.Includes(index, huge)),
+            VerificationSample.MaxStridedBlocks, VerificationSample.HeadBlocks + VerificationSample.TailBlocks + VerificationSample.MaxStridedBlocks);
+        Assert.False(sample.Includes(-1, blocks));
+        Assert.False(sample.Includes(blocks, blocks));
+    }
+
+    [Fact]
+    public void VerificationSample_RotatesBetweenRunsButIsStableWithinARun()
+    {
+        const long blocks = 3000;
+        static HashSet<long> Sampled(VerificationSample sample) =>
+            Enumerable.Range(0, (int)blocks).Select(index => (long)index).Where(index => sample.Includes(index, blocks)).ToHashSet();
+
+        var today = VerificationSample.ForRun(new DateTimeOffset(2026, 9, 30, 1, 0, 0, TimeSpan.Zero));
+        Assert.Equal(today, VerificationSample.ForRun(new DateTimeOffset(2026, 9, 30, 23, 0, 0, TimeSpan.Zero)));
+        var tomorrow = VerificationSample.ForRun(new DateTimeOffset(2026, 10, 1, 1, 0, 0, TimeSpan.Zero));
+        Assert.NotEqual(Sampled(today), Sampled(tomorrow));
+        Assert.Equal(Sampled(today), Sampled(today));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RoutineRecheck_SkipsUnsampledBlocksWhileFullRecheckFindsTheirDamage(bool full)
+    {
+        // 24 blocks with seed 0: head 0-3, tail 22-23 and strided 0-15 are hashed; 16-21 are skipped.
+        var (identity, bytes) = await WriteBlocksAsync("sampled-movie", 24);
+        await CorruptBlockAsync(identity, 18);
+        var source = new VerifiedSource(bytes, true);
+        await using var stream = new NativeCachedStream(_store, identity, _ => Task.FromResult<Stream>(source), () => true);
+
+        await NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0, _ => new ValueTask<bool>(true), _ => { }, CancellationToken.None,
+            sampling: full ? null : new VerificationSample(0));
+
+        // Routine sampling never opens the source for an unsampled block; a full pass refills it.
+        Assert.Equal(full ? NativeCacheStore.BlockSize : 0, source.ReadBytes);
+    }
+
+    [Fact]
+    public async Task RoutineRecheck_DamagedSampledBlockEscalatesToAFullPass()
+    {
+        var (identity, bytes) = await WriteBlocksAsync("escalated-movie", 24);
+        await CorruptBlockAsync(identity, 10); // Sampled.
+        await CorruptBlockAsync(identity, 18); // Unsampled; only found by escalating.
+        var source = new VerifiedSource(bytes, true);
+        await using var stream = new NativeCachedStream(_store, identity, _ => Task.FromResult<Stream>(source), () => true);
+        var reports = new List<long>();
+
+        await NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0, _ => new ValueTask<bool>(true), reports.Add, CancellationToken.None,
+            sampling: new VerificationSample(0));
+
+        Assert.Equal(2L * NativeCacheStore.BlockSize, source.ReadBytes);
+        foreach (var index in new[] { 10, 18 })
+        {
+            var actual = new byte[NativeCacheStore.BlockSize];
+            Assert.Equal(actual.Length, await _store.ReadBlockAsync(identity, (long)index * NativeCacheStore.BlockSize, actual));
+            Assert.Equal(bytes.AsSpan(index * NativeCacheStore.BlockSize, NativeCacheStore.BlockSize).ToArray(), actual);
+        }
+        Assert.Equal(identity.Length, reports[^1]);
+    }
+
+    private async Task<(NativeCacheIdentity Identity, byte[] Bytes)> WriteBlocksAsync(string name, int blocks)
+    {
+        var bytes = new byte[(long)blocks * NativeCacheStore.BlockSize];
+        new Random(blocks).NextBytes(bytes);
+        var identity = new NativeCacheIdentity(name, "revision", bytes.Length);
+        for (var index = 0; index < blocks; index++)
+            Assert.True(await _store.WriteBlockAsync(identity, (long)index * NativeCacheStore.BlockSize,
+                bytes.AsMemory(index * NativeCacheStore.BlockSize, NativeCacheStore.BlockSize)));
+        return (identity, bytes);
+    }
+
+    private async Task CorruptBlockAsync(NativeCacheIdentity identity, int index)
+    {
+        var path = Path.Combine(_root, "media", "v1", identity.Key[..2], identity.Key, "content.data");
+        await using var file = File.OpenWrite(path);
+        file.Position = (long)index * NativeCacheStore.BlockSize;
+        await file.WriteAsync(new byte[NativeCacheStore.BlockSize]);
+    }
+
     public async Task DisposeAsync()
     {
         await _store.DisposeAsync();

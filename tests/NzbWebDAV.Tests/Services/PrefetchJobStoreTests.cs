@@ -20,6 +20,19 @@ public sealed class PrefetchJobStoreTests : IDisposable
     }
 
     [Fact]
+    public void HasOwner_DistinguishesManualRequestsFromPolicyOwners()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var job = jobs.Enqueue(item, "plex:hub", 20);
+        Assert.False(jobs.HasOwner(job.Id, "manual"));
+        Assert.True(jobs.HasOwner(job.Id, "plex:hub"));
+
+        Assert.Equal(job.Id, jobs.Enqueue(item, "manual", 50).Id); // A manual ask joins the queued job.
+        Assert.True(jobs.HasOwner(job.Id, "manual"));
+    }
+
+    [Fact]
     public void RecordedVerification_MatchesOnlyContainedRangesOfTheSameGenerationSinceCutoff()
     {
         using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
