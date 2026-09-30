@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using NzbWebDAV.Clients.Usenet;
+using NzbWebDAV.Exceptions;
 using NzbWebDAV.Services.StreamTrace;
 using UsenetSharp.Streams;
 
@@ -81,6 +82,15 @@ internal sealed class SharedReaderStream : FastReadOnlyStream
             var result = _ring.TryCopyAt(_readerId, _cursor, buffer.Span);
             switch (result.Kind)
             {
+                case RingReadKind.Copied when result.Count == 0:
+                    // The ring completed before this reader reached the file end: the shared
+                    // pump stopped (entry teardown or an upstream pipeline that ended early),
+                    // which is not evidence of missing data. Continue on a private source so
+                    // only a truncation that reproduces there surfaces as a short read.
+                    if (!_entry.ValidateSourceGeneration()) ThrowGenerationChanged();
+                    await DetachToPrivateAsync(cancellationToken).ConfigureAwait(false);
+                    return await ReadFallbackAsync(buffer, cancellationToken).ConfigureAwait(false);
+
                 case RingReadKind.Copied:
                     if (!_entry.ValidateSourceGeneration()) ThrowGenerationChanged();
                     _cursor += result.Count;
@@ -224,7 +234,7 @@ internal sealed class SharedReaderStream : FastReadOnlyStream
 
     private void ThrowGenerationChanged()
     {
-        _deliveredFailure = new IOException("Media source changed during this response. Retry the current source.");
+        _deliveredFailure = new MediaSourceChangedException("Media source changed during this response. Retry the current source.");
         DetachQuiet();
         throw _deliveredFailure;
     }
