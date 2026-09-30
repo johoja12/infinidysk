@@ -60,6 +60,8 @@ public sealed class PrefetchJobStore : IDisposable
             CREATE TABLE IF NOT EXISTS DailyBudget(Day TEXT PRIMARY KEY,Bytes INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS Owners(Id TEXT NOT NULL REFERENCES Jobs(Id) ON DELETE CASCADE,Owner TEXT NOT NULL,PRIMARY KEY(Id,Owner));
             CREATE TABLE IF NOT EXISTS Attempts(Id TEXT PRIMARY KEY REFERENCES Jobs(Id) ON DELETE CASCADE,Count INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS Verified(ItemId TEXT NOT NULL,Generation TEXT NOT NULL,Start INTEGER NOT NULL,Length INTEGER NOT NULL,
+                At INTEGER NOT NULL,PRIMARY KEY(ItemId,Generation,Start,Length));
             INSERT OR IGNORE INTO State VALUES('paused','false');
             DELETE FROM Jobs WHERE State IN ('queued','running','paused') AND Id NOT IN (SELECT Id FROM Owners WHERE Owner='manual');
             UPDATE Jobs SET State='paused',Error='Restored after restart; resume to recheck verified coverage.' WHERE State IN ('running','queued');
@@ -282,6 +284,42 @@ public sealed class PrefetchJobStore : IDisposable
         if (committedBytes < 0 || generation.Length > 512) throw new ArgumentException("Invalid committed progress.");
         lock (_gate) Execute("UPDATE Jobs SET Generation=$generation,CommittedBytes=$bytes,Updated=$now WHERE Id=$id AND State='running'",
             ("$generation", generation), ("$bytes", committedBytes), ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), ("$id", id));
+    }
+
+    /// <summary>
+    /// Records that a completed warm verified every cached block of this range for one cache
+    /// generation, so routine policy refreshes can skip re-reading it within the intent window.
+    /// </summary>
+    public void RecordVerified(Guid itemId, string generation, long start, long length)
+    {
+        if (start < 0 || length < 0 || generation is not { Length: > 0 and <= 512 }) throw new ArgumentException("Invalid verified range.");
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        lock (_gate)
+        Atomic(() =>
+        {
+            Execute("INSERT INTO Verified(ItemId,Generation,Start,Length,At) VALUES($item,$generation,$start,$length,$now) ON CONFLICT(ItemId,Generation,Start,Length) DO UPDATE SET At=excluded.At",
+                ("$item", itemId.ToString("N")), ("$generation", generation), ("$start", start), ("$length", length), ("$now", now));
+            // Bounded bookkeeping: the intent window is at most 168 hours, so older rows are never consulted.
+            Execute("DELETE FROM Verified WHERE At<$cutoff", ("$cutoff", DateTimeOffset.UtcNow.AddHours(-168).ToUnixTimeMilliseconds()));
+            Execute("DELETE FROM Verified WHERE rowid IN (SELECT rowid FROM Verified ORDER BY At DESC LIMIT -1 OFFSET 4096)");
+        });
+    }
+
+    /// <summary>
+    /// True when a verification of this generation recorded since <paramref name="since"/> contains the
+    /// range. A length of 0 means "to the end of the file" for both the request and the record.
+    /// </summary>
+    public bool WasVerifiedSince(Guid itemId, string generation, long start, long length, DateTimeOffset since)
+    {
+        lock (_gate)
+        {
+            using var command = Command(
+                "SELECT 1 FROM Verified WHERE ItemId=$item AND Generation=$generation AND At>=$since AND Start<=$start " +
+                "AND (Length=0 OR ($length<>0 AND $start+$length<=Start+Length)) LIMIT 1",
+                ("$item", itemId.ToString("N")), ("$generation", generation), ("$since", since.ToUnixTimeMilliseconds()),
+                ("$start", start), ("$length", length));
+            return command.ExecuteScalar() is not null;
+        }
     }
 
     public void Change(string id, string operation, int? priority = null)

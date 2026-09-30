@@ -20,6 +20,29 @@ public sealed class PrefetchJobStoreTests : IDisposable
     }
 
     [Fact]
+    public void RecordedVerification_MatchesOnlyContainedRangesOfTheSameGenerationSinceCutoff()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var since = DateTimeOffset.UtcNow.AddMinutes(-1);
+        Assert.False(jobs.WasVerifiedSince(item, "rev-a", 0, 0, since));
+
+        jobs.RecordVerified(item, "rev-a", 0, 0);
+        Assert.True(jobs.WasVerifiedSince(item, "rev-a", 0, 0, since));
+        Assert.True(jobs.WasVerifiedSince(item, "rev-a", 100, 50, since)); // A whole-file record contains any range.
+        Assert.False(jobs.WasVerifiedSince(item, "rev-b", 0, 0, since)); // A changed source must warm again.
+        Assert.False(jobs.WasVerifiedSince(Guid.NewGuid(), "rev-a", 0, 0, since));
+        Assert.False(jobs.WasVerifiedSince(item, "rev-a", 0, 0, DateTimeOffset.UtcNow.AddMinutes(1))); // Outside the window.
+
+        var partial = Guid.NewGuid();
+        jobs.RecordVerified(partial, "rev-a", 100, 50);
+        Assert.True(jobs.WasVerifiedSince(partial, "rev-a", 110, 40, since));
+        Assert.False(jobs.WasVerifiedSince(partial, "rev-a", 90, 20, since));
+        Assert.False(jobs.WasVerifiedSince(partial, "rev-a", 110, 50, since));
+        Assert.False(jobs.WasVerifiedSince(partial, "rev-a", 100, 0, since)); // To end of file exceeds the record.
+    }
+
+    [Fact]
     public void BridgingQueuedRanges_CoalescesTransitively_WithOwnersAndPriority()
     {
         using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));

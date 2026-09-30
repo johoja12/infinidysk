@@ -99,6 +99,15 @@ public sealed class NativePrefetchIntegrationTests
             await runtime.Coordinator!.RunOnceAsync(CancellationToken.None);
             Assert.Equal("completed", Assert.Single(runtime.Jobs.List()).State);
             Assert.Equal(1, factory.Opens); // Already verified bytes do not consume NNTP again.
+
+            // The completed warm recorded its verification, so a later hub refresh (a fresh policy
+            // instance without the in-memory cooldown) does not queue a re-read of the same revision.
+            using var refreshed = new PlexPrefetchService(config, api, runtime, provider.GetRequiredService<IServiceScopeFactory>(), reads);
+            await refreshed.SyncAsync(true, CancellationToken.None);
+            Assert.Equal("completed", Assert.Single(runtime.Jobs.List()).State);
+            // Explicit requests still verify.
+            runtime.Jobs.Enqueue(id, "manual", 1);
+            Assert.Contains(runtime.Jobs.List(), job => job.State == "queued");
         }
         finally { Environment.SetEnvironmentVariable("CONFIG_PATH", previous); Directory.Delete(root, true); }
     }
