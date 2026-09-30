@@ -199,6 +199,23 @@ public sealed class NativePrefetchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task CachedVerification_ReportsProgressBeforeCompletion()
+    {
+        var identity = new NativeCacheIdentity("verified-movie", "revision", 2L * NativeCacheStore.BlockSize);
+        var bytes = new byte[identity.Length];
+        Assert.True(await _store.WriteBlockAsync(identity, 0, bytes.AsMemory(0, NativeCacheStore.BlockSize)));
+        Assert.True(await _store.WriteBlockAsync(identity, NativeCacheStore.BlockSize, bytes.AsMemory(NativeCacheStore.BlockSize)));
+        await using var stream = new NativeCachedStream(_store, identity, _ => throw new InvalidOperationException("Opened source"), () => true);
+        var reports = new List<long>();
+
+        await NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0, (Func<long, bool>)(_ => throw new InvalidOperationException("Spent budget")),
+            reports.Add, CancellationToken.None);
+
+        Assert.Equal(NativeCacheStore.BlockSize, reports[0]); // Movement is visible before the whole pass completes.
+        Assert.Equal(identity.Length, reports[^1]);
+    }
+
+    [Fact]
     public async Task RecentlyWarm_RequiresRecordedVerificationOfCurrentGenerationAndCompleteCatalogue()
     {
         using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
