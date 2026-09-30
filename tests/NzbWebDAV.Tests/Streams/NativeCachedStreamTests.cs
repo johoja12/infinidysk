@@ -1,3 +1,4 @@
+using NzbWebDAV.Exceptions;
 using NzbWebDAV.Services.NativeCache;
 using NzbWebDAV.Streams;
 using NzbWebDAV.WebDav.Requests;
@@ -378,7 +379,7 @@ public sealed class NativeCachedStreamTests : IDisposable
         await stream.ReadAsync(bytes);
         Assert.Equal(1, bytes[0]);
         current = false;
-        await Assert.ThrowsAsync<IOException>(() => stream.ReadAsync(bytes).AsTask());
+        await Assert.ThrowsAsync<MediaSourceChangedException>(() => stream.ReadAsync(bytes).AsTask());
     }
 
     [Fact]

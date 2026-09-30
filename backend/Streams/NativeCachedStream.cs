@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Diagnostics;
 using Microsoft.Data.Sqlite;
+using NzbWebDAV.Exceptions;
 using NzbWebDAV.Services.NativeCache;
 using NzbWebDAV.WebDav.Requests;
 using UsenetSharp.Streams;
@@ -112,7 +113,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             responseBudget is > 0 ? responseBudget.Value : Length - _position);
         if (!_untrackedSource && !_generationIsCurrent())
         {
-            if (_servedBytes) throw new IOException("Media source changed during this response. Retry the range against the current source.");
+            if (_servedBytes) throw new MediaSourceChangedException("Media source changed during this response. Retry the range against the current source.");
             _untrackedSource = true;
             _bypassFill = true;
         }
@@ -427,7 +428,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     private void EnsureResponseGeneration()
     {
         if (!_untrackedSource && !_generationIsCurrent())
-            throw new IOException("Media source changed during this response. Retry the range against the current source.");
+            throw new MediaSourceChangedException("Media source changed during this response. Retry the range against the current source.");
     }
 
     public override long Seek(long offset, SeekOrigin origin)

@@ -339,6 +339,42 @@ public class SharedStreamEntryTests : IDisposable
     }
 
     [Fact]
+    public async Task UpstreamEndingBeforeFileSize_ContinuesOnPrivateFallback()
+    {
+        var payload = Encoding.ASCII.GetBytes("0123456789abcdefghijklmnopqrstuv");
+        var truncatedUpstream = new MemoryStream(payload[..12], writable: false);
+        await using var entry = StartEntry(truncatedUpstream, payload.Length);
+        var fallbackAt = new TaskCompletionSource<long>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var reader = Attach(entry, 0, (offset, _) =>
+        {
+            fallbackAt.TrySetResult(offset);
+            var stream = TestStreams.Create(payload);
+            stream.Seek(offset, SeekOrigin.Begin);
+            return Task.FromResult(stream);
+        });
+
+        Assert.Equal(payload, await ReadAllAsync(reader));
+        Assert.Equal(12, await fallbackAt.Task);
+        Assert.True(reader.IsDetached);
+    }
+
+    [Fact]
+    public async Task UpstreamAndFallbackBothTruncated_StillEndEarly()
+    {
+        var payload = Encoding.ASCII.GetBytes("0123456789abcdefghijklmnopqrstuv");
+        await using var entry = StartEntry(new MemoryStream(payload[..12], writable: false), payload.Length);
+        await using var reader = Attach(entry, 0, (offset, _) =>
+        {
+            Stream stream = new MemoryStream(payload[..20], writable: false);
+            stream.Seek(offset, SeekOrigin.Begin);
+            return Task.FromResult(stream);
+        });
+
+        // A truncation that reproduces on a fresh source must still surface as a short read.
+        Assert.Equal(payload[..20], await ReadAllAsync(reader));
+    }
+
+    [Fact]
     public async Task RetainedBytes_ThrowingFirstSubscriber_DoesNotFailPumpOrSkipLaterSubscriber()
     {
         var payload = Encoding.ASCII.GetBytes("hello shared stream payload!!!!");

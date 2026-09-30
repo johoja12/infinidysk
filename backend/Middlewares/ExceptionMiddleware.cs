@@ -573,7 +573,9 @@ public class ExceptionMiddleware(
             // and incomplete multipart data are expected operational conditions, so they
             // warn rather than error. Other retryable failures (e.g. unknown-length
             // segments that need repair) stay at Error.
-            var knownLevel = isIncompleteData || e is TransientSegmentExhaustionException
+            var knownLevel = isIncompleteData
+                             || e is TransientSegmentExhaustionException
+                             || e.TryGetCausingException(out MediaSourceChangedException? _)
                 ? LogEventLevel.Warning
                 : LogEventLevel.Error;
             var dedupeKey = $"{filePath}|{seekPosition}|{reason}";
@@ -962,7 +964,9 @@ public class ExceptionMiddleware(
                 return true;
             }
 
-            if (current.IsRetryableDownloadException() || current.IsNonRetryableDownloadException())
+            if (current is MediaSourceChangedException ||
+                current.IsRetryableDownloadException() ||
+                current.IsNonRetryableDownloadException())
             {
                 message = current.Message;
                 return true;

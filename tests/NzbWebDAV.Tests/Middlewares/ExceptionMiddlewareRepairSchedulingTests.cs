@@ -163,6 +163,26 @@ public sealed class ExceptionMiddlewareRepairSchedulingTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task MediaSourceChanged_DoesNotScheduleRepairEvenAtThresholdZero()
+    {
+        var item = await SeedItemAsync();
+        var middleware = new ExceptionMiddleware(
+            _ => throw new MediaSourceChangedException(
+                "Media source changed during this response. Retry the current source."),
+            Config(threshold: 0),
+            new StreamingFailureTracker(),
+            new TestDbContextFactory(_options));
+
+        var context = ContextFor(item);
+        await middleware.InvokeAsync(context);
+
+        Assert.Equal(StatusCodes.Status500InternalServerError, context.Response.StatusCode);
+        var persisted = await LoadItemAsync(item.Id);
+        Assert.Null(persisted.NextHealthCheck);
+        Assert.Null(persisted.UrgentRepairFailures);
+    }
+
+    [Fact]
     public async Task ScheduleRepair_AlreadyUrgent_RaisesPersistedCountButNeverLowersIt()
     {
         var item = await SeedItemAsync(qualifyingFailures: 5);

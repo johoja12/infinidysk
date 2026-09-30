@@ -3266,6 +3266,24 @@ public class MultiProviderNntpClientTests
     }
 
     [Fact]
+    public void ClassifyException_ConnectionOpenTimeout_ReturnsTimeout()
+    {
+        var exception = new ConnectionOpenTimeoutException(
+            "news.example.com", "Factory", TimeSpan.FromSeconds(5), factoryStarted: true);
+        var status = MultiProviderNntpClient.ClassifyException(exception);
+        Assert.Equal(SegmentFetch.FetchStatus.Timeout, status);
+    }
+
+    [Fact]
+    public void ClassifyException_ProviderTransferAdmissionTimeout_ReturnsTimeout()
+    {
+        var exception = new ProviderTransferAdmissionTimeoutException(
+            "news.example.com", TimeSpan.FromSeconds(5));
+        var status = MultiProviderNntpClient.ClassifyException(exception);
+        Assert.Equal(SegmentFetch.FetchStatus.Timeout, status);
+    }
+
+    [Fact]
     public void ClassifyException_CorruptArticle_ReturnsCorrupt()
     {
         var exception = new UsenetCorruptArticleException("segment", "provider", new Exception("bad crc"));

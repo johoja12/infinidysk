@@ -1,3 +1,4 @@
+using NzbWebDAV.Exceptions;
 using NzbWebDAV.Streams;
 using NzbWebDAV.WebDav.Base;
 
@@ -14,7 +15,7 @@ public sealed class NativeSharedGenerationTests
         Assert.NotNull(reader);
         Assert.Equal(1, await reader.ReadAsync(new byte[1]));
         source.IsSourceCurrent = false;
-        await Assert.ThrowsAsync<IOException>(() => reader.ReadAsync(new byte[1]).AsTask());
+        await Assert.ThrowsAsync<MediaSourceChangedException>(() => reader.ReadAsync(new byte[1]).AsTask());
         Assert.False(entry.IsAttachable);
         Assert.Null(entry.TryAttach(0, (_, _) => throw new InvalidOperationException("Unexpected fallback"), out _));
     }
@@ -35,7 +36,7 @@ public sealed class NativeSharedGenerationTests
         Assert.Equal(1, await reader.ReadAsync(new byte[1]));
         reader.Position = 1000; // Outside the tiny retained ring: force private reopening.
         if (accepted) Assert.Equal(1, await reader.ReadAsync(new byte[1]));
-        else await Assert.ThrowsAsync<IOException>(() => reader.ReadAsync(new byte[1]).AsTask());
+        else await Assert.ThrowsAsync<MediaSourceChangedException>(() => reader.ReadAsync(new byte[1]).AsTask());
     }
 
     private static SharedStreamEntry Start(Stream source)
