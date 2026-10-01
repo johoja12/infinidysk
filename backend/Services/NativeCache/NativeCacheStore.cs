@@ -2,6 +2,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
+using Serilog;
 
 namespace NzbWebDAV.Services.NativeCache;
 
@@ -1565,8 +1566,19 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
             var actual = ReadVolume(root);
             // An already registered folder must never claim the empty directory left
             // behind when a NAS is unmounted, including after an application restart.
-            if (expected is not null && actual != expected) return false;
-            if (registeredIdentity is not null && registeredIdentity != root.RegistrationIdentity) return false;
+            if (expected is not null && actual != expected)
+            {
+                Log.Warning("Native cache folder {Folder} is offline. Reason: {Reason}", folder.Id,
+                    actual is null ? $"volume marker is missing at {folder.Path}; the storage may be unmounted"
+                        : $"volume marker at {folder.Path} belongs to different storage");
+                return false;
+            }
+            if (registeredIdentity is not null && !NativeFileSystem.RegistrationMatches(registeredIdentity, root.RegistrationIdentity))
+            {
+                Log.Warning("Native cache folder {Folder} is offline. Reason: {Reason}", folder.Id,
+                    $"root identity changed from {registeredIdentity} to {root.RegistrationIdentity}; register a new folder if the storage was replaced");
+                return false;
+            }
             if (actual is null)
             {
                 if (folder.ReadOnly) return false;
@@ -1579,7 +1591,8 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
             if (!root.IsCurrent(folder.Path)) return false;
             Execute("INSERT OR IGNORE INTO FolderIdentity(Folder,Volume) VALUES($folder,$volume)",
                 ("$folder", folder.Id), ("$volume", actual));
-            Execute("UPDATE FolderIdentity SET RootIdentity=$identity WHERE Folder=$folder AND RootIdentity IS NULL",
+            // Also refreshes an anonymous device number reassigned by a remount.
+            Execute("UPDATE FolderIdentity SET RootIdentity=$identity WHERE Folder=$folder AND (RootIdentity IS NULL OR RootIdentity<>$identity)",
                 ("$folder", folder.Id), ("$identity", root.RegistrationIdentity));
             _volumes[folder.Id] = actual;
             _roots[folder.Id] = root;

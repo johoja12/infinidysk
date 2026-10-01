@@ -44,6 +44,21 @@ public static class NativeFileSystem
         public int Error { get; } = error;
     }
     internal static bool IsMissing(IOException exception) => exception is DescriptorException { Error: 2 };
+
+    /// <summary>
+    /// Whether a registration identity ("major:minor:inode") recorded earlier still names the same root.
+    /// Network and virtual filesystems (NFS, SMB, FUSE, overlay) get anonymous major-0 device numbers
+    /// that the kernel reassigns on every mount, so for them only the inode is compared; the caller's
+    /// volume-marker check is what fences a different or empty directory.
+    /// </summary>
+    internal static bool RegistrationMatches(string registered, string current)
+    {
+        if (registered == current) return true;
+        var before = registered.Split(':');
+        var now = current.Split(':');
+        return before.Length == 3 && now.Length == 3
+            && before[0] == "0" && now[0] == "0" && before[2] == now[2];
+    }
     private static SafeFileHandle Own(int descriptor) => descriptor >= 0
         ? new SafeFileHandle(descriptor, ownsHandle: true)
         : throw new DescriptorException(Marshal.GetLastPInvokeError());
@@ -60,8 +75,9 @@ public static class NativeFileSystem
         }
 
         public string DeviceIdentity => $"{_identity.DeviceMajor}:{_identity.DeviceMinor}";
-        // Device numbers can change after a legitimate remount. A mismatch fails
-        // closed until the administrator explicitly registers a new folder ID.
+        // Block-device numbers are stable, so a mismatch fails closed until the
+        // administrator explicitly registers a new folder ID. See RegistrationMatches
+        // for anonymous (NFS/SMB/FUSE) devices.
         public string RegistrationIdentity => $"{DeviceIdentity}:{_identity.Inode}";
 
         public (string FileSystem, string Capability) GetFileSystem()
