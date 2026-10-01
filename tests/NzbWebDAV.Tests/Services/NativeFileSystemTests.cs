@@ -11,6 +11,17 @@ public sealed class NativeFileSystemTests
     public void LinuxOpenFlags_MatchEachSupportedArchitecture(Architecture architecture, int directory, int noFollow)
         => Assert.Equal((directory, noFollow), NativeFileSystem.GetOpenFlags(architecture));
 
+    [Theory]
+    [InlineData("0:56:3974103", "0:79:3974103", true)]   // NFS remount reassigned the anonymous device
+    [InlineData("8:1:3974103", "8:1:3974103", true)]
+    [InlineData("8:1:3974103", "8:2:3974103", false)]    // block device changed: stays fenced
+    [InlineData("0:56:3974103", "8:1:3974103", false)]
+    [InlineData("8:1:3974103", "0:56:3974103", false)]
+    [InlineData("0:56:3974103", "0:79:3974104", false)]  // different root directory
+    [InlineData("garbage", "0:79:3974103", false)]
+    public void RegistrationMatches_IgnoresOnlyAnonymousDeviceNumbers(string registered, string current, bool expected)
+        => Assert.Equal(expected, NativeFileSystem.RegistrationMatches(registered, current));
+
     [Fact]
     public void LinuxOpenFlags_UnsupportedArchitectureFailsClosed()
         => Assert.Throws<PlatformNotSupportedException>(() => NativeFileSystem.GetOpenFlags(Architecture.X86));
