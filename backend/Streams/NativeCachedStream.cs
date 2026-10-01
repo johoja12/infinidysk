@@ -12,7 +12,6 @@ namespace NzbWebDAV.Streams;
 public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence, IStreamGenerationEvidence
 {
     private const int SourceWindowBytes = 4 * NativeCacheStore.BlockSize;
-    internal const int MaxSourceWindowBytes = 32 * NativeCacheStore.BlockSize;
     private readonly NativeCacheStore _store;
     private readonly NativeCacheIdentity _identity;
     private readonly Func<CancellationToken, Task<Stream>> _openSource;
@@ -333,11 +332,13 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         if (source.Position == position && position < _sourceWindowEnd) return;
         if (!_background && !completeBlock)
         {
-            // Each window rebuilds the NNTP pipeline with lookahead bounded by the window, so
-            // a fixed 16 MiB caps a high-latency provider at a handful of connections. Windows
-            // exhausted by sequential reading double (playback); any seek starts small again.
+            // Each window rebuilds the NNTP pipeline from cold with lookahead bounded by the
+            // window, which caps distant providers at a handful of connections. Once a window is
+            // exhausted by sequential reading (playback, not a probe) the source stays open to the
+            // end of the response, so the pipeline is not rebuilt and its prefetch ceiling bounds
+            // lookahead as with the cache off. Any seek starts with a bounded window again.
             _foregroundWindowBytes = source.Position == position && position == _sourceWindowEnd
-                ? Math.Min(_foregroundWindowBytes * 2, MaxSourceWindowBytes)
+                ? long.MaxValue
                 : SourceWindowBytes;
         }
         var windowBytes = _background || completeBlock ? NativeCacheStore.BlockSize : _foregroundWindowBytes;

@@ -383,7 +383,7 @@ public sealed class NativeCachedStreamTests : IDisposable
     }
 
     [Fact]
-    public async Task SequentialReads_GrowSourceWindow_AndSeekResetsIt()
+    public async Task SequentialReads_OpenSourceToEnd_AndSeekResetsIt()
     {
         await using var store = CreateStore();
         const long mib = 1024 * 1024;
@@ -391,9 +391,10 @@ public sealed class NativeCachedStreamTests : IDisposable
         var source = new BudgetRecordingStream(300 * mib);
         await using var stream = new NativeCachedStream(store, id, _ => Task.FromResult<Stream>(source), () => true);
         var buffer = new byte[mib];
-        for (var read = 0L; read < 120 * mib;)
+        for (var read = 0L; read < 250 * mib;)
             read += await stream.ReadAsync(buffer);
-        Assert.Equal(new long?[] { 16 * mib, 32 * mib, 64 * mib, 128 * mib }, source.WindowBudgets);
+        // One bounded 16 MiB window, then the rest of the file without further pipeline rebuilds.
+        Assert.Equal(new long?[] { 16 * mib, 300 * mib - 16 * mib }, source.WindowBudgets);
 
         stream.Position = 40 * mib; // a seek starts small again
         await stream.ReadAsync(buffer);
