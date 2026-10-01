@@ -4,6 +4,7 @@ using Microsoft.Data.Sqlite;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Services.NativeCache;
 using NzbWebDAV.WebDav.Requests;
+using Serilog;
 using UsenetSharp.Streams;
 
 namespace NzbWebDAV.Streams;
@@ -27,6 +28,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     private Stream? _source;
     private long _sourceWindowEnd = -1;
     private long _foregroundWindowBytes = SourceWindowBytes;
+    private long _reopenedFillBlock = -1;
     private long? _responseEnd;
     private byte[]? _buffer;
     private long _bufferStart = -1;
@@ -200,6 +202,8 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 }
                 catch (Exception exception) when (exception is not OperationCanceledException and not OutOfMemoryException)
                 {
+                    if (await TryReopenFillAsync(blockStart, exception).ConfigureAwait(false))
+                        return await ReadCoreAsync(destination, completeBlock, cancellationToken).ConfigureAwait(false);
                     // Read-ahead is speculative. A later missing article must not
                     // break a readable prefix/range requested by the player. Reopen
                     // without native proof/read-ahead context and use ordinary reads.
@@ -268,6 +272,8 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             }
             catch (Exception exception) when (exception is not OperationCanceledException and not OutOfMemoryException)
             {
+                if (await TryReopenFillAsync(blockStart, exception).ConfigureAwait(false))
+                    return await ReadCoreAsync(destination, completeBlock, cancellationToken).ConfigureAwait(false);
                 if (_source is not null)
                 {
                     try { await _source.DisposeAsync().ConfigureAwait(false); }
@@ -323,6 +329,32 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 .ConfigureAwait(false)) { _statistics?.Committed(expected); _transfer?.Committed(expected); }
         }
         catch (Exception exception) when (exception is IOException or SqliteException or UnauthorizedAccessException) { }
+    }
+
+    /// <summary>
+    /// A long-lived source pipeline can fail transiently (a dropped connection or a segment
+    /// timeout far ahead of the reader). Retry the block once on a fresh, bounded pipeline
+    /// before abandoning cache fills for the rest of the response; a block that fails again
+    /// (for example a truly missing article) falls back to ordinary source reads as before.
+    /// </summary>
+    private async ValueTask<bool> TryReopenFillAsync(long blockStart, Exception exception)
+    {
+        if (_reopenedFillBlock == blockStart) return false;
+        _reopenedFillBlock = blockStart;
+        Log.Debug("Native cache fill at {Offset} reopening its source after: {Reason}", blockStart, exception.Message);
+        if (_source is not null)
+        {
+            try { await _source.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception teardown) when (teardown is not OutOfMemoryException) { }
+        }
+        _source = null;
+        _sourceWindowEnd = -1;
+        _bufferStart = -1;
+        _bufferCount = 0;
+        _bufferVerified = false;
+        _activeFill?.Dispose();
+        _activeFill = null;
+        return true;
     }
 
     private void PositionSourceForFill(Stream source, long position, bool completeBlock)

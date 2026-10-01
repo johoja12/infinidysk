@@ -401,6 +401,63 @@ public sealed class NativeCachedStreamTests : IDisposable
         Assert.Equal(16 * mib, source.WindowBudgets[^1]);
     }
 
+    [Fact]
+    public async Task TransientSourceFailure_ReopensAndKeepsCachingTheResponse()
+    {
+        await using var store = CreateStore();
+        var length = 3 * NativeCacheStore.BlockSize;
+        var data = Enumerable.Range(0, length).Select(index => (byte)(index * 31)).ToArray();
+        var id = new NativeCacheIdentity("id", "version", length);
+        var opens = 0;
+        await using var stream = new NativeCachedStream(store, id, _ =>
+        {
+            // The first pipeline drops mid-way through the second block; the reopened one is healthy.
+            var failAt = ++opens == 1 ? NativeCacheStore.BlockSize + 4096 : long.MaxValue;
+            return Task.FromResult<Stream>(new FlakySource(data, failAt));
+        }, () => true);
+        var actual = new byte[length];
+        await stream.ReadExactlyAsync(actual);
+        Assert.Equal(data, actual);
+        Assert.Equal(2, opens);
+        Assert.Equal(length, await store.GetCoverageAsync(id));
+    }
+
+    [Fact]
+    public async Task RepeatedSourceFailure_StillServesTheResponseWithoutCaching()
+    {
+        await using var store = CreateStore();
+        var length = 2 * NativeCacheStore.BlockSize;
+        var data = Enumerable.Range(0, length).Select(index => (byte)(index * 7)).ToArray();
+        var id = new NativeCacheIdentity("id", "version", length);
+        var opens = 0;
+        await using var stream = new NativeCachedStream(store, id, _ =>
+        {
+            // Native fills keep failing at the same place (a missing article); plain reads succeed.
+            opens++;
+            return Task.FromResult<Stream>(new FlakySource(data, NativeCacheStore.BlockSize + 4096, failOnlyUnderNative: true));
+        }, () => true);
+        var actual = new byte[length];
+        await stream.ReadExactlyAsync(actual);
+        Assert.Equal(data, actual);
+        Assert.InRange(opens, 2, 3);
+        Assert.Equal(NativeCacheStore.BlockSize, await store.GetCoverageAsync(id));
+    }
+
+    private sealed class FlakySource(byte[] data, long failAt, bool failOnlyUnderNative = false)
+        : MemoryStream(data), ICacheReadEvidence
+    {
+        public bool LastReadCacheable => true;
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (Position + buffer.Length > failAt && (!failOnlyUnderNative || NativeCacheReadContext.IsActive))
+            {
+                if (Position < failAt) buffer = buffer[..(int)(failAt - Position)];
+                else throw new IOException("connection reset");
+            }
+            return base.ReadAsync(buffer, cancellationToken);
+        }
+    }
+
     /// <summary>Zero-filled source that records the native read budget each time it is positioned.</summary>
     private sealed class BudgetRecordingStream(long length) : Stream
     {
