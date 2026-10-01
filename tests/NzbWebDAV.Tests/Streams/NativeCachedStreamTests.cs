@@ -383,6 +383,54 @@ public sealed class NativeCachedStreamTests : IDisposable
     }
 
     [Fact]
+    public async Task SequentialReads_GrowSourceWindow_AndSeekResetsIt()
+    {
+        await using var store = CreateStore();
+        const long mib = 1024 * 1024;
+        var id = new NativeCacheIdentity("id", "version", 300 * mib);
+        var source = new BudgetRecordingStream(300 * mib);
+        await using var stream = new NativeCachedStream(store, id, _ => Task.FromResult<Stream>(source), () => true);
+        var buffer = new byte[mib];
+        for (var read = 0L; read < 120 * mib;)
+            read += await stream.ReadAsync(buffer);
+        Assert.Equal(new long?[] { 16 * mib, 32 * mib, 64 * mib, 128 * mib }, source.WindowBudgets);
+
+        stream.Position = 40 * mib; // a seek starts small again
+        await stream.ReadAsync(buffer);
+        Assert.Equal(16 * mib, source.WindowBudgets[^1]);
+    }
+
+    /// <summary>Zero-filled source that records the native read budget each time it is positioned.</summary>
+    private sealed class BudgetRecordingStream(long length) : Stream
+    {
+        private long _position;
+        public List<long?> WindowBudgets { get; } = [];
+        public override bool CanRead => true;
+        public override bool CanSeek => true;
+        public override bool CanWrite => false;
+        public override long Length => length;
+        public override long Position
+        {
+            get => _position;
+            set { WindowBudgets.Add(NativeCacheReadContext.ReadBudget); _position = value; }
+        }
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            var read = (int)Math.Min(count, length - _position);
+            Array.Clear(buffer, offset, read);
+            _position += read;
+            return read;
+        }
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => Position = origin switch
+        {
+            SeekOrigin.Begin => offset, SeekOrigin.Current => _position + offset, _ => length + offset
+        };
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    [Fact]
     public async Task SpeculativeTailFailure_DoesNotBreakReadablePrefix()
     {
         await using var store = CreateStore();

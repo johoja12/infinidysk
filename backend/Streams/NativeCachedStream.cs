@@ -12,6 +12,7 @@ namespace NzbWebDAV.Streams;
 public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence, IStreamGenerationEvidence
 {
     private const int SourceWindowBytes = 4 * NativeCacheStore.BlockSize;
+    internal const int MaxSourceWindowBytes = 32 * NativeCacheStore.BlockSize;
     private readonly NativeCacheStore _store;
     private readonly NativeCacheIdentity _identity;
     private readonly Func<CancellationToken, Task<Stream>> _openSource;
@@ -26,6 +27,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     private NativeCacheStatistics.NativeCacheTransfer? _transfer;
     private Stream? _source;
     private long _sourceWindowEnd = -1;
+    private long _foregroundWindowBytes = SourceWindowBytes;
     private long? _responseEnd;
     private byte[]? _buffer;
     private long _bufferStart = -1;
@@ -329,7 +331,16 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         // Keep the NNTP pipeline alive across integrity blocks. Seeking even to
         // the current offset in proof context tears down its finite segment plan.
         if (source.Position == position && position < _sourceWindowEnd) return;
-        var windowBytes = _background || completeBlock ? NativeCacheStore.BlockSize : SourceWindowBytes;
+        if (!_background && !completeBlock)
+        {
+            // Each window rebuilds the NNTP pipeline with lookahead bounded by the window, so
+            // a fixed 16 MiB caps a high-latency provider at a handful of connections. Windows
+            // exhausted by sequential reading double (playback); any seek starts small again.
+            _foregroundWindowBytes = source.Position == position && position == _sourceWindowEnd
+                ? Math.Min(_foregroundWindowBytes * 2, MaxSourceWindowBytes)
+                : SourceWindowBytes;
+        }
+        var windowBytes = _background || completeBlock ? NativeCacheStore.BlockSize : _foregroundWindowBytes;
         var remaining = Math.Min(Length - position, windowBytes);
         if (_responseEnd is { } responseEnd && responseEnd > position)
         {
