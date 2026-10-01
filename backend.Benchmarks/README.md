@@ -174,6 +174,40 @@ decoded bytes, SHA-256, BODY and response counts, callbacks, article-budget
 cleanup remain deterministic gates. Peak connection count remains a console
 diagnostic because thread scheduling can change it in short scenarios.
 
+### Uncached playback with Native Cache (`--set native-cold`)
+
+```bash
+dotnet run --project backend.Benchmarks -c Release -- \
+  --nntp-whole-path-report --set native-cold --json /tmp/native-cold.json
+```
+
+This measures what a player sees on an uncached file while Native Cache saves
+it: `NativeCachedStream` over `NzbFileStream`, the path behind a WebDAV GET with
+`cache.mode=native`. The scenario streams 342 × 768 KiB articles (256.5 MiB)
+over 40 connections at width 4 with a 40-article window, against a server that
+waits 250 ms before each BODY response, caps each connection at 4 MB/s and
+delays handshakes by 250 ms. That gives each connection about 1.7 MB/s, close to
+the per-connection rate of distant production providers, so throughput depends
+on how many connections the stream keeps busy. The run fails unless the same
+read committed every byte to a temporary cache folder and the bytes hash-match
+the corpus.
+
+The scheduled **Performance** workflow gates it against
+`Baselines/nntp-whole-path-native-cold-baseline.json`. BODY and response counts
+are deterministic gates: a cache path that rebuilds its NNTP pipeline every few
+MiB re-fetches boundary articles (2026-10-01 `main`: 383 BODY commands for 342
+articles, ~7.9 MB/s, 6 peak connections; after the sequential-window fix: 345,
+~17.1 MB/s, 26). Wall time and throughput use the usual envelopes. Rebaseline on
+the scheduled runner after a deliberate change.
+
+For a deployment-level check against real providers, run
+[`scripts/native-cold-throughput.py`](../scripts/native-cold-throughput.py)
+against an isolated test instance. It evicts each pinned item from Native
+Cache, streams one byte range over WebDAV as a player would, requires that range
+to be committed to the cache by the same read, and writes JSON lines. `--compare`
+reports paired per-item speed ratios between builds. Evicting first keeps the
+same pinned list cold on every run. Do not point it at a production cache.
+
 The initial loopback scenarios are plaintext. Validated-TLS loopback is
 deliberately deferred: UsenetSharp accepts only platform-default trust or a
 skip-all switch, and the benchmark must not add a permissive certificate

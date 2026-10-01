@@ -103,6 +103,7 @@ jobs:
           nntp_quick_status=0
           nntp_sustained_status=0
           nntp_cold_status=0
+          nntp_native_cold_status=0
           set +e
           run_with_retry streaming --streaming-report
           streaming_status=$?
@@ -138,9 +139,16 @@ jobs:
           if [ "${nntp_cold_status}" -eq 2 ]; then
             exit 2
           fi
+          set +e
+          run_with_retry nntp-whole-path-native-cold --nntp-whole-path-report --set native-cold
+          nntp_native_cold_status=$?
+          set -e
+          if [ "${nntp_native_cold_status}" -eq 2 ]; then
+            exit 2
+          fi
           if [ "${streaming_status}" -ne 0 ] || [ "${sab_status}" -ne 0 ] || \
              [ "${nntp_quick_status}" -ne 0 ] || [ "${nntp_sustained_status}" -ne 0 ] || \
-             [ "${nntp_cold_status}" -ne 0 ]; then
+             [ "${nntp_cold_status}" -ne 0 ] || [ "${nntp_native_cold_status}" -ne 0 ]; then
             exit 1
           fi
 
@@ -236,6 +244,12 @@ jobs:
               performance-out/nntp-whole-path-cold-2.json \
               performance-out/nntp-whole-path-cold-3.json \
             --write-baseline backend.Benchmarks/Baselines/nntp-whole-path-cold-baseline.json
+          python3 scripts/check-performance-baseline.py \
+            --candidates \
+              performance-out/nntp-whole-path-native-cold-1.json \
+              performance-out/nntp-whole-path-native-cold-2.json \
+              performance-out/nntp-whole-path-native-cold-3.json \
+            --write-baseline backend.Benchmarks/Baselines/nntp-whole-path-native-cold-baseline.json
 
           BODY_FILE="$(mktemp)"
           python3 - "${BODY_FILE}" "${RUN_URL}" <<'PY'
@@ -252,6 +266,7 @@ jobs:
               ("nntp-whole-path", "backend.Benchmarks/Baselines/nntp-whole-path-baseline.json"),
               ("nntp-whole-path-sustained", "backend.Benchmarks/Baselines/nntp-whole-path-sustained-baseline.json"),
               ("nntp-whole-path-cold", "backend.Benchmarks/Baselines/nntp-whole-path-cold-baseline.json"),
+              ("nntp-whole-path-native-cold", "backend.Benchmarks/Baselines/nntp-whole-path-native-cold-baseline.json"),
           ]
           lines = [
               "## Summary",
