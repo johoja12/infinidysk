@@ -26,6 +26,12 @@ internal sealed class SharedReaderStream : FastReadOnlyStream
     private int _disposed;
     private string? _responseGeneration;
     private bool _servedBytes;
+    private int _sourceRestarts;
+
+    // A revision published before any byte reached the client (for example lazy RAR
+    // resolution persisting its blob during the first read) cannot make this response
+    // inconsistent, so it reopens against the current source a bounded number of times.
+    internal const int MaxUnservedSourceRestarts = 3;
 
     internal SharedReaderStream(
         SharedStreamEntry entry,
@@ -78,7 +84,8 @@ internal sealed class SharedReaderStream : FastReadOnlyStream
 
         while (true)
         {
-            if (!_entry.ValidateSourceGeneration()) ThrowGenerationChanged();
+            if (!_entry.ValidateSourceGeneration())
+                return await RestartOrThrowAsync(buffer, cancellationToken).ConfigureAwait(false);
             var result = _ring.TryCopyAt(_readerId, _cursor, buffer.Span);
             switch (result.Kind)
             {
@@ -87,12 +94,14 @@ internal sealed class SharedReaderStream : FastReadOnlyStream
                     // pump stopped (entry teardown or an upstream pipeline that ended early),
                     // which is not evidence of missing data. Continue on a private source so
                     // only a truncation that reproduces there surfaces as a short read.
-                    if (!_entry.ValidateSourceGeneration()) ThrowGenerationChanged();
+                    if (!_entry.ValidateSourceGeneration())
+                        return await RestartOrThrowAsync(buffer, cancellationToken).ConfigureAwait(false);
                     await DetachToPrivateAsync(cancellationToken).ConfigureAwait(false);
                     return await ReadFallbackAsync(buffer, cancellationToken).ConfigureAwait(false);
 
                 case RingReadKind.Copied:
-                    if (!_entry.ValidateSourceGeneration()) ThrowGenerationChanged();
+                    if (!_entry.ValidateSourceGeneration())
+                        return await RestartOrThrowAsync(buffer, cancellationToken).ConfigureAwait(false);
                     _cursor += result.Count;
                     _servedBytes |= result.Count > 0;
                     if (result.Count > 0)
@@ -115,6 +124,10 @@ internal sealed class SharedReaderStream : FastReadOnlyStream
                 case RingReadKind.Released:
                 case RingReadKind.Detached:
                     await DetachToPrivateAsync(cancellationToken).ConfigureAwait(false);
+                    return await ReadFallbackAsync(buffer, cancellationToken).ConfigureAwait(false);
+
+                case RingReadKind.Failed when result.Exception is MediaSourceChangedException
+                    && await TryRestartUnservedAsync(cancellationToken).ConfigureAwait(false):
                     return await ReadFallbackAsync(buffer, cancellationToken).ConfigureAwait(false);
 
                 case RingReadKind.Failed:
@@ -217,19 +230,51 @@ internal sealed class SharedReaderStream : FastReadOnlyStream
 
     private async ValueTask<int> ReadFallbackAsync(Memory<byte> buffer, CancellationToken cancellationToken)
     {
-        if (_servedBytes && _responseGeneration is not null && !_entry.ValidateSourceGeneration()) ThrowGenerationChanged();
-        _fallback ??= await _fallbackFactory(_cursor, cancellationToken).ConfigureAwait(false);
-        var evidence = _fallback as IStreamGenerationEvidence;
-        if (_servedBytes && _responseGeneration is not null && evidence?.GenerationIdentity != _responseGeneration)
-            ThrowGenerationChanged();
-        if (!_servedBytes) _responseGeneration = evidence?.GenerationIdentity;
-        if (evidence?.IsSourceCurrent == false) ThrowGenerationChanged();
-        var read = await _fallback.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-        if (evidence?.IsSourceCurrent == false || _responseGeneration is not null && evidence?.GenerationIdentity != _responseGeneration)
-            ThrowGenerationChanged();
-        _cursor += read;
-        _servedBytes |= read > 0;
-        return read;
+        while (true)
+        {
+            if (_servedBytes && _responseGeneration is not null && !_entry.ValidateSourceGeneration()) ThrowGenerationChanged();
+            _fallback ??= await _fallbackFactory(_cursor, cancellationToken).ConfigureAwait(false);
+            var evidence = _fallback as IStreamGenerationEvidence;
+            if (_servedBytes && _responseGeneration is not null && evidence?.GenerationIdentity != _responseGeneration)
+                ThrowGenerationChanged();
+            if (!_servedBytes) _responseGeneration = evidence?.GenerationIdentity;
+            if (evidence?.IsSourceCurrent == false)
+            {
+                if (await TryRestartUnservedAsync(cancellationToken).ConfigureAwait(false)) continue;
+                ThrowGenerationChanged();
+            }
+            var read = await _fallback.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+            if (evidence?.IsSourceCurrent == false || _responseGeneration is not null && evidence?.GenerationIdentity != _responseGeneration)
+            {
+                if (await TryRestartUnservedAsync(cancellationToken).ConfigureAwait(false)) continue;
+                ThrowGenerationChanged();
+            }
+            _cursor += read;
+            _servedBytes |= read > 0;
+            return read;
+        }
+    }
+
+    private async ValueTask<int> RestartOrThrowAsync(Memory<byte> buffer, CancellationToken cancellationToken)
+    {
+        if (!await TryRestartUnservedAsync(cancellationToken).ConfigureAwait(false)) ThrowGenerationChanged();
+        return await ReadFallbackAsync(buffer, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask<bool> TryRestartUnservedAsync(CancellationToken cancellationToken)
+    {
+        if (_servedBytes || _sourceRestarts >= MaxUnservedSourceRestarts) return false;
+        _sourceRestarts++;
+        DetachQuiet();
+        if (_fallback is { } stale)
+        {
+            _fallback = null;
+            await stale.DisposeAsync().ConfigureAwait(false);
+        }
+        _responseGeneration = null;
+        // Give an in-flight blob publication a moment to finish before reopening.
+        await Task.Delay(TimeSpan.FromMilliseconds(50 * _sourceRestarts), cancellationToken).ConfigureAwait(false);
+        return true;
     }
 
     private void ThrowGenerationChanged()

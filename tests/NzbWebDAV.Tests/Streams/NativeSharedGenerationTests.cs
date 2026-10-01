@@ -20,6 +20,43 @@ public sealed class NativeSharedGenerationTests
         Assert.Null(entry.TryAttach(0, (_, _) => throw new InvalidOperationException("Unexpected fallback"), out _));
     }
 
+    [Fact]
+    public async Task InvalidationBeforeFirstByte_ReopensAgainstCurrentSource()
+    {
+        var source = new GenerationStream("old");
+        await using var entry = Start(source);
+        var reopened = 0;
+        await using var reader = entry.TryAttach(0, (offset, _) =>
+        {
+            reopened++;
+            Stream fallback = new GenerationStream("new") { Position = offset };
+            return Task.FromResult(fallback);
+        }, out _)!;
+        Assert.NotNull(reader);
+        source.IsSourceCurrent = false; // e.g. lazy RAR resolution persisted the blob mid-startup
+        Assert.Equal(1, await reader.ReadAsync(new byte[1]));
+        Assert.Equal(1, reopened);
+        Assert.Equal(1, reader.Position);
+    }
+
+    [Fact]
+    public async Task InvalidationBeforeFirstByte_GivesUpAfterBoundedRestarts()
+    {
+        var source = new GenerationStream("old");
+        await using var entry = Start(source);
+        var reopened = 0;
+        await using var reader = entry.TryAttach(0, (offset, _) =>
+        {
+            reopened++;
+            Stream fallback = new GenerationStream("churning") { Position = offset, IsSourceCurrent = false };
+            return Task.FromResult(fallback);
+        }, out _)!;
+        Assert.NotNull(reader);
+        source.IsSourceCurrent = false;
+        await Assert.ThrowsAsync<MediaSourceChangedException>(() => reader.ReadAsync(new byte[1]).AsTask());
+        Assert.Equal(SharedReaderStream.MaxUnservedSourceRestarts, reopened);
+    }
+
     [Theory]
     [InlineData("old", true)]
     [InlineData("new", false)]
