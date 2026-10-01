@@ -282,10 +282,12 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false);
             }
         }
-        EnsureResponseGeneration();
+        if (!KeepResponseGeneration())
+            return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false);
         var count = Math.Min(destination.Length, _bufferCount - bufferOffset);
         _buffer!.AsMemory(bufferOffset, count).CopyTo(destination);
-        EnsureResponseGeneration();
+        if (!KeepResponseGeneration())
+            return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false);
         _position += count;
         _servedBytes |= count > 0;
         LastReadCacheable = _bufferVerified && _generationIsCurrent();
@@ -418,17 +420,30 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         for (var block = start / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize;
             block < start + count; block += NativeCacheStore.BlockSize)
             if (block != _lastDirectMissBlock) { _statistics?.Miss(); _lastDirectMissBlock = block; }
-        EnsureResponseGeneration();
+        KeepResponseGeneration(); // These bytes came from the source, so they stay valid.
         _position += count;
         _servedBytes |= count > 0;
         LastReadCacheable = false;
         return count;
     }
 
-    private void EnsureResponseGeneration()
+    /// <summary>
+    /// False when the revision changed before any byte was served (for example lazy RAR
+    /// resolution persisting its blob during this first read): the response then continues
+    /// from the source only, as at the start of <see cref="ReadCoreAsync"/>, and buffered
+    /// block bytes must be re-read. Once bytes were served a change fails the response.
+    /// </summary>
+    private bool KeepResponseGeneration()
     {
-        if (!_untrackedSource && !_generationIsCurrent())
+        if (_untrackedSource || _generationIsCurrent()) return true;
+        if (_servedBytes)
             throw new MediaSourceChangedException("Media source changed during this response. Retry the range against the current source.");
+        _untrackedSource = true;
+        _bypassFill = true;
+        _bufferStart = -1;
+        _activeFill?.Dispose();
+        _activeFill = null;
+        return false;
     }
 
     public override long Seek(long offset, SeekOrigin origin)
