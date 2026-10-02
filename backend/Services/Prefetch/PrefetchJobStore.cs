@@ -35,11 +35,26 @@ public sealed record PrefetchJob(string Id, Guid ItemId, string Trigger, int Pri
     public string? FailureCode { get; init; }
     /// <summary>Follow-up taken for a failure, for example <c>repair-queued</c>; null when none.</summary>
     public string? Remedy { get; init; }
+    /// <summary>Running jobs only: bytes per second fetched over the last few seconds; null until measurable.</summary>
+    public double? RecentBytesPerSecond { get; init; }
+    /// <summary>Running jobs only: Unix milliseconds of the latest progress report (fetch or verification).</summary>
+    public long? LastProgressAt { get; init; }
+    /// <summary>Running jobs only: true when no progress was reported for a minute.</summary>
+    public bool? Stalled { get; init; }
+    /// <summary>
+    /// Every source that requested this job, resolved to a display label and category, most specific
+    /// first and capped at eight; <see cref="SourceCount"/> is the full number.
+    /// </summary>
+    public IReadOnlyList<PrefetchJobSource>? Sources { get; init; }
+    public int? SourceCount { get; init; }
     /// <summary>True for jobs that warm part of a file (backfill, head/tail minimum, resume range).</summary>
     public bool IsRangeJob => Start != 0 || Length != 0;
 }
 
 public sealed record PrefetchEnqueueResult(PrefetchJob Job, bool Created);
+
+/// <summary>A job owner as shown to people: a concrete label (e.g. a Plex hub title) and a stable category.</summary>
+public sealed record PrefetchJobSource(string Label, string Category);
 
 public sealed class PrefetchJobStore : IDisposable
 {
@@ -53,6 +68,8 @@ public sealed class PrefetchJobStore : IDisposable
     private int _wireBudgetBlocked;
     private readonly CancellationTokenSource _wireBudgetFailure = new();
     public bool WireBudgetBlocked => Volatile.Read(ref _wireBudgetBlocked) != 0;
+    /// <summary>Live per-job warming rate, fed by <see cref="Progress"/>.</summary>
+    public WarmingRateWindow Rates { get; } = new();
     public CancellationToken WireBudgetFailure => _wireBudgetFailure.Token;
     public void BlockWireBudget()
     {
@@ -275,6 +292,7 @@ public sealed class PrefetchJobStore : IDisposable
     public bool Defer(string id, string reason, TimeSpan delay, bool consumeAttempt = true, string? failureCode = null)
     {
         if (delay < TimeSpan.Zero || delay > TimeSpan.FromDays(1)) throw new ArgumentOutOfRangeException(nameof(delay));
+        Rates.Stop(id);
         lock (_gate)
         return Atomic(() =>
         {
@@ -368,6 +386,26 @@ public sealed class PrefetchJobStore : IDisposable
         Execute("INSERT OR IGNORE INTO Owners(Id,Owner) VALUES($id,$owner)", ("$id", id), ("$owner", owner));
     }
 
+    /// <summary>Owners of the given jobs, in a stable order.</summary>
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> OwnersOf(IEnumerable<string> ids)
+    {
+        var wanted = ids.ToHashSet(StringComparer.Ordinal);
+        var result = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        lock (_gate)
+        {
+            using var command = Command("SELECT Id,Owner FROM Owners ORDER BY Id,Owner");
+            using var reader = command.ExecuteReader();
+            while (reader.Read())
+            {
+                var id = reader.GetString(0);
+                if (!wanted.Contains(id)) continue;
+                if (!result.TryGetValue(id, out var owners)) result[id] = owners = [];
+                owners.Add(reader.GetString(1));
+            }
+        }
+        return result.ToDictionary(pair => pair.Key, pair => (IReadOnlyList<string>)pair.Value, StringComparer.Ordinal);
+    }
+
     public bool HasOwner(string id, string owner)
     {
         lock (_gate)
@@ -442,6 +480,7 @@ public sealed class PrefetchJobStore : IDisposable
             if (job is null) return null;
             Execute("UPDATE Jobs SET State='running',Error=NULL,FailureCode=NULL,Remedy=NULL,StartedAt=COALESCE(StartedAt,$now),RunStarted=$now,ActiveMs=COALESCE(ActiveMs,0),WarmedBytes=COALESCE(WarmedBytes,0) WHERE Id=$id",
                 ("$id", job.Id), ("$now", now));
+            Rates.Start(job.Id, DateTimeOffset.FromUnixTimeMilliseconds(now));
             return job with { State = "running", Error = null, FailureCode = null, Remedy = null, StartedAt = job.StartedAt ?? now, ActiveMs = job.ActiveMs ?? 0, WarmedBytes = job.WarmedBytes ?? 0 };
         }
     }
@@ -451,6 +490,7 @@ public sealed class PrefetchJobStore : IDisposable
     public void Progress(string id, string generation, long committedBytes, long warmedBytes = 0)
     {
         if (committedBytes < 0 || warmedBytes < 0 || generation.Length > 512) throw new ArgumentException("Invalid committed progress.");
+        Rates.Record(id, warmedBytes, DateTimeOffset.UtcNow);
         lock (_gate) Execute("UPDATE Jobs SET Generation=$generation,CommittedBytes=$bytes,WarmedBytes=COALESCE(WarmedBytes,0)+$warmed,Updated=$now WHERE Id=$id AND State='running'",
             ("$generation", generation), ("$bytes", committedBytes), ("$warmed", warmedBytes), ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), ("$id", id));
     }
@@ -537,6 +577,7 @@ public sealed class PrefetchJobStore : IDisposable
 
     public void Finish(string id, bool success, string? error, string? failureCode = null, string? remedy = null)
     {
+        Rates.Stop(id);
         lock (_gate) Execute($"UPDATE Jobs SET State=$state,Error=$error,FailureCode=$code,Remedy=$remedy,Updated=$now,FinishedAt=$now,{CloseRunClock} WHERE Id=$id AND State='running'",
             ("$state", success ? "completed" : "failed"), ("$error", error is null ? DBNull.Value : error[..Math.Min(error.Length, 512)]),
             ("$code", (object?)failureCode ?? DBNull.Value), ("$remedy", (object?)remedy ?? DBNull.Value),
@@ -555,7 +596,21 @@ public sealed class PrefetchJobStore : IDisposable
             using var command = Command("SELECT * FROM Jobs ORDER BY Updated DESC,Id LIMIT $limit", ("$limit", _capacity + 256));
             using var reader = command.ExecuteReader();
             var result = new List<PrefetchJob>();
-            while (reader.Read()) result.Add(Read(reader));
+            var now = DateTimeOffset.UtcNow;
+            while (reader.Read())
+            {
+                var job = Read(reader);
+                if (job.State == "running")
+                {
+                    // Include the current run so a running job's average speed is live.
+                    if (NullableInt64(reader, "RunStarted") is { } runStarted)
+                        job = job with { ActiveMs = (job.ActiveMs ?? 0) + Math.Max(0, now.ToUnixTimeMilliseconds() - runStarted) };
+                    if (Rates.Get(job.Id, now) is { } rate)
+                        job = job with { RecentBytesPerSecond = rate.RecentBytesPerSecond,
+                            LastProgressAt = rate.LastProgressAt.ToUnixTimeMilliseconds(), Stalled = rate.Stalled };
+                }
+                result.Add(job);
+            }
             return result;
         }
     }

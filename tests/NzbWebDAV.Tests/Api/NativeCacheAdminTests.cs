@@ -114,6 +114,10 @@ public sealed class NativeCacheAdminTests
             Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("rangeCachedBytes").ValueKind);
             Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("failureCode").ValueKind);
             Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("remedy").ValueKind);
+            var source = Assert.Single(cancelledJob.GetProperty("sources").EnumerateArray());
+            Assert.Equal("Manual", source.GetProperty("label").GetString());
+            Assert.Equal("manual", source.GetProperty("category").GetString());
+            Assert.Equal(1, cancelledJob.GetProperty("sourceCount").GetInt32());
         }
         using var invalid = await client.PostAsJsonAsync("/api/prefetch/operations", new { operation = "warm", itemIds = new[] { Guid.NewGuid() } });
         Assert.Equal(HttpStatusCode.Accepted, invalid.StatusCode);

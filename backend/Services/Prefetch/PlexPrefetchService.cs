@@ -361,7 +361,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         return true;
     }
 
-    private static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)))[..16];
+    internal static string Hash(string value) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)))[..16];
     public static string SourceLabel(string owner) => owner.Split(':') switch
     {
         ["manual"] => "Manual",
@@ -375,13 +375,65 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         ["plex", _, "history", ..] => "Plex watch history",
         _ => "Background warming"
     };
+    /// <summary>Source categories, most specific first; the frontend colours bubbles by these.</summary>
+    private static readonly string[] SourceCategories =
+    [
+        "plex-realtime", "plex-realtime-next", "plex-history-next", "plex-history", "plex-source",
+        "finish-watched", "backfill", "manual", "read", "other",
+    ];
+
+    /// <summary>
+    /// Resolves a job owner to a concrete label and category. Plex hub and collection owners only
+    /// store a hash of the source, so the title is found by matching the same hashes against the
+    /// configured sources; a removed source falls back to the generic label.
+    /// </summary>
+    public static PrefetchJobSource DescribeOwner(string owner, PrefetchSettings settings, IReadOnlyList<PlexServer> servers)
+    {
+        var parts = owner.Split(':');
+        var minimum = parts.Length > 1 && parts[^1] == "minimum";
+        string WithRange(string label) => minimum ? label + " · head/tail" : label;
+        return parts switch
+        {
+            ["manual"] => new("Manual", "manual"),
+            [PrefetchRuntime.BackfillOwner] => new("Playback not yet cached", "backfill"),
+            [FinishWatchedOwner] => new("Finish partially watched", "finish-watched"),
+            ["read", ..] => new(WithRange("Read activity"), "read"),
+            ["plex", var server, "source", var key, ..] => new(WithRange(SourceTitle(server, key, settings, servers)
+                ?? "Selected Plex hub/collection"), "plex-source"),
+            ["plex", _, "realtime-next", ..] => new(WithRange("Next episode · realtime"), "plex-realtime-next"),
+            ["plex", _, "history-next", ..] => new(WithRange("Next episode · history"), "plex-history-next"),
+            ["plex", _, "realtime", ..] => new(WithRange("Playing now"), "plex-realtime"),
+            ["plex", _, "history", ..] => new(WithRange("Watch history"), "plex-history"),
+            _ => new("Background warming", "other"),
+        };
+    }
+
+    private static string? SourceTitle(string serverHash, string sourceHash, PrefetchSettings settings, IReadOnlyList<PlexServer> servers)
+    {
+        var server = servers.FirstOrDefault(candidate => Hash(candidate.Id) == serverHash);
+        if (server is null) return null;
+        var source = settings.Sources.FirstOrDefault(candidate => candidate.ServerId == server.Id
+            && Hash(candidate.Kind + ":" + candidate.Key) == sourceHash);
+        return string.IsNullOrWhiteSpace(source?.Title) ? null : source.Title;
+    }
+
+    /// <summary>Distinct sources of one job, most specific category first, capped at <paramref name="limit"/>.</summary>
+    public static (IReadOnlyList<PrefetchJobSource> Sources, int Count) DescribeOwners(IEnumerable<string> owners,
+        PrefetchSettings settings, IReadOnlyList<PlexServer> servers, int limit = 8)
+    {
+        var distinct = owners.Select(owner => DescribeOwner(owner, settings, servers)).Distinct()
+            .OrderBy(source => Array.IndexOf(SourceCategories, source.Category)).ThenBy(source => source.Label, StringComparer.Ordinal)
+            .ToArray();
+        return (distinct.Take(limit).ToArray(), distinct.Length);
+    }
+
     public static string RangeReason(string owner, long length) =>
         (owner == PrefetchRuntime.BackfillOwner ? "Fills in what playback streamed without caching"
             : owner == FinishWatchedOwner ? "Finishes caching a file you started watching"
             : owner.EndsWith(":minimum", StringComparison.Ordinal) ? "Minimum head/tail" : length == 0 ? "Whole-file warming" : "Resume/start range")
         + (owner.Contains(":watch-unknown", StringComparison.Ordinal) ? "; watched status unknown"
             : owner.Contains(":unwatched", StringComparison.Ordinal) ? "; next unwatched episode" : "");
-    private static string Owner(string server, string kind, string key) => $"plex:{Hash(server)}:{kind}:{Hash(key)}";
+    internal static string Owner(string server, string kind, string key) => $"plex:{Hash(server)}:{kind}:{Hash(key)}";
     private static bool UserSelected(PrefetchSettings settings, string server, string user) => settings.Users.Length == 0
         || settings.Users.Contains(server + ":" + user, StringComparer.Ordinal);
     /// <summary>Owners that are not Plex policy sources and survive every policy change.</summary>
