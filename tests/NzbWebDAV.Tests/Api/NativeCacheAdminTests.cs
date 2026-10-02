@@ -108,6 +108,12 @@ public sealed class NativeCacheAdminTests
             Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("startedAt").ValueKind);
             Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("activeMs").ValueKind);
             Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("warmedBytes").ValueKind);
+            // A whole-file job reports whole-file coverage only; it has no own-range figure.
+            Assert.False(cancelledJob.GetProperty("isRangeJob").GetBoolean());
+            Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("rangeBytes").ValueKind);
+            Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("rangeCachedBytes").ValueKind);
+            Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("failureCode").ValueKind);
+            Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("remedy").ValueKind);
         }
         using var invalid = await client.PostAsJsonAsync("/api/prefetch/operations", new { operation = "warm", itemIds = new[] { Guid.NewGuid() } });
         Assert.Equal(HttpStatusCode.Accepted, invalid.StatusCode);

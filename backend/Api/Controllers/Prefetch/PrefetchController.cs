@@ -29,6 +29,7 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
         { runtime.ReportMetadataFailure(); }
         var items = (await database.GetItemsByIdsBatchedAsync(jobs.Select(job => job.ItemId).Distinct().ToArray(),
             ct: HttpContext.RequestAborted).ConfigureAwait(false)).ToDictionary(item => item.Id);
+        var coverage = await runtime.GetRangeCoverageAsync(jobs, items, HttpContext.RequestAborted).ConfigureAwait(false);
         return Ok(new PrefetchStatusResponse(
             runtime.Jobs is not null, runtime.InitializationError, runtime.RuntimeError, runtime.Healthy, paused,
             jobs.Select(job => job with
@@ -36,7 +37,9 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
                 DisplayName = items.GetValueOrDefault(job.ItemId)?.Name ?? "Removed media",
                 FileSize = items.GetValueOrDefault(job.ItemId)?.FileSize,
                 Source = PlexPrefetchService.SourceLabel(job.Trigger),
-                Reason = PlexPrefetchService.RangeReason(job.Trigger, job.Length)
+                Reason = PlexPrefetchService.RangeReason(job.Trigger, job.Length),
+                RangeBytes = coverage.TryGetValue(job.Id, out var range) ? range.Bytes : null,
+                RangeCachedBytes = coverage.TryGetValue(job.Id, out var cached) ? cached.Cached : null
             }).ToList(),
             runtime.Settings(), dailyBudgetUsed, policies.LastSuccess, policies.LastError));
     }

@@ -283,6 +283,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         }
         var cooldownKey = "queued:" + item.Id.ToString("N") + ":" + owner;
         if (_last.TryGetValue(cooldownKey, out var previous) && DateTimeOffset.UtcNow - previous < TimeSpan.FromMinutes(current.CooldownMinutes)) return true;
+        // A release that warming proved damaged waits for repair instead of failing again every refresh.
+        if (await runtime.IsKnownDamagedAsync(item, ct).ConfigureAwait(false)) return false;
         var ranges = PrefetchPolicy.Ranges(item.FileSize.Value, viewOffset, duration, current, minimum: false);
         IReadOnlyList<(long Start, long Length)> minimumRanges = current.MinimumWarmEnabled && !current.FullFileWarming
             ? PrefetchPolicy.Ranges(item.FileSize.Value, 0, 0, current, minimum: true) : [];
@@ -339,7 +341,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         _ => "Background warming"
     };
     public static string RangeReason(string owner, long length) =>
-        (owner.EndsWith(":minimum", StringComparison.Ordinal) ? "Minimum head/tail" : length == 0 ? "Whole-file warming" : "Resume/start range")
+        (owner == PrefetchRuntime.BackfillOwner ? "Fills in what playback streamed without caching"
+            : owner.EndsWith(":minimum", StringComparison.Ordinal) ? "Minimum head/tail" : length == 0 ? "Whole-file warming" : "Resume/start range")
         + (owner.Contains(":watch-unknown", StringComparison.Ordinal) ? "; watched status unknown"
             : owner.Contains(":unwatched", StringComparison.Ordinal) ? "; next unwatched episode" : "");
     private static string Owner(string server, string kind, string key) => $"plex:{Hash(server)}:{kind}:{Hash(key)}";

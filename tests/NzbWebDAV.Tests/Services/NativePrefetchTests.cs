@@ -208,10 +208,50 @@ public sealed class NativePrefetchTests : IAsyncLifetime
         var identity = new NativeCacheIdentity("movie", "revision", 3);
         var source = new VerifiedSource([1, 2, 3], verified);
         await using var stream = new NativeCachedStream(_store, identity, _ => Task.FromResult<Stream>(source), () => true);
-        await Assert.ThrowsAsync<PrefetchDeferredException>(() => NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0,
+        var deferred = await Assert.ThrowsAsync<PrefetchDeferredException>(() => NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0,
             _ => budget, _ => { }, CancellationToken.None));
         Assert.Equal(0, await _store.GetCoverageAsync(identity));
         if (!budget) Assert.Equal(0, source.ReadBytes);
+        // Unverified source bytes are classified so repeated failures can escalate to a damaged release.
+        Assert.Equal(budget ? PrefetchFailureCodes.SourceUnverified : PrefetchFailureCodes.Budget, deferred.FailureCode);
+        Assert.True(deferred.CountsAsFailure == budget);
+    }
+
+    [Fact]
+    public async Task ConclusiveArticleMiss_IsReportedAsSourceDamage()
+    {
+        var identity = new NativeCacheIdentity("damaged", "revision", 3);
+        await using var stream = new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new MissingArticleSource(inconclusive: false)), () => true);
+        var damaged = await Assert.ThrowsAsync<PrefetchSourceDamagedException>(() => NativePrefetchExecutor.WarmAsync(
+            _store, stream, 0, 0, _ => true, _ => { }, CancellationToken.None));
+        Assert.Equal("missing-segment", damaged.SegmentId);
+        Assert.Contains("different post", damaged.Message);
+        Assert.Equal(0, await _store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
+    public async Task InconclusiveArticleMiss_IsNotTreatedAsDamage()
+    {
+        var identity = new NativeCacheIdentity("maybe-damaged", "revision", 3);
+        await using var stream = new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new MissingArticleSource(inconclusive: true)), () => true);
+        var failure = await Record.ExceptionAsync(() => NativePrefetchExecutor.WarmAsync(
+            _store, stream, 0, 0, _ => true, _ => { }, CancellationToken.None));
+        Assert.NotNull(failure);
+        Assert.IsNotType<PrefetchSourceDamagedException>(failure);
+    }
+
+    [Fact]
+    public async Task ChangedSource_DefersWithoutCountingAFailure()
+    {
+        var identity = new NativeCacheIdentity("changed", "revision", 3);
+        await using var stream = new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new VerifiedSource([1, 2, 3], true)), () => false);
+        var deferred = await Assert.ThrowsAsync<PrefetchDeferredException>(() => NativePrefetchExecutor.WarmAsync(
+            _store, stream, 0, 0, _ => true, _ => { }, CancellationToken.None));
+        Assert.Equal(PrefetchFailureCodes.SourceChanged, deferred.FailureCode);
+        Assert.False(deferred.CountsAsFailure);
     }
 
     [Fact]
@@ -353,6 +393,14 @@ public sealed class NativePrefetchTests : IAsyncLifetime
     {
         await _store.DisposeAsync();
         Directory.Delete(_root, true);
+    }
+
+    private sealed class MissingArticleSource(bool inconclusive) : MemoryStream(new byte[3]), ICacheReadEvidence
+    {
+        public bool LastReadCacheable => false;
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+            throw new NzbWebDAV.Exceptions.UsenetArticleNotFoundException("missing-segment")
+            { InconclusiveReason = inconclusive ? "A provider timed out." : null };
     }
 
     private sealed class VerifiedSource(byte[] bytes, bool verified) : MemoryStream(bytes), ICacheReadEvidence

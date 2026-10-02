@@ -93,6 +93,16 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     }
 
     public bool LastReadCacheable { get; private set; }
+    /// <summary>
+    /// The source failure that last made this stream stop filling the cache, for warming to classify
+    /// (missing or foreign articles versus a transient transport error). Null when none occurred.
+    /// </summary>
+    internal Exception? LastFillFailure { get; private set; }
+    /// <summary>
+    /// Start of the last block whose source bytes arrived without integrity proof (gap-filled, CRC
+    /// mismatch, or a different post), or -1. Warming treats repeated failures here as source damage.
+    /// </summary>
+    internal long LastUnverifiedSourceBlock { get; private set; } = -1;
     public NativeCacheIdentity Identity => _identity;
     public string GenerationIdentity => _identity.Key;
     public bool IsSourceCurrent => _generationIsCurrent();
@@ -335,6 +345,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 _activeFill?.Dispose();
                 _activeFill = null;
                 if (exception is not TimeoutException) _statistics?.Fallback();
+                LastFillFailure = exception;
                 RecordSkip("fill_source_failure", abandonsResponse: true);
                 return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false);
             }
@@ -524,6 +535,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                         _activeFill?.Dispose();
                         _activeFill = null;
                         if (exception is not TimeoutException) _statistics?.Fallback();
+                        LastFillFailure = exception;
                         RecordSkip("fill_source_failure", abandonsResponse: true);
                         return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false);
                     }
@@ -560,7 +572,11 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                             bytes: read, elapsed: Stopwatch.GetElapsedTime(readStarted));
                     if (read == 0) throw new EndOfStreamException("Source ended before the declared media length.");
                     _statistics?.SourceBytes(read);
-                    _bufferVerified &= _source is ICacheReadEvidence { LastReadCacheable: true };
+                    if (_source is not ICacheReadEvidence { LastReadCacheable: true })
+                    {
+                        _bufferVerified = false;
+                        LastUnverifiedSourceBlock = blockStart;
+                    }
                     _bufferCount += read;
                 }
                 if (_bufferCount == expected) await CompleteFillAsync(blockStart, expected, cancellationToken).ConfigureAwait(false);
@@ -589,6 +605,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 _activeFill?.Dispose();
                 _activeFill = null;
                 if (exception is not TimeoutException) _statistics?.Fallback();
+                LastFillFailure = exception;
                 RecordSkip("fill_source_failure", abandonsResponse: true);
                 return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false);
             }
