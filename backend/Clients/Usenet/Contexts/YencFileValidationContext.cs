@@ -1,7 +1,10 @@
 using System.Security.Cryptography;
 using System.Text;
+using NzbWebDAV.Exceptions;
 using NzbWebDAV.Models.Nzb;
 using NzbWebDAV.Streams;
+using Serilog;
+using Serilog.Events;
 using UsenetSharp.Models;
 
 namespace NzbWebDAV.Clients.Usenet.Contexts;
@@ -19,6 +22,8 @@ internal sealed class YencFileValidationContext : IDisposable
     private readonly string[][]? _segmentFallbacks;
     private readonly Lazy<Dictionary<string, int>> _positionIndex;
     private readonly bool _deferToPar2Proof;
+    private readonly string? _fileName;
+    private string? _trackerKey;
 
     private YencFileValidationContext(
         int expectedTotalParts,
@@ -26,8 +31,10 @@ internal sealed class YencFileValidationContext : IDisposable
         NzbFile? file = null,
         string[]? segmentIds = null,
         string[][]? segmentFallbacks = null,
-        bool deferToPar2Proof = false)
+        bool deferToPar2Proof = false,
+        string? fileName = null)
     {
+        _fileName = string.IsNullOrWhiteSpace(fileName) ? null : fileName;
         ExpectedTotalParts = expectedTotalParts;
         Stage = stage;
         _file = file;
@@ -82,16 +89,74 @@ internal sealed class YencFileValidationContext : IDisposable
     public static IDisposable BeginSizeProbe(NzbFile file) =>
         new YencFileValidationContext(file.Segments.Count, "SizeProbe", file: file);
 
-    public static IDisposable BeginStreaming(string[] segmentIds, string[][]? segmentFallbacks) =>
+    public static IDisposable BeginStreaming(
+        string[] segmentIds, string[][]? segmentFallbacks, string? fileName = null) =>
         new YencFileValidationContext(
             segmentIds.Length, "Streaming", segmentIds: segmentIds, segmentFallbacks: segmentFallbacks,
             deferToPar2Proof: Current?._deferToPar2Proof == true
-                && ReferenceEquals(Current._segmentIds, segmentIds));
+                && ReferenceEquals(Current._segmentIds, segmentIds),
+            fileName: fileName);
 
-    internal static IDisposable BeginBufferedPar2ProofRead(string[] segmentIds, string[][]? segmentFallbacks) =>
+    internal static IDisposable BeginBufferedPar2ProofRead(
+        string[] segmentIds, string[][]? segmentFallbacks, string? fileName = null) =>
         new YencFileValidationContext(
             segmentIds.Length, "BufferedPar2ProofRead", segmentIds: segmentIds,
-            segmentFallbacks: segmentFallbacks, deferToPar2Proof: true);
+            segmentFallbacks: segmentFallbacks, deferToPar2Proof: true, fileName: fileName);
+
+    /// <summary>
+    /// Identity of the active file for <see cref="MismatchedArticleTracker"/>: its first
+    /// article plus its segment count, the same evidence a mismatch is judged against.
+    /// Null when the context cannot identify a file or defers validation to PAR2.
+    /// </summary>
+    private string? TrackerKey
+    {
+        get
+        {
+            if (_deferToPar2Proof) return null;
+            if (_trackerKey is not null) return _trackerKey;
+            var anchor = _file is { Segments.Count: > 0 } file
+                ? file.Segments[0].MessageId
+                : _segmentIds is { Length: > 0 } ids ? ids[0] : null;
+            return anchor is null
+                ? null
+                : _trackerKey = $"{NormalizeMessageId(anchor)}|{ExpectedTotalParts}";
+        }
+    }
+
+    private string? DisplayFileName => _fileName ?? FetchAttributionContext.Current?.FileName;
+
+    /// <summary>
+    /// True when <paramref name="providerKey"/> already answered this file's
+    /// <paramref name="requestedId"/> with another post's article. The provider walk skips
+    /// it like a cached miss instead of downloading and discarding the same foreign body.
+    /// </summary>
+    public static bool IsKnownForeign(string requestedId, string providerKey) =>
+        Current?.TrackerKey is { } fileKey
+        && MismatchedArticleTracker.IsKnownForeign(fileKey, NormalizeMessageId(requestedId), providerKey);
+
+    /// <summary>Records that a provider returned this file's own post for one of its articles.</summary>
+    public static void RecordMatch()
+    {
+        if (Current?.TrackerKey is { } fileKey)
+            MismatchedArticleTracker.RecordMatch(fileKey);
+    }
+
+    /// <summary>
+    /// When enough of the active file's articles came back as another post on every
+    /// provider that answered, returns the conclusive miss a reader should fail with
+    /// instead of walking the providers again.
+    /// </summary>
+    public static UsenetForeignPostException? GetForeignFileFailure()
+    {
+        var current = Current;
+        if (current?.TrackerKey is not { } fileKey
+            || !MismatchedArticleTracker.TryGetFileVerdict(fileKey, out var foreignArticles))
+            return null;
+        var anchor = current._file is { Segments.Count: > 0 } file
+            ? file.Segments[0].MessageId
+            : current._segmentIds![0];
+        return new UsenetForeignPostException(anchor, foreignArticles, current.ExpectedTotalParts);
+    }
 
     public (string? FileAnchor, int? Position, int? NzbNumber) GetRequestDetails(string requestedId)
     {
@@ -125,23 +190,59 @@ internal sealed class YencFileValidationContext : IDisposable
         var key = $"yenc-mismatch/{Stage}/{fileRef}/{articleRef}/{providerRef}/{position}/{nzbNumber}/" +
                   $"{ExpectedTotalParts}/{responseCode}/{returnedNameRef}/{header.PartNumber}/{header.TotalParts}/" +
                   $"{header.FileSize}/{header.PartOffset}/{header.PartSize}/{header.LineLength}";
+        // Per-article evidence is for maintainers; operators get one line per file below.
         ThrottledSegmentWarning.Write(
+            LogEventLevel.Debug,
             key,
-            "Rejected yEnc article because its parsed total differs from the active file segment count. " +
-            "Stage: {Stage}; FileRef: {FileRef}; ArticleRef: {ArticleRef}; ProviderRef: {ProviderRef}; " +
-            "RequestedIdKind: {RequestedIdKind}; RequestedSegmentPosition: {RequestedSegmentPosition}; " +
-            "NzbSegmentNumber: {NzbSegmentNumber}; " +
-            "ExpectedTotalParts: {ExpectedTotalParts}; ResponseCode: {ResponseCode}; " +
-            "GeometryImpliedTotalParts: {GeometryImpliedTotalParts}; " +
-            "ReturnedNameRef: {ReturnedNameRef}; ReturnedPartNumber: {ReturnedPartNumber}; " +
-            "ReturnedTotalParts: {ReturnedTotalParts}; ReturnedFileSize: {ReturnedFileSize}; " +
-            "ReturnedPartOffset: {ReturnedPartOffset}; ReturnedPartSize: {ReturnedPartSize}; " +
-            "ReturnedLineLength: {ReturnedLineLength}; MetadataSource: ParsedYencHeader",
+            MismatchDetailTemplate,
             Stage, fileRef, articleRef, providerRef, requestedIdKind, position, nzbNumber, ExpectedTotalParts, responseCode,
             geometryImpliedTotalParts,
             returnedNameRef, header.PartNumber, header.TotalParts, header.FileSize, header.PartOffset,
             header.PartSize, header.LineLength);
+
+        var foreignArticles = 0;
+        var rejections = 0;
+        var verdictReached = false;
+        if (TrackerKey is { } fileKey)
+        {
+            (foreignArticles, rejections, verdictReached) = MismatchedArticleTracker.RecordForeign(
+                fileKey, NormalizeMessageId(requestedId), providerKey);
+        }
+
+        var fileName = DisplayFileName ?? "an unnamed file";
+        if (verdictReached)
+        {
+            Log.Warning(
+                "Stopping reads of {FileName}: {ForeignArticles} of its articles returned yEnc data from a different " +
+                "post (yEnc total {ReturnedTotalParts} instead of {ExpectedTotalParts} parts) and no provider returned " +
+                "this file's own post. The release looks overwritten or mis-posted, so reads now fail fast as missing " +
+                "articles (which queues repair) instead of re-trying every provider for every article. " +
+                "Stage: {Stage}; FileRef: {FileRef}",
+                fileName, foreignArticles, header.TotalParts, ExpectedTotalParts, Stage, fileRef);
+            return;
+        }
+
+        ThrottledSegmentWarning.Write(
+            $"yenc-mismatch-file/{Stage}/{fileRef}",
+            "Rejected yEnc articles from a different post while reading {FileName}: providers returned yEnc total " +
+            "{ReturnedTotalParts} for a file with {ExpectedTotalParts} parts. Those providers are skipped for these " +
+            "articles and other providers are tried. RejectedArticles: {RejectedArticles}; Rejections: {Rejections}; " +
+            "Stage: {Stage}; FileRef: {FileRef}",
+            fileName, header.TotalParts, ExpectedTotalParts, Math.Max(1, foreignArticles), Math.Max(1, rejections),
+            Stage, fileRef);
     }
+
+    internal const string MismatchDetailTemplate =
+        "Rejected yEnc article because its parsed total differs from the active file segment count. " +
+        "Stage: {Stage}; FileRef: {FileRef}; ArticleRef: {ArticleRef}; ProviderRef: {ProviderRef}; " +
+        "RequestedIdKind: {RequestedIdKind}; RequestedSegmentPosition: {RequestedSegmentPosition}; " +
+        "NzbSegmentNumber: {NzbSegmentNumber}; " +
+        "ExpectedTotalParts: {ExpectedTotalParts}; ResponseCode: {ResponseCode}; " +
+        "GeometryImpliedTotalParts: {GeometryImpliedTotalParts}; " +
+        "ReturnedNameRef: {ReturnedNameRef}; ReturnedPartNumber: {ReturnedPartNumber}; " +
+        "ReturnedTotalParts: {ReturnedTotalParts}; ReturnedFileSize: {ReturnedFileSize}; " +
+        "ReturnedPartOffset: {ReturnedPartOffset}; ReturnedPartSize: {ReturnedPartSize}; " +
+        "ReturnedLineLength: {ReturnedLineLength}; MetadataSource: ParsedYencHeader";
 
     private bool IsPrimaryRequest(string requestedId, int? position)
     {

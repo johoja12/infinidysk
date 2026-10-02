@@ -113,7 +113,8 @@ public class NzbFileStream(
 
     private async Task ReadPar2CandidateAsync(long start, Memory<byte> target, CancellationToken cancellationToken)
     {
-        using var validation = YencFileValidationContext.BeginBufferedPar2ProofRead(fileSegmentIds, segmentFallbacks);
+        using var validation = YencFileValidationContext.BeginBufferedPar2ProofRead(
+            fileSegmentIds, segmentFallbacks, fileName);
         // A proof slice may exceed one native block; verification must read the entire
         // slice (bounded by Par2FileProof), not truncate it at the caller's cache window.
         using var nativeRead = NativeCacheReadContext.IsActive
@@ -154,9 +155,15 @@ public class NzbFileStream(
             LastReadCacheable = verifiedRead > 0 && VerifiedStream.LastReadCacheable;
             return verifiedRead;
         }
-        using var yencFileValidation = YencFileValidationContext.BeginStreaming(fileSegmentIds, segmentFallbacks);
+        using var yencFileValidation = YencFileValidationContext.BeginStreaming(
+            fileSegmentIds, segmentFallbacks, fileName);
         if (buffer.IsEmpty) return 0;
         if (_position >= fileSize) return 0;
+        // A file whose articles keep coming back as another post can only gap-fill from
+        // here on; fail the read as a conclusive miss instead of walking every provider
+        // for every remaining article (#120).
+        if (YencFileValidationContext.GetForeignFileFailure() is { } foreignPost)
+            throw foreignPost;
         // A prior Seek started the old inner stream's teardown non-blocking; join it
         // here so its article-budget leases release before a new stream leases again.
         if (_pendingInnerDispose is { } pendingDispose)
