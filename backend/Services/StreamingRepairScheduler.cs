@@ -1,0 +1,181 @@
+using System.Collections.Concurrent;
+using Microsoft.EntityFrameworkCore;
+using NzbWebDAV.Config;
+using NzbWebDAV.Database;
+using NzbWebDAV.Database.Models;
+using NzbWebDAV.Extensions;
+using Serilog;
+
+namespace NzbWebDAV.Services;
+
+/// <summary>What happened to a request to repair an item after a confirmed source failure.</summary>
+public enum RepairScheduleOutcome
+{
+    /// <summary>Repairs are disabled in settings; see <see cref="ConfigManager.GetRepairDisabledReason"/>.</summary>
+    Disabled,
+    /// <summary>The failure was counted, but the configured failure threshold is not reached yet.</summary>
+    BelowThreshold,
+    /// <summary>The item is already flagged for urgent repair (or a request is in flight).</summary>
+    AlreadyScheduled,
+    /// <summary>The item is being flagged for urgent repair by the health service.</summary>
+    Scheduled,
+}
+
+/// <summary>
+/// Flags an item for urgent repair (the <see cref="DateTimeOffset.UnixEpoch"/> health-check sentinel)
+/// once confirmed source failures reach the configured threshold. Playback failures
+/// (<c>ExceptionMiddleware</c>) and Smart Prefetch warming share this one path and its
+/// process-wide de-duplication.
+/// </summary>
+public sealed class StreamingRepairScheduler(
+    ConfigManager configManager,
+    StreamingFailureTracker failureTracker,
+    IDbContextFactory<DavDatabaseContext>? dbContextFactory = null)
+{
+    private static readonly ConcurrentDictionary<Guid, RepairScheduleReservation> RecentRepairTriggers = new();
+    private static readonly TimeSpan RepairDedupeWindow = TimeSpan.FromMinutes(5);
+
+    internal Func<Guid, Task>? CompletionHook { get; set; }
+
+    /// <summary>
+    /// Records one confirmed failure for <paramref name="davItem"/> (attributed to
+    /// <paramref name="segmentId"/> when known) and, at the threshold, schedules urgent repair in
+    /// the background. The returned outcome reflects the decision, not the database write.
+    /// </summary>
+    public RepairScheduleOutcome Schedule(DavItem davItem, string? segmentId = null)
+    {
+        var davItemId = davItem.Id;
+        if (configManager.GetRepairDisabledReason() != null) return RepairScheduleOutcome.Disabled;
+
+        // Count every distinct streaming failure before applying either threshold or deduplication.
+        // Repeated failures must still advance the repair threshold while duplicate DB scheduling
+        // writes remain suppressed below.
+        var failureCount = string.IsNullOrEmpty(segmentId)
+            ? failureTracker.RecordUnattributedFailure(davItemId).Count
+            : failureTracker.RecordAttributedFailure(davItemId, segmentId).Count;
+        var threshold = configManager.GetAutoRemoveAfterFailures();
+        if (!ShouldScheduleUrgentRepair(threshold, failureCount))
+        {
+            Log.Information(
+                "Deferring dynamic repair for DavItem {DavItemId} until streaming failure {FailureCount}/{FailureThreshold}",
+                davItemId, failureCount, threshold);
+            return RepairScheduleOutcome.BelowThreshold;
+        }
+
+        var reservation = new RepairScheduleReservation(DateTime.UtcNow, false);
+        if (RecentRepairTriggers.TryAdd(davItemId, reservation))
+        {
+            // This request owns the pending scheduling attempt.
+        }
+        else if (RecentRepairTriggers.TryGetValue(davItemId, out var existing)
+             && existing is not null
+             && (!existing.Committed || DateTime.UtcNow - existing.Timestamp < RepairDedupeWindow))
+        {
+            return RepairScheduleOutcome.AlreadyScheduled;
+        }
+        else if (existing is null || !RecentRepairTriggers.TryUpdate(davItemId, reservation, existing))
+        {
+            return RepairScheduleOutcome.AlreadyScheduled;
+        }
+
+        _ = Task.Run(() => CommitAsync(davItemId, failureCount, threshold, reservation));
+        return RepairScheduleOutcome.Scheduled;
+    }
+
+    private async Task CommitAsync(Guid davItemId, int failureCount, int threshold, RepairScheduleReservation reservation)
+    {
+        try
+        {
+            await using var mutationGate = await failureTracker
+                .AcquireMutationGateAsync(davItemId, CancellationToken.None)
+                .ConfigureAwait(false);
+            await using var dbContext = DavDatabaseContexts.Create(null, dbContextFactory);
+            var item = await dbContext.Items.FindAsync(davItemId).ConfigureAwait(false);
+            if (item == null)
+            {
+                RecentRepairTriggers.TryRemove(
+                    new KeyValuePair<Guid, RepairScheduleReservation>(davItemId, reservation));
+                return;
+            }
+
+            // UnixEpoch sorts first in HealthCheckService (non-null before null, then ascending).
+            // Only skip if already urgent — overdue items must still be bumped (Pukabyte#4).
+            var urgent = DateTimeOffset.UnixEpoch;
+            if (item.NextHealthCheck == urgent)
+            {
+                if (item.UrgentRepairFailures is null || item.UrgentRepairFailures < failureCount)
+                {
+                    item.UrgentRepairFailures = failureCount;
+                    await dbContext.SaveChangesAsync().ConfigureAwait(false);
+                }
+                RecentRepairTriggers.TryUpdate(
+                    davItemId,
+                    reservation with { Committed = true },
+                    reservation);
+                return;
+            }
+
+            item.NextHealthCheck = urgent;
+            item.UrgentRepairFailures = failureCount;
+            await dbContext.SaveChangesAsync().ConfigureAwait(false);
+            RecentRepairTriggers.TryUpdate(
+                davItemId, reservation with { Committed = true }, reservation);
+            Log.Information(
+                "Scheduled dynamic repair for {FilePath} (streaming failures {FailureCount}/{FailureThreshold})",
+                item.Path, failureCount, threshold);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            RecentRepairTriggers.TryRemove(
+                new KeyValuePair<Guid, RepairScheduleReservation>(davItemId, reservation));
+            if (ex.TryGetKnownErrorMessage(out var reason))
+            {
+                Log.Warning("Dynamic repair scheduling deferred. Reason: {Reason}", reason);
+                Log.Debug(ex, "Dynamic repair scheduling known failure stack");
+            }
+            else
+            {
+                Log.Warning(ex, "Failed to schedule dynamic repair for DavItem {DavItemId}", davItemId);
+            }
+        }
+        finally
+        {
+            if (CompletionHook is { } completionHook)
+            {
+                try
+                {
+                    await completionHook(davItemId).ConfigureAwait(false);
+                }
+                catch (Exception e) when (e is not OutOfMemoryException)
+                {
+                    Log.Debug(e, "Dynamic repair scheduling completion hook failed for DavItem {DavItemId}", davItemId);
+                }
+            }
+        }
+    }
+
+    internal static void InvalidateDedup(Guid davItemId)
+    {
+        if (!RecentRepairTriggers.TryGetValue(davItemId, out var reservation) || !reservation.Committed)
+            return;
+
+        RecentRepairTriggers.TryRemove(
+            new KeyValuePair<Guid, RepairScheduleReservation>(davItemId, reservation));
+    }
+
+    internal static bool ShouldScheduleUrgentRepair(int threshold, int failureCount)
+    {
+        return threshold <= 0 || failureCount >= threshold;
+    }
+
+    internal static void CleanupStale(DateTime cutoff)
+    {
+        foreach (var kvp in RecentRepairTriggers)
+        {
+            if (kvp.Value.Timestamp < cutoff)
+                RecentRepairTriggers.TryRemove(kvp.Key, out _);
+        }
+    }
+
+    private sealed record RepairScheduleReservation(DateTime Timestamp, bool Committed);
+}
