@@ -694,7 +694,9 @@ public class LazyRarResolver(INntpClient usenetClient, ConfigManager configManag
         try
         {
             if (Volatile.Read(ref p.LatestStamp) != myStamp) return;
-            await BlobStore.WriteBlob(mpf.Id, mpf).ConfigureAwait(false);
+            // Resolved volumes describe bytes the blob already referenced, so active
+            // streams on this file must keep playing (#111, #114).
+            await BlobStore.WriteContentPreservingBlob(mpf.Id, mpf).ConfigureAwait(false);
 
             if (reconcileFileSize)
             {
