@@ -41,7 +41,9 @@ internal sealed record FailedImportRow(
 internal sealed record FailedImportCleanupEntry(
     Guid DavItemId,
     string SourcePath,
-    string Stage);
+    string Stage,
+    ArrCleanupTarget? ArrTarget = null,
+    ArrCleanupState? ArrState = null);
 
 internal sealed record FailedImportCleanupJournal(
     string PackageDigest,
@@ -221,10 +223,17 @@ internal static class FailedImportCleanup
         foreach (var item in journal.Entries.ToArray())
         {
             if (item.Stage is "completed" or "skipped_source_changed") continue;
-            if (item.Stage is "source_deleting" or "arr_cleanup_started")
+            if (item.Stage == "arr_cleanup_started" && item.ArrState?.Stage == "completed"
+                && item.ArrTarget is not null)
+            {
+                // The accepted search was saved before a crash between the two journal writes.
+                await SetStageAsync(journalPath, journal, item, "completed", ct).ConfigureAwait(false);
+                continue;
+            }
+            if (item.Stage == "arr_cleanup_started" && (item.ArrTarget is null || item.ArrState is null))
                 throw new InvalidOperationException(
                     $"Cleanup of {item.DavItemId} has an uncertain external outcome; reconcile it before resuming.");
-            if (item.Stage is not ("planned" or "source_deleted"))
+            if (item.Stage is not ("planned" or "source_deleting" or "source_deleted" or "arr_cleanup_started"))
                 throw new InvalidDataException("Cleanup journal contains an unknown stage.");
 
             var row = report.Failures.Single(failure => failure.LegacyDavItemId == item.DavItemId);
@@ -253,6 +262,17 @@ internal static class FailedImportCleanup
             }
 
             var arrPath = Path.Join(canonicalArrRoot, row.LibraryRelativePath);
+            if (item.ArrTarget is not null)
+            {
+                if (item.ArrTarget.Path != arrPath)
+                    throw new InvalidDataException("Persisted Arr target path disagrees with the selected link.");
+                var client = clients.SingleOrDefault(client => InstanceKey(client) == item.ArrTarget.InstanceKey)
+                    ?? throw new InvalidDataException("Persisted Arr cleanup instance is no longer enabled.");
+                if ((client is SonarrClient) != (item.ArrTarget.Match.Kind == ArrMediaKind.Episode))
+                    throw new InvalidDataException("Persisted Arr cleanup kind disagrees with its instance.");
+                actions.Add((item, client, item.ArrTarget.Match));
+                continue;
+            }
             var matches = new List<(ArrClient Client, ArrMediaFileMatch Match)>();
             for (var attempt = 1; attempt <= 4; attempt++)
             {
@@ -284,48 +304,97 @@ internal static class FailedImportCleanup
         foreach (var action in actions)
         {
             var item = action.Entry;
-            if (item.Stage == "planned")
+            if (item.ArrTarget is null)
             {
-                try
+                item = item with
                 {
-                    await legacyReader.AssertOnlyMappedLinkAsync(item.DavItemId, item.SourcePath, ct)
-                        .ConfigureAwait(false);
-                    if (new FileInfo(item.SourcePath).LinkTarget
-                        != selected[item.DavItemId].OriginalTarget)
-                        throw new InvalidDataException("Failed item source symlink changed during cleanup.");
-                }
-                catch (InvalidDataException) when (skipChangedHistoricalSources || skipChangedCurrentSources)
+                    ArrTarget = new ArrCleanupTarget(InstanceKey(action.Client),
+                    Path.Join(canonicalArrRoot, selected[item.DavItemId].LibraryRelativePath), action.Match),
+                    ArrState = new ArrCleanupState()
+                };
+                journal.Entries[journal.Entries.FindIndex(entry => entry.DavItemId == item.DavItemId)] = item;
+                await SaveJournalAsync(journalPath, journal, ct).ConfigureAwait(false);
+            }
+            if (item.Stage is "planned" or "source_deleting")
+            {
+                var deleted = false;
+                for (var attempt = 1; attempt <= 4; attempt++)
                 {
-                    await SetStageAsync(journalPath, journal, item, "skipped_source_changed", ct)
-                        .ConfigureAwait(false);
-                    continue;
+                    if (item.Stage == "source_deleting")
+                    {
+                        try
+                        {
+                            await AssertSourceDeletedAsync(legacyReader, item, ct).ConfigureAwait(false);
+                            if (!CanaryPathSafety.PathExistsNoFollow(item.SourcePath)) { deleted = true; break; }
+                        }
+                        catch (InvalidDataException) { /* Require original ownership before retry. */ }
+                    }
+                    try
+                    {
+                        await legacyReader.AssertOnlyMappedLinkAsync(item.DavItemId, item.SourcePath, ct).ConfigureAwait(false);
+                        if (new FileInfo(item.SourcePath).LinkTarget != selected[item.DavItemId].OriginalTarget)
+                            throw new InvalidDataException("Failed item source symlink changed during cleanup.");
+                    }
+                    catch (InvalidDataException) when (item.Stage == "planned"
+                        && (skipChangedHistoricalSources || skipChangedCurrentSources))
+                    {
+                        await SetStageAsync(journalPath, journal, item, "skipped_source_changed", ct).ConfigureAwait(false);
+                        break;
+                    }
+                    item = item with { Stage = "source_deleting" };
+                    await SetStageAsync(journalPath, journal, item, item.Stage, ct).ConfigureAwait(false);
+                    try
+                    {
+                        using var response = await http.PostAsJsonAsync(new Uri(baseUri, "api/stats/delete-files"),
+                            new { davItemIds = new[] { item.DavItemId } }, ct).ConfigureAwait(false);
+                        response.EnsureSuccessStatusCode();
+                        var result = await response.Content.ReadFromJsonAsync<LegacyDeleteResult>(JsonOptions, ct).ConfigureAwait(false);
+                        if (result is not { Deleted: 1, Failed: 0 })
+                            Console.WriteLine("Legacy deletion response needs an authoritative state recheck.");
+                    }
+                    catch (Exception e) when (ArrCleanupRecovery.Transient(e, ct))
+                    { Console.WriteLine($"Legacy deletion needs recheck (attempt {attempt}/4)."); }
+                    try
+                    {
+                        await AssertSourceDeletedAsync(legacyReader, item, ct).ConfigureAwait(false);
+                        if (!CanaryPathSafety.PathExistsNoFollow(item.SourcePath)) { deleted = true; break; }
+                    }
+                    catch (InvalidDataException) when (attempt < 4) { }
+                    if (attempt < 4) await Task.Delay(TimeSpan.FromSeconds(attempt * 2), ct).ConfigureAwait(false);
                 }
-                await SetStageAsync(journalPath, journal, item, "source_deleting", ct).ConfigureAwait(false);
-                using var response = await http.PostAsJsonAsync(
-                    new Uri(baseUri, "api/stats/delete-files"),
-                    new { davItemIds = new[] { item.DavItemId } }, ct).ConfigureAwait(false);
-                response.EnsureSuccessStatusCode();
-                var result = await response.Content.ReadFromJsonAsync<LegacyDeleteResult>(JsonOptions, ct)
-                    .ConfigureAwait(false);
-                if (result is not { Deleted: 1, Failed: 0 })
-                    throw new InvalidOperationException("Legacy NzbDav did not confirm deletion of exactly one item.");
-                await legacyReader.AssertMappedLinkAbsentAsync(item.DavItemId, item.SourcePath, ct)
-                    .ConfigureAwait(false);
-                if (new FileInfo(item.SourcePath).LinkTarget is not null
-                    || File.Exists(item.SourcePath) || Directory.Exists(item.SourcePath))
-                    throw new InvalidDataException("Legacy NzbDav still has the deleted library link.");
-                await SetStageAsync(journalPath, journal, item, "source_deleted", ct).ConfigureAwait(false);
+                if (journal.Entries.Single(entry => entry.DavItemId == item.DavItemId).Stage == "skipped_source_changed") continue;
+                if (!deleted) throw new IOException("Legacy deletion remains pending after four verified attempts.");
+                item = item with { Stage = "source_deleted" };
+                await SetStageAsync(journalPath, journal, item, item.Stage, ct).ConfigureAwait(false);
             }
 
+            await AssertSourceDeletedAsync(legacyReader, item, ct).ConfigureAwait(false);
+            if (CanaryPathSafety.PathExistsNoFollow(item.SourcePath))
+                throw new InvalidDataException("Source link reappeared; refusing Arr cleanup.");
             await SetStageAsync(journalPath, journal, item, "arr_cleanup_started", ct).ConfigureAwait(false);
-            var outcome = await action.Client.RemoveMissingPayloadAndSearchAsync(action.Match, ct: ct)
-                .ConfigureAwait(false);
-            if (outcome != ArrMissingPayloadCleanupOutcome.RemovedSearchRequested)
-                throw new InvalidOperationException(
-                    $"Radarr/Sonarr cleanup for {item.DavItemId} ended with {outcome}; reconcile before resuming.");
+            var details = arrConfig.GetEnabledInstances().Single(instance =>
+                ArrConfig.MakeInstanceKey(instance.AppType, instance.Details.Host) == item.ArrTarget!.InstanceKey).Details;
+            await ArrCleanupRecovery.RunAsync(new MigrationArrClient(details.Host, details.ApiKey),
+                item.ArrTarget!, item.ArrState ?? new ArrCleanupState(), async state =>
+                {
+                    item = item with { Stage = "arr_cleanup_started", ArrState = state };
+                    await SetStageAsync(journalPath, journal, item, item.Stage, ct).ConfigureAwait(false);
+                }, ct).ConfigureAwait(false);
             await SetStageAsync(journalPath, journal, item, "completed", ct).ConfigureAwait(false);
         }
     }
+
+    private static async Task AssertSourceDeletedAsync(LegacyNzbDavReader reader,
+        FailedImportCleanupEntry item, CancellationToken ct)
+    {
+        await reader.AssertMappedLinkAbsentAsync(item.DavItemId, item.SourcePath, ct).ConfigureAwait(false);
+        var result = await reader.ReadAsync(new[] { item.DavItemId }, ct).ConfigureAwait(false);
+        if (!result.MissingIds.Contains(item.DavItemId))
+            throw new InvalidDataException("Legacy deletion has not removed the recorded Dav item.");
+    }
+
+    private static string InstanceKey(ArrClient client) => ArrConfig.MakeInstanceKey(
+        client is SonarrClient ? "sonarr" : "radarr", client.Host);
 
     private sealed record LegacyDeleteResult(int Deleted, int Failed);
 
