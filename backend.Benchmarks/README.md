@@ -208,6 +208,16 @@ committed without falling back to backfill (2026-10-02: 17.2–17.4 MB/s in both
 The report drains queued commits, disposes the stream and verifies coverage
 after the timed region, because a player has every byte before that happens.
 
+`native-cold-256mib-rtt250-w4-8players-4slots` runs eight concurrent players, each
+started 1.5 s apart and streaming its own block-aligned slice of the same file as a
+ranged response at a steady 3 MB/s, through four shared 4 MiB buffer slots (a 16 MiB budget) over the
+same 40 connections. A stream holds a slot only while it fills or verifies a block,
+so every player must keep its rate (no more than 3 s behind) and every byte must be
+committed by its own reads with nothing deferred to backfill. With the per-response
+admission used before #118, four players would hold every slot for their whole
+response and the other four would stream uncached. The file's short tail block is catalogued first, because the store does
+not queue a brand-new entry's first commit behind another write.
+
 On a live instance, `nzbdav_native_cache_phase_seconds{phase}` shows where cache
 IO time goes (thread-pool start delay, gate waits, data write and fsync, journal
 and directory fsync, catalogue commit, queue wait) and

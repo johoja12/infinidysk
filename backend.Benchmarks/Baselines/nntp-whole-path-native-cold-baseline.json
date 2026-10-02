@@ -138,6 +138,72 @@
           "policy": "warn"
         }
       }
+    },
+    "native-cold-256mib-rtt250-w4-8players-4slots": {
+      "deterministic": {
+        "expectedBytes": 268959744,
+        "actualBytes": 268959744,
+        "sha256Match": 1,
+        "bodyCommands": 382,
+        "responses": 382,
+        "retrievedCallbacks": 0,
+        "cancelledCallbacks": 0,
+        "notFoundCallbacks": 0,
+        "notRetrievedCallbacks": 0,
+        "finalArticleBudgetBytes": 0
+      },
+      "timing": {
+        "wallSeconds": {
+          "baseline": 22.377,
+          "envelope": 67.131,
+          "policy": "fail"
+        },
+        "clientCpuSeconds": {
+          "baseline": 3.238,
+          "envelope": 9.714,
+          "policy": "warn"
+        },
+        "serverCpuSeconds": {
+          "baseline": 1.63,
+          "envelope": 4.89,
+          "policy": "warn"
+        },
+        "clientCpuSecondsPerGb": {
+          "baseline": 12.04,
+          "envelope": 36.12,
+          "policy": "warn"
+        },
+        "throughputMbps": {
+          "baseline": 12.02,
+          "floor": 4.007,
+          "policy": "fail"
+        },
+        "timeToPeakActiveMs": {
+          "baseline": 10535.41,
+          "envelope": 31606.23,
+          "policy": "fail"
+        },
+        "clientAllocatedBytes": {
+          "baseline": 16541925.0,
+          "envelope": 49625775.0,
+          "policy": "warn"
+        },
+        "gen0Collections": {
+          "baseline": 2.0,
+          "envelope": 6.0,
+          "policy": "warn"
+        },
+        "gen1Collections": {
+          "baseline": 1.0,
+          "envelope": 3.0,
+          "policy": "warn"
+        },
+        "gen2Collections": {
+          "baseline": 0.0,
+          "envelope": 0.25,
+          "policy": "warn"
+        }
+      }
     }
   }
 }
