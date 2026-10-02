@@ -14,16 +14,18 @@ import {
   backendClient,
   type LibraryBrowseResponse,
   type LibraryCatalogItem,
-  type LibraryFileDetails,
 } from "~/clients/backend-client.server";
-import { getDownloadKey } from "~/auth/downloads.server";
+import { getPreviewUrl } from "~/auth/downloads.server";
 import { getFrontendRuntimeConfig } from "../../../server/runtime-config";
 import { formatFileSize } from "~/utils/file-size";
 import { withUrlBase } from "~/utils/url-base";
 import { Alert, Badge, Button, Input, PageHeader } from "~/components/ui";
-import { LibraryFileModal, type LibraryModalFeedback } from "./file-modal";
-import { fileName, libraryPath } from "./library-path";
-import { MediaPreview } from "~/components/media-preview";
+import { handleLibraryFileAction } from "~/components/library-file-modal/file-modal-actions.server";
+import { fileName, libraryPath } from "~/components/library-file-modal/library-path";
+import {
+  LibraryFileModalHost,
+  useLibraryFileModal,
+} from "~/components/library-file-modal/use-library-file-modal";
 import { plexRequest } from "~/utils/plex-request";
 
 type Category = "all" | "shows" | "movies" | "unmatched";
@@ -140,11 +142,7 @@ export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPage
   const previewUrls: Record<string, string> = {};
   for (const { item } of [...(browse.expandedGroup?.items ?? []), ...(browse.files ?? [])]) {
     if (item.kind === "internal" && item.contentPath && item.davItemId) {
-      const relative = item.contentPath.startsWith("/")
-        ? item.contentPath.slice(1)
-        : item.contentPath;
-      const key = getDownloadKey(relative, frontendBackendApiKey);
-      previewUrls[item.davItemId] = `/view${item.contentPath}?downloadKey=${key}`;
+      previewUrls[item.davItemId] = getPreviewUrl(item.contentPath, frontendBackendApiKey);
     }
   }
   let nativeCacheActive = false;
@@ -158,19 +156,7 @@ export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPage
 }
 
 export async function action({ request }: Route.ActionArgs) {
-  const form = await request.formData();
-  const operation = form.get("operation");
-  const davItemId = form.get("davItemId");
-  if (operation === "prewarm" && typeof davItemId === "string" && davItemId) {
-    try {
-      await backendClient.warmPrefetch([davItemId]);
-      return Response.json({ status: true });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Could not prewarm this file.";
-      return Response.json({ status: false, error: message }, { status: 502 });
-    }
-  }
-  return Response.json({ status: false, error: "Unknown library action." }, { status: 400 });
+  return await handleLibraryFileAction(request);
 }
 
 function withParams(params: URLSearchParams, changes: Record<string, string | null>): string {
@@ -221,17 +207,11 @@ export default function Library({ loaderData }: Route.ComponentProps) {
   const navigate = useNavigate();
   const submit = useSubmit();
   const revalidator = useRevalidator();
-  const fetcher = useFetcher<{ status: boolean; error?: string }>();
+  const fileModal = useLibraryFileModal();
+  const { selected, open: openModal } = fileModal;
   const groupFetcher = useFetcher<LibraryPageData>();
   const { query, browse, previewUrls, nativeCacheActive, libraryRoot } = loaderData;
   const [expandedKey, setExpandedKey] = useState<string | null>(query.group);
-  const [selected, setSelected] = useState<LibraryCatalogItem | null>(null);
-  const [details, setDetails] = useState<LibraryFileDetails | null>(null);
-  const [detailsLoading, setDetailsLoading] = useState(false);
-  const [detailsError, setDetailsError] = useState<string | null>(null);
-  const [showPreview, setShowPreview] = useState(false);
-  const [actionPending, setActionPending] = useState(false);
-  const [feedback, setFeedback] = useState<LibraryModalFeedback>(null);
   const [plexSyncing, setPlexSyncing] = useState(false);
   const [plexSyncError, setPlexSyncError] = useState<string | null>(null);
 
@@ -290,93 +270,6 @@ export default function Library({ loaderData }: Route.ComponentProps) {
       setPlexSyncing(false);
     }
   }, [revalidator]);
-
-  const openModal = useCallback((item: LibraryCatalogItem) => {
-    setSelected(item);
-    setDetails(null);
-    setDetailsError(null);
-    setShowPreview(false);
-    setFeedback(null);
-    if (item.kind === "internal" && item.davItemId) {
-      setDetailsLoading(true);
-      void fetch(
-        withUrlBase(
-          `/api/get-library-file-details?davItemId=${encodeURIComponent(item.davItemId)}`,
-        ),
-      )
-        .then(async (response) => {
-          if (!response.ok) throw new Error("Could not load file details.");
-          setDetails((await response.json()) as LibraryFileDetails);
-        })
-        .catch(() => setDetailsError("Could not load file details."))
-        .finally(() => setDetailsLoading(false));
-    }
-  }, []);
-
-  const closeModal = useCallback(() => {
-    setSelected(null);
-    setDetails(null);
-    setDetailsError(null);
-    setShowPreview(false);
-    setFeedback(null);
-  }, []);
-
-  const runAction = useCallback(async (fn: () => Promise<{ ok: boolean; message: string }>) => {
-    setActionPending(true);
-    setFeedback(null);
-    try {
-      const result = await fn();
-      setFeedback({ variant: result.ok ? "success" : "danger", message: result.message });
-    } catch (error) {
-      setFeedback({
-        variant: "danger",
-        message: error instanceof Error ? error.message : "Action failed.",
-      });
-    } finally {
-      setActionPending(false);
-    }
-  }, []);
-
-  const onRunHealthCheck = useCallback(() => {
-    void runAction(async () => {
-      const response = await fetch(withUrlBase("/api/trigger-health-check"), { method: "POST" });
-      if (response.status === 409) {
-        const body = (await response.json().catch(() => null)) as { error?: string } | null;
-        return { ok: false, message: body?.error || "Background repairs are disabled." };
-      }
-      if (!response.ok) return { ok: false, message: "Could not start health checks." };
-      return { ok: true, message: "Health checks queued." };
-    });
-  }, [runAction]);
-
-  const onRequeue = useCallback(() => {
-    const id = selected?.davItemId;
-    if (!id) return;
-    void runAction(async () => {
-      const response = await fetch(
-        withUrlBase(`/api/requeue-action-needed-health-checks?davItemId=${encodeURIComponent(id)}`),
-        { method: "POST" },
-      );
-      if (!response.ok) {
-        const body = (await response.json().catch(() => null)) as { error?: string } | null;
-        return { ok: false, message: body?.error || "Could not queue this file for re-check." };
-      }
-      const body = (await response.json()) as { requeuedCount?: number };
-      const count = body.requeuedCount ?? 0;
-      return {
-        ok: true,
-        message: count === 0 ? "No action-needed result to re-check." : "File queued for re-check.",
-      };
-    });
-  }, [runAction, selected]);
-
-  const onPrewarm = useCallback(() => {
-    if (!selected?.davItemId) return;
-    const form = new FormData();
-    form.set("operation", "prewarm");
-    form.set("davItemId", selected.davItemId);
-    void fetcher.submit(form, { method: "post" });
-  }, [fetcher, selected]);
 
   const selectedPreviewUrl =
     selected?.davItemId != null ? (expandedPreviewUrls[selected.davItemId] ?? null) : null;
@@ -926,14 +819,14 @@ export default function Library({ loaderData }: Route.ComponentProps) {
         </>
       )}
 
-      {fetcher.data?.status === false ? (
+      {fileModal.prewarmFailed ? (
         <Alert variant="danger" role="alert">
-          {fetcher.data.error ?? "Could not prewarm this file."}
+          {fileModal.prewarmError ?? "Could not prewarm this file."}
         </Alert>
       ) : null}
       {selected ? (
-        <LibraryFileModal
-          item={selected}
+        <LibraryFileModalHost
+          modal={fileModal}
           libraryRoot={libraryRoot}
           quality={
             (browse.files ?? []).find(
@@ -957,32 +850,8 @@ export default function Library({ loaderData }: Route.ComponentProps) {
             )?.cachePercentage ??
             null
           }
-          details={details}
-          detailsLoading={detailsLoading}
-          detailsError={detailsError}
           previewUrl={selectedPreviewUrl}
           canPrewarm={nativeCacheActive}
-          actionState={actionPending || fetcher.state !== "idle" ? "pending" : "idle"}
-          feedback={
-            fetcher.data?.status === true
-              ? { variant: "success", message: "Prewarm requested." }
-              : feedback
-          }
-          onClose={closeModal}
-          onPreview={() => setShowPreview(true)}
-          onRunHealthCheck={onRunHealthCheck}
-          onRequeue={onRequeue}
-          onPrewarm={onPrewarm}
-        />
-      ) : null}
-      {showPreview && selected && selectedPreviewUrl ? (
-        <MediaPreview
-          fileName={selected.displayName}
-          filePath={selected.contentPath ?? selected.displayName}
-          mimeType={mimeTypeFor(selected.displayName)}
-          sizeBytes={selected.size ?? null}
-          previewUrl={selectedPreviewUrl}
-          onClose={() => setShowPreview(false)}
         />
       ) : null}
     </div>
@@ -1050,19 +919,4 @@ function Pagination({
       </div>
     </nav>
   );
-}
-
-function mimeTypeFor(name: string): string {
-  const lower = name.toLowerCase();
-  if (lower.endsWith(".mp4")) return "video/mp4";
-  if (lower.endsWith(".mkv")) return "video/x-matroska";
-  if (lower.endsWith(".avi")) return "video/x-msvideo";
-  if (lower.endsWith(".mov")) return "video/quicktime";
-  if (lower.endsWith(".webm")) return "video/webm";
-  if (lower.endsWith(".mp3")) return "audio/mpeg";
-  if (lower.endsWith(".flac")) return "audio/flac";
-  if (lower.endsWith(".ogg") || lower.endsWith(".oga")) return "audio/ogg";
-  if (lower.endsWith(".m4a")) return "audio/mp4";
-  if (lower.endsWith(".wav")) return "audio/wav";
-  return "application/octet-stream";
 }

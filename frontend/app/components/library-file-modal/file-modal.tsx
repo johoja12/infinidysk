@@ -22,6 +22,11 @@ export type LibraryFileModalProps = {
   canPrewarm: boolean;
   actionState: LibraryModalActionState;
   feedback: LibraryModalFeedback;
+  /**
+   * Set when the file was opened outside the Media Library and has no library record.
+   * Library-only details and repair actions are hidden and this reason is shown instead.
+   */
+  libraryUnavailable?: string | null;
   onClose: () => void;
   onPreview: () => void;
   onRunHealthCheck: () => void;
@@ -31,6 +36,7 @@ export type LibraryFileModalProps = {
 
 export function LibraryFileModal(props: LibraryFileModalProps) {
   const { item, details, detailsLoading, detailsError, previewUrl, canPrewarm } = props;
+  const libraryUnavailable = props.libraryUnavailable ?? null;
   const latest = details?.latestHealth ?? null;
   const downloadUrl = previewUrl
     ? `${previewUrl}${previewUrl.includes("?") ? "&" : "?"}download=true`
@@ -49,7 +55,7 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
             </div>
             <div className="min-w-0 flex-1">
               <p className="text-xs font-semibold uppercase tracking-wide text-base-content/55">
-                Library file
+                {libraryUnavailable ? "Media file" : "Library file"}
               </p>
               <p className="mt-1 break-all text-lg font-semibold leading-snug">
                 {fileName(item.displayName)}
@@ -126,6 +132,11 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
             {detailsError}
           </Alert>
         )}
+        {libraryUnavailable && (
+          <Alert variant="info" role="status">
+            {libraryUnavailable}
+          </Alert>
+        )}
 
         <div className="flex flex-wrap gap-2 rounded-xl border border-base-content/10 bg-base-200 p-3">
           {previewUrl && (
@@ -146,24 +157,28 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
           )}
           {item.kind === "internal" && item.davItemId && (
             <>
-              <Button
-                variant="outline"
-                size="small"
-                onClick={props.onRunHealthCheck}
-                disabled={props.actionState === "pending"}
-              >
-                <Icon name="favorite" className="!text-[16px]" />
-                Run health check
-              </Button>
-              <Button
-                variant="outline"
-                size="small"
-                onClick={props.onRequeue}
-                disabled={props.actionState === "pending"}
-              >
-                <Icon name="refresh" className="!text-[16px]" />
-                Requeue repair
-              </Button>
+              {libraryUnavailable ? null : (
+                <>
+                  <Button
+                    variant="outline"
+                    size="small"
+                    onClick={props.onRunHealthCheck}
+                    disabled={props.actionState === "pending"}
+                  >
+                    <Icon name="favorite" className="!text-[16px]" />
+                    Run health check
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="small"
+                    onClick={props.onRequeue}
+                    disabled={props.actionState === "pending"}
+                  >
+                    <Icon name="refresh" className="!text-[16px]" />
+                    Requeue repair
+                  </Button>
+                </>
+              )}
               {canPrewarm ? (
                 <Button
                   variant="outline"
@@ -183,9 +198,11 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
             Prewarm is unavailable: Native cache is inactive.
           </p>
         )}
-        <p className="text-xs text-base-content/60">
-          Run health check queues all due checks, not just this file.
-        </p>
+        {libraryUnavailable ? null : (
+          <p className="text-xs text-base-content/60">
+            Run health check queues all due checks, not just this file.
+          </p>
+        )}
 
         {props.feedback && (
           <Alert
@@ -196,48 +213,53 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
           </Alert>
         )}
 
-        <section className="rounded-xl border border-base-content/10 bg-base-200 p-4">
-          <h3 className="text-sm font-semibold">
-            Mappings <span className="font-normal text-base-content/50">({item.mappingCount})</span>
-          </h3>
-          <ul className="mt-3 flex flex-col gap-2">
-            {item.mappings.map((m) => (
-              <li
-                key={m.linkPath}
-                className="rounded-lg border border-base-content/10 bg-base-300/50 p-3 text-sm"
-              >
-                <div className="mb-2 flex flex-wrap gap-2">
-                  <Badge>{m.mappingType}</Badge>
-                  <Badge>{m.status}</Badge>
-                </div>
-                <p className="break-all font-medium">
-                  {fullLibraryLinkPath(m.linkPath, props.libraryRoot)}
-                </p>
-                <p className="mt-1 break-all font-mono text-xs text-base-content/55">
-                  → {m.targetText}
-                </p>
-              </li>
-            ))}
-          </ul>
-        </section>
+        {libraryUnavailable ? null : (
+          <>
+            <section className="rounded-xl border border-base-content/10 bg-base-200 p-4">
+              <h3 className="text-sm font-semibold">
+                Mappings{" "}
+                <span className="font-normal text-base-content/50">({item.mappingCount})</span>
+              </h3>
+              <ul className="mt-3 flex flex-col gap-2">
+                {item.mappings.map((m) => (
+                  <li
+                    key={m.linkPath}
+                    className="rounded-lg border border-base-content/10 bg-base-300/50 p-3 text-sm"
+                  >
+                    <div className="mb-2 flex flex-wrap gap-2">
+                      <Badge>{m.mappingType}</Badge>
+                      <Badge>{m.status}</Badge>
+                    </div>
+                    <p className="break-all font-medium">
+                      {fullLibraryLinkPath(m.linkPath, props.libraryRoot)}
+                    </p>
+                    <p className="mt-1 break-all font-mono text-xs text-base-content/55">
+                      → {m.targetText}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            </section>
 
-        <section className="rounded-xl border border-base-content/10 bg-base-200 p-4">
-          <h3 className="text-sm font-semibold">Health history</h3>
-          {latest ? (
-            <p className="mt-2 text-sm">
-              {latest.result} · {latest.repairStatus} ·{" "}
-              {new Date(latest.createdAt).toLocaleString()}
-              {latest.message ? ` — ${latest.message}` : ""}
-            </p>
-          ) : (
-            <p className="mt-2 text-sm text-base-content/60">
-              No health checks recorded for this file.
-            </p>
-          )}
-          <a className="link mt-3 inline-block text-sm" href="/health">
-            Open Health
-          </a>
-        </section>
+            <section className="rounded-xl border border-base-content/10 bg-base-200 p-4">
+              <h3 className="text-sm font-semibold">Health history</h3>
+              {latest ? (
+                <p className="mt-2 text-sm">
+                  {latest.result} · {latest.repairStatus} ·{" "}
+                  {new Date(latest.createdAt).toLocaleString()}
+                  {latest.message ? ` — ${latest.message}` : ""}
+                </p>
+              ) : (
+                <p className="mt-2 text-sm text-base-content/60">
+                  No health checks recorded for this file.
+                </p>
+              )}
+              <a className="link mt-3 inline-block text-sm" href="/health">
+                Open Health
+              </a>
+            </section>
+          </>
+        )}
       </div>
     </Modal>
   );
