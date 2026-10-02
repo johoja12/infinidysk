@@ -260,6 +260,39 @@ One playback session therefore produces a handful of rows rather than one per 4 
 block. Warming skips blocks that are already cached, so a merged range only fetches
 what is missing.
 
+### Playback gap fills [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since }
+
+**Warming history** has two tabs so a small backfill never looks like a cached file:
+
+- **Prefetch warming** lists policy, manual, and finish-watched jobs with whole-file
+  coverage. Filter by **Fully cached**, **Partially cached**, **Failed**,
+  **Cancelled**, or **Expired**.
+- **Playback gap fills** lists backfill jobs. Each row says where the gap was, for
+  example `Playback streamed 4 MiB at ~21:25 of 52:00 directly from Usenet.`, and
+  draws the gap on a map of the whole file. Whole-file coverage is a footnote
+  (`File overall: 3% cached`). Running gap fills read `— filling it in now`. Gap fills
+  waiting in the **Activity** tab use the same layout.
+
+Each gap fill names why playback did not cache those bytes. Filter the tab by reason:
+
+| Reason | What happened |
+|--------|---------------|
+| Cache buffers full | Every cache buffer was busy, so playback read the block straight from Usenet. |
+| Block already filling | Another reader was caching the same block, and playback did not wait. |
+| Cache storage too slow | A cache read or write missed its deadline. |
+| Cache write queue full | Too many cache writes were pending. |
+| Cache write failed | Writing to cache storage failed or was rejected. |
+| Source interrupted | Usenet fetching hiccuped, so caching paused for the rest of that stream. |
+| Source changed | The file was replaced during playback. |
+| Read without caching | Playback read the bytes directly without a more specific cause. |
+| Reason not recorded | The gap fill was recorded before this release. |
+
+When Plex reports the session (realtime playback checks enabled and the file mapped),
+the row also names the player and user, for example `Living Room TV · alex`, and
+estimates the playback time from the byte offset and the Plex runtime. Without a Plex
+session the row shows the position as a percentage of the file instead. Gap fills
+that merge or reopen keep the most recent reason and viewer.
+
 **What stays uncached.** Native Cache keeps what was played, backfill of anything
 playback missed, and the files your prefetch policies select (Plex hubs and
 collections, playback and history predictions, manual requests). The unplayed rest of
