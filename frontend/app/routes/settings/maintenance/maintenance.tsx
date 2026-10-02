@@ -12,6 +12,7 @@ import { MigrateDatabaseFilesToBlobstore } from "./migrate-database-files-to-blo
 import { ResetHealthCheckStats } from "./reset-health-check-stats/reset-health-check-stats";
 import { ResetHealthCheckQueue } from "./reset-health-check-queue/reset-health-check-queue";
 import { ResetOverviewStats } from "./reset-overview-stats/reset-overview-stats";
+import { VerifyImportedContent } from "./verify-imported-content/verify-imported-content";
 
 type MaintenanceProps = {
   savedConfig: Record<string, string>;
@@ -317,7 +318,7 @@ export function Maintenance({ savedConfig, config, setNewConfig }: MaintenancePr
               Run repair, migration, and destructive cleanup tools on demand.
             </p>
           </div>
-          <span className="badge badge-ghost badge-sm shrink-0">9 tools</span>
+          <span className="badge badge-ghost badge-sm shrink-0">11 tools</span>
         </div>
         <div className="space-y-3">
           <MaintenanceTaskDetails title="Clean Missing Payloads">
@@ -340,6 +341,9 @@ export function Maintenance({ savedConfig, config, setNewConfig }: MaintenancePr
           </MaintenanceTaskDetails>
           <MaintenanceTaskDetails title="Migrate Large Database Blobs to Blobstore">
             <MigrateDatabaseFilesToBlobstore savedConfig={savedConfig} />
+          </MaintenanceTaskDetails>
+          <MaintenanceTaskDetails title="Verify Imported Article Content">
+            <VerifyImportedContent />
           </MaintenanceTaskDetails>
           <MaintenanceTaskDetails title="Re-run Library Health Checks">
             <ResetHealthCheckQueue />

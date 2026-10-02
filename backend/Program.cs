@@ -498,6 +498,8 @@ public sealed partial class Program
                 .AddSingleton<IHealthCheckQuiescence>(
                     sp => sp.GetRequiredService<HealthCheckService>())
                 .AddHostedService(sp => sp.GetRequiredService<HealthCheckService>())
+                .AddSingleton<ImportedContentSweepService>()
+                .AddHostedService(sp => sp.GetRequiredService<ImportedContentSweepService>())
                 .AddHostedService<HealthCheckRetentionService>()
                 .AddHostedService<ArrMonitoringService>()
                 .AddSingleton<ArrHealthService>()
