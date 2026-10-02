@@ -143,16 +143,19 @@ public class ExceptionMiddleware(
 
             var filePath = GetRequestFilePath(context);
             var dedupeKey = $"{filePath}|{notFound!.SegmentId}";
+            // A foreign-post verdict was already explained by one warning naming the file;
+            // keep its per-request line at Warning as well.
+            var level = notFound is UsenetForeignPostException ? LogEventLevel.Warning : LogEventLevel.Error;
             LogWithDedup(RecentMissingArticles, dedupeKey, suppressed =>
             {
                 if (suppressed > 0)
-                    Log.Error(
+                    Log.Write(level,
                         "File {FilePath} has missing articles: {Reason} (suppressed {SuppressedCount} duplicates in last 60s)",
                         filePath,
                         notFound.Message,
                         suppressed);
                 else
-                    Log.Error(
+                    Log.Write(level,
                         "File {FilePath} has missing articles: {Reason}",
                         filePath,
                         notFound.Message);
@@ -294,7 +297,8 @@ public class ExceptionMiddleware(
             e is not OutOfMemoryException)
         {
             context.Items[CircuitAdmissionRejectedKey] = true;
-            if (!context.Response.HasStarted)
+            var afterHeaders = context.Response.HasStarted;
+            if (!afterHeaders)
             {
                 context.Response.Clear();
                 context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
@@ -306,10 +310,25 @@ public class ExceptionMiddleware(
             }
 
             var filePath = GetRequestFilePath(context);
-            LogWithDedup(RecentReadErrors, "circuit-admission|" + filePath, suppressed =>
-                Log.Warning(
-                    "WebDAV read deferred. Path={Path} Reason: {Reason} SuppressedCount={SuppressedCount}",
-                    filePath, "provider circuit admission unavailable", suppressed));
+            if (afterHeaders)
+            {
+                // Once body bytes are on the wire HTTP has no way to report an error, so the
+                // client sees a connection reset. Say so, so a reset mid-range is traceable to
+                // every provider circuit opening at once rather than to a proxy or timeout (#120).
+                LogWithDedup(RecentReadErrors, "circuit-admission-after-headers|" + filePath, suppressed =>
+                    Log.Warning(
+                        "WebDAV read aborted mid-response. Path={Path} Reason: {Reason}. Every eligible provider's " +
+                        "circuit breaker was open (new connections failing), so the partial response was reset; the " +
+                        "client should retry the range once providers recover. SuppressedCount={SuppressedCount}",
+                        filePath, "provider circuit admission unavailable", suppressed));
+            }
+            else
+            {
+                LogWithDedup(RecentReadErrors, "circuit-admission|" + filePath, suppressed =>
+                    Log.Warning(
+                        "WebDAV read deferred. Path={Path} Reason: {Reason} SuppressedCount={SuppressedCount}",
+                        filePath, "provider circuit admission unavailable", suppressed));
+            }
         }
         catch (Exception e) when (e.TryGetCausingException(out StreamingReadTimeoutException? _) && e is not OutOfMemoryException)
         {
