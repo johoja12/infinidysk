@@ -299,9 +299,12 @@ internal static class FailedImportCleanup
             var item = action.Entry;
             if (item.ArrTarget is null)
             {
-                item = item with { ArrTarget = new ArrCleanupTarget(InstanceKey(action.Client),
+                item = item with
+                {
+                    ArrTarget = new ArrCleanupTarget(InstanceKey(action.Client),
                     Path.Join(canonicalArrRoot, selected[item.DavItemId].LibraryRelativePath), action.Match),
-                    ArrState = new ArrCleanupState() };
+                    ArrState = new ArrCleanupState()
+                };
                 journal.Entries[journal.Entries.FindIndex(entry => entry.DavItemId == item.DavItemId)] = item;
                 await SaveJournalAsync(journalPath, journal, ct).ConfigureAwait(false);
             }

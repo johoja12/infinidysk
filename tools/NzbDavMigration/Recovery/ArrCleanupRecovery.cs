@@ -119,13 +119,17 @@ internal static class ArrCleanupRecovery
         {
             await AssertNoReplacement().ConfigureAwait(false);
             var previous = await Commands().ConfigureAwait(false);
-            state = state with { Stage = "search_started", SearchStarted = DateTimeOffset.UtcNow,
-                PreviousCommands = previous.Select(x => x.GetProperty("id").GetInt32()).ToArray() };
+            state = state with
+            {
+                Stage = "search_started",
+                SearchStarted = DateTimeOffset.UtcNow,
+                PreviousCommands = previous.Select(x => x.GetProperty("id").GetInt32()).ToArray()
+            };
             await save(state).ConfigureAwait(false); // Never repeat an uncertain search POST.
             try
             {
                 var command = await client.SearchAsync(new Dictionary<string, object>
-                    { ["name"] = commandName, [idProperty] = match.MediaIds }, ct).ConfigureAwait(false);
+                { ["name"] = commandName, [idProperty] = match.MediaIds }, ct).ConfigureAwait(false);
                 if (command.Id <= 0) throw new InvalidDataException("Arr search returned no command ID.");
                 if (command.Status is "failed" or "aborted" or "cancelled")
                     throw new InvalidOperationException("Arr replacement search command failed; reconcile before resuming.");
