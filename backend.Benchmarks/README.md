@@ -200,6 +200,20 @@ articles, ~7.9 MB/s, 6 peak connections; after the sequential-window fix: 345,
 ~17.1 MB/s, 26). Wall time and throughput use the usual envelopes. Rebaseline on
 the scheduled runner after a deliberate change.
 
+`native-cold-256mib-rtt250-w4-nas-stall` streams the same file while every 10th
+cache block write stalls for 1.5 s, longer than the playback path may wait for
+cache IO. Commits run in the background `NativeCacheCommitQueue`, so client
+throughput must match the unstalled scenario and every byte must still be
+committed without falling back to backfill (2026-10-02: 17.2–17.4 MB/s in both).
+The report drains queued commits, disposes the stream and verifies coverage
+after the timed region, because a player has every byte before that happens.
+
+On a live instance, `nzbdav_native_cache_phase_seconds{phase}` shows where cache
+IO time goes (thread-pool start delay, gate waits, data write and fsync, journal
+and directory fsync, catalogue commit, queue wait) and
+`nzbdav_native_cache_skipped_total{reason}` counts every block or response that
+was not cached directly, including `backfill_scheduled`.
+
 For a deployment-level check against real providers, run
 [`scripts/native-cold-throughput.py`](../scripts/native-cold-throughput.py)
 against an isolated test instance. It evicts each pinned item from Native
