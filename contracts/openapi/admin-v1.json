@@ -1490,6 +1490,17 @@
           "enabled": {
             "type": "boolean"
           },
+          "finishWatchedEnabled": {
+            "type": "boolean"
+          },
+          "finishWatchedPercent": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
           "fullFileWarming": {
             "type": "boolean"
           },

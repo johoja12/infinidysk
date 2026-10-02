@@ -68,7 +68,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             {
                 _last.Clear();
                 if (_policyRevision is not null)
-                    runtime.Coordinator?.PruneOwners(IsSystemOwner);
+                    runtime.Coordinator?.PruneOwners(owner => IsSystemOwner(owner) || IsPlaybackOwnerEnabled(owner, settings));
                 _policyRevision = revision;
             }
             await runtime.WaitForInitializationAsync(deadline.Token).ConfigureAwait(false);
@@ -97,6 +97,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
                     if (item is not null) await QueueImportedAsync(item, "read", 5, 0, 0, settings, deadline.Token).ConfigureAwait(false);
                 }
             }
+            if (settings.FinishWatchedEnabled && preview is null)
+                await QueueFinishWatchedAsync(settings, deadline.Token).ConfigureAwait(false);
             if (preview is null) LastSuccess = DateTimeOffset.UtcNow;
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
@@ -257,8 +259,39 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         return await QueueImportedAsync(imported, scopedOwner, priority, item.ViewOffset, item.Duration, settings, ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Opt-in completion of partially watched files: a sustained foreground read session that served at
+    /// least <see cref="PrefetchSettings.FinishWatchedPercent"/> of a file queues the whole file.
+    /// </summary>
+    private async Task QueueFinishWatchedAsync(PrefetchSettings settings, CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var watched = reads.Snapshot().Where(read => QualifiesAsWatched(read, settings, now)).Take(32).ToArray();
+        if (watched.Length == 0) return;
+        using var scope = scopes.CreateScope();
+        var database = scope.ServiceProvider.GetRequiredService<DavDatabaseClient>();
+        foreach (var read in watched)
+        {
+            if (!Due("finish-watched:" + read.Path, TimeSpan.FromMinutes(settings.CooldownMinutes), force: false)) continue;
+            var item = await ResolveDavAsync(database, read.Path, ct).ConfigureAwait(false);
+            if (item is not null)
+                await QueueImportedAsync(item, FinishWatchedOwner, FinishWatchedPriority, 0, 0, settings, ct, wholeFile: true).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// True for a playback-length session: it served the configured share of the file over at least
+    /// <see cref="FinishWatchedMinimumSession"/>, so a fast library scan of the same bytes does not count.
+    /// </summary>
+    internal static bool QualifiesAsWatched(ActiveReadRegistry.Entry read, PrefetchSettings settings, DateTimeOffset now)
+    {
+        if (read.FileSize is not > 0 || now - read.StartedAt < FinishWatchedMinimumSession) return false;
+        var served = Interlocked.Read(ref read.BytesRead);
+        return served >= FinishWatchedMinimumBytes && served >= read.FileSize.Value / 100 * settings.FinishWatchedPercent;
+    }
+
     private async Task<bool> QueueImportedAsync(DavItem item, string owner, int priority, long viewOffset, long duration,
-        PrefetchSettings settings, CancellationToken ct)
+        PrefetchSettings settings, CancellationToken ct, bool wholeFile = false)
     {
         var current = runtime.Settings();
         var servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers));
@@ -285,8 +318,9 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         if (_last.TryGetValue(cooldownKey, out var previous) && DateTimeOffset.UtcNow - previous < TimeSpan.FromMinutes(current.CooldownMinutes)) return true;
         // A release that warming proved damaged waits for repair instead of failing again every refresh.
         if (await runtime.IsKnownDamagedAsync(item, ct).ConfigureAwait(false)) return false;
-        var ranges = PrefetchPolicy.Ranges(item.FileSize.Value, viewOffset, duration, current, minimum: false);
-        IReadOnlyList<(long Start, long Length)> minimumRanges = current.MinimumWarmEnabled && !current.FullFileWarming
+        IReadOnlyList<(long Start, long Length)> ranges = wholeFile ? [(0, 0)]
+            : PrefetchPolicy.Ranges(item.FileSize.Value, viewOffset, duration, current, minimum: false);
+        IReadOnlyList<(long Start, long Length)> minimumRanges = !wholeFile && current.MinimumWarmEnabled && !current.FullFileWarming
             ? PrefetchPolicy.Ranges(item.FileSize.Value, 0, 0, current, minimum: true) : [];
         // Hub and history refreshes rediscover the same media every interval. When a completed warm
         // already verified this revision within the intent window, a new job would only re-read
@@ -332,6 +366,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     {
         ["manual"] => "Manual",
         [PrefetchRuntime.BackfillOwner] => "Playback not yet cached",
+        [FinishWatchedOwner] => "Finish partially watched",
         ["read", ..] => "Read activity (unverified)",
         ["plex", _, "source", ..] => "Selected Plex hub/collection",
         ["plex", _, "realtime-next", ..] => "Plex playback prediction",
@@ -342,6 +377,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     };
     public static string RangeReason(string owner, long length) =>
         (owner == PrefetchRuntime.BackfillOwner ? "Fills in what playback streamed without caching"
+            : owner == FinishWatchedOwner ? "Finishes caching a file you started watching"
             : owner.EndsWith(":minimum", StringComparison.Ordinal) ? "Minimum head/tail" : length == 0 ? "Whole-file warming" : "Resume/start range")
         + (owner.Contains(":watch-unknown", StringComparison.Ordinal) ? "; watched status unknown"
             : owner.Contains(":unwatched", StringComparison.Ordinal) ? "; next unwatched episode" : "");
@@ -351,9 +387,24 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     /// <summary>Owners that are not Plex policy sources and survive every policy change.</summary>
     internal static bool IsSystemOwner(string owner) => owner is "manual" or PrefetchRuntime.BackfillOwner;
 
-    private static bool IsOwnerEnabled(string owner, PrefetchSettings settings, IReadOnlyList<PlexServer> servers)
+    /// <summary>Owner of opt-in whole-file jobs that finish caching a partially watched file.</summary>
+    public const string FinishWatchedOwner = "finish-watched";
+    // Below backfill (60) and manual (50), above Plex sources (20): someone started watching this file.
+    private const int FinishWatchedPriority = 30;
+    internal static readonly TimeSpan FinishWatchedMinimumSession = TimeSpan.FromMinutes(2);
+    internal const long FinishWatchedMinimumBytes = 64L * 1024 * 1024;
+
+    /// <summary>
+    /// Playback-driven owners that are not Plex sources: they keep their work across policy changes
+    /// while their setting stays on, and lose it when switched off.
+    /// </summary>
+    internal static bool IsPlaybackOwnerEnabled(string owner, PrefetchSettings settings) =>
+        owner == FinishWatchedOwner && settings.Enabled && settings.FinishWatchedEnabled;
+
+    internal static bool IsOwnerEnabled(string owner, PrefetchSettings settings, IReadOnlyList<PlexServer> servers)
     {
         if (IsSystemOwner(owner)) return true;
+        if (owner == FinishWatchedOwner) return IsPlaybackOwnerEnabled(owner, settings);
         if (!settings.Enabled) return false;
         if (owner == "read") return settings.ReadActivityEnabled;
         if (owner == "read:minimum") return settings.ReadActivityEnabled && settings.MinimumWarmEnabled;

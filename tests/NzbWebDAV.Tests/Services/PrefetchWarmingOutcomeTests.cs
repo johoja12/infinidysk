@@ -18,7 +18,7 @@ namespace NzbWebDAV.Tests.Services;
 
 /// <summary>
 /// End-to-end prefetch behaviour over a real Native Cache, job store and policy service:
-/// own-range coverage, backfill coalescing, damaged-release hand-off, and repair hand-off.
+/// own-range coverage, backfill coalescing, damaged-release hand-off, and finish-watched.
 /// </summary>
 [Collection(nameof(ConfigPathCollection))]
 public sealed class PrefetchWarmingOutcomeTests
@@ -129,6 +129,66 @@ public sealed class PrefetchWarmingOutcomeTests
         Assert.Equal(escalates, jobs.IsDamaged(harness.Item.Id, null, DateTimeOffset.UtcNow));
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task FinishWatched_IsOptIn(bool enabled)
+    {
+        await using var harness = await Harness.CreateAsync(fileSize: 100 * MiB,
+            settings: new PrefetchSettings { Enabled = true, FinishWatchedEnabled = enabled, FinishWatchedPercent = 10 });
+        harness.Watch(servedBytes: 20 * MiB + FinishWatchedMinimumBytes());
+        using var policies = harness.Policies();
+
+        await policies.SyncAsync(true, CancellationToken.None);
+
+        if (!enabled)
+        {
+            Assert.Empty(harness.Runtime.Jobs!.List());
+            return;
+        }
+        var job = Assert.Single(harness.Runtime.Jobs!.List());
+        Assert.Equal(PlexPrefetchService.FinishWatchedOwner, job.Trigger);
+        Assert.Equal((0L, 0L), (job.Start, job.Length)); // The rest of the file, not just a range.
+        Assert.Equal("Finish partially watched", PlexPrefetchService.SourceLabel(job.Trigger));
+    }
+
+    [Fact]
+    public void FinishWatched_IgnoresShortOrFastSessions()
+    {
+        var settings = new PrefetchSettings { Enabled = true, FinishWatchedEnabled = true, FinishWatchedPercent = 10 };
+        var now = DateTimeOffset.UtcNow;
+        ActiveReadRegistry.Entry Session(TimeSpan age, long served) =>
+            new() { FileSize = 1000 * MiB, StartedAt = now - age, BytesRead = served };
+        Assert.True(PlexPrefetchService.QualifiesAsWatched(Session(TimeSpan.FromMinutes(5), 100 * MiB), settings, now));
+        Assert.False(PlexPrefetchService.QualifiesAsWatched(Session(TimeSpan.FromMinutes(5), 99 * MiB), settings, now));
+        // A library scan reading the same bytes within seconds is not a viewing session.
+        Assert.False(PlexPrefetchService.QualifiesAsWatched(Session(TimeSpan.FromSeconds(20), 500 * MiB), settings, now));
+    }
+
+    [Fact]
+    public async Task FinishWatchedWork_SurvivesPolicyChangesWhileEnabled_AndIsPrunedWhenDisabled()
+    {
+        await using var harness = await Harness.CreateAsync(fileSize: 100 * MiB,
+            settings: new PrefetchSettings { Enabled = true, FinishWatchedEnabled = true, PauseDuringPlayback = true });
+        harness.Watch(servedBytes: 20 * MiB + FinishWatchedMinimumBytes());
+        using var policies = harness.Policies();
+        await policies.SyncAsync(true, CancellationToken.None);
+        var job = Assert.Single(harness.Runtime.Jobs!.List());
+
+        // Any other policy change starts a new revision; the finish-watched job keeps its owner.
+        harness.ConfigureSettings(new PrefetchSettings { Enabled = true, FinishWatchedEnabled = true, CooldownMinutes = 30 });
+        await policies.SyncAsync(true, CancellationToken.None);
+        Assert.Equal("queued", harness.Runtime.Jobs.List().Single(row => row.Id == job.Id).State);
+
+        harness.ConfigureSettings(new PrefetchSettings { Enabled = true, FinishWatchedEnabled = false, CooldownMinutes = 30 });
+        await policies.SyncAsync(true, CancellationToken.None);
+        Assert.Equal("cancelled", harness.Runtime.Jobs.List().Single(row => row.Id == job.Id).State);
+        Assert.False(PlexPrefetchService.IsOwnerEnabled(PlexPrefetchService.FinishWatchedOwner,
+            new PrefetchSettings { Enabled = false, FinishWatchedEnabled = true }, []));
+    }
+
+    private static long FinishWatchedMinimumBytes() => PlexPrefetchService.FinishWatchedMinimumBytes;
+
     private sealed class Harness : IAsyncDisposable
     {
         private readonly string _root;
@@ -211,8 +271,19 @@ public sealed class PrefetchWarmingOutcomeTests
             };
         }
 
+        /// <summary>Records a sustained five-minute playback session of the harness item.</summary>
+        public void Watch(long servedBytes)
+        {
+            var session = _sessionReads.GetOrCreate(Item.Path, "player", Item.Name, Item.FileSize, null, null, null,
+                DateTimeOffset.UtcNow.AddMinutes(-5));
+            _sessionReads.Touch(session, servedBytes, servedBytes);
+        }
+
         public PlexPrefetchService Policies() => new(Config, new PlexApiClient(_http, "warm-outcome-test"),
             Runtime, _provider.GetRequiredService<IServiceScopeFactory>(), _sessionReads);
+
+        public void ConfigureSettings(PrefetchSettings settings) => Config.UpdateValues([
+            new ConfigItem { ConfigName = ConfigKeys.SmartPrefetchSettings, ConfigValue = JsonSerializer.Serialize(settings) }]);
 
         public void ConfigurePlexSource() => Config.UpdateValues([
             new ConfigItem { ConfigName = ConfigKeys.PlexServers, ConfigValue = JsonSerializer.Serialize(new[] { new PlexServer
