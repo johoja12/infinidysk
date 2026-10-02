@@ -43,7 +43,10 @@ public sealed class PrometheusMetricsCollector(
                     metrics.SetHealthCheckGate(healthCheckConnectionGate.GetSnapshot());
                     metrics.SetSegmentCache(segmentCacheStatistics.GetSnapshot());
                     if (nativeCache is not null)
+                    {
                         metrics.SetNativeCache(nativeCache.Statistics.Snapshot(), nativeCache.ReservedBufferBytes, nativeCache.Store is not null);
+                        if (nativeCache.BufferSlots is { } slots) metrics.SetNativeCacheBufferSlots(slots.Free, slots.Held, slots.Serving);
+                    }
                 }
                 catch (Exception ex) when (ex is not OutOfMemoryException)
                 {
