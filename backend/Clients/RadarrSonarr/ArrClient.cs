@@ -56,6 +56,22 @@ public class ArrClient(string host, string apiKey)
         CancellationToken ct = default) =>
         throw new InvalidOperationException();
 
+    /// <summary>
+    /// The Arr media-file id currently attached to the first movie/episode of
+    /// <paramref name="match"/>, or null when Arr reports no file. Used to notice
+    /// when a regrab has been replaced by a new import.
+    /// </summary>
+    public virtual Task<int?> GetCurrentMediaFileIdAsync(
+        ArrMediaFileMatch match,
+        CancellationToken ct = default) =>
+        throw new InvalidOperationException();
+
+    /// <summary>Requests a replacement search for the media of <paramref name="match"/> only.</summary>
+    public virtual Task RequestSearchAsync(
+        ArrMediaFileMatch match,
+        CancellationToken ct = default) =>
+        throw new InvalidOperationException();
+
     public virtual Task<List<ArrRootFolder>> GetRootFolders(CancellationToken ct = default) =>
         Get<List<ArrRootFolder>>($"/rootfolder", ct);
 

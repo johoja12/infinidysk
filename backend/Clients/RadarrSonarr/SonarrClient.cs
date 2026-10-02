@@ -65,6 +65,25 @@ public class SonarrClient(string host, string apiKey) : ArrClient(host, apiKey)
             episodeIds);
     }
 
+    public override async Task<int?> GetCurrentMediaFileIdAsync(
+        ArrMediaFileMatch match,
+        CancellationToken ct = default)
+    {
+        if (match.Kind != ArrMediaKind.Episode || match.MediaIds.Count == 0)
+            throw new ArgumentException("Sonarr lookups require an episode match.", nameof(match));
+        var episode = await Get<SonarrEpisode>($"/episode/{match.MediaIds[0]}", ct).ConfigureAwait(false);
+        return episode.HasFile && episode.EpisodeFileId > 0 ? episode.EpisodeFileId : null;
+    }
+
+    public override Task RequestSearchAsync(ArrMediaFileMatch match, CancellationToken ct = default)
+    {
+        if (match.Kind != ArrMediaKind.Episode || match.MediaIds.Count == 0)
+            throw new ArgumentException("Sonarr search requires an episode match.", nameof(match));
+        return ExecuteWithTransientRetryAsync(
+            token => CommandAsync(new { name = "EpisodeSearch", episodeIds = match.MediaIds }, token),
+            ct);
+    }
+
     public override async Task<ArrMissingPayloadCleanupOutcome> RemoveMissingPayloadAndSearchAsync(
         ArrMediaFileMatch match,
         Func<IReadOnlyList<string>, bool>? shouldRequestSearch = null,

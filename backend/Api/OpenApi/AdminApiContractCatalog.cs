@@ -7,7 +7,7 @@ namespace NzbWebDAV.Api.OpenApi;
 /// </summary>
 public static class AdminApiContractCatalog
 {
-    public const string ContractVersion = "2.7.0";
+    public const string ContractVersion = "2.8.0";
     public const string RelativeContractPath = "contracts/openapi/admin-v1.json";
 
     public sealed record Operation(string Method, string Path, string OperationId);
@@ -52,6 +52,14 @@ public static class AdminApiContractCatalog
         new("POST", "/api/migration/nzbdav/reconcile", "post-api-migration-nzbdav-reconcile"),
         new("GET", "/api/get-library-catalog", "get-api-get-library-catalog"),
         new("GET", "/api/get-library-file-details", "get-api-get-library-file-details"),
+        new("GET", "/api/arr-regrab", "get-api-arr-regrab"),
+        new("POST", "/api/arr-regrab", "post-api-arr-regrab"),
+        new("GET", "/api/arr-regrab/migration-failures", "get-api-arr-regrab-migration-failures"),
+        new("POST", "/api/arr-regrab/migration-failures", "post-api-arr-regrab-migration-failures"),
+        new(
+            "POST",
+            "/api/arr-regrab/migration-failures/dry-run",
+            "post-api-arr-regrab-migration-failures-dry-run"),
         new("GET", "/api/native-cache/summary", "get-api-native-cache-summary"),
         new("GET", "/api/native-cache/files", "get-api-native-cache-files"),
         new("GET", "/api/native-cache/activity", "get-api-native-cache-activity"),
