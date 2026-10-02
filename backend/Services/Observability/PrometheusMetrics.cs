@@ -95,6 +95,8 @@ public sealed class PrometheusMetrics
     private readonly HashSet<string> _providerKeys = new(StringComparer.Ordinal);
     private readonly Counter _nativeHits, _nativeHitBytes, _nativeMisses, _nativeCommitted, _nativeFallbacks, _nativeTimeouts;
     private readonly Gauge _nativeReserved, _nativeReady;
+    private readonly Histogram _nativePhase;
+    private readonly Counter _nativeSkips;
 
     public PrometheusMetrics(CollectorRegistry registry)
     {
@@ -107,6 +109,11 @@ public sealed class PrometheusMetrics
         _nativeTimeouts = metrics.CreateCounter("nzbdav_native_cache_timeouts_total", "Bounded native IO wait timeouts.");
         _nativeReserved = metrics.CreateGauge("nzbdav_native_cache_buffer_reserved_bytes", "Native buffer admission retained, including detached IO.");
         _nativeReady = metrics.CreateGauge("nzbdav_native_cache_ready", "Native catalogue initialized; not proof that every volume is online.");
+        _nativePhase = metrics.CreateHistogram("nzbdav_native_cache_phase_seconds",
+            "Native cache IO phase duration (thread-pool start delay, waits, NAS write/fsync, catalogue commit).",
+            new HistogramConfiguration { LabelNames = ["phase"], Buckets = Histogram.ExponentialBuckets(0.001, 2, 15) });
+        _nativeSkips = metrics.CreateCounter("nzbdav_native_cache_skipped_total",
+            "Native cache blocks or responses left uncached, by reason.", new CounterConfiguration { LabelNames = ["reason"] });
         _activeReads = metrics.CreateGauge("nzbdav_active_reads", "Current active read sessions.");
         _bytesServed = metrics.CreateCounter("nzbdav_bytes_served_total", "Bytes served to readers.");
         _readStarts = metrics.CreateCounter("nzbdav_concurrent_read_starts_total", "Read starts.", new CounterConfiguration { LabelNames = ["region"] });
@@ -373,6 +380,11 @@ public sealed class PrometheusMetrics
         _segmentCacheEvictedBytes.IncTo(snapshot.BytesEvicted);
         _segmentCacheTemporaryFilesCleaned.IncTo(snapshot.TemporaryFilesCleaned);
     }
+
+    public void RecordNativeCachePhase(string phase, TimeSpan elapsed) =>
+        _nativePhase.WithLabels(phase).Observe(elapsed.TotalSeconds);
+
+    public void RecordNativeCacheSkip(string reason) => _nativeSkips.WithLabels(reason).Inc();
 
     public void SetNativeCache(NativeCache.NativeCacheSnapshot snapshot, long reservedBytes, bool ready)
     {
