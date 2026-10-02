@@ -14,6 +14,8 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+from existing_id_imports import id_target, skip_existing
+
 HOST = "http://192.168.20.65:8080"
 BASE = Path("/mnt/nzbdav-cache3/infinidysk-migration-artifacts/mapped-20260924T214816Z/plex")
 BATCHES = BASE / "batches-20260927"
@@ -212,6 +214,12 @@ def ensure_scan_and_run(batch_index, stage_name, destination, manifest):
         elif state["sessionStatus"] == "scanning":
             wait_session({"scanned"}, batch_index, "scan")
     state = current_status()
+    if state["sessionStatus"] in ("scanned", "paused"):
+        skipped = skip_existing(
+            "/opt/infinidysk/config/usenet-migration.db", manifest,
+            LIBRARY_ROOT, TARGET_ROOT, expected_root,
+            REPORTS / f"batch-{batch_index + 1:04d}" / "already-infinidysk.json")
+        log(f"batch {batch_index + 1}: skipped {len(skipped)} already-InfiniDysk library files")
     if state["sessionStatus"] == "scanned":
         digest = hashlib.sha256((destination / "SHA256SUMS").read_bytes()).hexdigest()
         request("/api/migration/nzbdav/run", "POST", {
@@ -288,6 +296,8 @@ def record_batch_outcomes(batch_index, correlation, failures):
         item_id = str(row.get("legacyDavItemId", ""))
         if status == "import-failed":
             reason = fail_by_id.get(item_id, {}).get("reason", "terminal import failure")
+        elif status == "scan-excluded":
+            reason = "Recorded scan exclusion; existing InfiniDysk links are preserved"
         else:
             reason = "No exact target file matched this imported NZB item"
         rows.append({"batchIndex": batch_index, "libraryRelativePath": row.get("libraryRelativePath", ""),
@@ -444,7 +454,18 @@ def filtered_journal(batch_index, journal, excluded_paths):
     return output
 
 
+def verify_existing_links(batch_index):
+    existing_report = REPORTS / f"batch-{batch_index + 1:04d}" / "already-infinidysk.json"
+    if existing_report.exists():
+        evidence = json.loads(existing_report.read_text())
+        for link in evidence["skippedLinks"]:
+            relative = link["libraryRelativePath"]
+            if id_target(LIBRARY_ROOT, relative, TARGET_ROOT) != evidence["observedTargets"][relative]:
+                raise RuntimeError("Previously skipped InfiniDysk library link changed; reconcile before resuming")
+
+
 def process_batch(batch_index, stage_name, destination, manifest):
+    verify_existing_links(batch_index)
     request("/api/migration/nzbdav/reconcile", "POST", {}, timeout=3600)
     report_dir, excluded = record_batch_outcomes(
         batch_index,
@@ -479,7 +500,7 @@ def process_batch(batch_index, stage_name, destination, manifest):
         if not os.path.islink(source):
             continue
         current_target = os.readlink(source)
-        if current_target != row["originalLegacyTarget"] and current_target.startswith(TARGET_ROOT + "/.ids/"):
+        if current_target != row["originalLegacyTarget"] and id_target(LIBRARY_ROOT, row["libraryRelativePath"], TARGET_ROOT) is not None:
             replaced_paths[row["libraryRelativePath"]] = current_target
     missing_file = report_dir / "missing-source-paths.json"
     if missing_paths:
@@ -581,6 +602,7 @@ def process_batch(batch_index, stage_name, destination, manifest):
         if not os.path.islink(source) or os.readlink(source) != row["replacementSourceTarget"] \
                 or os.path.lexists(os.path.join(TARGET_LIBRARY, relative)):
             raise RuntimeError(f"replaced source evidence changed before acknowledgement: {relative}")
+    verify_existing_links(batch_index)
     ack = request(f"/api/migration/nzbdav/full/batches/{batch_index}/acknowledge-plan", "POST", {
         "planDigest": digest, "appliedCount": applied, "validatedCount": validated,
         "unvalidatedExactSourceIds": validation_rejects, "missingSourceIds": missing_ids,
