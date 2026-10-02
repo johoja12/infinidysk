@@ -17,7 +17,16 @@ import {
   medianWarmingSpeed,
 } from "./warming-speed";
 import { SourceBubbles, type JobSource } from "./source-bubbles";
-import { decimalBytes, describeCoverage, failureReason } from "./job-coverage";
+import { decimalBytes, describeCoverage, failureReason, mebibytes } from "./job-coverage";
+import {
+  gapBytes,
+  gapHeadline,
+  gapSpan,
+  isGapFill,
+  missReason,
+  missReasons,
+  viewerLabel,
+} from "./gap-fills";
 
 type Job = {
   id: string;
@@ -47,6 +56,10 @@ type Job = {
   stalled?: boolean | null;
   sources?: JobSource[] | null;
   sourceCount?: number | null;
+  missReason?: string | null;
+  viewerUser?: string | null;
+  viewerPlayer?: string | null;
+  mediaDurationMs?: number | null;
 };
 type Status = {
   available: boolean;
@@ -67,7 +80,30 @@ type Status = {
 };
 const terminal = new Set(["completed", "failed", "cancelled", "expired"]);
 const filterStates = ["all", "running", "queued", "deferred", "paused", "failed"];
-const historyStates = ["all", "completed", "failed", "cancelled", "expired"];
+type HistoryKind = "warming" | "gaps";
+const warmingFilters: Record<string, string> = {
+  all: "All jobs",
+  "fully-cached": "Fully cached",
+  partial: "Partially cached",
+  failed: "Failed",
+  cancelled: "Cancelled",
+  expired: "Expired",
+};
+const gapFilters: Record<string, string> = {
+  all: "All reasons",
+  ...Object.fromEntries(Object.entries(missReasons).map(([code, reason]) => [code, reason.label])),
+  unrecorded: "Reason not recorded",
+};
+function matchesHistoryFilter(job: Job, kind: HistoryKind, filter: string) {
+  if (filter === "all") return true;
+  if (kind === "gaps")
+    return filter === "unrecorded"
+      ? !job.missReason || !(job.missReason in missReasons)
+      : job.missReason === filter;
+  if (filter === "fully-cached") return coverage(job) === 100;
+  if (filter === "partial") return job.state === "completed" && coverage(job) !== 100;
+  return job.state === filter;
+}
 const bytes = decimalBytes;
 function when(value: number) {
   return Number.isFinite(value) ? new Date(value).toLocaleString() : "—";
@@ -107,6 +143,84 @@ function Card({
     </div>
   );
 }
+const reasonTone = { warning: "badge-warning", error: "badge-error", info: "badge-info" } as const;
+
+/**
+ * A backfill job: bytes playback streamed without caching. Shows where the gap was, why it was
+ * missed and who was playing, on a map of the whole file so a small fill never reads as a full cache.
+ */
+function GapRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
+  const reason = missReason(job);
+  const viewer = viewerLabel(job);
+  const span = gapSpan(job);
+  const size = gapBytes(job);
+  const filling = !terminal.has(job.state);
+  const filePct = coverage(job);
+  const failure = failureReason(job);
+  return (
+    <article className="border-b border-base-content/10 last:border-0">
+      <button
+        type="button"
+        aria-haspopup="dialog"
+        className="block w-full cursor-pointer px-4 py-4 text-left transition-colors hover:bg-base-300/40 focus-visible:bg-base-300/40 focus-visible:outline-none"
+        onClick={() => onOpen(job)}
+      >
+        <span className="flex flex-wrap items-center justify-between gap-2">
+          <span className="min-w-0 font-semibold">{job.displayName || job.itemId}</span>
+          {badge(job.state)}
+        </span>
+        <span className="mt-1 flex flex-wrap items-center gap-2 text-xs text-base-content/70">
+          <span
+            className={`tooltip tooltip-right badge badge-sm badge-soft ${reasonTone[reason.tone]}`}
+            data-tip={reason.help}
+          >
+            {reason.label}
+          </span>
+          {viewer && <span>{viewer}</span>}
+          <span>{when(job.updated)}</span>
+        </span>
+        <span className="mt-2 block text-sm">
+          {gapHeadline(job)}
+          {filling ? <span className="text-warning"> — filling it in now</span> : "."}
+        </span>
+        {failure && (
+          <span
+            className={`mt-1 flex flex-wrap items-center gap-2 text-xs font-semibold ${failure.tone === "error" ? "text-error" : "text-warning"}`}
+          >
+            {failure.title}
+            {failure.remedy && (
+              <span className="badge badge-sm badge-info badge-soft">{failure.remedy}</span>
+            )}
+          </span>
+        )}
+        {span && (
+          <span
+            className="relative mt-3 block h-2.5 overflow-hidden rounded-full bg-base-content/15"
+            role="img"
+            aria-label={`Gap at ${Math.round(span.at * 100)}% of the file`}
+            title="Where in the file this gap fill is"
+          >
+            <span
+              className={`absolute inset-y-0 rounded-sm ${filling ? "bg-warning" : job.state === "completed" ? "bg-success" : "bg-error"}`}
+              style={{ left: `${span.at * 100}%`, width: `max(8px, ${span.width * 100}%)` }}
+            />
+          </span>
+        )}
+        <span className="mt-2 flex flex-wrap justify-between gap-2 text-xs text-base-content/70">
+          <span>{size === null ? "Range" : `${mebibytes(size)} gap`}</span>
+          <span>{filling ? formatLiveWarming(job) : formatWarmingSpeed(job)}</span>
+          <span
+            className="tooltip tooltip-left text-base-content/60"
+            data-tip="A gap fill caches only its own range; the rest of the file fills in when played or selected by a prefetch policy."
+          >
+            File overall: {filePct ?? "—"}% cached
+          </span>
+        </span>
+      </button>
+    </article>
+  );
+}
+
 function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
   const summary = describeCoverage(job);
   const pct = summary.percent;
@@ -210,6 +324,7 @@ export default function SmartPrefetchActivityPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [view, setView] = useState<"activity" | "history">("activity");
+  const [historyKind, setHistoryKind] = useState<HistoryKind>("warming");
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
   const [page, setPage] = useState(0);
@@ -259,17 +374,22 @@ export default function SmartPrefetchActivityPage() {
   const jobs = status?.jobs ?? [];
   const active = jobs.filter((job) => !terminal.has(job.state));
   const history = jobs.filter((job) => terminal.has(job.state));
-  const current = view === "activity" ? active : history;
+  const gapHistory = history.filter(isGapFill);
+  const warmingHistory = history.filter((job) => !isGapFill(job));
+  const current =
+    view === "activity" ? active : historyKind === "gaps" ? gapHistory : warmingHistory;
   const visible = useMemo(
     () =>
       current.filter(
         (job) =>
-          (filter === "all" || job.state === filter) &&
+          (view === "activity"
+            ? filter === "all" || job.state === filter
+            : matchesHistoryFilter(job, historyKind, filter)) &&
           `${job.displayName ?? ""} ${job.itemId} ${job.source ?? job.trigger} ${(job.sources ?? []).map((source) => source.label).join(" ")}`
             .toLowerCase()
             .includes(search.toLowerCase()),
       ),
-    [current, filter, search],
+    [current, filter, search, view, historyKind],
   );
   const lastPage = Math.max(0, Math.ceil(visible.length / 25) - 1);
   const shownPage = Math.min(page, lastPage);
@@ -398,9 +518,11 @@ export default function SmartPrefetchActivityPage() {
           <p className="text-xs text-base-content/55">
             {view === "activity"
               ? "Current queue jobs refresh every 10 seconds."
-              : "Recent finished and interrupted jobs retained by the warming queue."}
+              : historyKind === "gaps"
+                ? "Small ranges playback had to stream straight from Usenet because they weren't cached. Each fill caches only that range — it does not mean the whole file is cached."
+                : "Policy, manual and finish-watched warming. Coverage is for the whole file."}
           </p>
-          {view === "history" && (
+          {view === "history" && historyKind === "warming" && (
             <p className="mt-1 max-w-3xl text-xs text-base-content/55">
               The cache keeps what was played plus the files your prefetch policies select.
               Partially cached files fill in when they are played
@@ -431,11 +553,19 @@ export default function SmartPrefetchActivityPage() {
               setPage(0);
             }}
           >
-            {(view === "activity" ? filterStates : historyStates).map((state) => (
-              <option value={state} key={state}>
-                {state === "all" ? "All states" : state}
-              </option>
-            ))}
+            {view === "activity"
+              ? filterStates.map((state) => (
+                  <option value={state} key={state}>
+                    {state === "all" ? "All states" : state}
+                  </option>
+                ))
+              : Object.entries(historyKind === "gaps" ? gapFilters : warmingFilters).map(
+                  ([value, label]) => (
+                    <option value={value} key={value}>
+                      {label}
+                    </option>
+                  ),
+                )}
           </select>
         </div>
       </div>
@@ -496,17 +626,43 @@ export default function SmartPrefetchActivityPage() {
           </div>
         </div>
       ) : (
-        <JobList
-          title="Recent outcomes"
-          summary={median === null ? null : `median ${formatSpeed(median)}`}
-          jobs={pageJobs}
-          total={visible.length}
-          loaded={status !== null}
-          page={shownPage}
-          lastPage={lastPage}
-          onPage={setPage}
-          onOpen={(job) => openJob(fileModal, job)}
-        />
+        <>
+          <div className="tabs tabs-box w-fit" role="tablist" aria-label="Warming history kind">
+            {(
+              [
+                ["warming", "Prefetch warming", warmingHistory.length],
+                ["gaps", "Playback gap fills", gapHistory.length],
+              ] as const
+            ).map(([kind, label, count]) => (
+              <button
+                key={kind}
+                type="button"
+                role="tab"
+                aria-selected={historyKind === kind}
+                className={`tab gap-2 ${historyKind === kind ? "tab-active" : ""}`}
+                onClick={() => {
+                  setHistoryKind(kind);
+                  setFilter("all");
+                  setPage(0);
+                }}
+              >
+                {label}
+                <span className="badge badge-sm">{count}</span>
+              </button>
+            ))}
+          </div>
+          <JobList
+            title={historyKind === "gaps" ? "Playback gap fills" : "Recent outcomes"}
+            summary={median === null ? null : `median ${formatSpeed(median)}`}
+            jobs={pageJobs}
+            total={visible.length}
+            loaded={status !== null}
+            page={shownPage}
+            lastPage={lastPage}
+            onPage={setPage}
+            onOpen={(job) => openJob(fileModal, job)}
+          />
+        </>
       )}
       <LibraryFileModalHost
         modal={fileModal}
@@ -566,7 +722,13 @@ function JobList({
         </span>
       </div>
       {total ? (
-        jobs.map((job) => <JobRow key={job.id} job={job} onOpen={onOpen} />)
+        jobs.map((job) =>
+          isGapFill(job) ? (
+            <GapRow key={job.id} job={job} onOpen={onOpen} />
+          ) : (
+            <JobRow key={job.id} job={job} onOpen={onOpen} />
+          ),
+        )
       ) : (
         <p className="px-4 py-16 text-center text-sm text-base-content/60">
           {loaded ? "No matching jobs." : "Loading warming jobs…"}
