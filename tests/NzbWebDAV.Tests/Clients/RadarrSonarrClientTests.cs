@@ -410,6 +410,66 @@ public class RadarrSonarrClientTests
     }
 
     [Fact]
+    public async Task SonarrFindMediaFile_ResolvesSeriesByParsingWithoutListingEverySeries()
+    {
+        const string seriesPath = "/library/tv/South Park";
+        const string filePath = seriesPath + "/Season 1/South Park - S01E12 - Mecha-Streisand WEBDL-2160p.mkv";
+        var handler = CreateHandler(
+            ("GET /api/v3/parse?title=South%20Park%20-%20S01E12%20-%20Mecha-Streisand%20WEBDL-2160p.mkv",
+                JsonResponse($"{{\"series\":{{\"id\":455,\"path\":\"{seriesPath}\"}},\"episodes\":[{{\"id\":21935}}]}}")),
+            ("GET /api/v3/episodefile?seriesId=455",
+                JsonResponse($"[{{\"id\":15260,\"seriesId\":455,\"path\":\"{filePath}\"}}]")),
+            ("GET /api/v3/episode?episodeFileId=15260", JsonResponse("""[{"id":21935,"seriesId":455}]""")));
+        using var httpClient = new HttpClient(handler);
+        var client = new TestSonarrClient("http://sonarr-parse.test", httpClient);
+
+        var match = await client.FindMediaFileAsync(filePath);
+
+        Assert.NotNull(match);
+        Assert.Equal(15260, match.FileId);
+        Assert.DoesNotContain("GET /api/v3/series", handler.Requests);
+    }
+
+    [Fact]
+    public async Task SonarrFindMediaFile_IgnoresParsedSeriesFromAnotherFolder()
+    {
+        const string seriesPath = "/library/tv/House of the Dragon";
+        const string filePath = seriesPath + "/Season 3/House of the Dragon S03E08.mkv";
+        var handler = CreateHandler(
+            ("GET /api/v3/parse?title=House%20of%20the%20Dragon%20S03E08.mkv",
+                JsonResponse("""{"series":{"id":660,"path":"/library/tv/House"}}""")),
+            ("GET /api/v3/series", JsonResponse($"[{{\"id\":484,\"path\":\"{seriesPath}\"}}]")),
+            ("GET /api/v3/episodefile?seriesId=484",
+                JsonResponse($"[{{\"id\":85001,\"seriesId\":484,\"path\":\"{filePath}\"}}]")),
+            ("GET /api/v3/episode?episodeFileId=85001", JsonResponse("""[{"id":308,"seriesId":484}]""")));
+        using var httpClient = new HttpClient(handler);
+        var client = new TestSonarrClient("http://sonarr-parse-mismatch.test", httpClient);
+
+        var match = await client.FindMediaFileAsync(filePath);
+
+        Assert.NotNull(match);
+        Assert.Equal(85001, match.FileId);
+        Assert.Contains("GET /api/v3/series", handler.Requests);
+    }
+
+    [Fact]
+    public async Task RadarrFindMediaFile_ResolvesMovieByParsingAndVerifiesItsFile()
+    {
+        const string filePath = "/library/movies/Lost Blob (2024)/Lost Blob (2024).mkv";
+        var handler = CreateHandler(
+            ("GET /api/v3/parse?title=Lost%20Blob%20%282024%29.mkv", JsonResponse("""{"movie":{"id":111}}""")),
+            ("GET /api/v3/movie/111", JsonResponse($"{{\"id\":111,\"movieFile\":{{\"id\":211,\"path\":\"{filePath}\"}}}}")));
+        using var httpClient = new HttpClient(handler);
+        var client = new TestRadarrClient("http://radarr-parse.test", httpClient);
+
+        var match = await client.FindMediaFileAsync(filePath);
+
+        Assert.NotNull(match);
+        Assert.Equal(211, match.FileId);
+        Assert.DoesNotContain("GET /api/v3/movie", handler.Requests);
+    }
+
+    [Fact]
     public async Task GetQueueCountAsync_HonorsCancellationToken()
     {
         using var httpClient = new HttpClient(new HangUntilCancelledHandler());

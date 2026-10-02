@@ -19,7 +19,7 @@ public class RadarrClient(string host, string apiKey) : ArrClient(host, apiKey)
         GetOrNull<RadarrMovie>($"/movie/{id}", ct);
 
     public Task<List<RadarrMovie>> GetMoviesAsync(CancellationToken ct = default) =>
-        Get<List<RadarrMovie>>($"/movie", ct);
+        GetBulk<List<RadarrMovie>>($"/movie", ct);
 
     public Task<RadarrQueue> GetRadarrQueueAsync(CancellationToken ct = default) =>
         Get<RadarrQueue>($"/queue?protocol=usenet&pageSize=5000", ct);
@@ -218,6 +218,18 @@ public class RadarrClient(string host, string apiKey) : ArrClient(host, apiKey)
             if (movieFile is not null && movieFile.Path == symlinkOrStrmPath)
                 return new MovieFileIds(movieFile.Id, movieId);
             SymlinkOrStrmToMovieIdCache.TryRemove(cacheKey, out _);
+        }
+
+        // A busy Radarr can take minutes to list every movie; parsing the file name resolves the
+        // movie in milliseconds. Accept it only when that movie's file is exactly this path.
+        if (await TryParseTitleAsync(Path.GetFileName(symlinkOrStrmPath), ct).ConfigureAwait(false) is { } parsed
+            && parsed.TryGetProperty("movie", out var parsedMovie) && parsedMovie.ValueKind == JsonValueKind.Object
+            && parsedMovie.TryGetProperty("id", out var parsedId) && parsedId.TryGetInt32(out var parsedMovieId)
+            && await GetMovieOrNullAsync(parsedMovieId, ct).ConfigureAwait(false) is { MovieFile: { } parsedFile }
+            && parsedFile.Path == symlinkOrStrmPath)
+        {
+            SymlinkOrStrmToMovieIdCache[cacheKey] = parsedMovieId;
+            return new MovieFileIds(parsedFile.Id, parsedMovieId);
         }
 
         // otherwise, let's fetch all movies, cache all movie files

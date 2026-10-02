@@ -14,6 +14,13 @@ public class ArrClient(string host, string apiKey)
         new(ArrHttpTransport.CreateHandler(), disposeHandler: true) { Timeout = RequestTimeout };
     protected virtual HttpClient Client => HttpClient;
 
+    // Whole-library listings (every series or movie) can take minutes on a busy NAS-hosted
+    // Sonarr/Radarr; only those requests get the long timeout. Substituted clients (tests) are reused.
+    internal static readonly TimeSpan BulkRequestTimeout = TimeSpan.FromMinutes(5);
+    private static readonly HttpClient BulkHttpClient =
+        new(ArrHttpTransport.CreateHandler(), disposeHandler: true) { Timeout = BulkRequestTimeout };
+    protected HttpClient BulkClient => ReferenceEquals(Client, HttpClient) ? BulkHttpClient : Client;
+
     public string Host { get; } = host;
     private string ApiKey { get; } = apiKey;
     private const string BasePath = "/api/v3";
@@ -300,6 +307,45 @@ public class ArrClient(string host, string apiKey)
     protected Task<T?> GetOrNull<T>(string path, CancellationToken ct = default) where T : class =>
         GetRootOrNull<T>($"{BasePath}{path}", ct);
 
+    /// <summary>A whole-library listing, allowed <see cref="BulkRequestTimeout"/>.</summary>
+    protected async Task<T> GetBulk<T>(string path, CancellationToken ct = default)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"{Host}{BasePath}{path}");
+        using var response = await SendAsync(request, ct, BulkClient).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        return await JsonSerializer.DeserializeAsync<T>(stream, cancellationToken: ct).ConfigureAwait(false) ?? throw new InvalidDataException("The response deserialized to null.");
+    }
+
+    /// <summary>
+    /// Asks Sonarr/Radarr to parse a release or file name. Returns null when the instance cannot parse
+    /// it or the endpoint fails, so callers fall back to a full listing.
+    /// </summary>
+    protected async Task<JsonElement?> TryParseTitleAsync(string fileName, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(fileName)) return null;
+        try
+        {
+            return await GetOrNull<JsonDocumentHolder>($"/parse?title={Uri.EscapeDataString(fileName)}", ct)
+                .ConfigureAwait(false) is { } holder ? holder.Root : null;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException and not OutOfMemoryException)
+        {
+            // Parsing is only a shortcut; any failure falls back to the full listing.
+            Serilog.Log.Debug(exception, "Could not parse {FileName} on {Host}; using the full listing", fileName, Host);
+            return null;
+        }
+    }
+
+    /// <summary>Deserialization target that keeps the raw JSON of an endpoint's response.</summary>
+    protected sealed class JsonDocumentHolder
+    {
+        [System.Text.Json.Serialization.JsonExtensionData]
+        public Dictionary<string, JsonElement>? Properties { get; set; }
+
+        public JsonElement Root => JsonSerializer.SerializeToElement(Properties ?? []);
+    }
+
     protected async Task<T> GetRoot<T>(string rootPath, CancellationToken ct = default)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, $"{Host}{rootPath}");
@@ -347,18 +393,20 @@ public class ArrClient(string host, string apiKey)
         return resource;
     }
 
-    private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+    private async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct,
+        HttpClient? client = null)
     {
+        client ??= Client;
         request.Headers.Add("X-Api-Key", ApiKey);
         try
         {
-            return await Client.SendAsync(request, ct).ConfigureAwait(false);
+            return await client.SendAsync(request, ct).ConfigureAwait(false);
         }
         catch (TaskCanceledException e) when (!ct.IsCancellationRequested && e.InnerException is TimeoutException)
         {
             // HttpClient.Timeout surfaces as TaskCanceledException wrapping a TimeoutException.
             var operation = $"{request.Method} {request.RequestUri?.AbsolutePath}";
-            throw new ArrRequestTimeoutException(operation, Host, Client.Timeout, e);
+            throw new ArrRequestTimeoutException(operation, Host, client.Timeout, e);
         }
     }
 }
