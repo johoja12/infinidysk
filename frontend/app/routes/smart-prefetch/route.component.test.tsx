@@ -210,6 +210,67 @@ describe("Smart Prefetch activity page", () => {
     expect(screen.getByText(/Partially cached files fill in when they are played/)).toBeTruthy();
   });
 
+  it("shows live speed for running jobs and source bubbles in activity and history", async () => {
+    const live = {
+      ...response,
+      jobs: [
+        {
+          ...response.jobs[0],
+          displayName: "Ted_Lasso_S04E07",
+          committedBytes: 3_000_000_000,
+          fileSize: 7_800_000_000,
+          activeMs: 200_000,
+          warmedBytes: 14_200_000 * 200,
+          recentBytesPerSecond: 18_400_000,
+          lastProgressAt: now,
+          stalled: false,
+          sources: [{ label: "Popular TV This Year", category: "plex-source" }],
+          sourceCount: 1,
+        },
+        {
+          ...response.jobs[0],
+          id: "stalled",
+          itemId: "item-s",
+          displayName: "Stuck movie",
+          stalled: true,
+          lastProgressAt: now - 90_000,
+          sources: [{ label: "Playing now", category: "plex-realtime" }],
+          sourceCount: 1,
+        },
+        {
+          ...response.jobs[1],
+          sources: [
+            { label: "Next episode · history", category: "plex-history-next" },
+            { label: "Manual", category: "manual" },
+            { label: "Watch history", category: "plex-history" },
+          ],
+          sourceCount: 3,
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(live) }),
+    );
+    const router = createMemoryRouter(
+      [{ path: "/smart-prefetch", element: <SmartPrefetchActivityPage /> }],
+      { initialEntries: ["/smart-prefetch"] },
+    );
+    render(<RouterProvider router={router} />);
+    const running = await screen.findByRole("button", { name: /Ted_Lasso_S04E07/ });
+    expect(running.textContent).toContain("18.4 MB/s now · 14.2 MB/s avg · ETA 4m 21s");
+    expect(within(running).getByText("Popular TV This Year").className).toContain("badge-primary");
+    expect(screen.getByRole("button", { name: /Stuck movie/ }).textContent).toMatch(
+      /Stalled · no progress for 1m 3\ds/,
+    );
+
+    await userEvent.setup().click(screen.getByRole("tab", { name: /Warming history/ }));
+    const finished = screen.getByRole("button", { name: /Series finished/ });
+    expect(within(finished).getByText("Next episode · history")).toBeTruthy();
+    expect(within(finished).getByText("+1")).toBeTruthy();
+    expect(finished.textContent).not.toContain("now ·");
+  });
+
   it("opens the shared media file modal from a history row with the keyboard", async () => {
     const details = {
       davItemId: "item-b",

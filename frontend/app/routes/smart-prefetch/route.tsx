@@ -10,7 +10,13 @@ import {
   useLibraryFileModal,
   type LibraryFileModalController,
 } from "~/components/library-file-modal/use-library-file-modal";
-import { formatSpeed, formatWarmingSpeed, medianWarmingSpeed } from "./warming-speed";
+import {
+  formatLiveWarming,
+  formatSpeed,
+  formatWarmingSpeed,
+  medianWarmingSpeed,
+} from "./warming-speed";
+import { SourceBubbles, type JobSource } from "./source-bubbles";
 import { decimalBytes, describeCoverage, failureReason } from "./job-coverage";
 
 type Job = {
@@ -36,6 +42,11 @@ type Job = {
   rangeCachedBytes?: number | null;
   failureCode?: string | null;
   remedy?: string | null;
+  recentBytesPerSecond?: number | null;
+  lastProgressAt?: number | null;
+  stalled?: boolean | null;
+  sources?: JobSource[] | null;
+  sourceCount?: number | null;
 };
 type Status = {
   available: boolean;
@@ -113,8 +124,13 @@ function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
           <span className="min-w-0 font-semibold">{job.displayName || job.itemId}</span>
           {badge(job.state)}
         </span>
-        <span className="mt-1 block text-xs text-base-content/55">
-          {job.source || job.trigger} · {when(job.updated)}
+        <span className="mt-1 flex flex-wrap items-center gap-2 text-xs text-base-content/55">
+          <SourceBubbles
+            sources={job.sources ?? null}
+            sourceCount={job.sourceCount ?? null}
+            fallback={job.source || job.trigger}
+          />
+          <span>{when(job.updated)}</span>
         </span>
         {failure && (
           <span
@@ -144,6 +160,14 @@ function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
           {finished && (
             <span title="Average speed of the bytes this job fetched, over its active warming time">
               {formatWarmingSpeed(job)}
+            </span>
+          )}
+          {job.state === "running" && (
+            <span
+              className={job.stalled ? "font-semibold text-warning" : undefined}
+              title="Speed over the last 20 seconds and the average for this job; the estimate uses the current speed"
+            >
+              {formatLiveWarming(job)}
             </span>
           )}
           {summary.secondary ? (
@@ -241,7 +265,7 @@ export default function SmartPrefetchActivityPage() {
       current.filter(
         (job) =>
           (filter === "all" || job.state === filter) &&
-          `${job.displayName ?? ""} ${job.itemId} ${job.source ?? job.trigger}`
+          `${job.displayName ?? ""} ${job.itemId} ${job.source ?? job.trigger} ${(job.sources ?? []).map((source) => source.label).join(" ")}`
             .toLowerCase()
             .includes(search.toLowerCase()),
       ),
