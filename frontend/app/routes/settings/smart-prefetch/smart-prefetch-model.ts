@@ -37,6 +37,7 @@ export const numericDefaults = {
   DailyByteBudget: 10_000_000_000,
   MinimumHeadMb: 16,
   MinimumTailMb: 8,
+  FinishWatchedPercent: 10,
 };
 export const booleanDefaults = {
   Enabled: false,
@@ -50,6 +51,7 @@ export const booleanDefaults = {
   TvEnabled: true,
   WarmLocalFiles: false,
   PauseDuringPlayback: true,
+  FinishWatchedEnabled: false,
 };
 export const DECIMAL_GB_BYTES = 1_000_000_000;
 
@@ -153,6 +155,12 @@ export const numericFields: {
   },
   { key: "MinimumHeadMb", label: "Minimum head range (MiB)", min: 0, max: 1024 },
   { key: "MinimumTailMb", label: "Minimum tail range (MiB)", min: 0, max: 1024 },
+  {
+    key: "FinishWatchedPercent",
+    label: "Finish a file after this much was played (%)",
+    min: 1,
+    max: 90,
+  },
 ];
 export function parsePrefetchSettings(json: string | undefined): PrefetchSettings {
   const parsed: unknown = json?.trim() ? JSON.parse(json) : {};

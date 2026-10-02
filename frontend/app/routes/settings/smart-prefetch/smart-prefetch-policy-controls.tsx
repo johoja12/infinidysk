@@ -20,9 +20,13 @@ type BooleanKey = keyof Pick<
   | "FullFileWarming"
   | "WarmLocalFiles"
   | "PauseDuringPlayback"
+  | "FinishWatchedEnabled"
 >;
 
-const booleanGroups: { title: string; controls: { key: BooleanKey; label: string }[] }[] = [
+const booleanGroups: {
+  title: string;
+  controls: { key: BooleanKey; label: string; help?: string }[];
+}[] = [
   {
     title: "Signals",
     controls: [
@@ -42,6 +46,11 @@ const booleanGroups: { title: string; controls: { key: BooleanKey; label: string
       { key: "MinimumWarmEnabled", label: "Warm minimum head and tail ranges" },
       { key: "FullFileWarming", label: "Warm full files" },
       { key: "PauseDuringPlayback", label: "Pause background warming during playback" },
+      {
+        key: "FinishWatchedEnabled",
+        label: "Finish caching partially watched files",
+        help: "Off by default. After a playback session plays the share of a file set below, the rest of that file is warmed in the background. Uses the daily download budget; long library scans that read a large share of a file can also qualify.",
+      },
     ],
   },
 ];
@@ -82,7 +91,7 @@ const numericGroups: { title: string; keys: NumericKey[] }[] = [
   },
   {
     title: "Warming",
-    keys: ["MinimumHeadMb", "MinimumTailMb"],
+    keys: ["MinimumHeadMb", "MinimumTailMb", "FinishWatchedPercent"],
   },
 ];
 
@@ -172,16 +181,29 @@ export function SmartPrefetchPolicyControls({
             <section key={group.title} className="space-y-2">
               <h3 className="text-sm font-semibold">{group.title}</h3>
               <div className="grid gap-3 md:grid-cols-2">
-                {group.controls.map((control) => (
-                  <Toggle
-                    key={control.key}
-                    label={control.label}
-                    checked={settings[control.key]}
-                    onChange={(event) =>
-                      onChange({ ...settings, [control.key]: event.target.checked })
-                    }
-                  />
-                ))}
+                {group.controls.map((control) =>
+                  control.help ? (
+                    <div key={control.key}>
+                      <Toggle
+                        label={control.label}
+                        checked={settings[control.key]}
+                        onChange={(event) =>
+                          onChange({ ...settings, [control.key]: event.target.checked })
+                        }
+                      />
+                      <small className="block text-xs text-base-content/50">{control.help}</small>
+                    </div>
+                  ) : (
+                    <Toggle
+                      key={control.key}
+                      label={control.label}
+                      checked={settings[control.key]}
+                      onChange={(event) =>
+                        onChange({ ...settings, [control.key]: event.target.checked })
+                      }
+                    />
+                  ),
+                )}
               </div>
             </section>
           ))}
