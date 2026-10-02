@@ -22,3 +22,14 @@ resuming is requested. Test the exclusion logic with:
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/operations -p 'test_existing_id_imports.py'
 ```
+
+## Failed imports are regrabbed, not cleaned up
+
+`plex-import-runner.py` no longer runs `cleanup-failed-imports` for failed batch
+imports (nor replays it for earlier batches at startup); that tool deleted the
+legacy NzbDav item. InfiniDysk now queues a Sonarr/Radarr regrab for imports that
+fail as damaged or missing articles: it removes only the broken library symlink
+(journaled in `/config/regrab/library-link-removals.jsonl`) and the Arr file record,
+then requests a search. The runner records the regrab state (`regrab-queued`,
+`regrab-requested`, …) with the Arr target in each batch's `not-imported.csv`.
+Validation-failure cleanup (`cleanup-validation-failures`) is unchanged.
