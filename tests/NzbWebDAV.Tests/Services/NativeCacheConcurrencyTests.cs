@@ -121,13 +121,14 @@ public sealed class NativeCacheConcurrencyTests : IDisposable
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         await using var store = new NativeCacheStore(Path.Combine(_root, "index.db"), [Folder()])
         {
-            BeforeWriteReserveAsync = async _ => { entered.TrySetResult(); await release.Task; }
+            BeforeWriteReserveAsync = async _ => { if (entered.TrySetResult()) await release.Task; }
         };
         var first = store.WriteBlockAsync(new("first", "v1", 3), 0, new byte[3]);
         try
         {
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
-            Assert.False(await store.WriteBlockAsync(new("other", "v1", 3), 0, new byte[3]).WaitAsync(TimeSpan.FromSeconds(2)));
+            // Commits share the device: another file publishes while the first is still in flight.
+            Assert.True(await store.WriteBlockAsync(new("other", "v1", 3), 0, new byte[3]).WaitAsync(TimeSpan.FromSeconds(2)));
         }
         finally { release.TrySetResult(); await first; }
     }

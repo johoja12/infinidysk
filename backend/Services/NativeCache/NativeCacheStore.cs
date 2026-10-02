@@ -11,7 +11,8 @@ namespace NzbWebDAV.Services.NativeCache;
 /// <summary>
 /// Final-file storage with bounded integrity blocks and an indexed, local catalogue.
 /// Sparse length is never coverage: only a checksummed committed block is a hit.
-/// Writes are serialized and durably flushed before catalogue publication. Reads
+/// Blocks commit in parallel (per-device gate in shared mode) and are durably flushed before
+/// catalogue publication; maintenance holds the device gate exclusively. Reads
 /// open delete-sharing handles under the catalogue gate then perform IO outside it.
 /// </summary>
 public sealed partial class NativeCacheStore : IAsyncDisposable
@@ -38,14 +39,13 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
     private readonly SqliteConnection _database;
     [SuppressMessage("Usage", "CA2213:Disposable fields should be disposed", Justification = "Managed-only semaphore: no WaitHandle is created. Retained so queued waiters can observe disposal and release safely.")]
     private readonly SemaphoreSlim _gate = new(1, 1);
-    [SuppressMessage("Usage", "CA2213:Disposable fields should be disposed", Justification = "Managed-only semaphore: no WaitHandle is created. Retained so queued waiters can observe disposal and release safely.")]
-    private readonly SemaphoreSlim _writer = new(1, 1);
+    private readonly NativeCacheDeviceGate _writer = new();
     private readonly NativeCacheFolder[] _folders;
-    private readonly Dictionary<string, SemaphoreSlim> _folderWriters = new(StringComparer.Ordinal);
-    private SemaphoreSlim Writer(string folder) => _folderWriters.GetValueOrDefault(folder, _writer);
+    private readonly Dictionary<string, NativeCacheDeviceGate> _folderWriters = new(StringComparer.Ordinal);
+    private NativeCacheDeviceGate Writer(string folder) => _folderWriters.GetValueOrDefault(folder, _writer);
 
     [SuppressMessage("Performance", "CA1849", Justification = LocalSqliteReason)]
-    private async Task<SemaphoreSlim> EntryWriterAsync(string key, CancellationToken ct)
+    private async Task<NativeCacheDeviceGate> EntryWriterAsync(string key, CancellationToken ct)
     {
         await _gate.WaitAsync(ct).ConfigureAwait(false);
         try
@@ -57,8 +57,8 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
     }
 
     [SuppressMessage("Performance", "CA1849", Justification = LocalSqliteReason)]
-    private async Task<(NativeCacheFolder Folder, SemaphoreSlim Writer)?> SelectWriterAsync(
-        NativeCacheIdentity identity, long required, bool wait, CancellationToken ct)
+    private async Task<(NativeCacheFolder Folder, NativeCacheDeviceGate Writer)?> SelectWriterAsync(
+        NativeCacheIdentity identity, long required, bool wait, bool shared, CancellationToken ct)
     {
         NativeCacheFolder[] candidates;
         string? existing;
@@ -79,13 +79,17 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
                 && (reserved is null || folder.Id == reserved) && HasQuota(folder, required + (existing is null ? EntryOverhead : 0), identity.Key)).ToArray();
         }
         finally { _gate.Release(); }
+        // A new entry prefers an idle device over a busy (possibly stalled) one of higher priority,
+        // as it did when every commit held the device exclusively.
+        if (shared && existing is null) candidates = candidates.OrderBy(folder => Writer(folder.Id).IsIdle ? 0 : 1).ToArray();
         foreach (var folder in candidates)
         {
             var writer = Writer(folder.Id);
-            if (!await writer.WaitAsync(0, ct).ConfigureAwait(false))
+            if (!(shared ? writer.TryEnterShared() : await writer.WaitAsync(0, ct).ConfigureAwait(false)))
             {
                 if (!wait || existing is null) continue;
-                await writer.WaitAsync(ct).ConfigureAwait(false);
+                if (shared) await writer.EnterSharedAsync(ct).ConfigureAwait(false);
+                else await writer.WaitAsync(ct).ConfigureAwait(false);
             }
             try
             {
@@ -95,10 +99,16 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
                 finally { _gate.Release(); }
                 if (CanUseFolder(folder, freeRequired)) return (folder, writer);
             }
-            catch { writer.Release(); throw; }
-            writer.Release();
+            catch { Exit(writer); throw; }
+            Exit(writer);
         }
         return null;
+
+        void Exit(NativeCacheDeviceGate writer)
+        {
+            if (shared) writer.ReleaseShared();
+            else writer.Release();
+        }
     }
     private readonly Dictionary<string, FileStream> _owners = new(StringComparer.Ordinal);
     private readonly Dictionary<string, NativeFileSystem.PinnedDirectory> _roots = new(StringComparer.Ordinal);
@@ -111,6 +121,8 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
     private readonly Dictionary<string, string> _pendingCheckpoints = new(StringComparer.Ordinal);
     private readonly Dictionary<(string Key, long Offset), FillState> _fills = [];
     private readonly Dictionary<(string Key, long Offset), Task<bool>> _verifications = [];
+    private readonly Dictionary<(string Key, long Offset), Task<bool>> _blockWrites = [];
+    private readonly Dictionary<string, EntryCommits> _entryCommits = new(StringComparer.Ordinal);
 
     internal Task<bool> VerifyOnceAsync(NativeCacheIdentity identity, long offset, Func<Task<bool>> verify, CancellationToken ct)
     {
@@ -363,11 +375,11 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
             catch (UnauthorizedAccessException) { }
             catch (PlatformNotSupportedException) { /* Unsupported platforms fail closed. */ }
         }
-        var devices = new Dictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
+        var devices = new Dictionary<string, NativeCacheDeviceGate>(StringComparer.Ordinal);
         foreach (var folder in _folders)
         {
             var device = _roots.TryGetValue(folder.Id, out var root) ? root.DeviceIdentity.ToString() : folder.Id;
-            if (!devices.TryGetValue(device, out var writer)) devices[device] = writer = new SemaphoreSlim(1, 1);
+            if (!devices.TryGetValue(device, out var writer)) devices[device] = writer = new NativeCacheDeviceGate();
             _folderWriters[folder.Id] = writer;
         }
     }
@@ -437,19 +449,106 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
 
     }
 
-    [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
     public async Task<bool> WriteBlockAsync(NativeCacheIdentity identity, long offset, ReadOnlyMemory<byte> data,
         bool waitForWriter = false, CancellationToken cancellationToken = default)
     {
         ValidateOffset(identity, offset);
         if (data.Length != Math.Min(BlockSize, identity.Length - offset))
             throw new ArgumentException("Only complete integrity blocks may be published.", nameof(data));
+        // Two streams can hand over the same block. The second shares the first's outcome rather
+        // than writing the same bytes again and appending a duplicate journal record.
+        var key = (identity.Key, offset);
+        Task<bool>? pending;
+        TaskCompletionSource<bool>? completion = null;
+        lock (_leaseLock)
+        {
+            if (!_blockWrites.TryGetValue(key, out pending))
+            {
+                completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                _blockWrites.Add(key, completion.Task);
+            }
+        }
+        if (completion is null) return await pending!.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var published = false;
+        try
+        {
+            published = await WriteBlockCoreAsync(identity, offset, data, waitForWriter, cancellationToken).ConfigureAwait(false);
+            return published;
+        }
+        finally
+        {
+            lock (_leaseLock) _blockWrites.Remove(key);
+            completion.TrySetResult(published);
+        }
+    }
+
+    private async Task<bool> WriteBlockCoreAsync(NativeCacheIdentity identity, long offset, ReadOnlyMemory<byte> data,
+        bool waitForWriter, CancellationToken cancellationToken)
+    {
         using var lease = AcquireLease(identity);
         var commitStarted = Stopwatch.GetTimestamp();
         var phaseStarted = commitStarted;
-        using var placement = await AcquireFillAsync(identity, -1, cancellationToken).ConfigureAwait(false);
-        Phase("placement_wait", ref phaseStarted);
-        var selectedWriter = await SelectWriterAsync(identity, RoundAllocation(data.Length), waitForWriter, cancellationToken).ConfigureAwait(false);
+        // Hashing is CPU work: keep it out of every lock and the catalogue gate.
+        var hash = SHA256.HashData(data.Span);
+        Phase("block_hash", ref phaseStarted);
+        var entry = AcquireEntryCommits(identity.Key);
+        IDisposable? placement = null;
+        try
+        {
+            // Placement serializes only creating an entry (folder choice and manifest). Blocks of
+            // an existing entry commit in parallel under the device gate's shared mode.
+            if (!await EntryExistsAsync(identity.Key, cancellationToken).ConfigureAwait(false))
+            {
+                placement = await AcquireFillAsync(identity, -1, cancellationToken).ConfigureAwait(false);
+                // Blocks racing the first one wait only until it has created the entry.
+                if (await EntryExistsAsync(identity.Key, cancellationToken).ConfigureAwait(false))
+                {
+                    placement.Dispose();
+                    placement = null;
+                }
+            }
+            Phase("placement_wait", ref phaseStarted);
+            while (true)
+            {
+                if (await CommitBlockAsync(identity, offset, data, hash, waitForWriter, placement is not null, entry,
+                        commitStarted, cancellationToken).ConfigureAwait(false) is { } result)
+                    return result;
+                // The entry was relocated or evicted after the lookup: create it again under placement.
+                placement = await AcquireFillAsync(identity, -1, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            placement?.Dispose();
+            ReleaseEntryCommits(identity.Key, entry);
+        }
+    }
+
+    [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
+    private async Task<bool> EntryExistsAsync(string key, CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            using var query = Command("SELECT 1 FROM Entries WHERE Key=$key", ("$key", key));
+            return query.ExecuteScalar() is not null;
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Publishes one block. Ordering per block: data fsync, then any directory fsync its file
+    /// needs, then the journal record and its fsync, then catalogue publication. Returns null
+    /// when the entry must be (re)created and the caller does not hold the placement lease.
+    /// </summary>
+    [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
+    private async Task<bool?> CommitBlockAsync(NativeCacheIdentity identity, long offset, ReadOnlyMemory<byte> data,
+        byte[] hash, bool waitForWriter, bool placementHeld, EntryCommits entry, long commitStarted, CancellationToken cancellationToken)
+    {
+        var phaseStarted = Stopwatch.GetTimestamp();
+        var selectedWriter = await SelectWriterAsync(identity, RoundAllocation(data.Length), waitForWriter, shared: true,
+            cancellationToken).ConfigureAwait(false);
         Phase("writer_wait", ref phaseStarted);
         if (selectedWriter is not { } selection)
         {
@@ -457,18 +556,22 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
             return false;
         }
         var catalogueHeld = false;
+        var reserved = false;
         try
         {
+            // Scans and checkpoints admit a key under the exclusive gate, so none starts while
+            // this commit holds the shared gate, and none is running past this check.
             lock (_leaseLock) if (_scanning.Contains(identity.Key)) return false;
             await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
             Phase("gate_wait", ref phaseStarted);
             catalogueHeld = true;
             ObjectDisposedException.ThrowIf(_disposed, this);
             using var lookup = Command("SELECT Folder,ChunkSize FROM Entries WHERE Key=$key", ("$key", identity.Key));
-            using var entry = lookup.ExecuteReader();
-            var folderId = entry.Read() ? entry.GetString(0) : null;
-            var chunkSize = folderId is null ? _newEntryChunkSize : entry.GetInt32(1);
-            entry.Close();
+            using var row = lookup.ExecuteReader();
+            var folderId = row.Read() ? row.GetString(0) : null;
+            var chunkSize = folderId is null ? _newEntryChunkSize : row.GetInt32(1);
+            row.Close();
+            if (folderId is null && !placementHeld) return null;
             if (chunkSize != 0 && !ValidChunkSize(chunkSize)) return false;
             var allocation = RoundAllocation(data.Length);
             using var exists = Command("SELECT 1 FROM Blocks WHERE Key=$key AND Offset=$offset", ("$key", identity.Key), ("$offset", offset));
@@ -488,7 +591,7 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
 
             if (BeforeWriteReserveAsync is { } beforeReserve) await beforeReserve(cancellationToken).ConfigureAwait(false);
 
-            using var directory = OpenEntry(folder, identity.Key, create: true);
+            using var directory = OpenEntryForWrite(folder, identity.Key, entry);
             if (folderId is null)
             {
                 // A missing local catalogue row does not authorize changing a payload's
@@ -504,18 +607,17 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
                     await manifest.WriteAsync(JsonSerializer.SerializeToUtf8Bytes(new Manifest(chunkSize == 0 ? 1 : 2, identity, chunkSize)), cancellationToken).ConfigureAwait(false);
                     FlushToDisk(manifest);
                 }
+                // The manifest is a new directory entry; the path is synced before journal publication.
+                entry.Path.Created();
             }
-            await using var journal = directory.OpenFile("ranges.journal", FileMode.OpenOrCreate, FileAccess.ReadWrite);
-            await RepairJournalTailAsync(journal, cancellationToken).ConfigureAwait(false);
-            var softLimit = JournalSoftLimit(identity.Length);
-            if (journal.Length >= softLimit) QueueCheckpoint(identity.Key, folder.Id);
-            if (journal.Length > softLimit + 65536 - 256) return false;
+            else if (!JournalAdmitsAppend(folder, identity, directory)) return false;
             Phase("entry_open", ref phaseStarted);
             await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
             Phase("gate_wait", ref phaseStarted);
             catalogueHeld = true;
-            // Writers/eviction are serialized separately; readers need only this
-            // short local transaction, even while another folder is stalled.
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            // Concurrent commits share the device gate, so the quota is checked again where it is reserved.
+            if (!HasQuota(folder, required, identity.Key)) return false;
             if (folderId is null)
             {
                 Execute("INSERT INTO Entries(Key,Folder,Length,Bytes,Access,Dirty,ItemId,Generation,DisplayName,ChunkSize) VALUES($key,$folder,$length,$bytes,$access,1,$item,$generation,$name,$chunk)",
@@ -529,14 +631,26 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
             // Reserve before disk IO. Failed writes deliberately retain their reservation until
             // reconciliation/eviction, so interrupted writes cannot silently exceed the quota.
             Execute("UPDATE Entries SET Bytes=Bytes+$bytes,PendingBytes=PendingBytes+$bytes WHERE Key=$key", ("$bytes", allocation), ("$key", identity.Key));
-
-            var hash = SHA256.HashData(data.Span);
+            Interlocked.Increment(ref entry.Reserved);
+            reserved = true;
             // A slow NAS write must not hold the local catalogue gate or stall hits
-            // in other folders. The writer gate and activity lease protect publication.
+            // in other folders. The device gate and activity lease protect publication.
             _gate.Release();
             catalogueHeld = false;
             Phase("catalogue_reserve", ref phaseStarted);
-            await using (var stream = directory.OpenFile(DataFileName(offset, chunkSize), FileMode.OpenOrCreate, FileAccess.Write))
+
+            // Each commit writes its own block through its own handle at its own offset, so
+            // concurrent blocks of one content or chunk file never overlap.
+            var dataName = DataFileName(offset, chunkSize);
+            FileStream stream;
+            try { stream = directory.OpenFile(dataName, FileMode.Open, FileAccess.Write); }
+            catch (IOException exception) when (NativeFileSystem.IsMissing(exception))
+            {
+                entry.Directory.Begin();
+                try { stream = directory.OpenFile(dataName, FileMode.OpenOrCreate, FileAccess.Write); }
+                finally { entry.Directory.End(); }
+            }
+            await using (stream)
             {
                 stream.Position = chunkSize == 0 ? offset : offset % chunkSize;
                 await stream.WriteAsync(data, cancellationToken).ConfigureAwait(false);
@@ -544,18 +658,14 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
                 FlushToDisk(stream);
                 Phase("data_fsync", ref phaseStarted);
             }
-            // The colocated journal makes explicit scans/imports possible without the local catalogue.
-            var record = JsonSerializer.SerializeToUtf8Bytes(new JournalBlock(offset, data.Length, Convert.ToHexString(hash)));
-            await journal.WriteAsync(record, cancellationToken).ConfigureAwait(false);
-            await journal.WriteAsync("\n"u8.ToArray(), cancellationToken).ConfigureAwait(false);
-            FlushToDisk(journal);
-            Phase("journal_fsync", ref phaseStarted);
-            if (journal.Length >= softLimit) QueueCheckpoint(identity.Key, folder.Id);
-            directory.Flush();
-            using (var shard = _roots[folder.Id].OpenDirectory($"v1/{identity.Key[..2]}")) shard.Flush();
-            using (var version = _roots[folder.Id].OpenDirectory("v1")) version.Flush();
-            _roots[folder.Id].Flush();
+            // Directory metadata is synced only when this entry gained a file or directory that may
+            // not be durable yet (possibly created by a concurrent commit), not for every block.
+            SyncEntryPath(folder, identity.Key, directory, entry);
             Phase("dir_fsync", ref phaseStarted);
+            await AppendJournalAsync(folder, identity, directory, entry, new JournalBlock(offset, data.Length, Convert.ToHexString(hash)),
+                cancellationToken).ConfigureAwait(false);
+            Phase("journal_fsync", ref phaseStarted);
+            var observedPublications = Interlocked.Read(ref entry.Published);
             var allocated = PhysicalEntryBytes(directory);
             if (!IsVolumeCurrent(folder)) return false;
             await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
@@ -568,12 +678,21 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
                 insert.Transaction = transaction;
                 insert.ExecuteNonQuery();
             }
-            using (var update = Command("UPDATE Entries SET Dirty=0,PendingBytes=0,Bytes=$bytes WHERE Key=$key", ("$key", identity.Key), ("$bytes", allocated)))
+            // The physical size is exact only when no other commit of this entry reserved or
+            // published since it was measured. Otherwise release just this block's pending bytes:
+            // its reservation stays charged in Bytes, which never undercounts.
+            var exact = Volatile.Read(ref entry.Reserved) == 1 && Interlocked.Read(ref entry.Published) == observedPublications;
+            using (var update = exact
+                ? Command("UPDATE Entries SET Dirty=0,PendingBytes=0,Bytes=$bytes WHERE Key=$key", ("$key", identity.Key), ("$bytes", allocated))
+                : Command("UPDATE Entries SET PendingBytes=MAX(0,PendingBytes-$bytes) WHERE Key=$key", ("$key", identity.Key), ("$bytes", allocation)))
             {
                 update.Transaction = transaction;
                 update.ExecuteNonQuery();
             }
             transaction.Commit();
+            Interlocked.Increment(ref entry.Published);
+            Interlocked.Decrement(ref entry.Reserved);
+            reserved = false;
             lock (_leaseLock)
                 if (_reservations.TryGetValue(identity.Key, out var reservation))
                     reservation.Remaining = Math.Max(0, reservation.Remaining - required);
@@ -586,9 +705,152 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
         catch (UnauthorizedAccessException) { return false; }
         finally
         {
+            if (reserved) Interlocked.Decrement(ref entry.Reserved);
             if (catalogueHeld) _gate.Release();
-            selection.Writer.Release();
+            selection.Writer.ReleaseShared();
         }
+    }
+
+    // Opens an existing entry directory, or creates the entry path and records that it is not durable yet.
+    private NativeFileSystem.PinnedDirectory OpenEntryForWrite(NativeCacheFolder folder, string key, EntryCommits entry)
+    {
+        try { return OpenEntry(folder, key); }
+        catch (IOException exception) when (NativeFileSystem.IsMissing(exception)) { }
+        entry.Path.Begin();
+        try { return OpenEntry(folder, key, create: true); }
+        finally { entry.Path.End(); }
+    }
+
+    // Declines a block before it reserves space or touches payload when the journal awaits a checkpoint.
+    // The append re-checks under the entry's journal lock.
+    private bool JournalAdmitsAppend(NativeCacheFolder folder, NativeCacheIdentity identity, NativeFileSystem.PinnedDirectory directory)
+    {
+        long length;
+        try
+        {
+            using var journal = directory.OpenFile("ranges.journal", FileMode.Open, FileAccess.Read);
+            length = journal.Length;
+        }
+        catch (IOException exception) when (NativeFileSystem.IsMissing(exception)) { return true; }
+        var softLimit = JournalSoftLimit(identity.Length);
+        if (length >= softLimit) QueueCheckpoint(identity.Key, folder.Id);
+        return length <= softLimit + 65536 - 256;
+    }
+
+    private void SyncEntryPath(NativeCacheFolder folder, string key, NativeFileSystem.PinnedDirectory directory, EntryCommits entry)
+    {
+        var path = entry.Path.Pending();
+        var files = entry.Directory.Pending();
+        if (path is { } pathGeneration)
+        {
+            directory.Flush();
+            using (var shard = _roots[folder.Id].OpenDirectory($"v1/{key[..2]}")) shard.Flush();
+            using (var version = _roots[folder.Id].OpenDirectory("v1")) version.Flush();
+            _roots[folder.Id].Flush();
+            entry.Path.Synced(pathGeneration);
+            if (files is { } fileGeneration) entry.Directory.Synced(fileGeneration);
+        }
+        else if (files is { } fileGeneration)
+        {
+            directory.Flush();
+            entry.Directory.Synced(fileGeneration);
+        }
+    }
+
+    private async Task AppendJournalAsync(NativeCacheFolder folder, NativeCacheIdentity identity,
+        NativeFileSystem.PinnedDirectory directory, EntryCommits entry, JournalBlock block, CancellationToken cancellationToken)
+    {
+        // The colocated journal makes explicit scans/imports possible without the local catalogue.
+        // Appends of one entry are serialized: each record is one complete line after a repaired tail.
+        var record = JsonSerializer.SerializeToUtf8Bytes(block);
+        var line = new byte[record.Length + 1];
+        record.CopyTo(line, 0);
+        line[^1] = (byte)'\n';
+        await entry.Journal.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var created = false;
+            FileStream journal;
+            try { journal = directory.OpenFile("ranges.journal", FileMode.Open, FileAccess.ReadWrite); }
+            catch (IOException exception) when (NativeFileSystem.IsMissing(exception))
+            {
+                journal = directory.OpenFile("ranges.journal", FileMode.OpenOrCreate, FileAccess.ReadWrite);
+                created = true;
+            }
+            await using (journal)
+            {
+                await RepairJournalTailAsync(journal, cancellationToken).ConfigureAwait(false);
+                var softLimit = JournalSoftLimit(identity.Length);
+                if (journal.Length >= softLimit) QueueCheckpoint(identity.Key, folder.Id);
+                if (journal.Length > softLimit + 65536 - 256) throw new IOException("Native cache journal awaits a checkpoint.");
+                journal.Position = journal.Length;
+                await journal.WriteAsync(line, cancellationToken).ConfigureAwait(false);
+                FlushToDisk(journal);
+                if (journal.Length >= softLimit) QueueCheckpoint(identity.Key, folder.Id);
+            }
+            // Later appends wait for this lock, so the new journal is durable before any of them.
+            if (created) directory.Flush();
+        }
+        finally { entry.Journal.Release(); }
+    }
+
+    private EntryCommits AcquireEntryCommits(string key)
+    {
+        lock (_leaseLock)
+        {
+            if (!_entryCommits.TryGetValue(key, out var entry)) _entryCommits[key] = entry = new EntryCommits();
+            entry.References++;
+            return entry;
+        }
+    }
+
+    private void ReleaseEntryCommits(string key, EntryCommits entry)
+    {
+        lock (_leaseLock)
+        {
+            // An entry whose new files are not durable yet is kept, so a later commit still syncs them.
+            if (--entry.References != 0 || entry.Path.Dirty || entry.Directory.Dirty) return;
+            _entryCommits.Remove(key);
+            entry.Journal.Dispose();
+        }
+    }
+
+    /// <summary>In-process coordination of concurrent block commits for one entry.</summary>
+    private sealed class EntryCommits
+    {
+        public int References;
+        /// <summary>Commits holding a catalogue reservation that is not published yet.</summary>
+        public int Reserved;
+        public long Published;
+        public SemaphoreSlim Journal { get; } = new(1, 1);
+        /// <summary>The entry directory and its parents (shard, v1, root).</summary>
+        public CreationTracker Path { get; } = new();
+        /// <summary>Files created inside the entry directory.</summary>
+        public CreationTracker Directory { get; } = new();
+    }
+
+    /// <summary>
+    /// Tracks directory entries that may not be durable yet. A commit that opened a file created
+    /// by another commit must sync the directory itself before publishing, because the creator's
+    /// sync may still be pending. Begin precedes the create call, so any commit that can see the
+    /// new name also sees it as pending.
+    /// </summary>
+    private sealed class CreationTracker
+    {
+        private readonly Lock _sync = new();
+        private int _inProgress;
+        private long _completed;
+        private long _synced;
+
+        public bool Dirty { get { lock (_sync) return _inProgress != 0 || _completed != _synced; } }
+        public void Begin() { lock (_sync) _inProgress++; }
+        public void End() { lock (_sync) { _inProgress--; _completed++; } }
+        public void Created() { lock (_sync) _completed++; }
+
+        /// <summary>The generation a sync started now covers, or null when nothing is pending.</summary>
+        public long? Pending() { lock (_sync) return _inProgress != 0 || _completed != _synced ? _completed : null; }
+
+        public void Synced(long generation) { lock (_sync) _synced = Math.Max(_synced, generation); }
     }
 
     [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
@@ -731,7 +993,7 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
         if (bytesToFetch < 0 || bytesToFetch > identity.Length) throw new ArgumentOutOfRangeException(nameof(bytesToFetch));
         using var placement = await AcquireFillAsync(identity, -1, cancellationToken).ConfigureAwait(false);
         var reservationBytes = checked(bytesToFetch + ((bytesToFetch + BlockSize - 1) / BlockSize) * (65536 + 4096));
-        var selectedWriter = await SelectWriterAsync(identity, reservationBytes, true, cancellationToken).ConfigureAwait(false);
+        var selectedWriter = await SelectWriterAsync(identity, reservationBytes, true, shared: false, cancellationToken).ConfigureAwait(false);
         if (selectedWriter is not { } selection) return null;
         try
         {

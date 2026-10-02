@@ -29,6 +29,39 @@ public sealed class NativeCacheCommitQueueTests : IDisposable
     }
 
     [Fact]
+    public async Task Queue_CommitsBlocksOfOneFileInParallel()
+    {
+        // Every commit waits until four are in flight at once: serial commits would never get there.
+        var inFlight = 0;
+        var allInFlight = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var store = CreateStore(async token =>
+        {
+            if (Interlocked.Increment(ref inFlight) >= NativeCacheCommitQueue.DefaultWorkers) allInFlight.TrySetResult();
+            await allInFlight.Task.WaitAsync(token);
+        });
+        var identity = new NativeCacheIdentity("parallel", "v1", 9L * Block);
+        var data = Pattern(9 * Block);
+        allInFlight.TrySetResult();
+        Assert.True(await store.WriteBlockAsync(identity, 0, data.AsMemory(0, Block)));
+        inFlight = 0;
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        allInFlight = gate;
+        await using var queue = new NativeCacheCommitQueue();
+        var done = Enumerable.Range(1, 8).Select(_ => new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)).ToArray();
+        for (var index = 1; index <= 8; index++)
+            Assert.True(queue.TryEnqueue(store, identity, (long)index * Block, data.AsSpan(index * Block, Block), done[index - 1].SetResult));
+        await gate.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.All(await Task.WhenAll(done.Select(item => item.Task)).WaitAsync(TimeSpan.FromSeconds(10)), result => Assert.True(result));
+        Assert.Equal(identity.Length, await store.GetCoverageAsync(identity));
+        var read = new byte[Block];
+        for (var index = 0; index < 9; index++)
+        {
+            Assert.Equal(Block, await store.ReadBlockAsync(identity, (long)index * Block, read));
+            Assert.True(read.AsSpan().SequenceEqual(data.AsSpan(index * Block, Block)));
+        }
+    }
+
+    [Fact]
     public async Task Queue_RefusesWorkBeyondItsByteBudget()
     {
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

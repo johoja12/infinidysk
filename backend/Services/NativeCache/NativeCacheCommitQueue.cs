@@ -15,13 +15,19 @@ namespace NzbWebDAV.Services.NativeCache;
 public sealed class NativeCacheCommitQueue : IAsyncDisposable
 {
     public const long DefaultCapacityBytes = 256L * 1024 * 1024;
+    /// <summary>
+    /// Blocks of one file commit in parallel, and a NAS commit is mostly fsync latency, not
+    /// bandwidth: at ~250 ms per 4 MiB block, four workers sustain ~64 MB/s per file, above a
+    /// fast single stream, while bounding concurrent NAS writes.
+    /// </summary>
+    public const int DefaultWorkers = 4;
     private readonly Channel<Item> _items = Channel.CreateUnbounded<Item>(new UnboundedChannelOptions { SingleReader = false });
     private readonly CancellationTokenSource _stopping = new();
     private readonly Task[] _workers;
     private readonly long _capacityBytes;
     private long _queuedBytes;
 
-    public NativeCacheCommitQueue(long capacityBytes = DefaultCapacityBytes, int workers = 2)
+    public NativeCacheCommitQueue(long capacityBytes = DefaultCapacityBytes, int workers = DefaultWorkers)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(capacityBytes, NativeCacheStore.BlockSize);
         ArgumentOutOfRangeException.ThrowIfLessThan(workers, 1);
