@@ -218,6 +218,26 @@ a busy cache disk. Jobs recorded before this release show "—". Select any hist
 activity row to open the same file details modal as Media Library; files without a
 Media Library record show their name, size, and cache coverage only.
 
+### Live speed and sources [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since }
+
+A running job shows its current speed (the last 20 seconds), its average so far, and an
+estimate of the time left, for example `18.4 MB/s now · 14.2 MB/s avg · ETA 4m 21s`.
+Range jobs estimate from the rest of their own range. A job that has reported no
+progress (fetching or verifying) for a minute reads **Stalled**, with how long it has
+been quiet.
+
+Each row names its concrete sources as colour-coded bubbles:
+
+- the Plex hub or collection title, for example *Popular TV This Year*;
+- **Playing now** (verified Plex playback) and **Watch history**;
+- **Next episode · realtime** and **Next episode · history** (predictions);
+- **Playback not yet cached** (backfill), **Finish partially watched**, **Manual**,
+  and **Read activity**.
+
+A hub or collection removed from the settings shows as *Selected Plex
+hub/collection*. A job requested by several sources shows two bubbles and `+N`; hover
+over `+N` to see the rest.
+
 ### Range jobs and backfill [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since }
 
 Some jobs warm only part of a file: **Playback not yet cached** (backfill),
