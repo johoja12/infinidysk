@@ -107,6 +107,8 @@ class Backend:
                         window_start, window_bytes = now, 0
         except urllib.error.HTTPError as error:
             status = error.code
+        except (OSError, TimeoutError) as error:  # reset or stalled connection: report it, keep going
+            status = f"error: {type(error).__name__}"
         elapsed = time.monotonic() - began
         return {"status": status, "bytes": received, "ttfb_s": round(first or 0, 3), "wall_s": round(elapsed, 3),
                 "mb_s": round(received / max(elapsed, 1e-9) / 1e6, 3), "windows_mb_s": windows,
