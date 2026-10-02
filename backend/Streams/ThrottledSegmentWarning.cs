@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Text;
 using Serilog;
+using Serilog.Events;
 
 namespace NzbWebDAV.Streams;
 
@@ -19,8 +20,16 @@ internal static class ThrottledSegmentWarning
     public static bool Write(
         string key,
         string messageTemplate,
+        params object?[] propertyValues) =>
+        Write(LogEventLevel.Warning, key, messageTemplate, propertyValues);
+
+    public static bool Write(
+        LogEventLevel level,
+        string key,
+        string messageTemplate,
         params object?[] propertyValues)
     {
+        if (!Log.IsEnabled(level)) return false;
         var now = DateTime.UtcNow;
         var dedupeKey = key.Normalize(NormalizationForm.FormC);
         var state = Windows.GetOrAdd(dedupeKey, static _ => new WindowState());
@@ -46,13 +55,14 @@ internal static class ThrottledSegmentWarning
 
         if (suppressed > 0)
         {
-            Log.Warning(
+            Log.Write(
+                level,
                 "Suppressed {SuppressedCount} additional warnings for {WarningKey} in the previous 60 seconds.",
                 suppressed,
                 key);
         }
 
-        Log.Warning(messageTemplate, propertyValues);
+        Log.Write(level, messageTemplate, propertyValues);
 
         if (Interlocked.Increment(ref _callCount) % 256 == 0)
             Cleanup(now);

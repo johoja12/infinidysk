@@ -1587,8 +1587,12 @@ public class MultiProviderNntpClient(
             throw;
         }
 
-        if (header is null || YencFileValidationContext.MatchesExpectedFile(header, segmentId.ToString()))
+        if (header is null) return;
+        if (YencFileValidationContext.MatchesExpectedFile(header, segmentId.ToString()))
+        {
+            YencFileValidationContext.RecordMatch();
             return;
+        }
 
         YencFileValidationContext.Current?.ReportMismatch(
             segmentId.ToString(), providerKey, response.ResponseCode, header);
@@ -1604,6 +1608,13 @@ public class MultiProviderNntpClient(
     private bool IsCachedMissing(SegmentId segmentId, MultiConnectionNntpClient provider,
         NntpOperation operation)
     {
+        // A provider that already answered this file's article with another post's data
+        // will do so again; skipping it avoids re-downloading and discarding the same body
+        // (and the connection it rode on) on every retried range.
+        if (operation is NntpOperation.Body or NntpOperation.PipelinedBody
+                or NntpOperation.Article or NntpOperation.PipelinedArticle
+            && YencFileValidationContext.IsKnownForeign(segmentId.ToString()!, provider.MetricsKey))
+            return true;
         if (articleMissCache == null) return false;
         return providerGeneration is { } generation
             && TryGetMissOperation(operation) is { } missOperation

@@ -19,6 +19,8 @@ namespace NzbWebDAV.Tests.Clients.Usenet;
 [Collection(nameof(GlobalLoggerCollection))]
 public sealed class MultiProviderNntpClientYencValidationTests
 {
+    public MultiProviderNntpClientYencValidationTests() => MismatchedArticleTracker.ResetForTests();
+
     [Fact]
     public async Task ValidationContext_Par2DeferralIsLimitedToItsCandidateAndRestoresStrictValidation()
     {
@@ -350,7 +352,7 @@ public sealed class MultiProviderNntpClientYencValidationTests
     public async Task GetFileSizeAsync_MismatchedLastSegment_UsesBackupProvider()
     {
         var sink = new CollectingLogEventSink();
-        using var logger = new LoggerConfiguration().WriteTo.Sink(sink).CreateLogger();
+        using var logger = new LoggerConfiguration().MinimumLevel.Debug().WriteTo.Sink(sink).CreateLogger();
         var previousLogger = Log.Logger;
         var segments = new Dictionary<string, byte[]>
         {
@@ -419,7 +421,7 @@ public sealed class MultiProviderNntpClientYencValidationTests
     public async Task DecodedArticleAsync_MismatchedTotalParts_UsesBackupProvider()
     {
         var sink = new CollectingLogEventSink();
-        using var logger = new LoggerConfiguration().WriteTo.Sink(sink).CreateLogger();
+        using var logger = new LoggerConfiguration().MinimumLevel.Debug().WriteTo.Sink(sink).CreateLogger();
         var previousLogger = Log.Logger;
         var innerSegments = new Dictionary<string, byte[]> { ["segment"] = [1, 2, 3] };
         using var wrongInner = new FakeNntpClient(innerSegments, useCachedYencStreams: true);
@@ -460,7 +462,7 @@ public sealed class MultiProviderNntpClientYencValidationTests
     public void ReportMismatch_LabelsRequestKindAndGeometryImpliedTotalParts()
     {
         var sink = new CollectingLogEventSink();
-        using var logger = new LoggerConfiguration().WriteTo.Sink(sink).CreateLogger();
+        using var logger = new LoggerConfiguration().MinimumLevel.Debug().WriteTo.Sink(sink).CreateLogger();
         var previousLogger = Log.Logger;
         var header = CreateHeader(partNumber: 1, totalParts: 21) with
         {
@@ -505,7 +507,7 @@ public sealed class MultiProviderNntpClientYencValidationTests
     public void ReportMismatch_DoesNotInferInconsistentLaterPartGeometry()
     {
         var sink = new CollectingLogEventSink();
-        using var logger = new LoggerConfiguration().WriteTo.Sink(sink).CreateLogger();
+        using var logger = new LoggerConfiguration().MinimumLevel.Debug().WriteTo.Sink(sink).CreateLogger();
         var previousLogger = Log.Logger;
         try
         {
@@ -664,7 +666,7 @@ public sealed class MultiProviderNntpClientYencValidationTests
     public async Task NzbFileStream_PipelinedMismatch_UsesBackupProvider()
     {
         var sink = new CollectingLogEventSink();
-        using var logger = new LoggerConfiguration().WriteTo.Sink(sink).CreateLogger();
+        using var logger = new LoggerConfiguration().MinimumLevel.Debug().WriteTo.Sink(sink).CreateLogger();
         var previousLogger = Log.Logger;
         var correctSegments = new Dictionary<string, byte[]>
         {
@@ -736,7 +738,7 @@ public sealed class MultiProviderNntpClientYencValidationTests
         file.Segments.Add(new NzbSegment { Bytes = 3, MessageId = "diagnostic-first", Number = 2 });
         file.Segments.Add(new NzbSegment { Bytes = 3, MessageId = "diagnostic-last", Number = 8 });
         var sink = new CollectingLogEventSink();
-        using var logger = new LoggerConfiguration().WriteTo.Sink(sink).CreateLogger();
+        using var logger = new LoggerConfiguration().MinimumLevel.Debug().WriteTo.Sink(sink).CreateLogger();
         var previousLogger = Log.Logger;
         try
         {
@@ -770,7 +772,7 @@ public sealed class MultiProviderNntpClientYencValidationTests
     public void MismatchDiagnostics_RedactsIdentifiersAndOnlyThrottlesIdenticalEvidence()
     {
         var sink = new CollectingLogEventSink();
-        using var logger = new LoggerConfiguration().WriteTo.Sink(sink).CreateLogger();
+        using var logger = new LoggerConfiguration().MinimumLevel.Debug().WriteTo.Sink(sink).CreateLogger();
         using var validation = YencFileValidationContext.BeginStreaming(
             ["private-anchor@example", "private-article@example"], null);
         var context = Assert.IsType<YencFileValidationContext>(YencFileValidationContext.Current);
@@ -794,7 +796,7 @@ public sealed class MultiProviderNntpClientYencValidationTests
         foreach (var warning in warnings)
         {
             Assert.Null(warning.Exception);
-            Assert.Equal(LogEventLevel.Warning, warning.Level);
+            Assert.Equal(LogEventLevel.Debug, warning.Level);
             Assert.DoesNotContain("private", warning.RenderMessage(), StringComparison.OrdinalIgnoreCase);
             Assert.Equal(1, Scalar(warning, "ReturnedPartNumber"));
             Assert.Equal(58, Scalar(warning, "ReturnedTotalParts"));
@@ -810,8 +812,9 @@ public sealed class MultiProviderNntpClientYencValidationTests
         Assert.Equal(42L, Scalar(warnings[2], "ReturnedPartOffset"));
     }
 
+    // Per-article evidence is logged at Debug; operators get one warning per file (#120).
     private static bool IsMismatchWarning(LogEvent logEvent) =>
-        logEvent.MessageTemplate.Text.StartsWith("Rejected yEnc article", StringComparison.Ordinal);
+        logEvent.MessageTemplate.Text == YencFileValidationContext.MismatchDetailTemplate;
 
     private static object? Scalar(LogEvent logEvent, string property) =>
         Assert.IsType<ScalarValue>(logEvent.Properties[property]).Value;
