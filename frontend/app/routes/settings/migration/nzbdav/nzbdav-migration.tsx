@@ -12,6 +12,7 @@ import {
   type NzbDavCorrelation,
   type NzbDavFullStatus,
 } from "./use-nzbdav-migration";
+import { RegrabFailedImports } from "./regrab-failed-imports";
 
 export type NzbDavMigrationViewProps = {
   form: NzbDavConnectForm;
@@ -346,6 +347,19 @@ export function NzbDavMigrationView(props: NzbDavMigrationViewProps) {
 
 export function NzbDavMigration() {
   const migration = useNzbDavMigration();
+  return (
+    <div className="space-y-4">
+      <NzbDavMigrationViewHost migration={migration} />
+      <RegrabFailedImports />
+    </div>
+  );
+}
+
+function NzbDavMigrationViewHost({
+  migration,
+}: {
+  migration: ReturnType<typeof useNzbDavMigration>;
+}) {
   return (
     <NzbDavMigrationView
       form={migration.form}
