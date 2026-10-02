@@ -223,6 +223,13 @@ internal static class FailedImportCleanup
         foreach (var item in journal.Entries.ToArray())
         {
             if (item.Stage is "completed" or "skipped_source_changed") continue;
+            if (item.Stage == "arr_cleanup_started" && item.ArrState?.Stage == "completed"
+                && item.ArrTarget is not null)
+            {
+                // The accepted search was saved before a crash between the two journal writes.
+                await SetStageAsync(journalPath, journal, item, "completed", ct).ConfigureAwait(false);
+                continue;
+            }
             if (item.Stage == "arr_cleanup_started" && (item.ArrTarget is null || item.ArrState is null))
                 throw new InvalidOperationException(
                     $"Cleanup of {item.DavItemId} has an uncertain external outcome; reconcile it before resuming.");
