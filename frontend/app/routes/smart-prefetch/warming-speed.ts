@@ -57,3 +57,50 @@ export function medianWarmingSpeed(jobs: readonly WarmingTiming[]): number | nul
   const middle = Math.floor(speeds.length / 2);
   return speeds.length % 2 === 1 ? speeds[middle]! : (speeds[middle - 1]! + speeds[middle]!) / 2;
 }
+
+/** Live fields a running job reports, plus what is needed to estimate the time left. */
+export type LiveWarming = WarmingTiming & {
+  recentBytesPerSecond?: number | null;
+  lastProgressAt?: number | null;
+  stalled?: boolean | null;
+  committedBytes?: number;
+  fileSize?: number | null;
+  isRangeJob?: boolean;
+  rangeBytes?: number | null;
+  rangeCachedBytes?: number | null;
+};
+
+/** Bytes the job still has to cache: its own range for range jobs, otherwise the rest of the file. */
+export function remainingBytes(job: LiveWarming): number | null {
+  if (job.isRangeJob) {
+    if (job.rangeBytes == null || job.rangeCachedBytes == null) return null;
+    return Math.max(0, job.rangeBytes - job.rangeCachedBytes);
+  }
+  if (!job.fileSize || job.committedBytes == null) return null;
+  return Math.max(0, job.fileSize - job.committedBytes);
+}
+
+/**
+ * Live status of a running job, e.g. `18.4 MB/s now · 14.2 MB/s avg · ETA 4m 10s`, or
+ * `Stalled · no progress for 1m 30s`. The current speed covers the last ~20 seconds; the ETA
+ * uses it (or the average when nothing was fetched recently).
+ */
+export function formatLiveWarming(job: LiveWarming, now: number = Date.now()): string {
+  if (job.stalled) {
+    const since = job.lastProgressAt == null ? null : Math.max(0, now - job.lastProgressAt);
+    return since === null ? "Stalled" : `Stalled · no progress for ${formatDuration(since)}`;
+  }
+  const average = warmingBytesPerSecond(job);
+  const recent =
+    job.recentBytesPerSecond != null && Number.isFinite(job.recentBytesPerSecond)
+      ? Math.max(0, job.recentBytesPerSecond)
+      : null;
+  const parts: string[] = [];
+  if (recent !== null) parts.push(`${formatSpeed(recent)} now`);
+  if (average !== null && average > 0) parts.push(`${formatSpeed(average)} avg`);
+  const rate = recent !== null && recent > 0 ? recent : average;
+  const remaining = remainingBytes(job);
+  if (rate !== null && rate > 0 && remaining !== null && remaining > 0)
+    parts.push(`ETA ${formatDuration((remaining / rate) * 1000)}`);
+  return parts.length > 0 ? parts.join(" · ") : "Measuring speed…";
+}

@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using NzbWebDAV.Config;
 using NzbWebDAV.Database;
+using NzbWebDAV.Services.Plex;
 using NzbWebDAV.Services.Prefetch;
 
 namespace NzbWebDAV.Api.Controllers.Prefetch;
@@ -8,12 +10,14 @@ namespace NzbWebDAV.Api.Controllers.Prefetch;
 [ApiController]
 [Route("api/prefetch")]
 [ProducesResponseType(typeof(PrefetchStatusResponse), StatusCodes.Status200OK)]
-public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchService policies, DavDatabaseClient database) : GetOnlyApiController
+public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchService policies, DavDatabaseClient database,
+    ConfigManager config) : GetOnlyApiController
 {
     protected override async Task<IActionResult> HandleRequest()
     {
         await runtime.WaitForInitializationAsync(HttpContext.RequestAborted).ConfigureAwait(false);
         IReadOnlyList<PrefetchJob> jobs = [];
+        IReadOnlyDictionary<string, IReadOnlyList<string>> owners = new Dictionary<string, IReadOnlyList<string>>();
         var paused = true;
         var dailyBudgetUsed = 0L;
         try
@@ -21,6 +25,7 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
             if (runtime.Healthy && runtime.Jobs is { } store)
             {
                 jobs = store.List();
+                owners = store.OwnersOf(jobs.Select(job => job.Id));
                 paused = store.Paused;
                 dailyBudgetUsed = store.GetDailyBudgetUsed();
             }
@@ -30,18 +35,29 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
         var items = (await database.GetItemsByIdsBatchedAsync(jobs.Select(job => job.ItemId).Distinct().ToArray(),
             ct: HttpContext.RequestAborted).ConfigureAwait(false)).ToDictionary(item => item.Id);
         var coverage = await runtime.GetRangeCoverageAsync(jobs, items, HttpContext.RequestAborted).ConfigureAwait(false);
+        var settings = runtime.Settings();
+        IReadOnlyList<PlexServer> servers;
+        try { servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers)); }
+        catch (ArgumentException) { servers = []; }
         return Ok(new PrefetchStatusResponse(
             runtime.Jobs is not null, runtime.InitializationError, runtime.RuntimeError, runtime.Healthy, paused,
-            jobs.Select(job => job with
+            jobs.Select(job =>
             {
-                DisplayName = items.GetValueOrDefault(job.ItemId)?.Name ?? "Removed media",
-                FileSize = items.GetValueOrDefault(job.ItemId)?.FileSize,
-                Source = PlexPrefetchService.SourceLabel(job.Trigger),
-                Reason = PlexPrefetchService.RangeReason(job.Trigger, job.Length),
-                RangeBytes = coverage.TryGetValue(job.Id, out var range) ? range.Bytes : null,
-                RangeCachedBytes = coverage.TryGetValue(job.Id, out var cached) ? cached.Cached : null
+                var (sources, count) = PlexPrefetchService.DescribeOwners(
+                    owners.GetValueOrDefault(job.Id) ?? [job.Trigger], settings, servers);
+                return job with
+                {
+                    DisplayName = items.GetValueOrDefault(job.ItemId)?.Name ?? "Removed media",
+                    FileSize = items.GetValueOrDefault(job.ItemId)?.FileSize,
+                    Source = PlexPrefetchService.SourceLabel(job.Trigger),
+                    Reason = PlexPrefetchService.RangeReason(job.Trigger, job.Length),
+                    RangeBytes = coverage.TryGetValue(job.Id, out var range) ? range.Bytes : null,
+                    RangeCachedBytes = coverage.TryGetValue(job.Id, out var cached) ? cached.Cached : null,
+                    Sources = sources,
+                    SourceCount = count,
+                };
             }).ToList(),
-            runtime.Settings(), dailyBudgetUsed, policies.LastSuccess, policies.LastError));
+            settings, dailyBudgetUsed, policies.LastSuccess, policies.LastError));
     }
 }
 
