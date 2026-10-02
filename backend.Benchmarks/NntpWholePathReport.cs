@@ -341,12 +341,20 @@ internal static class NntpWholePathReport
             store = new NativeCacheStore(Path.Join(directory.FullName, "index.db"),
                 [new NativeCacheFolder { Path = directory.FullName, MinFreeBytes = 0 }])
             {
-                BeforeWriteReserveAsync = scenario.CacheStallEveryNthWrite > 0
-                    ? token => Interlocked.Increment(ref writes) % scenario.CacheStallEveryNthWrite == 0
-                        ? Task.Delay(scenario.CacheStallMs, token) : Task.CompletedTask
+                BeforeWriteReserveAsync = scenario.CacheStallEveryNthWrite > 0 || scenario.CacheWriteDelayMs > 0
+                    ? token =>
+                    {
+                        var delay = scenario.CacheWriteDelayMs;
+                        if (scenario.CacheStallEveryNthWrite > 0
+                            && Interlocked.Increment(ref writes) % scenario.CacheStallEveryNthWrite == 0)
+                            delay += scenario.CacheStallMs;
+                        return delay > 0 ? Task.Delay(delay, token) : Task.CompletedTask;
+                    }
                     : null,
             };
-            queue = new NativeCacheCommitQueue();
+            queue = scenario.CommitQueueCapacityBytes is { } capacity
+                ? new NativeCacheCommitQueue(capacity)
+                : new NativeCacheCommitQueue();
             var backfilled = 0L;
             if (scenario.ConcurrentReaders > 1)
             {

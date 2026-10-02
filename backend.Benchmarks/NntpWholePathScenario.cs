@@ -37,6 +37,10 @@ internal sealed record NntpWholePathScenario(
     public long ReaderBytesPerSecond { get; init; } = 3_000_000;
     /// <summary>Native cache layer with concurrent readers: delay between successive players starting.</summary>
     public int ReaderStartIntervalMs { get; init; }
+    /// <summary>Native cache layer only: fixed latency added to every cache block write (a slow NAS commit).</summary>
+    public int CacheWriteDelayMs { get; init; }
+    /// <summary>Native cache layer only: commit queue byte budget; null uses the production default.</summary>
+    public long? CommitQueueCapacityBytes { get; init; }
 
     public static IReadOnlyList<NntpWholePathScenario> Quick =>
     [
@@ -109,6 +113,17 @@ internal sealed record NntpWholePathScenario(
             BufferSlots = 4,
             ReaderBytesPerSecond = 3_000_000,
             ReaderStartIntervalMs = 1500,
+        },
+        // A fast stream (~40 MB/s: 20 connections at 4 MB/s, 50 ms RTT) over a NAS where every 4 MiB block commit takes 250 ms, as
+        // measured on Synology NFS. Serial commits of one file manage ~16 MB/s, so a 64 MiB queue
+        // (a 256 MiB queue against a multi-GB file) overflows into backfill; blocks of the same
+        // file must commit in parallel for every byte to be cached by the read itself.
+        new("native-cold-256mib-fast-commit250", NntpWholePathLayer.NativeCache, false, 342, 768 * 1024, 20, 4, 50, 4_000_000, YencCrcValidationMode.Require)
+        {
+            HandshakeDelayMs = 50,
+            ArticleBufferSize = 40,
+            CacheWriteDelayMs = 250,
+            CommitQueueCapacityBytes = 64L * 1024 * 1024,
         },
     ];
 
