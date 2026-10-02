@@ -4,6 +4,7 @@ using Microsoft.Data.Sqlite;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Services.NativeCache;
 using NzbWebDAV.WebDav.Requests;
+using Serilog;
 using UsenetSharp.Streams;
 
 namespace NzbWebDAV.Streams;
@@ -26,6 +27,8 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     private NativeCacheStatistics.NativeCacheTransfer? _transfer;
     private Stream? _source;
     private long _sourceWindowEnd = -1;
+    private long _foregroundWindowBytes = SourceWindowBytes;
+    private long _reopenedFillBlock = -1;
     private long? _responseEnd;
     private byte[]? _buffer;
     private long _bufferStart = -1;
@@ -199,6 +202,8 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 }
                 catch (Exception exception) when (exception is not OperationCanceledException and not OutOfMemoryException)
                 {
+                    if (await TryReopenFillAsync(blockStart, exception).ConfigureAwait(false))
+                        return await ReadCoreAsync(destination, completeBlock, cancellationToken).ConfigureAwait(false);
                     // Read-ahead is speculative. A later missing article must not
                     // break a readable prefix/range requested by the player. Reopen
                     // without native proof/read-ahead context and use ordinary reads.
@@ -267,6 +272,8 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             }
             catch (Exception exception) when (exception is not OperationCanceledException and not OutOfMemoryException)
             {
+                if (await TryReopenFillAsync(blockStart, exception).ConfigureAwait(false))
+                    return await ReadCoreAsync(destination, completeBlock, cancellationToken).ConfigureAwait(false);
                 if (_source is not null)
                 {
                     try { await _source.DisposeAsync().ConfigureAwait(false); }
@@ -324,12 +331,49 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         catch (Exception exception) when (exception is IOException or SqliteException or UnauthorizedAccessException) { }
     }
 
+    /// <summary>
+    /// A long-lived source pipeline can fail transiently (a dropped connection or a segment
+    /// timeout far ahead of the reader). Retry the block once on a fresh, bounded pipeline
+    /// before abandoning cache fills for the rest of the response; a block that fails again
+    /// (for example a truly missing article) falls back to ordinary source reads as before.
+    /// </summary>
+    private async ValueTask<bool> TryReopenFillAsync(long blockStart, Exception exception)
+    {
+        if (_reopenedFillBlock == blockStart) return false;
+        _reopenedFillBlock = blockStart;
+        Log.Debug("Native cache fill at {Offset} reopening its source after: {Reason}", blockStart, exception.Message);
+        if (_source is not null)
+        {
+            try { await _source.DisposeAsync().ConfigureAwait(false); }
+            catch (Exception teardown) when (teardown is not OutOfMemoryException) { }
+        }
+        _source = null;
+        _sourceWindowEnd = -1;
+        _bufferStart = -1;
+        _bufferCount = 0;
+        _bufferVerified = false;
+        _activeFill?.Dispose();
+        _activeFill = null;
+        return true;
+    }
+
     private void PositionSourceForFill(Stream source, long position, bool completeBlock)
     {
         // Keep the NNTP pipeline alive across integrity blocks. Seeking even to
         // the current offset in proof context tears down its finite segment plan.
         if (source.Position == position && position < _sourceWindowEnd) return;
-        var windowBytes = _background || completeBlock ? NativeCacheStore.BlockSize : SourceWindowBytes;
+        if (!_background && !completeBlock)
+        {
+            // Each window rebuilds the NNTP pipeline from cold with lookahead bounded by the
+            // window, which caps distant providers at a handful of connections. Once a window is
+            // exhausted by sequential reading (playback, not a probe) the source stays open to the
+            // end of the response, so the pipeline is not rebuilt and its prefetch ceiling bounds
+            // lookahead as with the cache off. Any seek starts with a bounded window again.
+            _foregroundWindowBytes = source.Position == position && position == _sourceWindowEnd
+                ? long.MaxValue
+                : SourceWindowBytes;
+        }
+        var windowBytes = _background || completeBlock ? NativeCacheStore.BlockSize : _foregroundWindowBytes;
         var remaining = Math.Min(Length - position, windowBytes);
         if (_responseEnd is { } responseEnd && responseEnd > position)
         {
