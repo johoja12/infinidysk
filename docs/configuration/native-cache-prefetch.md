@@ -89,12 +89,25 @@ Foreground native I/O has a bounded wait and falls back to source reads; a stuck
 operation retains its buffer allowance until it actually finishes, so repeated NAS
 stalls cannot allocate unlimited buffers.
 
+The buffer allowance (`cache.native.writer-mb`) is split into 4 MiB block slots
+(32 MiB gives 8). A stream holds a slot only while it fills or verifies one block:
+once the block is ready the slot returns and the stream keeps just that block to
+play out, and a stream paused mid-fill gives its slot to a waiting stream. A response
+that starts on a block the cache does not have opens its source and reads its first
+bytes before taking a slot, so connection start-up never holds one. Many open streams
+therefore share a small allowance, and warming never takes the last slot. When a block cannot get a slot within about a
+second, or a cache probe or another stream's fill of the same block takes too long,
+only that block streams from the source; it is scheduled for backfill and the
+following blocks are cached as usual. `nzbdav_native_cache_buffer_slots{state}` shows
+`free` and `held` slots and the `serving` blocks streams keep; raise the allowance if
+`free` often reads zero.
+
 | Configuration key                | Purpose                                                             |
 | -------------------------------- | ------------------------------------------------------------------- |
 | `cache.mode`                     | `off`, `segment`, or `native`                                       |
 | `cache.native.folders`           | Bounded JSON array of native folder settings                        |
 | `cache.native.metadata-path`     | Direct local path for rebuildable catalogue and warming state       |
-| `cache.native.writer-mb`         | Native buffering allowance in MiB; 32 by default                    |
+| `cache.native.writer-mb`         | Native block buffer allowance in MiB (4 MiB slots); 32 by default   |
 | `smart-prefetch.settings`        | Validated policy settings JSON; automatic warming is off by default |
 | `plex.accounts` / `plex.servers` | Persisted Plex credentials, saved servers, and exact mappings       |
 

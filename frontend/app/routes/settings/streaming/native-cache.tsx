@@ -389,6 +389,12 @@ export function NativeCacheSettings({
                       setNewConfig({ ...config, "cache.native.writer-mb": event.target.value })
                     }
                   />
+                  <span className="text-xs text-base-content/60">
+                    Memory for 4 MiB blocks being filled or verified at the same time (32 MiB = 8
+                    blocks). A stream uses a slot only while it fills or verifies a block, so many
+                    streams share a small budget. Raise it if the free buffer slots metric often
+                    reads zero.
+                  </span>
                 </label>
               </ManagedSetting>
               <ManagedSetting configKey="cache.native.min-file-mb">
