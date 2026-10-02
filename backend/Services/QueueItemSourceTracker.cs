@@ -19,6 +19,9 @@ public class QueueItemSourceTracker
         _profileFlowItems[queueItemId] = 0;
     }
 
+    /// <summary>True while the item is marked as profile-flow; does not consume the marker.</summary>
+    public bool IsProfileFlow(Guid queueItemId) => _profileFlowItems.ContainsKey(queueItemId);
+
     /// <summary>
     /// Consume the marker. Returns true if the item was previously marked as
     /// profile-flow; removes it from the set either way.

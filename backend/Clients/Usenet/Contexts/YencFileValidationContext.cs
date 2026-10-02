@@ -23,6 +23,8 @@ internal sealed class YencFileValidationContext : IDisposable
     private readonly Lazy<Dictionary<string, int>> _positionIndex;
     private readonly bool _deferToPar2Proof;
     private readonly string? _fileName;
+    private readonly bool _ownerLogsOutcome;
+    private int _reportedMismatches;
     private string? _trackerKey;
 
     private YencFileValidationContext(
@@ -32,9 +34,11 @@ internal sealed class YencFileValidationContext : IDisposable
         string[]? segmentIds = null,
         string[][]? segmentFallbacks = null,
         bool deferToPar2Proof = false,
-        string? fileName = null)
+        string? fileName = null,
+        bool ownerLogsOutcome = false)
     {
         _fileName = string.IsNullOrWhiteSpace(fileName) ? null : fileName;
+        _ownerLogsOutcome = ownerLogsOutcome;
         ExpectedTotalParts = expectedTotalParts;
         Stage = stage;
         _file = file;
@@ -59,6 +63,17 @@ internal sealed class YencFileValidationContext : IDisposable
         || (requestedId is not null
             && Current!.GetRequestDetails(requestedId).Position is { } position
             && HasSelfContradictoryTotal(header, position));
+
+    /// <summary>
+    /// True when <paramref name="header"/>'s yEnc total is consistent with a posted file of
+    /// <paramref name="expectedTotalParts"/> articles read at <paramref name="position"/>, with
+    /// the same tolerances <see cref="MatchesExpectedFile"/> applies inside a validation scope.
+    /// </summary>
+    internal static bool MatchesTotal(UsenetYencHeader header, int expectedTotalParts, int position) =>
+        (expectedTotalParts == 1 && header.TotalParts == 0)
+        || (header.HasTotalParts == false && header.TotalParts == 0)
+        || header.TotalParts == expectedTotalParts
+        || HasSelfContradictoryTotal(header, position);
 
     // Some posters obfuscate total/size; a part at its requested ordinal whose own geometry
     // cannot yield that total carries no evidence of belonging to another post.
@@ -96,6 +111,27 @@ internal sealed class YencFileValidationContext : IDisposable
             deferToPar2Proof: Current?._deferToPar2Proof == true
                 && ReferenceEquals(Current._segmentIds, segmentIds),
             fileName: fileName);
+
+    /// <summary>
+    /// Scope for sampled article-content verification of an imported file. Foreign answers
+    /// are rejected per provider exactly as during streaming, but the verifier owns the
+    /// operator-facing log line (one per file), so the per-file mismatch warnings stay quiet.
+    /// </summary>
+    internal static YencFileValidationContext BeginContentVerification(
+        string[] segmentIds, string[][]? segmentFallbacks, string? fileName = null) =>
+        new YencFileValidationContext(
+            segmentIds.Length, "ContentVerification", segmentIds: segmentIds,
+            segmentFallbacks: segmentFallbacks, fileName: fileName, ownerLogsOutcome: true);
+
+    /// <summary>
+    /// Scope for PAR2 repair source reads: another post's article is rejected on each provider
+    /// (so a provider holding this file's own article can still serve it) and otherwise
+    /// surfaces as a missing article, which repair reconstructs from recovery blocks.
+    /// </summary>
+    internal static IDisposable BeginRepairSourceRead(string[] segmentIds, string? fileName = null) =>
+        new YencFileValidationContext(
+            segmentIds.Length, "Par2RepairSource", segmentIds: segmentIds, fileName: fileName,
+            ownerLogsOutcome: true);
 
     internal static IDisposable BeginBufferedPar2ProofRead(
         string[] segmentIds, string[][]? segmentFallbacks, string? fileName = null) =>
@@ -178,8 +214,16 @@ internal sealed class YencFileValidationContext : IDisposable
         return (null, null, null);
     }
 
+    /// <summary>
+    /// How many provider answers inside this scope were rejected as another post's article.
+    /// Lets a caller tell "some provider served a foreign body, the rest had nothing" apart
+    /// from a plain miss, since the provider walk reports whichever outcome came last.
+    /// </summary>
+    public int ReportedMismatches => Volatile.Read(ref _reportedMismatches);
+
     public void ReportMismatch(string requestedId, string providerKey, int responseCode, UsenetYencHeader header)
     {
+        Interlocked.Increment(ref _reportedMismatches);
         var (fileAnchor, position, nzbNumber) = GetRequestDetails(requestedId);
         var requestedIdKind = position is null ? "Unknown" : IsPrimaryRequest(requestedId, position) ? "Primary" : "Fallback";
         var geometryImpliedTotalParts = GetGeometryImpliedTotalParts(header);
@@ -208,6 +252,9 @@ internal sealed class YencFileValidationContext : IDisposable
             (foreignArticles, rejections, verdictReached) = MismatchedArticleTracker.RecordForeign(
                 fileKey, NormalizeMessageId(requestedId), providerKey);
         }
+
+        // Verification and repair scopes report one outcome line per file themselves.
+        if (_ownerLogsOutcome) return;
 
         var fileName = DisplayFileName ?? "an unnamed file";
         if (verdictReached)

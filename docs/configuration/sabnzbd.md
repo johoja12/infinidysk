@@ -62,6 +62,31 @@ container headers and short reads before Sonarr or Radarr begin import. It does
 not replace streaming corruption detection or PAR2 repair: damage limited to
 the middle of a release can only be detected when that part is read.
 
+## Article content verification [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since }
+
+STAT and the existence checks above only prove that *an* article exists for each
+message-id. Some posting tools reuse message-ids, so a provider can serve another
+upload's article under a release's id; that release looks healthy until playback
+reaches the damaged part.
+
+Every SAB import (including NzbDav migration imports) therefore samples the
+articles of each media file it mounts — the first and last article plus about 1%
+spread across the file, at least 8 and at most 32 per file — and reads each
+article only far enough to parse its yEnc header. The header must name the
+expected part number, the file's article count, and a byte range that fits that
+part. A provider that returns another post's article is skipped for one that
+holds the release's own article.
+
+If any sampled article belongs to a different post, the import fails into SAB
+history with a message such as
+`Release damaged on Usenet: 1 of 28 sampled articles belong to a different post (…)`,
+so Sonarr or Radarr can blocklist the release and grab another. PAR2 files,
+samples, NFOs and other files that are not mounted as library media are never
+sampled, and a missing sampled article does not fail the import on its own (the
+existence checks above own that policy). Play-on-demand imports use the lighter
+4–12 article sample. There is no setting for this check: it costs a few dozen
+article reads per imported media file.
+
 ## API-key rotation [since 1.2.5](https://github.com/infinidysk/infinidysk/releases/tag/v1.2.5){ .nzbdav-since }
 
 After rotating `api.key`, update the API key in every configured Sonarr/Radarr
