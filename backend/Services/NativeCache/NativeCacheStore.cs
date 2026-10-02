@@ -1054,6 +1054,22 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
         finally { _gate.Release(); }
     }
 
+    /// <summary>First catalogued block offset in [start, end), or end when the whole span is uncached.</summary>
+    [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
+    public async Task<long> FindNextCachedOffsetAsync(NativeCacheIdentity identity, long start, long end, CancellationToken cancellationToken = default)
+    {
+        if (start < 0 || end < start || end > identity.Length || start % BlockSize != 0)
+            throw new ArgumentOutOfRangeException(nameof(start));
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            using var command = Command("SELECT MIN(Offset) FROM Blocks WHERE Key=$key AND Offset>=$start AND Offset<$end",
+                ("$key", identity.Key), ("$start", start), ("$end", end));
+            return command.ExecuteScalar() is long offset ? offset : end;
+        }
+        finally { _gate.Release(); }
+    }
+
     [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
     public async Task<long> GetMissingRangeBytesAsync(NativeCacheIdentity identity, long start, long end, CancellationToken cancellationToken = default)
     {
