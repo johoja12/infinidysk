@@ -4,6 +4,7 @@ using System.Text.Json;
 using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Clients.Usenet.Connections;
 using NzbWebDAV.Models;
+using NzbWebDAV.Services.NativeCache;
 using NzbWebDAV.Streams;
 using UsenetSharp.Clients;
 using UsenetSharp.Models;
@@ -166,6 +167,9 @@ internal static class NntpWholePathReport
                         scenario, server.Port, corpus, callbackCounts, budget, verifyHash, httpLike,
                         responseCopyChunkBytes, startedTimestamp)
                     .ConfigureAwait(false),
+                NntpWholePathLayer.NativeCache => await ReadNativeCacheAsync(
+                        scenario, server.Port, corpus, budget, verifyHash, responseCopyChunkBytes, startedTimestamp)
+                    .ConfigureAwait(false),
                 _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
             };
             started.Stop();
@@ -298,6 +302,54 @@ internal static class NntpWholePathReport
 
         await stream.CopyToAsync(Stream.Null, CancellationToken.None).ConfigureAwait(false);
         return new ReadResult(corpus.ExpectedBytes, null, null);
+    }
+
+    /// <summary>
+    /// Streams the corpus through Native Cache read-through exactly as an uncached WebDAV GET
+    /// does, then requires every byte to have been committed to the cache by the same read.
+    /// </summary>
+    private static async Task<ReadResult> ReadNativeCacheAsync(
+        NntpWholePathScenario scenario,
+        int port,
+        NntpLoopbackCorpus corpus,
+        InFlightArticleBudget budget,
+        bool verifyHash,
+        int responseCopyChunkBytes,
+        long copyStartedTimestamp)
+    {
+        using var provider = CreateProvider(scenario, port);
+        var directory = Directory.CreateTempSubdirectory("native-cold-");
+        try
+        {
+            var ids = corpus.Articles.Select(article => article.SegmentId).ToArray();
+            var size = (long)scenario.DecodedArticleBytes;
+            var ranges = Enumerable.Range(0, ids.Length)
+                .Select(index => new LongRange(index * size, (index + 1) * size)).ToArray();
+            var identity = new NativeCacheIdentity("benchmark", "v1", corpus.ExpectedBytes);
+            await using var store = new NativeCacheStore(Path.Join(directory.FullName, "index.db"),
+                [new NativeCacheFolder { Path = directory.FullName, MinFreeBytes = 0 }]);
+            ReadResult result;
+            await using (var stream = new NativeCachedStream(store, identity,
+                _ => Task.FromResult<Stream>(new NzbFileStream(ids, corpus.ExpectedBytes, provider,
+                    scenario.ArticleBufferSize ?? Math.Max(scenario.BatchWidth * 2, 4), ranges,
+                    usePipelinedBodyRequests: true, fileName: "loopback.bin", inFlightArticleBudget: budget,
+                    streamingBodyBatchWidth: scenario.BatchWidth, segmentByteRangesTrusted: true)),
+                () => true, writeBehind: true))
+            {
+                var sink = new HttpLikeCountingSink(responseCopyChunkBytes, copyStartedTimestamp);
+                var sha256 = await sink.CopyFromAsync(stream, verifyHash, CancellationToken.None).ConfigureAwait(false);
+                result = new ReadResult(sink.BytesWritten, sha256, sink.TimeToFirstByte);
+            }
+            var cached = await store.GetCoverageAsync(identity).ConfigureAwait(false);
+            if (cached != corpus.ExpectedBytes)
+                throw new InvalidOperationException(
+                    $"Native cache committed {cached}/{corpus.ExpectedBytes} bytes during the uncached read.");
+            return result;
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
     }
 
 #pragma warning disable CA2000 // MultiProviderNntpClient owns and disposes its MultiConnectionNntpClient and pool.

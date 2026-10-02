@@ -8,6 +8,7 @@ internal enum NntpWholePathLayer
     Provider,
     BufferedStream,
     HttpLike,
+    NativeCache,
 }
 
 internal sealed record NntpWholePathScenario(
@@ -63,6 +64,21 @@ internal sealed record NntpWholePathScenario(
         },
     ];
 
+    /// <summary>
+    /// Uncached playback while Native Cache commits every byte: NativeCachedStream over
+    /// NzbFileStream, as a WebDAV GET sees it. Each response waits 250 ms and connections
+    /// are capped at 4 MB/s (~1.7 MB/s per connection for 768 KiB articles, like distant
+    /// providers), so throughput tracks how many connections the stream keeps busy.
+    /// </summary>
+    public static IReadOnlyList<NntpWholePathScenario> NativeCold =>
+    [
+        new("native-cold-256mib-rtt250-w4", NntpWholePathLayer.NativeCache, false, 342, 768 * 1024, 40, 4, 250, 4_000_000, YencCrcValidationMode.Require)
+        {
+            HandshakeDelayMs = 250,
+            ArticleBufferSize = 40,
+        },
+    ];
+
     public static IReadOnlyList<NntpWholePathScenario> ForSet(string set) =>
         set.Equals("quick", StringComparison.OrdinalIgnoreCase)
             ? Quick
@@ -72,7 +88,9 @@ internal sealed record NntpWholePathScenario(
                     ? Profile
                     : set.Equals("cold", StringComparison.OrdinalIgnoreCase)
                         ? Cold
-                        : throw new ArgumentException(
-                            "--set must be 'quick', 'sustained', 'profile', or 'cold'.",
-                            nameof(set));
+                        : set.Equals("native-cold", StringComparison.OrdinalIgnoreCase)
+                            ? NativeCold
+                            : throw new ArgumentException(
+                                "--set must be 'quick', 'sustained', 'profile', 'cold', or 'native-cold'.",
+                                nameof(set));
 }
