@@ -94,7 +94,7 @@ public sealed class PrometheusMetrics
     private readonly Counter _segmentCacheTemporaryFilesCleaned;
     private readonly HashSet<string> _providerKeys = new(StringComparer.Ordinal);
     private readonly Counter _nativeHits, _nativeHitBytes, _nativeMisses, _nativeCommitted, _nativeFallbacks, _nativeTimeouts;
-    private readonly Gauge _nativeReserved, _nativeReady;
+    private readonly Gauge _nativeReserved, _nativeReady, _nativeBufferSlots;
     private readonly Histogram _nativePhase;
     private readonly Counter _nativeSkips;
 
@@ -108,6 +108,9 @@ public sealed class PrometheusMetrics
         _nativeFallbacks = metrics.CreateCounter("nzbdav_native_cache_fallbacks_total", "Native cache source fallbacks.");
         _nativeTimeouts = metrics.CreateCounter("nzbdav_native_cache_timeouts_total", "Bounded native IO wait timeouts.");
         _nativeReserved = metrics.CreateGauge("nzbdav_native_cache_buffer_reserved_bytes", "Native buffer admission retained, including detached IO.");
+        _nativeBufferSlots = metrics.CreateGauge("nzbdav_native_cache_buffer_slots",
+            "Native 4 MiB block buffers by state: held slots (a block being filled or verified, or detached IO), free slots, and serving (ready blocks streams keep outside the slot budget).",
+            new GaugeConfiguration { LabelNames = ["state"] });
         _nativeReady = metrics.CreateGauge("nzbdav_native_cache_ready", "Native catalogue initialized; not proof that every volume is online.");
         _nativePhase = metrics.CreateHistogram("nzbdav_native_cache_phase_seconds",
             "Native cache IO phase duration (thread-pool start delay, waits, NAS write/fsync, catalogue commit).",
@@ -385,6 +388,13 @@ public sealed class PrometheusMetrics
         _nativePhase.WithLabels(phase).Observe(elapsed.TotalSeconds);
 
     public void RecordNativeCacheSkip(string reason) => _nativeSkips.WithLabels(reason).Inc();
+
+    public void SetNativeCacheBufferSlots(int free, int held, int serving = 0)
+    {
+        _nativeBufferSlots.WithLabels("free").Set(free);
+        _nativeBufferSlots.WithLabels("held").Set(held);
+        _nativeBufferSlots.WithLabels("serving").Set(serving);
+    }
 
     public void SetNativeCache(NativeCache.NativeCacheSnapshot snapshot, long reservedBytes, bool ready)
     {

@@ -14,11 +14,7 @@ public sealed class NativeCacheService : IAsyncDisposable
 {
     private readonly IBlobStore _blobs;
     private readonly RepairPatchStore _repairs;
-    [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "CA2213", Justification = "Managed-only semaphore: detached filesystem operations retain admissions after shutdown and must still release them. AvailableWaitHandle is never used.")]
-    private readonly SemaphoreSlim? _bufferSlots;
-    [System.Diagnostics.CodeAnalysis.SuppressMessage("Usage", "CA2213", Justification = "Detached IO retains managed-only admission through shutdown.")]
-    private readonly SemaphoreSlim _hitSlot = new(1, 1);
-    private readonly int _capacity;
+    private readonly NativeBufferSlots? _bufferSlots;
     private readonly object _lifetimeGate = new();
     private Task _initialization = Task.CompletedTask;
     private Task _cleanup = Task.CompletedTask;
@@ -45,8 +41,7 @@ public sealed class NativeCacheService : IAsyncDisposable
             ActiveSettings = NativeCacheSettings.FromConfig(config);
             if (!ActiveSettings.Folders.Any(folder => folder.Enabled))
                 throw new ArgumentException("Configure at least one enabled native cache folder.");
-            _capacity = Math.Max(1, ActiveSettings.BufferMb / 4);
-            _bufferSlots = new SemaphoreSlim(Math.Max(1, _capacity - 1), _capacity);
+            _bufferSlots = new NativeBufferSlots(NativeBufferSlots.CapacityFor(ActiveSettings.BufferMb));
             _initialization = Task.Run(() => InitializeStoreAsync(ActiveSettings, storeFactory));
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or SqliteException or ArgumentException)
@@ -76,7 +71,10 @@ public sealed class NativeCacheService : IAsyncDisposable
         var id = item.Id;
         return (offset, length) => BackfillSink?.Invoke(id, offset, length);
     }
-    public long ReservedBufferBytes => _bufferSlots is null ? 0 : (Math.Max(1, _capacity - 1) - _bufferSlots.CurrentCount + (_capacity > 1 ? 1 - _hitSlot.CurrentCount : 0)) * (long)NativeCacheStore.BlockSize;
+    public long ReservedBufferBytes => _bufferSlots?.HeldBytes ?? 0;
+
+    /// <summary>Block buffer slots shared by every Native Cache stream; null when the cache is inactive.</summary>
+    public NativeBufferSlots? BufferSlots => _bufferSlots;
 
     private async Task InitializeStoreAsync(NativeCacheSettings settings, Func<NativeCacheSettings, NativeCacheStore> factory)
     {
@@ -139,11 +137,12 @@ public sealed class NativeCacheService : IAsyncDisposable
             return await open(cancellationToken).ConfigureAwait(false);
         }
 
-        var admitted = _bufferSlots.Wait(0);
-        if (!admitted && requireNative)
+        // Streams take a buffer slot per block, not per response, so playback is always admitted.
+        // Warming is deferred up front when it could not take one now.
+        if (requireNative && !_bufferSlots.CanAdmitBackground())
             throw new InvalidOperationException("Native cache admission is unavailable; no source bytes were requested.");
         var watch = ContentRevisionTracker.Watch(blobId);
-        IDisposable? admission = admitted ? new AdmissionLease(_bufferSlots, watch) : watch;
+        ContentRevisionTracker.RevisionWatch? owned = watch;
         try
         {
             var identityStarted = Stopwatch.GetTimestamp();
@@ -152,18 +151,10 @@ public sealed class NativeCacheService : IAsyncDisposable
                 elapsed: Stopwatch.GetElapsedTime(identityStarted));
             if (current is { } cached)
             {
-                if (!admitted)
-                {
-                    var overflow = new NativeCacheOverflowStream(store, cached.Identity, open,
-                        () => watch.IsCurrent && cached.Revision.IsCurrent, watch, _capacity > 1 ? _hitSlot : _bufferSlots, Statistics,
-                        BackfillFor(item));
-                    admission = null;
-                    return overflow;
-                }
                 var stream = new NativeCachedStream(store, cached.Identity, open,
-                    () => watch.IsCurrent && cached.Revision.IsCurrent, admission, background: requireNative, statistics: Statistics, writeBehind: true,
-                    commitQueue: Volatile.Read(ref _commitQueue), backfill: requireNative ? null : BackfillFor(item));
-                admission = null; // The returned stream owns the watch and buffer admission.
+                    () => watch.IsCurrent && cached.Revision.IsCurrent, _bufferSlots, background: requireNative, statistics: Statistics, writeBehind: true,
+                    commitQueue: Volatile.Read(ref _commitQueue), backfill: requireNative ? null : BackfillFor(item), ownedResource: watch);
+                owned = null; // The returned stream owns the watch.
                 return stream;
             }
         }
@@ -173,7 +164,7 @@ public sealed class NativeCacheService : IAsyncDisposable
             // Only cache metadata failures fall back. A failure opening the actual
             // source below must not be mistaken for a cache failure and retried.
         }
-        finally { admission?.Dispose(); }
+        finally { owned?.Dispose(); }
         if (requireNative) throw new InvalidOperationException("Native cache metadata is unavailable; no source bytes were requested.");
         return await open(cancellationToken).ConfigureAwait(false);
     }
@@ -304,18 +295,7 @@ public sealed class NativeCacheService : IAsyncDisposable
         }
         try { await _cleanup.WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false); }
         catch (TimeoutException) { /* A stuck NAS must not hold host shutdown; cleanup remains owned. */ }
-        // Active response leases can finish during host shutdown. SemaphoreSlim has
-        // no native handle here; let remaining leases release it before collection.
-    }
-
-    private sealed class AdmissionLease(SemaphoreSlim slots, ContentRevisionTracker.RevisionWatch watch) : IDisposable
-    {
-        private int _disposed;
-        public void Dispose()
-        {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-            watch.Dispose();
-            slots.Release();
-        }
+        // Active response leases can finish during host shutdown. Buffer slots have
+        // no native handle; let remaining leases release them before collection.
     }
 }

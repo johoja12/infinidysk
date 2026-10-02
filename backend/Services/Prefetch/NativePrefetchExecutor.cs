@@ -65,6 +65,10 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
             warmed => unreportedWarmed += warmed).ConfigureAwait(false);
         jobs.RecordVerified(job.ItemId, cached.Identity.Generation, job.Start, job.Length);
         }
+        catch (NativeCacheBusyException)
+        {
+            throw new PrefetchDeferredException("Native cache buffers are busy with playback; warming resumes later.");
+        }
         catch (Exception exception) when (exception is not OutOfMemoryException && (wireBudget.Exceeded || jobs.WireBudgetBlocked) && !ct.IsCancellationRequested)
         {
             throw new PrefetchDeferredException(wireBudget.AccountingFailed || jobs.WireBudgetBlocked

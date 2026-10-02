@@ -5,7 +5,9 @@ using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Clients.Usenet.Connections;
 using NzbWebDAV.Models;
 using NzbWebDAV.Services.NativeCache;
+using NzbWebDAV.Services.Observability;
 using NzbWebDAV.Streams;
+using NzbWebDAV.WebDav.Requests;
 using UsenetSharp.Clients;
 using UsenetSharp.Models;
 
@@ -321,6 +323,11 @@ internal static class NntpWholePathReport
     {
         using var provider = CreateProvider(scenario, port);
         var directory = Directory.CreateTempSubdirectory("native-cold-");
+        // Counts why blocks went uncached, for the failure message below.
+        var registry = Prometheus.Metrics.NewCustomRegistry();
+        var metrics = new PrometheusMetrics(registry);
+        var previousMetrics = PrometheusMetrics.Current;
+        PrometheusMetrics.Current = metrics;
         NativeCacheStore? store = null;
         NativeCacheCommitQueue? queue = null;
         try
@@ -349,23 +356,44 @@ internal static class NntpWholePathReport
                 ? new NativeCacheCommitQueue(capacity)
                 : new NativeCacheCommitQueue();
             var backfilled = 0L;
-            var stream = new NativeCachedStream(store, identity,
+            if (scenario.ConcurrentReaders > 1)
+            {
+                // The store does not queue a brand-new entry's first commit behind another write
+                // (writer_busy), so concurrent readers of an uncatalogued file would race to create
+                // it. Catalogue the file's short tail block first, as for a file played before.
+                var tail = (corpus.ExpectedBytes - 1) / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize;
+                if (!await store.WriteBlockAsync(identity, tail, corpus.DecodedFile.AsMemory(checked((int)tail)))
+                        .ConfigureAwait(false))
+                    throw new InvalidOperationException("Could not catalogue the benchmark file.");
+            }
+            var slots = scenario.BufferSlots > 0 ? new NativeBufferSlots(scenario.BufferSlots) : null;
+            var (cacheStore, commitQueue) = (store, queue);
+            NativeCachedStream CreateStream() => new(cacheStore, identity,
                 _ => Task.FromResult<Stream>(new NzbFileStream(ids, corpus.ExpectedBytes, provider,
                     scenario.ArticleBufferSize ?? Math.Max(scenario.BatchWidth * 2, 4), ranges,
                     usePipelinedBodyRequests: true, fileName: "loopback.bin", inFlightArticleBudget: budget,
                     streamingBodyBatchWidth: scenario.BatchWidth, segmentByteRangesTrusted: true)),
-                () => true, writeBehind: true, commitQueue: queue,
+                () => true, slots, writeBehind: true, commitQueue: commitQueue,
                 backfill: (_, length) => Interlocked.Add(ref backfilled, length));
+            var streams = Enumerable.Range(0, Math.Max(1, scenario.ConcurrentReaders)).Select(_ => CreateStream()).ToArray();
             ReadResult result;
             try
             {
-                var sink = new HttpLikeCountingSink(responseCopyChunkBytes, copyStartedTimestamp);
-                var sha256 = await sink.CopyFromAsync(stream, verifyHash, CancellationToken.None).ConfigureAwait(false);
-                result = new ReadResult(sink.BytesWritten, sha256, sink.TimeToFirstByte);
+                if (streams.Length == 1)
+                {
+                    var sink = new HttpLikeCountingSink(responseCopyChunkBytes, copyStartedTimestamp);
+                    var sha256 = await sink.CopyFromAsync(streams[0], verifyHash, CancellationToken.None).ConfigureAwait(false);
+                    result = new ReadResult(sink.BytesWritten, sha256, sink.TimeToFirstByte);
+                }
+                else
+                {
+                    result = await ReadSlicesAsync(streams, corpus, verifyHash, responseCopyChunkBytes, copyStartedTimestamp,
+                        scenario.ReaderBytesPerSecond, scenario.ReaderStartIntervalMs).ConfigureAwait(false);
+                }
             }
             catch
             {
-                await stream.DisposeAsync().ConfigureAwait(false);
+                foreach (var stream in streams) await stream.DisposeAsync().ConfigureAwait(false);
                 throw;
             }
             // The client has every byte here, as when an HTTP response finishes sending before its
@@ -380,16 +408,17 @@ internal static class NntpWholePathReport
                 {
                     try
                     {
-                        await stream.DisposeAsync().ConfigureAwait(false);
+                        foreach (var stream in streams) await stream.DisposeAsync().ConfigureAwait(false);
                         await ownedQueue.DisposeAsync().ConfigureAwait(false);
                         var cached = await ownedStore.GetCoverageAsync(identity).ConfigureAwait(false);
                         if (cached != corpus.ExpectedBytes || backfilled != 0)
                             throw new InvalidOperationException(
                                 $"Native cache committed {cached}/{corpus.ExpectedBytes} bytes during the uncached read " +
-                                $"({backfilled} bytes deferred to backfill).");
+                                $"({backfilled} bytes deferred to backfill). Skips: {await SkipReasonsAsync(registry).ConfigureAwait(false)}");
                     }
                     finally
                     {
+                        if (ReferenceEquals(PrometheusMetrics.Current, metrics)) PrometheusMetrics.Current = previousMetrics;
                         await ownedStore.DisposeAsync().ConfigureAwait(false);
                         directory.Delete(recursive: true);
                     }
@@ -398,6 +427,7 @@ internal static class NntpWholePathReport
         }
         catch
         {
+            if (ReferenceEquals(PrometheusMetrics.Current, metrics)) PrometheusMetrics.Current = previousMetrics;
             if (queue is not null) await queue.DisposeAsync().ConfigureAwait(false);
             if (store is not null) await store.DisposeAsync().ConfigureAwait(false);
             directory.Delete(recursive: true);
@@ -405,6 +435,79 @@ internal static class NntpWholePathReport
         }
     }
 #pragma warning restore CA2000
+
+    private static async Task<string> SkipReasonsAsync(Prometheus.CollectorRegistry registry)
+    {
+        using var output = new MemoryStream();
+        await registry.CollectAndExportAsTextAsync(output).ConfigureAwait(false);
+        return string.Join(", ", System.Text.Encoding.UTF8.GetString(output.ToArray()).Split('\n')
+            .Where(line => line.StartsWith("nzbdav_native_cache_skipped_total{", StringComparison.Ordinal) || line.Contains("buffer_admission\"} ", StringComparison.Ordinal)));
+    }
+
+    /// <summary>
+    /// Concurrent players: each stream reads its own block-aligned slice of the file as a ranged
+    /// response at a steady playback rate, so readers share buffer slots and connections but never
+    /// fill the same block. A reader that falls well behind its rate fails the run as stalled.
+    /// </summary>
+    private static readonly TimeSpan MaxPlayerStall = TimeSpan.FromSeconds(3);
+
+    private static async Task<ReadResult> ReadSlicesAsync(
+        NativeCachedStream[] streams,
+        NntpLoopbackCorpus corpus,
+        bool verifyHash,
+        int responseCopyChunkBytes,
+        long copyStartedTimestamp,
+        long paceBytesPerSecond,
+        int startIntervalMs)
+    {
+        var blocksPerReader = corpus.ExpectedBytes / NativeCacheStore.BlockSize / streams.Length;
+        if (blocksPerReader == 0) throw new InvalidOperationException("The corpus is too small for this many readers.");
+        var slices = await Task.WhenAll(streams.Select((stream, index) => Task.Run(async () =>
+        {
+            var start = index * blocksPerReader * NativeCacheStore.BlockSize;
+            var end = index == streams.Length - 1 ? corpus.ExpectedBytes : start + blocksPerReader * NativeCacheStore.BlockSize;
+            await Task.Delay(index * startIntervalMs).ConfigureAwait(false);
+            RangeContext.SetReadBudget(end - start);
+            stream.Position = start;
+            var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(responseCopyChunkBytes);
+            try
+            {
+                TimeSpan? firstByte = null;
+                var playing = Stopwatch.StartNew();
+                var matches = true;
+                var position = start;
+                while (position < end)
+                {
+                    var read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(responseCopyChunkBytes, end - position)))
+                        .ConfigureAwait(false);
+                    if (read == 0) break;
+                    if (firstByte is null)
+                    {
+                        firstByte = Stopwatch.GetElapsedTime(copyStartedTimestamp);
+                        playing.Restart();
+                    }
+                    if (verifyHash)
+                        matches &= buffer.AsSpan(0, read).SequenceEqual(corpus.DecodedFile.AsSpan(checked((int)position), read));
+                    position += read;
+                    var ahead = TimeSpan.FromSeconds((double)(position - start) / paceBytesPerSecond) - playing.Elapsed;
+                    if (ahead > TimeSpan.Zero) await Task.Delay(ahead).ConfigureAwait(false);
+                }
+                // Playback time beyond the slice's duration at the target rate is time the player stalled.
+                var stalled = playing.Elapsed - TimeSpan.FromSeconds((double)(position - start) / paceBytesPerSecond);
+                return (Bytes: position - start, Matches: matches, FirstByte: firstByte, Stalled: stalled);
+            }
+            finally { System.Buffers.ArrayPool<byte>.Shared.Return(buffer); }
+        }))).ConfigureAwait(false);
+        var worst = slices.Max(slice => slice.Stalled);
+        if (worst > MaxPlayerStall)
+            throw new InvalidOperationException($"A player stalled for {worst.TotalSeconds:F1} s behind its playback rate.");
+        var total = slices.Sum(slice => slice.Bytes);
+        // Every slice compared byte for byte against the corpus stands in for the whole-file hash.
+        var sha256 = verifyHash
+            ? slices.All(slice => slice.Matches) && total == corpus.ExpectedBytes ? corpus.ExpectedSha256 : "mismatch"
+            : null;
+        return new ReadResult(total, sha256, slices.Min(slice => slice.FirstByte));
+    }
 
 #pragma warning disable CA2000 // MultiProviderNntpClient owns and disposes its MultiConnectionNntpClient and pool.
     private static MultiProviderNntpClient CreateProvider(NntpWholePathScenario scenario, int port)

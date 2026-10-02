@@ -81,7 +81,7 @@ public sealed class NativeCacheServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task SaturatedStreams_StillServeCachedBytesWithoutOpeningSource()
+    public async Task ManyOpenStreams_ServeCachedBytesAndHoldNoBufferBetweenBlocks()
     {
         using var blobs = new FileBlobStore();
         var blobId = Guid.NewGuid();
@@ -94,12 +94,19 @@ public sealed class NativeCacheServiceTests : IDisposable
         var streams = new List<Stream>();
         try
         {
+            // Far more open responses than the 8 buffer slots: every one is a cached read, and a
+            // finished block returns its slot even while its response stays open.
             for (var i = 0; i < 20; i++) streams.Add(await service.WrapAsync(item,
                 _ => throw new InvalidOperationException("Cache hit opened source"), CancellationToken.None));
-            foreach (var stream in streams) Assert.Equal(3, await stream.ReadAsync(new byte[3]));
-            foreach (var stream in streams.Where(stream => stream is NativeCachedStream)) await stream.DisposeAsync();
-            Assert.Equal(0, await service.Store!.EvictAsync("media", clear: true));
-            Assert.True(service.ReservedBufferBytes <= service.ActiveSettings!.BufferMb * 1024L * 1024);
+            Assert.All(streams, stream => Assert.IsType<NativeCachedStream>(stream));
+            foreach (var stream in streams)
+            {
+                Assert.Equal(3, await stream.ReadAsync(new byte[3]));
+                Assert.True(((NativeCachedStream)stream).LastReadCacheable);
+                Assert.Equal(0, service.ReservedBufferBytes);
+            }
+            Assert.Equal(0, await service.Store!.EvictAsync("media", clear: true)); // Open responses keep the entry.
+            Assert.Equal(service.BufferSlots!.Capacity, service.BufferSlots.Free);
         }
         finally { foreach (var stream in streams) await stream.DisposeAsync(); }
         Assert.Equal(0, service.ReservedBufferBytes);

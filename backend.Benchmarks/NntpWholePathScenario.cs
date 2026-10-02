@@ -29,6 +29,14 @@ internal sealed record NntpWholePathScenario(
     /// <summary>Native cache layer only: stall every Nth cache block write (a busy NAS).</summary>
     public int CacheStallEveryNthWrite { get; init; }
     public int CacheStallMs { get; init; }
+    /// <summary>Native cache layer only: concurrent readers, each streaming its own block-aligned slice.</summary>
+    public int ConcurrentReaders { get; init; } = 1;
+    /// <summary>Native cache layer only: shared 4 MiB buffer slots (0 = unbounded).</summary>
+    public int BufferSlots { get; init; }
+    /// <summary>Native cache layer with concurrent readers: each reader's steady playback rate.</summary>
+    public long ReaderBytesPerSecond { get; init; } = 3_000_000;
+    /// <summary>Native cache layer with concurrent readers: delay between successive players starting.</summary>
+    public int ReaderStartIntervalMs { get; init; }
     /// <summary>Native cache layer only: fixed latency added to every cache block write (a slow NAS commit).</summary>
     public int CacheWriteDelayMs { get; init; }
     /// <summary>Native cache layer only: commit queue byte budget; null uses the production default.</summary>
@@ -92,6 +100,19 @@ internal sealed record NntpWholePathScenario(
             ArticleBufferSize = 40,
             CacheStallEveryNthWrite = 10,
             CacheStallMs = 1500,
+        },
+        // Eight players at 3 MB/s each (a high-bitrate film), started 1.5 s apart, streaming
+        // different parts of the file through four buffer slots (a 16 MiB budget). Slots are held only while a block fills, so
+        // no player stalls and every byte is cached by the same reads; per-response admission would
+        // leave half the players uncached.
+        new("native-cold-256mib-rtt250-w4-8players-4slots", NntpWholePathLayer.NativeCache, false, 342, 768 * 1024, 40, 4, 250, 4_000_000, YencCrcValidationMode.Require)
+        {
+            HandshakeDelayMs = 250,
+            ArticleBufferSize = 40,
+            ConcurrentReaders = 8,
+            BufferSlots = 4,
+            ReaderBytesPerSecond = 3_000_000,
+            ReaderStartIntervalMs = 1500,
         },
         // A fast stream (~40 MB/s: 20 connections at 4 MB/s, 50 ms RTT) over a NAS where every 4 MiB block commit takes 250 ms, as
         // measured on Synology NFS. Serial commits of one file manage ~16 MB/s, so a 64 MiB queue

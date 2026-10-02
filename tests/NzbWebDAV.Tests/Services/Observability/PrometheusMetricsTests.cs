@@ -30,6 +30,19 @@ public sealed class PrometheusMetricsTests
         Assert.DoesNotContain("folder=", output);
     }
     [Fact]
+    public async Task NativeCacheBufferSlots_AreReportedByState()
+    {
+        var registry = new CollectorRegistry();
+        var metrics = new PrometheusMetrics(registry);
+        metrics.SetNativeCacheBufferSlots(free: 5, held: 3);
+        await using var stream = new MemoryStream();
+        await registry.CollectAndExportAsTextAsync(stream);
+        var output = Encoding.UTF8.GetString(stream.ToArray());
+        Assert.Contains("nzbdav_native_cache_buffer_slots{state=\"free\"} 5", output);
+        Assert.Contains("nzbdav_native_cache_buffer_slots{state=\"held\"} 3", output);
+    }
+
+    [Fact]
     public async Task NativeCachePhasesAndSkips_AreLabelledByPhaseAndReasonOnly()
     {
         var registry = new CollectorRegistry();
