@@ -28,6 +28,20 @@ describe("Smart Prefetch persisted settings", () => {
     expect(hasCustomizedPrefetchPolicy({ ...defaults, MaxRetries: 4 })).toBe(true);
   });
 
+  it("keeps finishing partially watched files off by default and bounds its threshold", () => {
+    const defaults = parsePrefetchSettings(undefined);
+    expect(defaults.FinishWatchedEnabled).toBe(false);
+    expect(defaults.FinishWatchedPercent).toBe(10);
+    const enabled = parsePrefetchSettings(
+      JSON.stringify({ FinishWatchedEnabled: true, FinishWatchedPercent: 25 }),
+    );
+    expect(enabled.FinishWatchedEnabled).toBe(true);
+    expect(validatePrefetchSettings(enabled)).toBeNull();
+    expect(hasCustomizedPrefetchPolicy(enabled)).toBe(true);
+    expect(validatePrefetchSettings({ ...enabled, FinishWatchedPercent: 95 })).toContain("1 to 90");
+    expect(resetPrefetchPolicyDefaults(enabled).FinishWatchedEnabled).toBe(false);
+  });
+
   it("resets policy values while preserving enablement, users and sources", () => {
     const source = {
       ServerId: "server",

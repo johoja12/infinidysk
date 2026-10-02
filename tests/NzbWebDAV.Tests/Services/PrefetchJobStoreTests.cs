@@ -540,5 +540,154 @@ public sealed class PrefetchJobStoreTests : IDisposable
         Assert.Equal(10, job.WarmedBytes);
     }
 
+    private const long MiB = 1024L * 1024;
+
+    [Fact]
+    public void Backfill_MergesNearbyQueuedRangesButKeepsDistantOnesSeparate()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var since = DateTimeOffset.UtcNow.AddHours(-6);
+        var first = jobs.EnqueueBackfill(item, PrefetchRuntime.BackfillOwner, 60, 0, 4 * MiB, "g1", 64 * MiB, since);
+        var near = jobs.EnqueueBackfill(item, PrefetchRuntime.BackfillOwner, 60, 40 * MiB, 4 * MiB, "g1", 64 * MiB, since);
+        Assert.True(first.Created);
+        Assert.False(near.Created);
+        Assert.Equal(first.Job.Id, near.Job.Id);
+        Assert.Equal((0L, 44 * MiB), (near.Job.Start, near.Job.Length));
+
+        var far = jobs.EnqueueBackfill(item, PrefetchRuntime.BackfillOwner, 60, 500 * MiB, 4 * MiB, "g1", 64 * MiB, since);
+        Assert.True(far.Created);
+        Assert.Equal(2, jobs.List().Count);
+    }
+
+    [Fact]
+    public void Backfill_ReopensARecentlyCompletedBackfillOfTheSameGeneration()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var since = DateTimeOffset.UtcNow.AddHours(-6);
+        var completed = jobs.EnqueueBackfill(item, PrefetchRuntime.BackfillOwner, 60, 0, 4 * MiB, "g1", 64 * MiB, since).Job;
+        Assert.Equal(completed.Id, jobs.ClaimNext()!.Id);
+        jobs.Progress(completed.Id, "g1", 4 * MiB, 4 * MiB);
+        jobs.Finish(completed.Id, true, null);
+
+        var reopened = jobs.EnqueueBackfill(item, PrefetchRuntime.BackfillOwner, 60, 8 * MiB, 4 * MiB, "g1", 64 * MiB, since);
+        Assert.False(reopened.Created);
+        Assert.Equal(completed.Id, reopened.Job.Id);
+        Assert.Equal("queued", reopened.Job.State);
+        Assert.Equal((0L, 12 * MiB), (reopened.Job.Start, reopened.Job.Length));
+        Assert.Null(reopened.Job.FinishedAt);
+        Assert.Single(jobs.List()); // One row per session instead of one per skipped block.
+    }
+
+    [Theory]
+    [InlineData("g2", false)] // The source changed: the old revision's job is history.
+    [InlineData("g1", true)] // Completed before the revive window.
+    public void Backfill_DoesNotReopenAnotherRevisionOrAnOldJob(string generation, bool expired)
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var old = jobs.EnqueueBackfill(item, PrefetchRuntime.BackfillOwner, 60, 0, 4 * MiB, "g1", 64 * MiB, DateTimeOffset.UtcNow).Job;
+        jobs.ClaimNext();
+        jobs.Progress(old.Id, "g1", 4 * MiB);
+        jobs.Finish(old.Id, true, null);
+
+        var since = expired ? DateTimeOffset.UtcNow.AddMinutes(1) : DateTimeOffset.UtcNow.AddHours(-6);
+        var next = jobs.EnqueueBackfill(item, PrefetchRuntime.BackfillOwner, 60, 4 * MiB, 4 * MiB, generation, 64 * MiB, since);
+        Assert.True(next.Created);
+        Assert.Equal("completed", jobs.List().Single(job => job.Id == old.Id).State);
+    }
+
+    [Fact]
+    public void Backfill_DoesNotReopenACompletedJobSharedWithAnotherOwner()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var shared = jobs.Enqueue(item, "manual", 50, 0, 4 * MiB);
+        jobs.Enqueue(item, PrefetchRuntime.BackfillOwner, 60, 0, 4 * MiB);
+        jobs.ClaimNext();
+        jobs.Progress(shared.Id, "g1", 4 * MiB);
+        jobs.Finish(shared.Id, true, null);
+
+        var next = jobs.EnqueueBackfill(item, PrefetchRuntime.BackfillOwner, 60, 4 * MiB, 4 * MiB, "g1", 64 * MiB,
+            DateTimeOffset.UtcNow.AddHours(-6));
+        Assert.True(next.Created);
+    }
+
+    [Fact]
+    public void FailureCodeAndRemedy_AreStoredAndClearedOnRetry()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var job = jobs.Enqueue(Guid.NewGuid(), "manual", 50);
+        jobs.ClaimNext();
+        jobs.Finish(job.Id, false, "Release damaged on Usenet.", PrefetchFailureCodes.SourceDamaged, PrefetchRemedies.RepairQueued);
+        var failed = jobs.List().Single();
+        Assert.Equal(PrefetchFailureCodes.SourceDamaged, failed.FailureCode);
+        Assert.Equal(PrefetchRemedies.RepairQueued, failed.Remedy);
+
+        jobs.Change(job.Id, "retry");
+        var retried = jobs.List().Single();
+        Assert.Null(retried.FailureCode);
+        Assert.Null(retried.Remedy);
+    }
+
+    [Fact]
+    public void Defer_ReportsWhenTheLastRetryFailsTheJob()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"),
+            settings: () => new PrefetchSettings { MaxRetries = 1 });
+        var job = jobs.Enqueue(Guid.NewGuid(), "manual", 50);
+        jobs.ClaimNext();
+        Assert.False(jobs.Defer(job.Id, "Cache storage error.", TimeSpan.Zero, failureCode: PrefetchFailureCodes.CacheStorage));
+        Assert.Equal(1, jobs.Attempts(job.Id));
+        Assert.Equal(PrefetchFailureCodes.CacheStorage, jobs.List().Single().FailureCode);
+        Assert.NotNull(jobs.ClaimNext());
+        Assert.True(jobs.Defer(job.Id, "Cache storage error.", TimeSpan.Zero, failureCode: PrefetchFailureCodes.CacheStorage));
+        Assert.Equal("failed", jobs.List().Single().State);
+    }
+
+    [Fact]
+    public void DamagedVerdict_HoldsUntilExpiryOrANewRevision()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var item = Guid.NewGuid();
+        var now = DateTimeOffset.UtcNow;
+        Assert.False(jobs.IsDamaged(item, "g1", now));
+
+        jobs.MarkDamaged(item, "g1", now.AddHours(24));
+        Assert.True(jobs.IsDamaged(item, "g1", now));
+        Assert.True(jobs.IsDamaged(item, null, now)); // Unknown revision keeps the cooldown.
+        Assert.False(jobs.IsDamaged(item, "g1", now.AddHours(25))); // Expired verdicts clear.
+        Assert.False(jobs.IsDamaged(item, "g1", now)); // ...and stay cleared.
+
+        jobs.MarkDamaged(item, "g1", now.AddHours(24));
+        Assert.False(jobs.IsDamaged(item, "g2", now)); // Repair changed the revision.
+        Assert.False(jobs.IsDamaged(item, "g1", now));
+    }
+
+    [Fact]
+    public void ExistingDatabase_GainsFailureColumnsAdditively()
+    {
+        var path = Path.Combine(_root, "jobs.db");
+        Directory.CreateDirectory(_root);
+        using (var legacy = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = path, Pooling = false }.ToString()))
+        {
+            legacy.Open();
+            using var create = legacy.CreateCommand();
+            create.CommandText = """
+                CREATE TABLE Jobs(Id TEXT PRIMARY KEY,ItemId TEXT NOT NULL,Trigger TEXT NOT NULL,Priority INTEGER NOT NULL,
+                    State TEXT NOT NULL,Start INTEGER NOT NULL,Length INTEGER NOT NULL,Generation TEXT NULL,
+                    CommittedBytes INTEGER NOT NULL DEFAULT 0,Error TEXT NULL,Updated INTEGER NOT NULL,Created INTEGER NOT NULL);
+                INSERT INTO Jobs VALUES('legacy','00000000000000000000000000000001','manual',1,'failed',0,0,NULL,0,'Old failure',1,1);
+                """;
+            create.ExecuteNonQuery();
+        }
+        using var jobs = new PrefetchJobStore(path);
+        var job = Assert.Single(jobs.List());
+        Assert.Equal("Old failure", job.Error);
+        Assert.Null(job.FailureCode);
+        Assert.Null(job.Remedy);
+    }
+
     public void Dispose() { if (Directory.Exists(_root)) Directory.Delete(_root, true); }
 }

@@ -1028,6 +1028,10 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
         finally { selection.Writer.Release(); }
     }
 
+    /// <summary>Display name of the folder a <see cref="ReserveWarmAsync"/> reservation writes to, for diagnostics.</summary>
+    public string? ReservationFolderName(IDisposable reservation) => reservation is WarmReservation warm
+        ? _folders.FirstOrDefault(folder => folder.Id == warm.Folder)?.Name : null;
+
     [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
     public async Task<long> FindNextMissingOffsetAsync(NativeCacheIdentity identity, long start, long end, CancellationToken cancellationToken = default)
     {

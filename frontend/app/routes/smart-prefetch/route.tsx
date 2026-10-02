@@ -11,6 +11,7 @@ import {
   type LibraryFileModalController,
 } from "~/components/library-file-modal/use-library-file-modal";
 import { formatSpeed, formatWarmingSpeed, medianWarmingSpeed } from "./warming-speed";
+import { decimalBytes, describeCoverage, failureReason } from "./job-coverage";
 
 type Job = {
   id: string;
@@ -30,6 +31,11 @@ type Job = {
   finishedAt?: number | null;
   activeMs?: number | null;
   warmedBytes?: number | null;
+  isRangeJob?: boolean;
+  rangeBytes?: number | null;
+  rangeCachedBytes?: number | null;
+  failureCode?: string | null;
+  remedy?: string | null;
 };
 type Status = {
   available: boolean;
@@ -40,19 +46,18 @@ type Status = {
   lastError?: string | null;
   lastSuccess?: string | null;
   dailyBudgetUsed?: number;
-  settings?: { enabled?: boolean; dailyByteBudget?: number; maxConcurrentJobs?: number };
+  settings?: {
+    enabled?: boolean;
+    dailyByteBudget?: number;
+    maxConcurrentJobs?: number;
+    finishWatchedEnabled?: boolean;
+  };
   jobs: Job[];
 };
 const terminal = new Set(["completed", "failed", "cancelled", "expired"]);
 const filterStates = ["all", "running", "queued", "deferred", "paused", "failed"];
 const historyStates = ["all", "completed", "failed", "cancelled", "expired"];
-const format = new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 });
-function bytes(value?: number | null) {
-  if (value == null || !Number.isFinite(value)) return "—";
-  if (value < 1000) return `${format.format(value)} B`;
-  const unit = Math.min(4, Math.floor(Math.log(value) / Math.log(1000)));
-  return `${format.format(value / 1000 ** unit)} ${["B", "KB", "MB", "GB", "TB"][unit]}`;
-}
+const bytes = decimalBytes;
 function when(value: number) {
   return Number.isFinite(value) ? new Date(value).toLocaleString() : "—";
 }
@@ -92,8 +97,10 @@ function Card({
   );
 }
 function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
-  const pct = coverage(job);
+  const summary = describeCoverage(job);
+  const pct = summary.percent;
   const finished = terminal.has(job.state);
+  const failure = failureReason(job);
   return (
     <article className="border-b border-base-content/10 last:border-0">
       <button
@@ -109,31 +116,52 @@ function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
         <span className="mt-1 block text-xs text-base-content/55">
           {job.source || job.trigger} · {when(job.updated)}
         </span>
+        {failure && (
+          <span
+            className={`mt-2 flex flex-wrap items-center gap-2 text-xs font-semibold ${failure.tone === "error" ? "text-error" : "text-warning"}`}
+          >
+            {failure.title}
+            {failure.remedy && (
+              <span className="badge badge-sm badge-info badge-soft">{failure.remedy}</span>
+            )}
+          </span>
+        )}
         {pct !== null && (
           <span
             className="mt-3 block h-1.5 overflow-hidden rounded-full bg-base-content/10"
-            aria-label={`${pct}% whole-file cache coverage`}
+            aria-label={summary.label}
           >
-            <span className="block h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
+            <span
+              className={`block h-full rounded-full ${summary.complete ? "bg-success" : "bg-primary"}`}
+              style={{ width: `${pct}%` }}
+            />
           </span>
         )}
         <span className="mt-2 flex flex-wrap justify-between gap-2 text-xs text-base-content/65">
-          <span>
-            {bytes(job.committedBytes)}
-            {job.fileSize ? ` of ${bytes(job.fileSize)}` : ""} cached file bytes
+          <span className={summary.complete && summary.secondary ? "text-success" : undefined}>
+            {summary.primary}
           </span>
           {finished && (
             <span title="Average speed of the bytes this job fetched, over its active warming time">
               {formatWarmingSpeed(job)}
             </span>
           )}
-          {pct !== null && (
+          {summary.secondary ? (
             <span
               className="tooltip tooltip-left"
-              data-tip="Includes bytes that were already cached before this job ran."
+              data-tip="This job only warms its own range; the rest of the file fills in when played or selected by a prefetch policy."
             >
-              {pct}% whole-file coverage
+              {summary.secondary}
             </span>
+          ) : (
+            pct !== null && (
+              <span
+                className="tooltip tooltip-left"
+                data-tip="Includes bytes that were already cached before this job ran."
+              >
+                {pct}% whole-file coverage
+              </span>
+            )
           )}
         </span>
       </button>
@@ -348,6 +376,15 @@ export default function SmartPrefetchActivityPage() {
               ? "Current queue jobs refresh every 10 seconds."
               : "Recent finished and interrupted jobs retained by the warming queue."}
           </p>
+          {view === "history" && (
+            <p className="mt-1 max-w-3xl text-xs text-base-content/55">
+              The cache keeps what was played plus the files your prefetch policies select.
+              Partially cached files fill in when they are played
+              {status?.settings?.finishWatchedEnabled
+                ? ", and after you have watched part of them."
+                : "; turn on finishing partially watched files in Prefetch settings to complete them automatically."}
+            </p>
+          )}
         </div>
         <div className="flex flex-wrap gap-2">
           <input

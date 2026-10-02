@@ -36,6 +36,10 @@ public sealed record PrefetchSettings
     public bool TvEnabled { get; init; } = true;
     public bool WarmLocalFiles { get; init; }
     public bool PauseDuringPlayback { get; init; } = true;
+    /// <summary>Opt-in: after a playback-length session, warm the rest of a partially watched file.</summary>
+    public bool FinishWatchedEnabled { get; init; }
+    /// <summary>Share of a file (percent) a session must have played before it is finished.</summary>
+    public int FinishWatchedPercent { get; init; } = 10;
     public int SyncIntervalMinutes { get; init; } = 15;
     public int RealtimeCheckIntervalSeconds { get; init; } = 30;
     public int MovieSyncIntervalMinutes { get; init; } = 60;
@@ -85,7 +89,8 @@ public sealed record PrefetchSettings
             || settings.IntentTtlHours is < 1 or > 168 || settings.VerifiedSessionExpirySeconds is < 5 or > 300
             || settings.MaxQueueAhead is < 1 or > 20 || settings.TvEpisodesPerShow is < 1 or > 20
             || settings.MaxBytesPerItem is <= 0 or > 100_000_000_000_000 || settings.DailyByteBudget is < 0 or > 100_000_000_000_000
-            || settings.MinimumHeadMb is < 0 or > 1024 || settings.MinimumTailMb is < 0 or > 1024)
+            || settings.MinimumHeadMb is < 0 or > 1024 || settings.MinimumTailMb is < 0 or > 1024
+            || settings.FinishWatchedPercent is < 1 or > 90)
             throw new ArgumentException("Smart Prefetch concurrency, intervals, prediction limits, or byte budgets are out of range.");
         if (settings.Users is null || settings.Users.Length > 256 || settings.Users.Any(user => string.IsNullOrWhiteSpace(user) || user.Length > 256)
             || settings.Sources is null || settings.Sources.Length > 128

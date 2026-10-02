@@ -63,7 +63,8 @@ public sealed class PrefetchCoordinator(PrefetchJobStore store, IPrefetchExecuto
             if (!store.IsRunning(job.Id)) return;
             if (RuntimeError is not null || store.Paused || !admission())
             {
-                store.Defer(job.Id, "Warming is paused or foreground playback has priority.", TimeSpan.FromMinutes(1), consumeAttempt: false);
+                store.Defer(job.Id, "Warming is paused or foreground playback has priority.", TimeSpan.FromMinutes(1), consumeAttempt: false,
+                    failureCode: PrefetchFailureCodes.Busy);
                 return;
             }
             try
@@ -77,24 +78,31 @@ public sealed class PrefetchCoordinator(PrefetchJobStore store, IPrefetchExecuto
             catch (Exception exception) when (exception is not OutOfMemoryException &&
                 (cancellation.IsCancellationRequested || applicationStopping.IsCancellationRequested))
             {
-                store.Defer(job.Id, "Interrupted; verified coverage retained.", TimeSpan.FromSeconds(30), consumeAttempt: false);
+                store.Defer(job.Id, "Interrupted; verified coverage retained.", TimeSpan.FromSeconds(30), consumeAttempt: false,
+                    failureCode: PrefetchFailureCodes.Busy);
+                return;
+            }
+            catch (PrefetchFailedException exception)
+            {
+                store.Finish(job.Id, false, exception.Message, exception.FailureCode, exception.Remedy);
                 return;
             }
             catch (PrefetchDeferredException exception)
             {
-                store.Defer(job.Id, exception.Message, TimeSpan.FromMinutes(1), exception.CountsAsFailure);
+                store.Defer(job.Id, exception.Message, TimeSpan.FromMinutes(1), exception.CountsAsFailure, exception.FailureCode);
                 return;
             }
             catch (IOException exception)
             {
                 store.Defer(job.Id, PrefetchFailureDiagnostics.Report(logger ?? Log.Logger, job, exception, retryable: true),
-                    TimeSpan.FromMinutes(1), consumeAttempt: true);
+                    TimeSpan.FromMinutes(1), consumeAttempt: true, PrefetchFailureDiagnostics.Classify(exception).Category);
                 return;
             }
             catch (Microsoft.Data.Sqlite.SqliteException) { throw; }
             catch (Exception exception) when (exception is not OutOfMemoryException)
             {
-                store.Finish(job.Id, false, PrefetchFailureDiagnostics.Report(logger ?? Log.Logger, job, exception, retryable: false));
+                store.Finish(job.Id, false, PrefetchFailureDiagnostics.Report(logger ?? Log.Logger, job, exception, retryable: false),
+                    PrefetchFailureDiagnostics.Classify(exception).Category);
                 return;
             }
             store.Finish(job.Id, true, null);

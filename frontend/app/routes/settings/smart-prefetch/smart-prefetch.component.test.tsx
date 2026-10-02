@@ -229,6 +229,29 @@ describe("Smart Prefetch settings", () => {
     expect(activity?.open).toBe(true);
   });
 
+  it("offers finishing partially watched files as an advanced opt-in that is off by default", async () => {
+    vi.stubGlobal("fetch", fakeApi());
+    render(<Harness />);
+    const toggle = screen.getByLabelText<HTMLInputElement>(
+      "Finish caching partially watched files",
+    );
+    expect(toggle.checked).toBe(false);
+    expect(screen.getByText("Advanced settings").closest("details")?.contains(toggle)).toBe(true);
+    expect(screen.getByText(/Off by default\. After a playback session plays/)).toBeTruthy();
+    const percent = screen.getByLabelText<HTMLInputElement>(
+      "Finish a file after this much was played (%)",
+    );
+    expect(percent.value).toBe("10");
+
+    await userEvent.click(screen.getByText("Advanced settings"));
+    await userEvent.click(toggle);
+    const config = JSON.parse(screen.getByTestId("config").textContent) as Record<string, string>;
+    const saved = parsePrefetchSettings(config["smart-prefetch.settings"]);
+    expect(saved.FinishWatchedEnabled).toBe(true);
+    expect(saved.FinishWatchedPercent).toBe(10);
+    expect(screen.getByText("Customized")).toBeTruthy();
+  });
+
   it("marks customized policy and resets defaults without losing identity selections", async () => {
     vi.stubGlobal("fetch", fakeApi());
     const initial = {

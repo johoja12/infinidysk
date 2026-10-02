@@ -36,9 +36,20 @@ public class ActiveReadRegistry
         string? clientUserAgent = null,
         string? clientIp = null,
         string? playerSession = null)
+        => GetOrCreate(path, clientKey, fileName, fileSize, clientUserAgent, clientIp, playerSession, DateTimeOffset.UtcNow);
+
+    // Test-visible overload: lets tests start a session in the past.
+    internal Guid GetOrCreate(
+        string path,
+        string clientKey,
+        string fileName,
+        long? fileSize,
+        string? clientUserAgent,
+        string? clientIp,
+        string? playerSession,
+        DateTimeOffset now)
     {
         var key = BuildKey(path, clientKey, playerSession);
-        var now = DateTimeOffset.UtcNow;
 
         while (true)
         {

@@ -205,8 +205,9 @@ admission. Native cache hits do not re-download the content. Configure workers,
 per-job connections, per-file and daily byte caps, and playback pause. A daily budget
 of zero means unlimited, not disabled; the initial default is 10 GB/day. Queue actions include manual/bulk imported
 item IDs, sync, pause/resume, cancel/retry, and priority changes; priority never bypasses
-foreground admission. Progress represents verified committed whole-file coverage,
-not bytes merely read from providers or the size of one requested range.
+foreground admission. Whole-file jobs report verified committed whole-file coverage,
+not bytes merely read from providers. Range jobs report their own range first (see
+below).
 
 **Warming history** [since unreleased](https://github.com/johoja12/infinidysk/issues/117){ .nzbdav-since }
 shows each finished job's average warming speed and active duration, for example
@@ -216,6 +217,60 @@ header shows the median speed of the visible jobs, which helps spot a slow provi
 a busy cache disk. Jobs recorded before this release show "—". Select any history or
 activity row to open the same file details modal as Media Library; files without a
 Media Library record show their name, size, and cache coverage only.
+
+### Range jobs and backfill [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since }
+
+Some jobs warm only part of a file: **Playback not yet cached** (backfill),
+minimum head/tail ranges, and resume ranges. Their rows show how much of *their own
+range* is cached for the file's current revision, for example
+`Cached the 4 MiB playback missed ✓` or `12 MiB of 40 MiB of the missed range cached`,
+with whole-file coverage as secondary text. A finished backfill of a 7 GB file
+therefore reads as done, not as "1% cached". A queued backfill reads
+`Waiting to cache the 8 MiB playback missed`. When the current revision cannot be
+resolved (for example after the source changed), the row says the range coverage is
+unavailable.
+
+Backfill fills in blocks that playback streamed without caching them, for example
+when a commit failed or a buffer or probe timed out. Requests for one file are held
+until playback of that file has been quiet for about 45 seconds (at most 3 minutes).
+Ranges within 64 MiB of each other are then merged, keeping at most eight ranges per
+file. A merged range joins queued work for the file, or reopens a backfill-only job of
+the same cache revision that completed in the last 6 hours, instead of adding a row.
+One playback session therefore produces a handful of rows rather than one per 4 MiB
+block. Warming skips blocks that are already cached, so a merged range only fetches
+what is missing.
+
+**What stays uncached.** Native Cache keeps what was played, backfill of anything
+playback missed, and the files your prefetch policies select (Plex hubs and
+collections, playback and history predictions, manual requests). The unplayed rest of
+a partially watched file is fetched from Usenet when it is played, and cached then,
+unless you turn on [finishing partially watched files](#finish-partially-watched-files).
+
+### Failure reasons [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since }
+
+Failed and deferred jobs show a headline from a stable reason code. The full message
+is under **Details**.
+
+| Headline | Meaning | What happens |
+| --- | --- | --- |
+| Release damaged on Usenet | Articles are missing, corrupt, or belong to a different post on every provider. This is also reported when the same block fails verification on every retry. | The job fails immediately and the file goes to the normal repair path (the same urgent health check that playback failures trigger). The row shows **Queued for repair**, **Repair pending** (the failure threshold under Settings → Health & Repairs is not reached yet), or **Repair disabled**. For 24 hours, or until repair changes the file's revision, policy refreshes, backfill, and finish-watched do not queue the file again. Manual warming and Retry still run. |
+| Source bytes did not verify | Source bytes arrived without integrity proof. | Retried with the normal retry limit, then treated as a damaged release. |
+| Cache storage error | Verified bytes could not be written to the cache folder named in the message, or no writable folder had room. | Retried. Check that folder's free space, permissions, and mount. |
+| Source changed | The file's source was repaired or replaced while it warmed. | Deferred without using a retry. Coverage is rechecked against the new revision. |
+| Daily budget reached / Waiting for playback to finish | Budget or playback priority. | Deferred until budget or playback allows. |
+
+### Finish partially watched files [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since } { #finish-partially-watched-files }
+
+**Finish caching partially watched files** (Smart Prefetch → Advanced settings →
+Warming) is off by default. When it is on, a foreground read session that plays at
+least **Finish a file after this much was played (%)** of a file (default 10%, range
+1–90, and at least 64 MiB) over at least two minutes queues whole-file warming of
+that file. These jobs show the source **Finish partially watched**. They use the daily
+download budget, respect pause-during-playback, and skip releases known to be
+damaged. The two-minute minimum keeps fast library scans from counting, but a long
+scan that reads a large share of a file, such as intro or credit detection, can still
+qualify. Turning the option, or Smart Prefetch, off cancels finish-watched work that
+is still queued. Other policy changes keep it.
 
 When application shutdown begins, warming stops taking new jobs and interrupts
 active work without treating it as a source failure or spending a retry attempt.
@@ -250,7 +305,7 @@ source or a manual request can retain the same job. Removing its last owner canc
 active work. On restart, manual interrupted jobs restore paused; speculative work is
 recomputed from current policy. Retry does not discard already verified coverage.
 Overlapping queued ranges coalesce without losing manual/source ownership, original
-age, or retry delays. Running ranges stay immutable and same-item jobs serialize.
+age, or retry delays; backfill also merges nearby ranges as described above. Running ranges stay immutable and same-item jobs serialize.
 Bulk warming returns an accepted, deduplicated, or rejected outcome for each item;
 one invalid item does not discard the other accepted requests.
 
@@ -259,7 +314,10 @@ one invalid item does not discard the other accepted requests.
 These are advanced, opt-in controls, not new-install prerequisites. Plex source
 accordions and their optional `DisabledLibraries` state therefore remain outside the
 setup wizard; the field defaults to empty, the setup completion allowlist is unchanged,
-and `SetupWizardService.CurrentWizardVersion` does not increase. Rerunning a strategy
+and `SetupWizardService.CurrentWizardVersion` does not increase. The same applies to
+**Finish caching partially watched files** and its threshold. They are advanced
+options inside the existing `smart-prefetch.settings` value, so the setup wizard
+does not show them. Rerunning a strategy
 preserves an explicit Native mode and does not silently rewrite imported files. Review
 restart and environment conflicts before Apply. Keep the test branch separate and
 switch back to your prior image and configuration backup if needed; do not delete

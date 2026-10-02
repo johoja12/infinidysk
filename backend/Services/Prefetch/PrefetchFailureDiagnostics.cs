@@ -7,9 +7,8 @@ internal static class PrefetchFailureDiagnostics
 {
     // Exception messages and inner exceptions can contain credentials, URLs and
     // media paths. Persist/log only stable guidance, type names and job identity.
-    internal static string Report(ILogger logger, PrefetchJob job, Exception exception, bool retryable)
-    {
-        var (category, guidance) = exception switch
+    /// <summary>A stable category (stored as the job's failure code) and safe operator guidance.</summary>
+    internal static (string Category, string Guidance) Classify(Exception exception) => exception switch
         {
             UsenetArticleNotFoundException => ("source-unavailable", "A required article is unavailable. Check source health before retrying."),
             SeekPositionNotFoundException => ("source-layout", "A source byte position could not be resolved. Check the imported source before retrying."),
@@ -19,6 +18,10 @@ internal static class PrefetchFailureDiagnostics
             ArgumentException => ("invalid-request", "The warming request or imported media is no longer valid. Review the item and warming limits."),
             _ => ("unexpected-failure", "Warming failed unexpectedly. Inspect the correlated diagnostic log before retrying.")
         };
+
+    internal static string Report(ILogger logger, PrefetchJob job, Exception exception, bool retryable)
+    {
+        var (category, guidance) = Classify(exception);
         var exceptionType = exception.GetType().Name;
         logger.Warning("Smart Prefetch job {JobId} for item {ItemId}: {FailureCategory} ({ExceptionType}). {Reason} Retry policy: {RetryPolicy}",
             job.Id, job.ItemId, category, exceptionType, guidance, retryable ? "bounded automatic retry" : "explicit retry required");

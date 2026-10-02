@@ -1282,6 +1282,12 @@
               "string"
             ]
           },
+          "failureCode": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
           "fileSize": {
             "format": "int64",
             "pattern": "^-?(?:0|[1-9]\\d*)$",
@@ -1309,6 +1315,9 @@
           "id": {
             "type": "string"
           },
+          "isRangeJob": {
+            "type": "boolean"
+          },
           "itemId": {
             "format": "uuid",
             "type": "string"
@@ -1329,7 +1338,31 @@
               "string"
             ]
           },
+          "rangeBytes": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          },
+          "rangeCachedBytes": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          },
           "reason": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "remedy": {
             "type": [
               "null",
               "string"
@@ -1456,6 +1489,17 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "finishWatchedEnabled": {
+            "type": "boolean"
+          },
+          "finishWatchedPercent": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
           },
           "fullFileWarming": {
             "type": "boolean"
@@ -2139,7 +2183,7 @@
   "info": {
     "description": "Contributor-facing reference for the InfiniDysk admin REST API. SABnzbd compatibility, WebDAV, streaming, adapters, and file-transfer routes are intentionally excluded.",
     "title": "InfiniDysk Admin API",
-    "version": "2.5.0"
+    "version": "2.6.0"
   },
   "openapi": "3.1.1",
   "paths": {

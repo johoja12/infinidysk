@@ -18,6 +18,25 @@ public sealed record PrefetchJob(string Id, Guid ItemId, string Trigger, int Pri
     public long? ActiveMs { get; init; }
     /// <summary>Bytes this job fetched and committed to the cache; excludes bytes that were already cached.</summary>
     public long? WarmedBytes { get; init; }
+    /// <summary>
+    /// Bytes of a range job's own range, widened to whole integrity blocks. Null for whole-file jobs
+    /// and when the range cannot be resolved against the current file.
+    /// </summary>
+    public long? RangeBytes { get; init; }
+    /// <summary>
+    /// Bytes of <see cref="RangeBytes"/> verified in the Native Cache catalogue for the item's current
+    /// revision. Null for whole-file jobs and when the revision or catalogue is unavailable.
+    /// </summary>
+    public long? RangeCachedBytes { get; init; }
+    /// <summary>
+    /// Stable reason code for the latest failure or deferral, for example <c>source-damaged</c>,
+    /// <c>cache-storage</c>, <c>source-changed</c> or <c>budget</c>. Null while healthy and for older rows.
+    /// </summary>
+    public string? FailureCode { get; init; }
+    /// <summary>Follow-up taken for a failure, for example <c>repair-queued</c>; null when none.</summary>
+    public string? Remedy { get; init; }
+    /// <summary>True for jobs that warm part of a file (backfill, head/tail minimum, resume range).</summary>
+    public bool IsRangeJob => Start != 0 || Length != 0;
 }
 
 public sealed record PrefetchEnqueueResult(PrefetchJob Job, bool Created);
@@ -70,6 +89,7 @@ public sealed class PrefetchJobStore : IDisposable
             CREATE TABLE IF NOT EXISTS Attempts(Id TEXT PRIMARY KEY REFERENCES Jobs(Id) ON DELETE CASCADE,Count INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS Verified(ItemId TEXT NOT NULL,Generation TEXT NOT NULL,Start INTEGER NOT NULL,Length INTEGER NOT NULL,
                 At INTEGER NOT NULL,PRIMARY KEY(ItemId,Generation,Start,Length));
+            CREATE TABLE IF NOT EXISTS Damaged(ItemId TEXT PRIMARY KEY,Generation TEXT NULL,Until INTEGER NOT NULL);
             INSERT OR IGNORE INTO State VALUES('paused','false');
             """);
         AddMissingJobColumns();
@@ -94,14 +114,33 @@ public sealed class PrefetchJobStore : IDisposable
         using (var command = Command("PRAGMA table_info(Jobs)"))
         using (var reader = command.ExecuteReader())
             while (reader.Read()) existing.Add(reader.GetString(1));
-        foreach (var column in new[] { "StartedAt", "FinishedAt", "ActiveMs", "RunStarted", "WarmedBytes" })
-            if (!existing.Contains(column)) Execute($"ALTER TABLE Jobs ADD COLUMN {column} INTEGER NULL");
+        foreach (var (column, type) in new[] { ("StartedAt", "INTEGER"), ("FinishedAt", "INTEGER"), ("ActiveMs", "INTEGER"),
+            ("RunStarted", "INTEGER"), ("WarmedBytes", "INTEGER"), ("FailureCode", "TEXT"), ("Remedy", "TEXT") })
+            if (!existing.Contains(column)) Execute($"ALTER TABLE Jobs ADD COLUMN {column} {type} NULL");
     }
 
     public PrefetchJob Enqueue(Guid itemId, string trigger, int priority, long start = 0, long length = 0)
         => EnqueueWithOutcome(itemId, trigger, priority, start, length).Job;
 
     public PrefetchEnqueueResult EnqueueWithOutcome(Guid itemId, string trigger, int priority, long start = 0, long length = 0)
+        => EnqueueCore(itemId, trigger, priority, start, length, mergeGap: 0, reviveGeneration: null, reviveSince: null);
+
+    /// <summary>
+    /// Schedules a backfill range. Nearby ranges (within <paramref name="mergeGap"/>) join a queued job of
+    /// the same item, or reopen a backfill-only job of the same cache generation that completed since
+    /// <paramref name="reviveSince"/>, so one playback session produces a handful of rows instead of
+    /// one per skipped block. Warming skips blocks that are already cached, so the union is safe.
+    /// </summary>
+    public PrefetchEnqueueResult EnqueueBackfill(Guid itemId, string owner, int priority, long start, long length,
+        string? generation, long mergeGap, DateTimeOffset reviveSince)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(mergeGap);
+        if (length <= 0) throw new ArgumentException("Backfill needs a bounded range.");
+        return EnqueueCore(itemId, owner, priority, start, length, mergeGap, generation, reviveSince);
+    }
+
+    private PrefetchEnqueueResult EnqueueCore(Guid itemId, string trigger, int priority, long start, long length,
+        long mergeGap, string? reviveGeneration, DateTimeOffset? reviveSince)
     {
         if (itemId == Guid.Empty || trigger is not { Length: > 0 and <= 128 } || priority is < -100 or > 100
             || start < 0 || length < 0 || start > long.MaxValue - length)
@@ -119,10 +158,13 @@ public sealed class PrefetchJobStore : IDisposable
                 AddOwner(existing.Id, trigger);
                 return new PrefetchEnqueueResult(existing with { Priority = Math.Max(existing.Priority, priority) }, false);
             }
-            var merged = MergeQueued(itemId, trigger, priority, start, length);
+            var merged = MergeQueued(itemId, trigger, priority, start, length, mergeGap);
             if (merged is not null) return new PrefetchEnqueueResult(merged, false);
             using var count = Command("SELECT COUNT(*) FROM Jobs WHERE State IN ('queued','running','paused')");
             if ((long)count.ExecuteScalar()! >= Capacity) throw new ArgumentException("Prefetch queue is full. Cancel or complete existing work first.");
+            if (reviveGeneration is not null && reviveSince is { } since
+                && ReviveCompleted(itemId, trigger, priority, start, length, mergeGap, reviveGeneration, since) is { } revived)
+                return new PrefetchEnqueueResult(revived, false);
             // Retain only bounded operation history; never grow a media-library-sized memory/index queue.
             Execute("DELETE FROM Jobs WHERE Id IN (SELECT Id FROM Jobs WHERE State IN ('completed','failed','cancelled') ORDER BY Updated DESC LIMIT -1 OFFSET 255)");
             var id = Guid.NewGuid().ToString("N");
@@ -137,7 +179,35 @@ public sealed class PrefetchJobStore : IDisposable
 
     private sealed record QueuedIntent(PrefetchJob Job, long Created, long Attempts, long? DeferredUntil);
 
-    private PrefetchJob? MergeQueued(Guid itemId, string owner, int priority, long start, long length)
+    /// <summary>
+    /// Reopens the newest completed job of this item and generation that only <paramref name="owner"/>
+    /// requested and whose range lies within <paramref name="gap"/> of the new one, widened to their union.
+    /// </summary>
+    private PrefetchJob? ReviveCompleted(Guid itemId, string owner, int priority, long start, long length, long gap,
+        string generation, DateTimeOffset since)
+    {
+        var end = start + length;
+        var job = ReadOne("""
+            SELECT * FROM Jobs j WHERE j.ItemId=$item AND j.State='completed' AND j.Generation=$generation AND j.Updated>=$since
+            AND j.Length>0 AND j.Start<=$end+$gap AND j.Start+j.Length+$gap>=$start
+            AND EXISTS (SELECT 1 FROM Owners o WHERE o.Id=j.Id AND o.Owner=$owner)
+            AND NOT EXISTS (SELECT 1 FROM Owners o WHERE o.Id=j.Id AND o.Owner<>$owner)
+            ORDER BY j.Updated DESC,j.Id LIMIT 1
+            """, ("$item", itemId.ToString("N")), ("$generation", generation), ("$since", since.ToUnixTimeMilliseconds()),
+            ("$start", start), ("$end", end), ("$gap", gap), ("$owner", owner));
+        if (job is null) return null;
+        var unionStart = Math.Min(start, job.Start);
+        var unionEnd = Math.Max(end, job.Start + job.Length);
+        var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        Execute("UPDATE Jobs SET State='queued',Start=$start,Length=$length,Priority=MAX(Priority,$priority),Error=NULL,FinishedAt=NULL,Updated=$now,Created=$created WHERE Id=$id",
+            ("$start", unionStart), ("$length", unionEnd - unionStart), ("$priority", priority), ("$now", now),
+            ("$created", NextCreated(now)), ("$id", job.Id));
+        Execute("DELETE FROM Attempts WHERE Id=$id", ("$id", job.Id));
+        Execute("DELETE FROM Deferred WHERE Id=$id", ("$id", job.Id));
+        return ReadOne("SELECT * FROM Jobs WHERE Id=$id", ("$id", job.Id))!;
+    }
+
+    private PrefetchJob? MergeQueued(Guid itemId, string owner, int priority, long start, long length, long gap = 0)
     {
         var candidates = new List<QueuedIntent>();
         using (var query = Command("""
@@ -161,8 +231,8 @@ public sealed class PrefetchJobStore : IDisposable
             {
                 var job = candidate.Job;
                 long? candidateEnd = job.Length == 0 ? null : checked(job.Start + job.Length);
-                if (selected.Contains(job.Id) || (end.HasValue && job.Start > end.Value)
-                    || (candidateEnd.HasValue && start > candidateEnd.Value)) continue;
+                if (selected.Contains(job.Id) || (end.HasValue && job.Start > end.Value + gap)
+                    || (candidateEnd.HasValue && start > candidateEnd.Value + gap)) continue;
                 selected.Add(job.Id);
                 start = Math.Min(start, job.Start);
                 end = !end.HasValue || !candidateEnd.HasValue ? null : Math.Max(end.Value, candidateEnd.Value);
@@ -201,22 +271,76 @@ public sealed class PrefetchJobStore : IDisposable
         get { lock (_gate) { using var command = Command("SELECT Value FROM State WHERE Key='paused'"); return command.ExecuteScalar() as string == "true"; } }
     }
 
-    public void Defer(string id, string reason, TimeSpan delay, bool consumeAttempt = true)
+    /// <returns>True when the deferral used the job's last retry and it is now failed.</returns>
+    public bool Defer(string id, string reason, TimeSpan delay, bool consumeAttempt = true, string? failureCode = null)
     {
         if (delay < TimeSpan.Zero || delay > TimeSpan.FromDays(1)) throw new ArgumentOutOfRangeException(nameof(delay));
         lock (_gate)
-        Atomic(() =>
+        return Atomic(() =>
         {
-            if (!IsRunning(id)) return;
+            if (!IsRunning(id)) return false;
             if (consumeAttempt) Execute("INSERT INTO Attempts(Id,Count) SELECT Id,1 FROM Jobs WHERE Id=$id AND State='running' ON CONFLICT(Id) DO UPDATE SET Count=Count+1", ("$id", id));
-            Execute("UPDATE Jobs SET State='queued',Error=$reason WHERE Id=$id AND State='running'", ("$id", id), ("$reason", reason[..Math.Min(512, reason.Length)]));
+            Execute("UPDATE Jobs SET State='queued',Error=$reason,FailureCode=$code,Remedy=NULL WHERE Id=$id AND State='running'", ("$id", id),
+                ("$reason", reason[..Math.Min(512, reason.Length)]), ("$code", (object?)failureCode ?? DBNull.Value));
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             Execute($"UPDATE Jobs SET {CloseRunClock} WHERE Id=$id AND RunStarted IS NOT NULL", ("$id", id), ("$now", now));
             Execute("UPDATE Jobs SET State='failed',FinishedAt=$now WHERE Id=$id AND State='queued' AND Id IN (SELECT Id FROM Attempts WHERE Count>$retries)",
                 ("$id", id), ("$retries", _settings?.Invoke().MaxRetries ?? 3), ("$now", now));
             Execute("INSERT INTO Deferred(Id,Until) VALUES($id,$until) ON CONFLICT(Id) DO UPDATE SET Until=excluded.Until",
                 ("$id", id), ("$until", DateTimeOffset.UtcNow.Add(delay).ToUnixTimeMilliseconds()));
+            return ReadOne("SELECT * FROM Jobs WHERE Id=$id", ("$id", id))?.State == "failed";
         });
+    }
+
+    /// <summary>Failed attempts already counted against this job's retry budget.</summary>
+    public long Attempts(string id)
+    {
+        lock (_gate)
+        {
+            using var command = Command("SELECT Count FROM Attempts WHERE Id=$id", ("$id", id));
+            return command.ExecuteScalar() as long? ?? 0;
+        }
+    }
+
+    /// <summary>
+    /// Remembers that warming proved this item's release damaged, so routine policy refreshes do not
+    /// re-enqueue it until <paramref name="until"/> or until its cache revision changes (repair).
+    /// </summary>
+    public void MarkDamaged(Guid itemId, string? generation, DateTimeOffset until)
+    {
+        if (generation?.Length > 512) throw new ArgumentException("Invalid cache generation.");
+        lock (_gate)
+        Atomic(() =>
+        {
+            Execute("INSERT INTO Damaged(ItemId,Generation,Until) VALUES($item,$generation,$until) ON CONFLICT(ItemId) DO UPDATE SET Generation=excluded.Generation,Until=excluded.Until",
+                ("$item", itemId.ToString("N")), ("$generation", (object?)generation ?? DBNull.Value), ("$until", until.ToUnixTimeMilliseconds()));
+            Execute("DELETE FROM Damaged WHERE Until<$now", ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+            Execute("DELETE FROM Damaged WHERE rowid IN (SELECT rowid FROM Damaged ORDER BY Until DESC LIMIT -1 OFFSET 4096)");
+        });
+    }
+
+    /// <summary>
+    /// True while a damaged-release verdict suppresses routine warming of this item. A different
+    /// <paramref name="currentGeneration"/> means the source was repaired or replaced, which clears it.
+    /// </summary>
+    public bool IsDamaged(Guid itemId, string? currentGeneration, DateTimeOffset now)
+    {
+        lock (_gate)
+        {
+            string? generation;
+            long until;
+            using (var command = Command("SELECT Generation,Until FROM Damaged WHERE ItemId=$item", ("$item", itemId.ToString("N"))))
+            using (var reader = command.ExecuteReader())
+            {
+                if (!reader.Read()) return false;
+                generation = reader.IsDBNull(0) ? null : reader.GetString(0);
+                until = reader.GetInt64(1);
+            }
+            if (until > now.ToUnixTimeMilliseconds()
+                && (generation is null || currentGeneration is null || generation == currentGeneration)) return true;
+            Execute("DELETE FROM Damaged WHERE ItemId=$item", ("$item", itemId.ToString("N")));
+            return false;
+        }
     }
 
     public void PruneOwners(Func<string, bool> keep)
@@ -316,9 +440,9 @@ public sealed class PrefetchJobStore : IDisposable
             var job = ReadOne("SELECT * FROM Jobs WHERE State='queued' AND ItemId NOT IN (SELECT ItemId FROM Jobs WHERE State='running') AND Id NOT IN (SELECT Id FROM Deferred WHERE Until>$now) ORDER BY Priority DESC,Created,Id LIMIT 1",
                 ("$now", now));
             if (job is null) return null;
-            Execute("UPDATE Jobs SET State='running',Error=NULL,StartedAt=COALESCE(StartedAt,$now),RunStarted=$now,ActiveMs=COALESCE(ActiveMs,0),WarmedBytes=COALESCE(WarmedBytes,0) WHERE Id=$id",
+            Execute("UPDATE Jobs SET State='running',Error=NULL,FailureCode=NULL,Remedy=NULL,StartedAt=COALESCE(StartedAt,$now),RunStarted=$now,ActiveMs=COALESCE(ActiveMs,0),WarmedBytes=COALESCE(WarmedBytes,0) WHERE Id=$id",
                 ("$id", job.Id), ("$now", now));
-            return job with { State = "running", Error = null, StartedAt = job.StartedAt ?? now, ActiveMs = job.ActiveMs ?? 0, WarmedBytes = job.WarmedBytes ?? 0 };
+            return job with { State = "running", Error = null, FailureCode = null, Remedy = null, StartedAt = job.StartedAt ?? now, ActiveMs = job.ActiveMs ?? 0, WarmedBytes = job.WarmedBytes ?? 0 };
         }
     }
 
@@ -396,7 +520,7 @@ public sealed class PrefetchJobStore : IDisposable
                 if (duplicate is not null) throw new ArgumentException("This file range is already queued.");
             }
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            Execute($"UPDATE Jobs SET State=$state,Error=NULL,Updated=$now,{CloseRunClock},FinishedAt=CASE WHEN $state='cancelled' THEN $now ELSE NULL END WHERE Id=$id",
+            Execute($"UPDATE Jobs SET State=$state,Error=NULL,FailureCode=NULL,Remedy=NULL,Updated=$now,{CloseRunClock},FinishedAt=CASE WHEN $state='cancelled' THEN $now ELSE NULL END WHERE Id=$id",
                 ("$state", state), ("$now", now), ("$id", id));
             // A retry is a fresh attempt, so its speed and duration are measured from scratch.
             if (operation == "retry")
@@ -411,10 +535,11 @@ public sealed class PrefetchJobStore : IDisposable
         });
     }
 
-    public void Finish(string id, bool success, string? error)
+    public void Finish(string id, bool success, string? error, string? failureCode = null, string? remedy = null)
     {
-        lock (_gate) Execute($"UPDATE Jobs SET State=$state,Error=$error,Updated=$now,FinishedAt=$now,{CloseRunClock} WHERE Id=$id AND State='running'",
+        lock (_gate) Execute($"UPDATE Jobs SET State=$state,Error=$error,FailureCode=$code,Remedy=$remedy,Updated=$now,FinishedAt=$now,{CloseRunClock} WHERE Id=$id AND State='running'",
             ("$state", success ? "completed" : "failed"), ("$error", error is null ? DBNull.Value : error[..Math.Min(error.Length, 512)]),
+            ("$code", (object?)failureCode ?? DBNull.Value), ("$remedy", (object?)remedy ?? DBNull.Value),
             ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), ("$id", id));
     }
 
@@ -449,7 +574,14 @@ public sealed class PrefetchJobStore : IDisposable
         FinishedAt = NullableInt64(reader, "FinishedAt"),
         ActiveMs = NullableInt64(reader, "ActiveMs"),
         WarmedBytes = NullableInt64(reader, "WarmedBytes"),
+        FailureCode = NullableString(reader, "FailureCode"),
+        Remedy = NullableString(reader, "Remedy"),
     };
+    private static string? NullableString(SqliteDataReader reader, string column)
+    {
+        var ordinal = reader.GetOrdinal(column);
+        return reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
+    }
     private static long? NullableInt64(SqliteDataReader reader, string column)
     {
         var ordinal = reader.GetOrdinal(column);

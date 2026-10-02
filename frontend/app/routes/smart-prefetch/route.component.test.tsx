@@ -125,6 +125,91 @@ describe("Smart Prefetch activity page", () => {
     expect(screen.getByText(/median 14\.2 MB\/s · 2 jobs/)).toBeTruthy();
   });
 
+  it("shows backfill range coverage, failure reasons, and how the cache fills in", async () => {
+    const MiB = 1024 * 1024;
+    const history = {
+      ...response,
+      settings: { ...response.settings, finishWatchedEnabled: false },
+      jobs: [
+        {
+          id: "backfill",
+          itemId: "item-d",
+          displayName: "A.Good.Girls.Guide.S02E02",
+          source: "Playback not yet cached",
+          trigger: "backfill",
+          state: "completed",
+          start: 100 * MiB,
+          length: 4 * MiB,
+          committedBytes: 50_300_000,
+          fileSize: 6_900_000_000,
+          isRangeJob: true,
+          rangeBytes: 4 * MiB,
+          rangeCachedBytes: 4 * MiB,
+          updated: now,
+        },
+        {
+          id: "damaged",
+          itemId: "item-e",
+          displayName: "South.Park.S01E07",
+          source: "Selected Plex hub/collection",
+          trigger: "plex:x:source:y:episode:z",
+          state: "failed",
+          start: 0,
+          length: 0,
+          committedBytes: 0,
+          fileSize: 3_000_000_000,
+          error: "Release damaged on Usenet. Queued for repair.",
+          failureCode: "source-damaged",
+          remedy: "repair-queued",
+          updated: now,
+        },
+        {
+          id: "queued-backfill",
+          itemId: "item-f",
+          displayName: "Queued backfill",
+          source: "Playback not yet cached",
+          trigger: "backfill",
+          state: "queued",
+          start: 0,
+          length: 8 * MiB,
+          committedBytes: 0,
+          fileSize: 6_900_000_000,
+          isRangeJob: true,
+          rangeBytes: 8 * MiB,
+          rangeCachedBytes: 0,
+          updated: now,
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(history) }),
+    );
+    const router = createMemoryRouter(
+      [{ path: "/smart-prefetch", element: <SmartPrefetchActivityPage /> }],
+      { initialEntries: ["/smart-prefetch"] },
+    );
+    render(<RouterProvider router={router} />);
+    const queued = await screen.findByRole("button", { name: /Queued backfill/ });
+    expect(queued.textContent).toContain("Waiting to cache the 8 MiB playback missed");
+    expect(queued.textContent).not.toContain("0% whole-file coverage");
+
+    await userEvent.setup().click(screen.getByRole("tab", { name: /Warming history/ }));
+    const backfill = screen.getByRole("button", { name: /A\.Good\.Girls\.Guide/ });
+    expect(backfill.textContent).toContain("Cached the 4 MiB playback missed ✓");
+    expect(backfill.textContent).toContain("1% of the whole file is cached");
+    expect(within(backfill).getByLabelText("4 MiB range fully cached")).toBeTruthy();
+    const damaged = screen.getByRole("button", { name: /South\.Park/ });
+    expect(damaged.textContent).toContain("Release damaged on Usenet");
+    expect(within(damaged).getByText("Queued for repair")).toBeTruthy();
+    expect(
+      screen.getByText(
+        /The cache keeps what was played plus the files your prefetch policies select/,
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText(/Partially cached files fill in when they are played/)).toBeTruthy();
+  });
+
   it("opens the shared media file modal from a history row with the keyboard", async () => {
     const details = {
       davItemId: "item-b",
