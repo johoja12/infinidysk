@@ -221,6 +221,7 @@ public class DavDatabaseContext : DbContext
     public DbSet<Par2RepairJob> Par2RepairJobs => Set<Par2RepairJob>();
     public DbSet<SetupWizardState> SetupWizardStates => Set<SetupWizardState>();
     public DbSet<LibraryLinkMap> LinkMaps => Set<LibraryLinkMap>();
+    public DbSet<ArrRegrabRequest> ArrRegrabRequests => Set<ArrRegrabRequest>();
 
     // Pending blob writes for the current unit of work (flushed in SaveChangesAsync).
     private readonly List<DavNzbFile> _blobNzbFiles = [];
@@ -1070,6 +1071,40 @@ public class DavDatabaseContext : DbContext
                 .IsUnique(false);
         });
 
+        // ArrRegrabRequest
+        b.Entity<ArrRegrabRequest>(e =>
+        {
+            e.ToTable("ArrRegrabRequests");
+            e.HasKey(i => i.Id);
+
+            e.Property(i => i.Id)
+                .ValueGeneratedNever();
+
+            e.Property(i => i.DedupKey)
+                .IsRequired();
+
+            e.Property(i => i.Source)
+                .IsRequired();
+
+            e.Property(i => i.Status)
+                .IsRequired();
+
+            e.Property(i => i.ReleaseName)
+                .IsRequired();
+
+            e.HasIndex(i => i.DedupKey)
+                .IsUnique();
+
+            e.HasIndex(i => i.Status)
+                .IsUnique(false);
+
+            e.HasIndex(i => i.DavItemId)
+                .IsUnique(false);
+
+            e.HasIndex(i => i.LibraryPath)
+                .IsUnique(false);
+        });
+
         if (DatabaseProviderConfig.IsPostgres)
         {
             // Existing installs store these values as SQLite date/time text with
@@ -1091,6 +1126,21 @@ public class DavDatabaseContext : DbContext
                 .HasColumnType("timestamp without time zone")
                 .HasConversion(PostgresWallClockDateTimeConverter);
             b.Entity<LibraryLinkMap>().Property(x => x.LastCheckedUtc)
+                .HasColumnType("timestamp without time zone")
+                .HasConversion(PostgresNullableWallClockDateTimeConverter);
+            b.Entity<ArrRegrabRequest>().Property(x => x.CreatedAt)
+                .HasColumnType("timestamp without time zone")
+                .HasConversion(PostgresWallClockDateTimeConverter);
+            b.Entity<ArrRegrabRequest>().Property(x => x.UpdatedAt)
+                .HasColumnType("timestamp without time zone")
+                .HasConversion(PostgresWallClockDateTimeConverter);
+            b.Entity<ArrRegrabRequest>().Property(x => x.NextAttemptAt)
+                .HasColumnType("timestamp without time zone")
+                .HasConversion(PostgresNullableWallClockDateTimeConverter);
+            b.Entity<ArrRegrabRequest>().Property(x => x.RequestedAt)
+                .HasColumnType("timestamp without time zone")
+                .HasConversion(PostgresNullableWallClockDateTimeConverter);
+            b.Entity<ArrRegrabRequest>().Property(x => x.CompletedAt)
                 .HasColumnType("timestamp without time zone")
                 .HasConversion(PostgresNullableWallClockDateTimeConverter);
         }
