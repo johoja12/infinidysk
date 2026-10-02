@@ -17,6 +17,10 @@ public sealed class FileBlobStore : IBlobStore, IDisposable
 {
     private const int CompressionLevel = 1;
     private readonly Lock _lockObj = new();
+    // Typed reads in flight per blob. A same-ID commit marks them stale so an
+    // older deserialization cannot repopulate the metadata cache, including
+    // content-preserving commits that do not publish a content revision.
+    private readonly Dictionary<Guid, List<PendingRead>> _pendingReads = [];
     private readonly MemoryCache _metadataCache = new(new MemoryCacheOptions
     {
         SizeLimit = 200_000
@@ -64,7 +68,7 @@ public sealed class FileBlobStore : IBlobStore, IDisposable
                 await stream.CopyToAsync(fileStream, cancellationToken).ConfigureAwait(false);
             }
 
-            CommitBlobWrite(id, blobPath, tempPath);
+            CommitBlobWrite(id, blobPath, tempPath, publishRevision: true);
             committed = true;
         }
         finally
@@ -74,7 +78,22 @@ public sealed class FileBlobStore : IBlobStore, IDisposable
         }
     }
 
-    public async Task WriteBlob<T>(Guid id, T blob, CancellationToken cancellationToken = default)
+    public Task WriteBlob<T>(Guid id, T blob, CancellationToken cancellationToken = default)
+        => WriteTypedBlob(id, blob, publishRevision: true, cancellationToken);
+
+    /// <summary>
+    /// Replaces a typed blob whose decoded media content is unchanged, such as lazy RAR
+    /// resolution filling in byte ranges for volumes the blob already references. Active
+    /// readers are not invalidated; the metadata cache is still refreshed.
+    /// </summary>
+    public Task WriteContentPreservingBlob<T>(Guid id, T blob, CancellationToken cancellationToken = default)
+        => WriteTypedBlob(id, blob, publishRevision: false, cancellationToken);
+
+    private async Task WriteTypedBlob<T>(
+        Guid id,
+        T blob,
+        bool publishRevision,
+        CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var blobPath = GetBlobPath(id);
@@ -92,7 +111,7 @@ public sealed class FileBlobStore : IBlobStore, IDisposable
             }
             cancellationToken.ThrowIfCancellationRequested();
 
-            CommitBlobWrite(id, blobPath, tempPath);
+            CommitBlobWrite(id, blobPath, tempPath, publishRevision);
             committed = true;
         }
         finally
@@ -139,47 +158,91 @@ public sealed class FileBlobStore : IBlobStore, IDisposable
         if (_metadataCache.TryGetValue(id, out T? cached)) return cached;
 
         using var revision = ContentRevisionTracker.Watch(id);
-
-        var stream = ReadBlob(id);
-        if (stream == null) return default;
-        var blobPath = GetBlobPath(id);
-        T? blob;
+        var pendingRead = BeginPendingRead(id);
         try
         {
-            await using var fileStream = stream;
-            await using var decompressionStream = new DecompressionStream(fileStream);
-            blob = await MemoryPackSerializer.DeserializeAsync<T>(decompressionStream).ConfigureAwait(false);
-        }
-        catch (Exception e) when (
-            e is MemoryPackSerializationException or ZstdException or EndOfStreamException)
-        {
-            // Truncated/corrupt on-disk blob (unclean shutdown, partial restore):
-            // the payload exists but cannot be decoded, distinct from a missing file.
-            throw new CorruptedBlobPayloadException(id, blobPath, typeof(T), e);
-        }
+            var stream = ReadBlob(id);
+            if (stream == null) return default;
+            var blobPath = GetBlobPath(id);
+            T? blob;
+            try
+            {
+                await using var fileStream = stream;
+                await using var decompressionStream = new DecompressionStream(fileStream);
+                blob = await MemoryPackSerializer.DeserializeAsync<T>(decompressionStream).ConfigureAwait(false);
+            }
+            catch (Exception e) when (
+                e is MemoryPackSerializationException or ZstdException or EndOfStreamException)
+            {
+                // Truncated/corrupt on-disk blob (unclean shutdown, partial restore):
+                // the payload exists but cannot be decoded, distinct from a missing file.
+                throw new CorruptedBlobPayloadException(id, blobPath, typeof(T), e);
+            }
 
-        lock (_lockObj)
-        {
-            // Deserialization can outlive a same-ID replacement. Check and publish
-            // under the same lock as replacement/cache invalidation.
-            if (blob is not null && revision.IsCurrent)
-                _metadataCache.Set(id, blob, new MemoryCacheEntryOptions()
-                    .SetSize(GetCacheSize(blob))
-                    .SetSlidingExpiration(TimeSpan.FromMinutes(10)));
-        }
+            lock (_lockObj)
+            {
+                // Deserialization can outlive a same-ID replacement. Check and publish
+                // under the same lock as replacement/cache invalidation.
+                if (blob is not null && revision.IsCurrent && !pendingRead.Stale)
+                    _metadataCache.Set(id, blob, new MemoryCacheEntryOptions()
+                        .SetSize(GetCacheSize(blob))
+                        .SetSlidingExpiration(TimeSpan.FromMinutes(10)));
+            }
 
-        return blob;
+            return blob;
+        }
+        finally
+        {
+            EndPendingRead(id, pendingRead);
+        }
     }
 
-    private void CommitBlobWrite(Guid id, string blobPath, string tempPath)
+    private void CommitBlobWrite(Guid id, string blobPath, string tempPath, bool publishRevision)
     {
         lock (_lockObj)
         {
-            using var publication = ContentRevisionTracker.BeginPublication(id);
+            // Content-preserving writes only fill in metadata for bytes the blob already
+            // describes; active streams keep serving the same content.
+            using var publication = publishRevision ? ContentRevisionTracker.BeginPublication(id) : null;
             Directory.CreateDirectory(Path.GetDirectoryName(blobPath)!);
             File.Move(tempPath, blobPath, overwrite: true);
-            _metadataCache.Remove(id);
+            InvalidateCachedMetadata(id);
         }
+    }
+
+    private PendingRead BeginPendingRead(Guid id)
+    {
+        var pendingRead = new PendingRead();
+        lock (_lockObj)
+        {
+            if (!_pendingReads.TryGetValue(id, out var reads)) _pendingReads[id] = reads = [];
+            reads.Add(pendingRead);
+        }
+
+        return pendingRead;
+    }
+
+    private void EndPendingRead(Guid id, PendingRead pendingRead)
+    {
+        lock (_lockObj)
+        {
+            if (!_pendingReads.TryGetValue(id, out var reads)) return;
+            reads.Remove(pendingRead);
+            if (reads.Count == 0) _pendingReads.Remove(id);
+        }
+    }
+
+    // Caller holds _lockObj.
+    private void InvalidateCachedMetadata(Guid id)
+    {
+        _metadataCache.Remove(id);
+        if (!_pendingReads.TryGetValue(id, out var reads)) return;
+        foreach (var read in reads) read.Stale = true;
+    }
+
+    private sealed class PendingRead
+    {
+        public bool Stale { get; set; }
     }
 
     private void TryDeleteIncompleteWrite(string tempPath)
@@ -206,12 +269,12 @@ public sealed class FileBlobStore : IBlobStore, IDisposable
     public bool Delete(Guid id)
     {
         using var publication = ContentRevisionTracker.BeginPublication(id);
-        _metadataCache.Remove(id);
         var blobPath = GetBlobPath(id);
         var deleted = false;
 
         lock (_lockObj)
         {
+            InvalidateCachedMetadata(id);
             try
             {
                 File.GetAttributes(blobPath);

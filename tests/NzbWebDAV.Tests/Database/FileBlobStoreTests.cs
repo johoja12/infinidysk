@@ -55,6 +55,48 @@ public sealed class FileBlobStoreTests : IDisposable
     }
 
     [Fact]
+    public async Task InFlightOldDeserialize_CannotRepopulateCacheAfterContentPreservingReplacement()
+    {
+        var id = Guid.NewGuid();
+        await _store.WriteBlob(id, new PausedBlob { Value = 1 });
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        PausedBlob.AfterRead = value =>
+        {
+            if (value != 1) return;
+            entered.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(10)));
+        };
+        try
+        {
+            var oldRead = Task.Run(() => _store.ReadBlob<PausedBlob>(id));
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(10)));
+            await _store.WriteContentPreservingBlob(id, new PausedBlob { Value = 2 });
+            release.Set();
+            await oldRead;
+            Assert.Equal(2, (await _store.ReadBlob<PausedBlob>(id))!.Value);
+        }
+        finally { release.Set(); PausedBlob.AfterRead = null; }
+    }
+
+    [Fact]
+    public async Task ContentPreservingReplacement_KeepsActiveNativeReadersCurrent()
+    {
+        var id = Guid.NewGuid();
+        await _store.WriteBlob(id, new PausedBlob { Value = 1 });
+        Assert.Equal(1, (await _store.ReadBlob<PausedBlob>(id))!.Value);
+        using var watch = ContentRevisionTracker.Watch(id);
+
+        await _store.WriteContentPreservingBlob(id, new PausedBlob { Value = 2 });
+
+        Assert.True(watch.IsCurrent);
+        Assert.Equal(2, (await _store.ReadBlob<PausedBlob>(id))!.Value);
+
+        await _store.WriteBlob(id, new PausedBlob { Value = 3 });
+        Assert.False(watch.IsCurrent);
+    }
+
+    [Fact]
     public async Task SameIdReplacement_InvalidatesActiveNativeReaders()
     {
         var id = Guid.NewGuid();

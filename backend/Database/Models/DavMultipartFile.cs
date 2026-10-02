@@ -45,6 +45,13 @@ public partial class DavMultipartFile
         // Null only for blobs written before continuation-chain validation.
         [MemoryPackOrder(6)]
         public long? ExpectedFileSize { get; set; }
+
+        // Content identity captured before lazy RAR resolution first rewrote
+        // this meta. Resolution only fills in metadata for volumes the blob
+        // already references, so it carries this forward to keep the Native
+        // Cache generation stable. Null: derive it from the current parts.
+        [MemoryPackOrder(7)]
+        public string? ContentIdentity { get; set; }
     }
 
     [MemoryPackable(GenerateType.VersionTolerant)]

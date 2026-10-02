@@ -8,6 +8,7 @@ using NzbWebDAV.Database.Models;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Extensions;
 using NzbWebDAV.Models;
+using NzbWebDAV.Services.NativeCache;
 using NzbWebDAV.Utils;
 using Serilog;
 using SharpCompress.Common.Rar.Headers;
@@ -211,6 +212,7 @@ public class LazyRarResolver(INntpClient usenetClient, ConfigManager configManag
                 ArchivePassword = meta.ArchivePassword,
                 PendingParts = [],
                 ExpectedFileSize = meta.ExpectedFileSize,
+                ContentIdentity = MultipartContentIdentity.Get(meta),
             };
 
             Log.Information(
@@ -625,6 +627,8 @@ public class LazyRarResolver(INntpClient usenetClient, ConfigManager configManag
                 ArchivePassword = meta.ArchivePassword,
                 PendingParts = newPending,
                 ExpectedFileSize = meta.ExpectedFileSize,
+                // Resolution fills in metadata only; the content identity must not change.
+                ContentIdentity = MultipartContentIdentity.Get(meta),
             };
 
             var becameComplete = meta.IsLazy && newPending.Length == 0;
@@ -690,7 +694,9 @@ public class LazyRarResolver(INntpClient usenetClient, ConfigManager configManag
         try
         {
             if (Volatile.Read(ref p.LatestStamp) != myStamp) return;
-            await BlobStore.WriteBlob(mpf.Id, mpf).ConfigureAwait(false);
+            // Resolved volumes describe bytes the blob already referenced, so active
+            // streams on this file must keep playing (#111, #114).
+            await BlobStore.WriteContentPreservingBlob(mpf.Id, mpf).ConfigureAwait(false);
 
             if (reconcileFileSize)
             {
