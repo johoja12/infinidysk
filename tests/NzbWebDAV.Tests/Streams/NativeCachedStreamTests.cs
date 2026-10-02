@@ -383,6 +383,45 @@ public sealed class NativeCachedStreamTests : IDisposable
     }
 
     [Fact]
+    public async Task GenerationChangeDuringFirstSourceRead_ServesSourceBytesInsteadOfFailing()
+    {
+        await using var store = CreateStore();
+        var id = new NativeCacheIdentity("id", "version", 3);
+        var current = true;
+        // Reading the source is what publishes the new revision (lazy RAR resolution).
+        await using var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(new CallbackStream(new byte[] { 7, 8, 9 }, () => current = false)), () => current);
+        var bytes = new byte[3];
+        Assert.Equal(3, await stream.ReadAsync(bytes));
+        Assert.Equal(new byte[] { 7, 8, 9 }, bytes);
+        Assert.Equal(0, await store.GetCoverageAsync(id));
+    }
+
+    [Fact]
+    public async Task GenerationChangeAfterCacheProbe_BeforeFirstByte_RereadsFromSource()
+    {
+        await using var store = CreateStore();
+        var id = new NativeCacheIdentity("id", "version", 3);
+        await store.WriteBlockAsync(id, 0, new byte[] { 1, 2, 3 });
+        var checks = 0;
+        // Current for the opening checks and the cache probe, then changed before the copy.
+        await using var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(new MemoryStream(new byte[] { 9, 9, 9 })), () => ++checks <= 3);
+        var bytes = new byte[3];
+        Assert.Equal(3, await stream.ReadAsync(bytes));
+        Assert.Equal(new byte[] { 9, 9, 9 }, bytes);
+    }
+
+    private sealed class CallbackStream(byte[] data, Action onRead) : MemoryStream(data)
+    {
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            onRead();
+            return base.ReadAsync(buffer, cancellationToken);
+        }
+    }
+
+    [Fact]
     public async Task SequentialReads_OpenSourceToEnd_AndSeekResetsIt()
     {
         await using var store = CreateStore();
