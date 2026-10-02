@@ -22,7 +22,7 @@ public class SonarrClient(string host, string apiKey) : ArrClient(host, apiKey)
         (await GetSonarrQueueAsync(ct).ConfigureAwait(false)).ToGeneric();
 
     public Task<List<SonarrSeries>> GetAllSeries(CancellationToken ct = default) =>
-        Get<List<SonarrSeries>>($"/series", ct);
+        GetBulk<List<SonarrSeries>>($"/series", ct);
 
     public Task<SonarrSeries> GetSeries(int seriesId, CancellationToken ct = default) =>
         Get<SonarrSeries>($"/series/{seriesId}", ct);
@@ -287,6 +287,18 @@ public class SonarrClient(string host, string apiKey) : ArrClient(host, apiKey)
             if (series?.Path != null && parentPaths.Contains(series.Path, StringComparer.Ordinal))
                 return cachedSeriesId;
             SeriesPathToSeriesIdCache.TryRemove((Host, cachedSeriesPath), out _);
+        }
+
+        // A busy Sonarr can take minutes to list every series; parsing the file name resolves the
+        // series in milliseconds. Accept it only when that series' folder contains this path.
+        if (await TryParseTitleAsync(Path.GetFileName(symlinkOrStrmPath), ct).ConfigureAwait(false) is { } parsed
+            && parsed.TryGetProperty("series", out var parsedSeries) && parsedSeries.ValueKind == JsonValueKind.Object
+            && parsedSeries.TryGetProperty("id", out var parsedId) && parsedId.TryGetInt32(out var seriesId)
+            && parsedSeries.TryGetProperty("path", out var parsedPath) && parsedPath.GetString() is { } seriesPath
+            && parentPaths.Contains(seriesPath, StringComparer.Ordinal))
+        {
+            SeriesPathToSeriesIdCache[(Host, seriesPath)] = seriesId;
+            return seriesId;
         }
 
         // otherwise, fetch all series and repopulate the cache
