@@ -136,7 +136,8 @@ internal static class ArrCleanupRecovery
                 await save(state with { Stage = "completed", CommandId = command.Id }).ConfigureAwait(false);
                 return; // An acknowledged command ID proves acceptance, even if history expires quickly.
             }
-            catch (Exception e) when (Transient(e, ct))
+            catch (Exception e) when (Transient(e, ct)
+                || !ct.IsCancellationRequested && e is JsonException or InvalidDataException)
             { Console.WriteLine("Arr search response uncertain; rechecking accepted commands."); }
         }
         if (state.SearchStarted is null || state.PreviousCommands is null)

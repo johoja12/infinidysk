@@ -343,7 +343,7 @@ internal static class FailedImportCleanup
                         response.EnsureSuccessStatusCode();
                         var result = await response.Content.ReadFromJsonAsync<LegacyDeleteResult>(JsonOptions, ct).ConfigureAwait(false);
                         if (result is not { Deleted: 1, Failed: 0 })
-                            throw new InvalidOperationException("Legacy deletion has an uncertain external outcome; recheck before resuming.");
+                            Console.WriteLine("Legacy deletion response needs an authoritative state recheck.");
                     }
                     catch (Exception e) when (ArrCleanupRecovery.Transient(e, ct))
                     { Console.WriteLine($"Legacy deletion needs recheck (attempt {attempt}/4)."); }
