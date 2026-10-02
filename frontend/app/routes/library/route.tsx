@@ -26,6 +26,7 @@ import {
   LibraryFileModalHost,
   useLibraryFileModal,
 } from "~/components/library-file-modal/use-library-file-modal";
+import { RegrabBadge } from "~/components/library-file-modal/regrab";
 import { plexRequest } from "~/utils/plex-request";
 
 type Category = "all" | "shows" | "movies" | "unmatched";
@@ -584,6 +585,7 @@ export default function Library({ loaderData }: Route.ComponentProps) {
                         <Badge className={mappingBadgeClass(row.item)}>
                           {mappingLabel(row.item)}
                         </Badge>
+                        <RegrabBadge status={row.item.regrabStatus} />
                       </td>
                     </tr>
                   );
@@ -740,6 +742,7 @@ export default function Library({ loaderData }: Route.ComponentProps) {
                                   {cachePercentage == null ? "unavailable" : `${cachePercentage}%`}
                                 </span>
                                 <Badge>{item.health}</Badge>
+                                <RegrabBadge status={item.regrabStatus} />
                                 <button
                                   type="button"
                                   className="btn btn-sm btn-outline"

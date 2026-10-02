@@ -2,6 +2,7 @@ import { Alert, Badge, Button, Icon, Modal } from "~/components/ui";
 import { formatFileSize } from "~/utils/file-size";
 import type { LibraryCatalogItem, LibraryFileDetails } from "~/clients/backend-client.server";
 import { fileName, fullLibraryLinkPath } from "./library-path";
+import { isActiveRegrab, regrabStatusLabel, type RegrabState } from "./regrab";
 
 export type LibraryModalActionState = "idle" | "pending";
 
@@ -32,6 +33,11 @@ export type LibraryFileModalProps = {
   onRunHealthCheck: () => void;
   onRequeue: () => void;
   onPrewarm: () => void;
+  /** Sonarr/Radarr regrab state; the Regrab action is hidden when omitted. */
+  regrab?: RegrabState;
+  onRegrab?: () => void;
+  onRegrabConfirm?: () => void;
+  onRegrabCancel?: () => void;
 };
 
 export function LibraryFileModal(props: LibraryFileModalProps) {
@@ -44,6 +50,20 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
   const qualityLabel =
     props.quality === "4k" ? "4K" : props.quality === "unknown" ? "Unknown" : props.quality;
   const sourcePath = details?.contentPath ?? item.contentPath ?? item.mappings[0]?.targetText;
+  const regrab = props.regrab;
+  const showRegrab =
+    regrab !== undefined && !libraryUnavailable && (!!item.davItemId || item.mappings.length > 0);
+  const regrabRequest = regrab?.preview?.request ?? null;
+  const regrabActive = isActiveRegrab(regrabRequest?.status);
+  const regrabTarget = regrab?.preview?.target ?? null;
+  const regrabDisabled =
+    !regrab ||
+    regrab.loading ||
+    regrab.pending ||
+    regrab.confirming ||
+    regrabActive ||
+    regrab.preview?.eligible !== true ||
+    props.actionState === "pending";
 
   return (
     <Modal open title={fileName(item.displayName)} onClose={props.onClose} size="wide">
@@ -192,7 +212,37 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
               ) : null}
             </>
           )}
+          {showRegrab && (
+            <Button
+              variant="outline"
+              size="small"
+              onClick={props.onRegrab}
+              disabled={regrabDisabled}
+              title={
+                regrab?.preview?.eligible === false && regrab.preview.disabledReason
+                  ? regrab.preview.disabledReason
+                  : "Ask Sonarr/Radarr for another copy of this file"
+              }
+            >
+              <Icon
+                name={regrab?.pending ? "progress_activity" : "autorenew"}
+                className={`!text-[16px] ${regrab?.pending ? "animate-spin" : ""}`}
+              />
+              {regrab?.pending ? "Regrabbing…" : "Regrab"}
+            </Button>
+          )}
         </div>
+        {showRegrab && regrab && (
+          <RegrabStatus
+            regrab={regrab}
+            active={regrabActive}
+            onConfirm={props.onRegrabConfirm}
+            onCancel={props.onRegrabCancel}
+            releaseName={regrab.preview?.releaseName ?? fileName(item.displayName)}
+            targetLabel={regrabTarget ? regrabTarget.label : null}
+            app={regrabTarget?.app ?? "Sonarr/Radarr"}
+          />
+        )}
         {!canPrewarm && item.kind === "internal" && (
           <p className="text-xs text-base-content/60">
             Prewarm is unavailable: Native cache is inactive.
@@ -263,6 +313,99 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
       </div>
     </Modal>
   );
+}
+
+function RegrabStatus({
+  regrab,
+  active,
+  releaseName,
+  targetLabel,
+  app,
+  onConfirm,
+  onCancel,
+}: {
+  regrab: RegrabState;
+  active: boolean;
+  releaseName: string;
+  targetLabel: string | null;
+  app: string;
+  onConfirm?: (() => void) | undefined;
+  onCancel?: (() => void) | undefined;
+}) {
+  const request = regrab.preview?.request ?? null;
+  if (regrab.confirming) {
+    return (
+      <section
+        role="alertdialog"
+        aria-label="Confirm regrab"
+        className="rounded-xl border border-warning/40 bg-warning/10 p-4 text-sm"
+      >
+        <h3 className="font-semibold">Regrab this file?</h3>
+        <dl className="mt-3 grid gap-2 text-xs sm:grid-cols-[8rem_1fr]">
+          <dt className="text-base-content/55">Release</dt>
+          <dd className="break-all font-mono">{releaseName}</dd>
+          <dt className="text-base-content/55">Arr target</dt>
+          <dd className="break-all">{targetLabel ?? "—"}</dd>
+          {regrab.preview?.libraryPath ? (
+            <>
+              <dt className="text-base-content/55">Library link</dt>
+              <dd className="break-all font-mono">{regrab.preview.libraryPath}</dd>
+            </>
+          ) : null}
+        </dl>
+        <p className="mt-3 text-xs leading-relaxed text-base-content/70">
+          InfiniDysk removes only the library symlink
+          {regrab.preview?.oldLibraryLink ? " in the old library (never its target)" : ""}. {app}{" "}
+          then removes its file record, blocklists the release when its download is known, and
+          searches for a replacement. The removal is journaled.
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <Button size="small" variant="outline" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button size="small" variant="danger" onClick={onConfirm}>
+            <Icon name="autorenew" className="!text-[16px]" />
+            Regrab
+          </Button>
+        </div>
+      </section>
+    );
+  }
+  if (request && (active || request.status === "failed" || request.status === "skipped")) {
+    return (
+      <Alert variant={active ? "info" : "warning"} role="status">
+        <span>
+          <strong>{regrabStatusLabel(request.status)}</strong>
+          {request.arrApp ? ` in ${request.arrApp}` : ""}
+          {request.requestedAt
+            ? ` · ${new Date(request.requestedAt).toLocaleString()}`
+            : request.createdAt
+              ? ` · ${new Date(request.createdAt).toLocaleString()}`
+              : ""}
+          {request.message ? ` — ${request.message}` : ""}
+        </span>
+      </Alert>
+    );
+  }
+  if (regrab.loading)
+    return (
+      <p role="status" className="text-xs text-base-content/60">
+        Checking Sonarr/Radarr for this file…
+      </p>
+    );
+  if (regrab.error)
+    return (
+      <p role="alert" className="text-xs text-error">
+        {regrab.error}
+      </p>
+    );
+  if (regrab.preview && !regrab.preview.eligible && regrab.preview.disabledReason)
+    return (
+      <p className="text-xs text-base-content/60">
+        Regrab is unavailable: {regrab.preview.disabledReason}
+      </p>
+    );
+  return null;
 }
 
 function Fact({ label, value }: { label: string; value: string }) {
