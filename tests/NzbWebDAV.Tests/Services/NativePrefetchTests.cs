@@ -75,6 +75,22 @@ public sealed class NativePrefetchTests : IAsyncLifetime
         Assert.Equal(bytes.Length, await _store.GetCoverageAsync(identity));
     }
 
+    [Fact]
+    public async Task WholeFileWarm_ReportsOnlyNewlyFilledBytesAsWarmed()
+    {
+        var bytes = new byte[NativeCacheStore.BlockSize + 3];
+        var identity = new NativeCacheIdentity("warmed-movie", "revision", bytes.Length);
+        Assert.True(await _store.WriteBlockAsync(identity, 0, bytes.AsMemory(0, NativeCacheStore.BlockSize)));
+        await using var stream = new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new VerifiedSource(bytes, true)), () => true);
+        var warmed = 0L;
+        var lastCoverage = 0L;
+        await NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0, _ => ValueTask.FromResult(true),
+            coverage => lastCoverage = coverage, CancellationToken.None, warmed: count => warmed += count);
+        Assert.Equal(3, warmed); // The already cached first block is not counted.
+        Assert.Equal(bytes.Length, lastCoverage);
+    }
+
     [Theory]
     [InlineData("missing")]
     [InlineData("truncated")]

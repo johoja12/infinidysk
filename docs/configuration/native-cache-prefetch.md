@@ -195,6 +195,15 @@ item IDs, sync, pause/resume, cancel/retry, and priority changes; priority never
 foreground admission. Progress represents verified committed whole-file coverage,
 not bytes merely read from providers or the size of one requested range.
 
+**Warming history** [since unreleased](https://github.com/johoja12/infinidysk/issues/117){ .nzbdav-since }
+shows each finished job's average warming speed and active duration, for example
+`14.2 MB/s · 3m 05s`. Speed counts only the bytes that job fetched and committed,
+divided by its running time; queued, deferred, and paused time is excluded. The list
+header shows the median speed of the visible jobs, which helps spot a slow provider or
+a busy cache disk. Jobs recorded before this release show "—". Select any history or
+activity row to open the same file details modal as Media Library; files without a
+Media Library record show their name, size, and cache coverage only.
+
 When application shutdown begins, warming stops taking new jobs and interrupts
 active work without treating it as a source failure or spending a retry attempt.
 Verified bytes remain cached. After restart, enabled Plex policies rebuild their

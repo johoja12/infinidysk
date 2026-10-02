@@ -85,6 +85,22 @@ describe("LibraryFileModal", () => {
     expect(onRequeue).toHaveBeenCalledTimes(1);
   });
 
+  it("hides library-only details and repair actions for a file outside the library", () => {
+    render(
+      <LibraryFileModal
+        {...baseProps}
+        item={{ ...item, mappings: [], mappingCount: 0 }}
+        libraryUnavailable="This file is not in the Media Library."
+      />,
+    );
+    expect(screen.getByText("This file is not in the Media Library.")).toBeTruthy();
+    expect(screen.getByText("Media file")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /requeue/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /run health check/i })).toBeNull();
+    expect(screen.queryByText(/health history/i)).toBeNull();
+    expect(screen.getByRole("button", { name: /prewarm/i })).toBeTruthy();
+  });
+
   it("hides prewarm when native cache is inactive", () => {
     render(<LibraryFileModal {...baseProps} canPrewarm={false} />);
     expect(screen.queryByRole("button", { name: /prewarm/i })).toBeNull();

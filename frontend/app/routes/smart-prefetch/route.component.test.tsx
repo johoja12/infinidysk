@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMemoryRouter, RouterProvider } from "react-router";
@@ -7,6 +8,19 @@ import SmartPrefetchActivityPage from "./route";
 
 vi.mock("~/auth/authorization", () => ({ useIsReadOnly: () => true }));
 vi.mock("~/components/prefetch-queue", () => ({ PrefetchQueue: () => null }));
+// jsdom has no <dialog>.showModal(), so render the shared modal as a plain dialog role.
+vi.mock("~/components/ui", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("~/components/ui")>();
+  return {
+    ...actual,
+    Modal: ({ open, title, children }: { open: boolean; title: string; children: ReactNode }) =>
+      open ? (
+        <div role="dialog" aria-label={title}>
+          {children}
+        </div>
+      ) : null,
+  };
+});
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
@@ -73,5 +87,129 @@ describe("Smart Prefetch activity page", () => {
     expect(screen.queryByText("Movie warming")).toBeNull();
     expect(screen.getByText("Completed today")).toBeTruthy();
     expect(screen.queryByText("Advanced warming controls")).toBeNull();
+    expect(screen.queryByText("About this history")).toBeNull();
+    expect(screen.queryByText("Why a job might wait")).toBeNull();
+  });
+
+  it("shows per-job warming speed and the median for recorded history", async () => {
+    const recorded = {
+      ...response,
+      jobs: [
+        response.jobs[1],
+        {
+          ...response.jobs[1],
+          id: "c",
+          itemId: "item-c",
+          displayName: "Timed movie",
+          activeMs: 185_000,
+          warmedBytes: 14_200_000 * 185,
+          startedAt: now - 200_000,
+          finishedAt: now,
+        },
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve(recorded) }),
+    );
+    const router = createMemoryRouter(
+      [{ path: "/smart-prefetch", element: <SmartPrefetchActivityPage /> }],
+      { initialEntries: ["/smart-prefetch"] },
+    );
+    render(<RouterProvider router={router} />);
+    await userEvent.setup().click(await screen.findByRole("tab", { name: /Warming history/ }));
+    const timed = screen.getByRole("button", { name: /Timed movie/ });
+    expect(timed.textContent).toContain("14.2 MB/s · 3m 05s");
+    // A job recorded before timing existed shows a dash instead of a speed.
+    expect(screen.getByRole("button", { name: /Series finished/ }).textContent).toContain("—");
+    expect(screen.getByText(/median 14\.2 MB\/s · 2 jobs/)).toBeTruthy();
+  });
+
+  it("opens the shared media file modal from a history row with the keyboard", async () => {
+    const details = {
+      davItemId: "item-b",
+      name: "Series.S01E01.1080p.mkv",
+      contentPath: "/content/Series.S01E01.1080p.mkv",
+      size: 2_000_000_000,
+      mappings: [
+        {
+          linkPath: "tv/Series/Series.S01E01.1080p.mkv",
+          targetText: "/mnt/.ids/item-b",
+          mappingType: "internal",
+          status: "valid",
+        },
+      ],
+    };
+    const fetchMock = vi.fn((input: string) =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve(
+            input.includes("/library-file")
+              ? {
+                  details,
+                  previewUrl: "/view/content/Series.S01E01.1080p.mkv?downloadKey=k",
+                  libraryRoot: "/mnt/plex",
+                  unavailableReason: null,
+                }
+              : response,
+          ),
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const router = createMemoryRouter(
+      [{ path: "/smart-prefetch", element: <SmartPrefetchActivityPage /> }],
+      { initialEntries: ["/smart-prefetch"] },
+    );
+    render(<RouterProvider router={router} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("tab", { name: /Warming history/ }));
+    screen.getByRole("button", { name: /Series finished/ }).focus();
+    await user.keyboard("{Enter}");
+
+    const dialog = await screen.findByRole("dialog");
+    expect(fetchMock).toHaveBeenCalledWith("/library-file?davItemId=item-b");
+    // Library path and mapping list both show the full link path once details load.
+    expect(
+      await within(dialog).findAllByText("/mnt/plex/tv/Series/Series.S01E01.1080p.mkv"),
+    ).toHaveLength(2);
+    expect(within(dialog).getByRole("button", { name: /Preview/ })).toBeTruthy();
+    expect(within(dialog).getByText("100%")).toBeTruthy();
+    expect(within(dialog).getByRole("button", { name: /Requeue repair/ })).toBeTruthy();
+  });
+
+  it("degrades the modal when the file is not in the Media Library", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: string) =>
+        Promise.resolve({
+          ok: true,
+          json: () =>
+            Promise.resolve(
+              input.includes("/library-file")
+                ? {
+                    details: null,
+                    previewUrl: null,
+                    libraryRoot: null,
+                    unavailableReason: "This file is not in the Media Library.",
+                  }
+                : response,
+            ),
+        }),
+      ),
+    );
+    const router = createMemoryRouter(
+      [{ path: "/smart-prefetch", element: <SmartPrefetchActivityPage /> }],
+      { initialEntries: ["/smart-prefetch"] },
+    );
+    render(<RouterProvider router={router} />);
+    await userEvent.setup().click(await screen.findByRole("button", { name: /Movie warming/ }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(await within(dialog).findByText("This file is not in the Media Library.")).toBeTruthy();
+    expect(within(dialog).getByText("Movie warming")).toBeTruthy();
+    expect(within(dialog).getByText("50%")).toBeTruthy();
+    expect(within(dialog).queryByRole("button", { name: /Requeue repair/ })).toBeNull();
+    expect(within(dialog).queryByRole("button", { name: /Run health check/ })).toBeNull();
   });
 });

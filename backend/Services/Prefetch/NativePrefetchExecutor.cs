@@ -52,10 +52,17 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         }
         // A manual request is an explicit ask to prove the cache, so it hashes every block.
         var sampling = jobs.HasOwner(job.Id, "manual") ? null : VerificationSample.ForRun(DateTimeOffset.UtcNow);
+        // Bytes this run filled since the last progress write; flushed with the next coverage update.
+        var unreportedWarmed = 0L;
         await WarmAsync(native.Store, cached, job.Start, job.Length,
             async _ => CanContinue() && await wireBudget.PrepareReadAsync(ct).ConfigureAwait(false),
-            bytes => jobs.Progress(job.Id, cached.Identity.Generation, bytes), wireBudget.Token,
-            CanContinue, native.ActiveSettings?.ChunkMb ?? 64, sampling).ConfigureAwait(false);
+            bytes =>
+            {
+                jobs.Progress(job.Id, cached.Identity.Generation, bytes, unreportedWarmed);
+                unreportedWarmed = 0;
+            }, wireBudget.Token,
+            CanContinue, native.ActiveSettings?.ChunkMb ?? 64, sampling,
+            warmed => unreportedWarmed += warmed).ConfigureAwait(false);
         jobs.RecordVerified(job.ItemId, cached.Identity.Generation, job.Start, job.Length);
         }
         catch (Exception exception) when (exception is not OutOfMemoryException && (wireBudget.Exceeded || jobs.WireBudgetBlocked) && !ct.IsCancellationRequested)
@@ -72,7 +79,8 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
 
     public static async Task WarmAsync(NativeCacheStore store, NativeCachedStream stream, long start, long length,
         Func<long, ValueTask<bool>> spend, Action<long> progress, CancellationToken ct,
-        Func<bool>? canContinue = null, int chunkMb = 64, VerificationSample? sampling = null)
+        Func<bool>? canContinue = null, int chunkMb = 64, VerificationSample? sampling = null,
+        Action<long>? warmed = null)
     {
         if (start < 0 || start >= stream.Length || length < 0 || length > stream.Length - start)
             throw new ArgumentException("The warm range is outside the media file.");
@@ -115,6 +123,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
                     if (await stream.ReadWarmProbeAsync(probe, ct).ConfigureAwait(false) != 1 || !stream.LastReadCacheable || !stream.IsSourceCurrent
                         || await store.FindNextMissingOffsetAsync(stream.Identity, position, Math.Min(position + count, chunkEnd), ct).ConfigureAwait(false) == position)
                         throw new PrefetchDeferredException("Source bytes were not verified or the cache could not commit this range.", countsAsFailure: true);
+                    warmed?.Invoke(count);
                     progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
                     position = Math.Min(position + count, chunkEnd);
                 }

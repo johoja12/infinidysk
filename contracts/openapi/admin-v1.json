@@ -1251,6 +1251,501 @@
         ],
         "type": "object"
       },
+      "PrefetchJob": {
+        "properties": {
+          "activeMs": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          },
+          "committedBytes": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "displayName": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "error": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "fileSize": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          },
+          "finishedAt": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          },
+          "generation": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "itemId": {
+            "format": "uuid",
+            "type": "string"
+          },
+          "length": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "priority": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "reason": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "source": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "start": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "startedAt": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          },
+          "state": {
+            "type": "string"
+          },
+          "trigger": {
+            "type": "string"
+          },
+          "updated": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "warmedBytes": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          }
+        },
+        "required": [
+          "committedBytes",
+          "error",
+          "generation",
+          "id",
+          "itemId",
+          "length",
+          "priority",
+          "start",
+          "state",
+          "trigger",
+          "updated"
+        ],
+        "type": "object"
+      },
+      "PrefetchLibraryIdentity": {
+        "properties": {
+          "libraryId": {
+            "default": "",
+            "type": "string"
+          },
+          "serverId": {
+            "default": "",
+            "type": "string"
+          },
+          "type": {
+            "default": "movie",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "PrefetchSettings": {
+        "properties": {
+          "confidenceThreshold": {
+            "format": "double",
+            "pattern": "^-?(?:0|[1-9]\\d*)(?:\\.\\d+)?(?:[eE][+-]?\\d+)?$",
+            "type": [
+              "number",
+              "string"
+            ]
+          },
+          "connectionsPerJob": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "cooldownMinutes": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "dailyByteBudget": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "disabledLibraries": {
+            "items": {
+              "$ref": "#/components/schemas/PrefetchLibraryIdentity"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "fullFileWarming": {
+            "type": "boolean"
+          },
+          "historyEnabled": {
+            "type": "boolean"
+          },
+          "intentTtlHours": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "lookbackDays": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "maxBytesPerItem": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "maxConcurrentJobs": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "maxQueueAhead": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "maxRetries": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "minEpisodesForPrediction": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "minimumHeadMb": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "minimumTailMb": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "minimumWarmEnabled": {
+            "type": "boolean"
+          },
+          "movieEnabled": {
+            "type": "boolean"
+          },
+          "moviePartialWatchLookbackDays": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "movieSyncIntervalMinutes": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "pauseDuringPlayback": {
+            "type": "boolean"
+          },
+          "predictionsEnabled": {
+            "type": "boolean"
+          },
+          "queueCapacity": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "readActivityEnabled": {
+            "type": "boolean"
+          },
+          "realtimeCheckIntervalSeconds": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "realtimeEnabled": {
+            "type": "boolean"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/PrefetchSource"
+            },
+            "type": "array"
+          },
+          "syncIntervalMinutes": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "tvEnabled": {
+            "type": "boolean"
+          },
+          "tvEpisodesPerShow": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "tvSyncIntervalMinutes": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "users": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "verifiedSessionExpirySeconds": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "warmLocalFiles": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "PrefetchSource": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "excludedShows": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "key": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "libraryId": {
+            "type": "string"
+          },
+          "limit": {
+            "format": "int32",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "serverId": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "PrefetchStatusResponse": {
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "dailyBudgetUsed": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "healthy": {
+            "type": "boolean"
+          },
+          "initializationError": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "jobs": {
+            "items": {
+              "$ref": "#/components/schemas/PrefetchJob"
+            },
+            "type": "array"
+          },
+          "lastError": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "lastSuccess": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "paused": {
+            "type": "boolean"
+          },
+          "runtimeError": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "settings": {
+            "$ref": "#/components/schemas/PrefetchSettings"
+          }
+        },
+        "required": [
+          "available",
+          "dailyBudgetUsed",
+          "healthy",
+          "initializationError",
+          "jobs",
+          "lastError",
+          "lastSuccess",
+          "paused",
+          "runtimeError",
+          "settings"
+        ],
+        "type": "object"
+      },
       "ProblemDetails": {
         "description": "RFC 7807 problem document. Failures also return the X-Correlation-ID header, which matches the traceId property and Serilog TraceId log context.",
         "properties": {
@@ -1644,7 +2139,7 @@
   "info": {
     "description": "Contributor-facing reference for the InfiniDysk admin REST API. SABnzbd compatibility, WebDAV, streaming, adapters, and file-transfer routes are intentionally excluded.",
     "title": "InfiniDysk Admin API",
-    "version": "2.4.0"
+    "version": "2.5.0"
   },
   "openapi": "3.1.1",
   "paths": {
@@ -9835,6 +10330,23 @@
         "operationId": "get-api-prefetch",
         "responses": {
           "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrefetchStatusResponse"
+                }
+              },
+              "text/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrefetchStatusResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrefetchStatusResponse"
+                }
+              }
+            },
             "description": "OK"
           },
           "400": {

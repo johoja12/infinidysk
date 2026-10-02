@@ -5,6 +5,12 @@ import { Icon } from "~/components/ui";
 import { settingsPath } from "~/navigation/settings-tabs";
 import { withUrlBase } from "~/utils/url-base";
 import { PrefetchQueue } from "~/components/prefetch-queue";
+import {
+  LibraryFileModalHost,
+  useLibraryFileModal,
+  type LibraryFileModalController,
+} from "~/components/library-file-modal/use-library-file-modal";
+import { formatSpeed, formatWarmingSpeed, medianWarmingSpeed } from "./warming-speed";
 
 type Job = {
   id: string;
@@ -20,6 +26,10 @@ type Job = {
   fileSize?: number;
   error?: string | null;
   updated: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+  activeMs?: number | null;
+  warmedBytes?: number | null;
 };
 type Status = {
   available: boolean;
@@ -81,33 +91,53 @@ function Card({
     </div>
   );
 }
-function JobRow({ job }: { job: Job }) {
+function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
   const pct = coverage(job);
+  const finished = terminal.has(job.state);
   return (
-    <article className="border-b border-base-content/10 p-4 last:border-0">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="min-w-0 font-semibold">{job.displayName || job.itemId}</div>
-        {badge(job.state)}
-      </div>
-      <p className="mt-1 text-xs text-base-content/55">
-        {job.source || job.trigger} · {when(job.updated)}
-      </p>
-      {pct !== null && (
-        <div
-          className="mt-3 h-1.5 overflow-hidden rounded-full bg-base-content/10"
-          aria-label={`${pct}% whole-file cache coverage`}
-        >
-          <div className="h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
-        </div>
-      )}
-      <div className="mt-2 flex justify-between gap-2 text-xs text-base-content/65">
-        <span>
-          {bytes(job.committedBytes)}
-          {job.fileSize ? ` of ${bytes(job.fileSize)}` : ""} cached file bytes
+    <article className="border-b border-base-content/10 last:border-0">
+      <button
+        type="button"
+        aria-haspopup="dialog"
+        className="block w-full cursor-pointer px-4 pt-4 text-left transition-colors hover:bg-base-300/40 focus-visible:bg-base-300/40 focus-visible:outline-none"
+        onClick={() => onOpen(job)}
+      >
+        <span className="flex flex-wrap items-center justify-between gap-2">
+          <span className="min-w-0 font-semibold">{job.displayName || job.itemId}</span>
+          {badge(job.state)}
         </span>
-        {pct !== null && <span>{pct}% whole-file coverage</span>}
-      </div>
-      <details className="mt-2 text-xs text-base-content/70">
+        <span className="mt-1 block text-xs text-base-content/55">
+          {job.source || job.trigger} · {when(job.updated)}
+        </span>
+        {pct !== null && (
+          <span
+            className="mt-3 block h-1.5 overflow-hidden rounded-full bg-base-content/10"
+            aria-label={`${pct}% whole-file cache coverage`}
+          >
+            <span className="block h-full rounded-full bg-primary" style={{ width: `${pct}%` }} />
+          </span>
+        )}
+        <span className="mt-2 flex flex-wrap justify-between gap-2 text-xs text-base-content/65">
+          <span>
+            {bytes(job.committedBytes)}
+            {job.fileSize ? ` of ${bytes(job.fileSize)}` : ""} cached file bytes
+          </span>
+          {finished && (
+            <span title="Average speed of the bytes this job fetched, over its active warming time">
+              {formatWarmingSpeed(job)}
+            </span>
+          )}
+          {pct !== null && (
+            <span
+              className="tooltip tooltip-left"
+              data-tip="Includes bytes that were already cached before this job ran."
+            >
+              {pct}% whole-file coverage
+            </span>
+          )}
+        </span>
+      </button>
+      <details className="px-4 pb-4 pt-2 text-xs text-base-content/70">
         <summary className="cursor-pointer font-semibold text-primary">Details</summary>
         <div className="mt-2 rounded-lg bg-base-300/65 p-3">
           <p>
@@ -132,6 +162,7 @@ export default function SmartPrefetchActivityPage() {
   const [filter, setFilter] = useState("all");
   const [page, setPage] = useState(0);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const fileModal = useLibraryFileModal({ prewarmAction: "/library-file" });
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const response = await fetch(withUrlBase("/api/prefetch"), signal ? { signal } : {});
     if (!response.ok)
@@ -200,6 +231,7 @@ export default function SmartPrefetchActivityPage() {
   const used = status?.dailyBudgetUsed;
   const pct = budget && used != null ? Math.min(100, (used / budget) * 100) : 0;
   const unavailable = !status?.available || status?.healthy === false;
+  const median = view === "history" ? medianWarmingSpeed(visible) : null;
   return (
     <div className="mx-auto max-w-7xl space-y-5 px-4 py-6 sm:px-6 lg:px-8">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -346,47 +378,19 @@ export default function SmartPrefetchActivityPage() {
           </select>
         </div>
       </div>
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_19rem]">
-        <section className="overflow-hidden rounded-xl border border-base-content/10 bg-base-200/50">
-          <div className="border-b border-base-content/10 px-4 py-3 text-sm font-semibold">
-            {view === "activity" ? "Warming queue" : "Recent outcomes"}{" "}
-            <span className="float-right text-xs font-normal text-base-content/50">
-              {visible.length} jobs
-            </span>
-          </div>
-          {visible.length ? (
-            pageJobs.map((job) => <JobRow key={job.id} job={job} />)
-          ) : (
-            <p className="px-4 py-16 text-center text-sm text-base-content/60">
-              {status ? "No matching jobs." : "Loading warming jobs…"}
-            </p>
-          )}
-          {visible.length > 25 && (
-            <div className="flex items-center justify-between border-t border-base-content/10 p-3 text-xs">
-              <button
-                type="button"
-                className="btn btn-xs btn-outline"
-                disabled={shownPage === 0}
-                onClick={() => setPage(shownPage - 1)}
-              >
-                Previous
-              </button>
-              <span>
-                Page {shownPage + 1} of {lastPage + 1}
-              </span>
-              <button
-                type="button"
-                className="btn btn-xs btn-outline"
-                disabled={shownPage === lastPage}
-                onClick={() => setPage(shownPage + 1)}
-              >
-                Next
-              </button>
-            </div>
-          )}
-        </section>
-        <div className="space-y-4">
-          {view === "activity" ? (
+      {view === "activity" ? (
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_19rem]">
+          <JobList
+            title="Warming queue"
+            jobs={pageJobs}
+            total={visible.length}
+            loaded={status !== null}
+            page={shownPage}
+            lastPage={lastPage}
+            onPage={setPage}
+            onOpen={(job) => openJob(fileModal, job)}
+          />
+          <div className="space-y-4">
             <section className="space-y-3 rounded-xl border border-base-content/10 bg-base-200/50 p-4">
               <h3 className="font-semibold">Queue controls</h3>
               <p className="text-xs text-base-content/60">
@@ -421,27 +425,32 @@ export default function SmartPrefetchActivityPage() {
                 Sync Plex policies now
               </button>
             </section>
-          ) : (
             <section className="rounded-xl border border-base-content/10 bg-base-200/50 p-4">
-              <h3 className="font-semibold">About this history</h3>
+              <h3 className="font-semibold">Why a job might wait</h3>
               <p className="mt-2 text-xs text-base-content/60">
-                Cached bytes show whole-file coverage after each job, including bytes already
-                present. A completed range may leave some of the file uncached.
-              </p>
-              <p className="mt-2 text-xs text-base-content/60">
-                The queue keeps a bounded set of recent outcomes. This is not a permanent audit log.
+                Active playback, provider limits, exhausted budget, and unavailable sources can
+                pause warming.
               </p>
             </section>
-          )}
-          <section className="rounded-xl border border-base-content/10 bg-base-200/50 p-4">
-            <h3 className="font-semibold">Why a job might wait</h3>
-            <p className="mt-2 text-xs text-base-content/60">
-              Active playback, provider limits, exhausted budget, and unavailable sources can pause
-              warming.
-            </p>
-          </section>
+          </div>
         </div>
-      </div>
+      ) : (
+        <JobList
+          title="Recent outcomes"
+          summary={median === null ? null : `median ${formatSpeed(median)}`}
+          jobs={pageJobs}
+          total={visible.length}
+          loaded={status !== null}
+          page={shownPage}
+          lastPage={lastPage}
+          onPage={setPage}
+          onOpen={(job) => openJob(fileModal, job)}
+        />
+      )}
+      <LibraryFileModalHost
+        modal={fileModal}
+        canPrewarm={Boolean(status?.available) && status?.healthy !== false}
+      />
       {!readOnly && (
         <details
           className="collapse collapse-arrow rounded-xl border border-base-content/10 bg-base-200/50"
@@ -454,5 +463,77 @@ export default function SmartPrefetchActivityPage() {
         </details>
       )}
     </div>
+  );
+}
+
+function openJob(modal: LibraryFileModalController, job: Job) {
+  modal.openByDavItemId(job.itemId, {
+    displayName: job.displayName || job.itemId,
+    size: job.fileSize ?? null,
+    cachePercentage: coverage(job),
+  });
+}
+
+function JobList({
+  title,
+  summary = null,
+  jobs,
+  total,
+  loaded,
+  page,
+  lastPage,
+  onPage,
+  onOpen,
+}: {
+  title: string;
+  summary?: string | null;
+  jobs: Job[];
+  total: number;
+  loaded: boolean;
+  page: number;
+  lastPage: number;
+  onPage: (page: number) => void;
+  onOpen: (job: Job) => void;
+}) {
+  return (
+    <section className="overflow-hidden rounded-xl border border-base-content/10 bg-base-200/50">
+      <div className="flex flex-wrap items-baseline justify-between gap-2 border-b border-base-content/10 px-4 py-3 text-sm font-semibold">
+        <span>{title}</span>
+        <span className="text-xs font-normal text-base-content/50">
+          {summary ? `${summary} · ` : ""}
+          {total} jobs
+        </span>
+      </div>
+      {total ? (
+        jobs.map((job) => <JobRow key={job.id} job={job} onOpen={onOpen} />)
+      ) : (
+        <p className="px-4 py-16 text-center text-sm text-base-content/60">
+          {loaded ? "No matching jobs." : "Loading warming jobs…"}
+        </p>
+      )}
+      {total > 25 && (
+        <div className="flex items-center justify-between border-t border-base-content/10 p-3 text-xs">
+          <button
+            type="button"
+            className="btn btn-xs btn-outline"
+            disabled={page === 0}
+            onClick={() => onPage(page - 1)}
+          >
+            Previous
+          </button>
+          <span>
+            Page {page + 1} of {lastPage + 1}
+          </span>
+          <button
+            type="button"
+            className="btn btn-xs btn-outline"
+            disabled={page === lastPage}
+            onClick={() => onPage(page + 1)}
+          >
+            Next
+          </button>
+        </div>
+      )}
+    </section>
   );
 }
