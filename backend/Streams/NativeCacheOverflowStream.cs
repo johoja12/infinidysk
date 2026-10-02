@@ -1,5 +1,6 @@
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Services.NativeCache;
+using NzbWebDAV.Services.Observability;
 using UsenetSharp.Streams;
 
 namespace NzbWebDAV.Streams;
@@ -7,9 +8,11 @@ namespace NzbWebDAV.Streams;
 /// <summary>Shares one reserved integrity buffer between readers when normal stream admission is full.</summary>
 internal sealed class NativeCacheOverflowStream(NativeCacheStore store, NativeCacheIdentity identity,
     Func<CancellationToken, Task<Stream>> open, Func<bool> current, IDisposable watch,
-    SemaphoreSlim slots, NativeCacheStatistics statistics) : FastReadOnlyStream, IStreamGenerationEvidence
+    SemaphoreSlim slots, NativeCacheStatistics statistics, Action<long, long>? backfill = null)
+    : FastReadOnlyStream, IStreamGenerationEvidence
 {
     private readonly IDisposable _lease = store.AcquireLease(identity);
+    private readonly UncachedRangeTracker _uncached = new(identity.Length, backfill, identity.DisplayName ?? identity.ItemId);
     private long _position;
     private bool _disposed;
     private Stream? _source;
@@ -39,6 +42,9 @@ internal sealed class NativeCacheOverflowStream(NativeCacheStore store, NativeCa
                 block < start + read; block += NativeCacheStore.BlockSize)
                 if (block != _lastSourceBlock) { statistics.Miss(); _lastSourceBlock = block; }
             if (!current()) throw new MediaSourceChangedException("Media source changed during this response. Retry the range.");
+            PrometheusMetrics.Current?.RecordNativeCacheSkip("admission_overflow");
+            _uncached.Note(start, start + read);
+            _uncached.Served(read);
             _position += read;
             return read;
         }
@@ -46,6 +52,7 @@ internal sealed class NativeCacheOverflowStream(NativeCacheStore store, NativeCa
             new SlotLease(slots), statistics: statistics) { Position = _position };
         var count = await stream.ReadAsync(destination, cancellationToken).ConfigureAwait(false);
         if (!current()) throw new MediaSourceChangedException("Media source changed during this response. Retry the range.");
+        _uncached.Served(count);
         _position += count;
         return count;
     }
@@ -69,6 +76,7 @@ internal sealed class NativeCacheOverflowStream(NativeCacheStore store, NativeCa
         if (disposing && !_disposed)
         {
             _disposed = true;
+            _uncached.Flush();
             try { _source?.Dispose(); }
             finally { try { watch.Dispose(); } finally { _lease.Dispose(); } }
         }
