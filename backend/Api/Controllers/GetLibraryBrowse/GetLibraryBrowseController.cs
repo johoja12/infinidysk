@@ -8,6 +8,7 @@ using NzbWebDAV.Extensions;
 using NzbWebDAV.Services.Library;
 using NzbWebDAV.Services.Plex;
 using NzbWebDAV.Services.NativeCache;
+using NzbWebDAV.Services.Regrab;
 
 namespace NzbWebDAV.Api.Controllers.GetLibraryBrowse;
 
@@ -28,6 +29,10 @@ public sealed class GetLibraryBrowseController(DavDatabaseClient dbClient,
         var browse = new LibraryBrowseService(catalog, plexMetadata, nativeCache);
         var result = await browse.QueryAsync(request.Query, scanner, request.CancellationToken)
             .ConfigureAwait(false);
+        var regrab = HttpContext.RequestServices.GetService<ArrRegrabService>();
+        if (regrab is not null)
+            result = await LibraryRegrabDecorator.DecorateAsync(
+                result, regrab, dbClient.Ctx, config.GetLibraryDir(), request.CancellationToken).ConfigureAwait(false);
         return Ok(result);
     }
 }
