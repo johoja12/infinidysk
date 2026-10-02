@@ -382,6 +382,62 @@ For archived batches whose source links may have changed since acknowledgement,
 `skipped_source_changed` in the journal and continues with still exact failures.
 Reconcile every skipped item separately; the command never deletes it.
 
+### Regrab damaged or missing-articles imports [since unreleased](https://github.com/johoja12/infinidysk/issues/134){ .nzbdav-since }
+
+Sonarr and Radarr did not start migration downloads, so they do not grab a
+replacement when InfiniDysk rejects a legacy release as **damaged on Usenet**
+or for **missing articles**. Meanwhile the old library link keeps pointing at
+the broken legacy file. InfiniDysk now regrabs these failures automatically
+through the same service as the file-modal **Regrab** action:
+
+1. While a batch runs, a failed submission in a `migration-*` category whose
+   reason is `Release damaged on Usenet` or `Missing articles` is recorded as a
+   regrab request for each selected library link of that release. Recording a
+   request never calls Sonarr/Radarr, so a batch never waits on them.
+2. A background worker processes one request at a time. It identifies the
+   owning Sonarr episode or Radarr movie from the library path, then removes
+   **only the old-library symlink**. The symlink must sit under the primary
+   Library Directory, must not be reached through a symlinked folder, and must
+   still point at the failed legacy item (the exported original target, or a
+   `.ids` target ending with the legacy DavItem ID). The link target and the
+   legacy NzbDav data are never touched. The worker then removes the orphaned
+   Arr file record (blocklisting the release when a unique import-history
+   download ID is known) and requests a budget-limited replacement search.
+3. Every removal is journaled to `/config/regrab/library-link-removals.jsonl`
+   (path, previous target, legacy item, release, Arr target, timestamp), and
+   each request is stored once per legacy item. Retries resume after a restart.
+   Sonarr/Radarr timeouts are retried with backoff and logged as one line per
+   release, for example
+   `Requested regrab for <release> in Sonarr (migration import failed: missing articles)`.
+
+Failures whose link has changed, disappeared, is not a symlink, or has no Arr
+match are recorded as skipped and left untouched. This deliberately widens the
+original `/mnt/plex` deletion boundary to symlinks of confirmed damaged or
+missing-articles imports only; see `DEPLOYMENT-NOTES.md`.
+
+`GET /api/migration/nzbdav/import-failures` records any missing requests
+(idempotently, without calling Arr) and adds `regrabStatus`
+(`regrab-queued`, `regrab-requested`, `regrab-replaced`, `regrab-skipped` or
+`regrab-failed`), `regrabArrTarget`, and `regrabMessage` to each failure.
+Record that status, with the Arr target, in the batch ledger instead of a bare
+`import-failed`. The batch acknowledgement still treats these rows as terminal
+import failures. Because the old link has been removed, the legacy-deleting
+`cleanup-failed-imports` step records them as `skipped_source_changed`. Do not
+use it for damaged or missing-articles failures.
+
+For failures from batches that ran before this change, open
+**Settings → System → Migration → NzbDav → Regrab failed migration imports**
+and load the saved `import-failures.json` reports (one per batch). Run the
+**Dry run** first: it counts eligible rows and skipped rows by reason without
+changing anything. Then queue at most the chosen limit (1–500). Each bounded
+run needs a fresh dry run. The same flow is available as
+`POST /api/arr-regrab/migration-failures/dry-run` with `{ "failures": [...] }`,
+followed by `POST /api/arr-regrab/migration-failures` with
+`{ "failures": [...], "limit": 25, "previewToken": "<from the dry run>" }`.
+`GET /api/arr-regrab/migration-failures` returns request counts by state. This
+is not a library-wide content sweep: only rows already recorded as failed for
+these two reasons qualify.
+
 Use each root's own mapped and recoverable counts in its full-connect request;
 the combined count is an audit gate, not a batch-master denominator. For each
 root's batch, download its checksummed plan and apply it with that

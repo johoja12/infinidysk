@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models.UsenetMigration;
+using NzbWebDAV.Services.Regrab;
 using NzbWebDAV.UsenetMigration;
 using NzbWebDAV.UsenetMigration.Canary;
 using NzbWebDAV.UsenetMigration.NzbDav;
@@ -11,13 +12,15 @@ using NzbWebDAV.UsenetMigration.Provenance;
 using NzbWebDAV.UsenetMigration.Runner;
 using NzbWebDAV.UsenetMigration.Source;
 using NzbWebDAV.UsenetMigration.Triage;
+using ArrRegrabStatus = NzbWebDAV.Database.Models.ArrRegrabStatus;
 
 namespace NzbWebDAV.Api.Controllers.UsenetMigration;
 
 public sealed class NzbDavMigrationController(
     UsenetMigrationStore store,
     UsenetMigrationRunner runner,
-    NzbDavReconciliationService? reconciliation = null) : UsenetMigrationBaseController
+    NzbDavReconciliationService? reconciliation = null,
+    ArrRegrabService? regrab = null) : UsenetMigrationBaseController
 {
     private readonly NzbDavPackageReader _packageReader = new();
     private readonly Action _interruptScan = () => runner?.InterruptScan();
@@ -385,13 +388,30 @@ public sealed class NzbDavMigrationController(
             throw new BadHttpRequestException("Wait for the import to reach a terminal state.");
         var package = await ReadPackageAsync(session.SourcePackageRoot!).ConfigureAwait(false);
         var failures = await LoadTerminalFailuresAsync(package).ConfigureAwait(false);
+        var regrabStates = await RecordRegrabsAsync(package, failures).ConfigureAwait(false);
         return Ok(new
         {
             status = true,
             packageDigest = package.PackageDigest,
             batchIndex = package.Manifest.BatchIndex,
             failedCount = failures.Count,
-            failures,
+            failures = failures.Select(failure =>
+            {
+                regrabStates.TryGetValue(failure.LegacyDavItemId, out var regrabState);
+                return new
+                {
+                    failure.SourceReleaseId,
+                    failure.LegacyDavItemId,
+                    failure.LibraryRelativePath,
+                    failure.SubmissionState,
+                    failure.Reason,
+                    regrabStatus = regrabState is null ? null : LedgerStatus(regrabState.Status),
+                    regrabArrTarget = regrabState?.ArrApp is null
+                        ? null
+                        : $"{regrabState.ArrApp} {regrabState.ArrMediaKind} on {regrabState.ArrHost}",
+                    regrabMessage = regrabState?.Message,
+                };
+            }),
         });
     });
 
@@ -473,6 +493,40 @@ public sealed class NzbDavMigrationController(
             download = "/api/migration/nzbdav/canary-plan",
         });
     });
+
+    /// <summary>
+    /// Records (idempotently, without calling Arr) a regrab for every damaged or
+    /// missing-articles failure and returns the current regrab state per legacy item, so
+    /// the batch ledger can show <c>regrab-requested</c> with its Arr target.
+    /// </summary>
+    private async Task<IReadOnlyDictionary<Guid, ArrRegrabRequestView>> RecordRegrabsAsync(
+        NzbDavVerifiedPackage package,
+        IReadOnlyList<NzbDavImportFailure> failures)
+    {
+        if (regrab is null || failures.Count == 0)
+            return new Dictionary<Guid, ArrRegrabRequestView>();
+        var records = MigrationFailureFeed.Build(
+            package,
+            failures
+                .Where(failure => failure.SubmissionState == "failed")
+                .Select(failure => ($"nzbdav:{failure.SourceReleaseId}", failure.Reason))
+                .Distinct()
+                .ToArray());
+        await regrab.EnqueueMigrationFailuresAsync(records, HttpContext.RequestAborted).ConfigureAwait(false);
+        return await regrab.GetMigrationStatesAsync(
+            failures.Select(failure => failure.LegacyDavItemId).ToArray(),
+            HttpContext.RequestAborted).ConfigureAwait(false);
+    }
+
+    private static string LedgerStatus(string status) => status switch
+    {
+        ArrRegrabStatus.Pending => "regrab-queued",
+        ArrRegrabStatus.Requested => "regrab-requested",
+        ArrRegrabStatus.SearchWithheld => "regrab-requested",
+        ArrRegrabStatus.Replaced => "regrab-replaced",
+        ArrRegrabStatus.Skipped => "regrab-skipped",
+        _ => "regrab-failed",
+    };
 
     private async Task<IReadOnlyList<NzbDavImportFailure>> LoadTerminalFailuresAsync(NzbDavVerifiedPackage package)
     {

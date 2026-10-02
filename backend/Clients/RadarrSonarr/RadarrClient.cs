@@ -43,6 +43,25 @@ public class RadarrClient(string host, string apiKey) : ArrClient(host, apiKey)
                 [movieIds.MovieId]);
     }
 
+    public override async Task<int?> GetCurrentMediaFileIdAsync(
+        ArrMediaFileMatch match,
+        CancellationToken ct = default)
+    {
+        if (match.Kind != ArrMediaKind.Movie || match.MediaIds.Count == 0)
+            throw new ArgumentException("Radarr lookups require a movie match.", nameof(match));
+        var movie = await GetMovieAsync(match.MediaIds[0], ct).ConfigureAwait(false);
+        return movie.HasFile && movie.MovieFile is { Id: > 0 } file ? file.Id : null;
+    }
+
+    public override Task RequestSearchAsync(ArrMediaFileMatch match, CancellationToken ct = default)
+    {
+        if (match.Kind != ArrMediaKind.Movie || match.MediaIds.Count == 0)
+            throw new ArgumentException("Radarr search requires a movie match.", nameof(match));
+        return ExecuteWithTransientRetryAsync(
+            token => CommandAsync(new { name = "MoviesSearch", movieIds = match.MediaIds }, token),
+            ct);
+    }
+
     public override async Task<ArrMissingPayloadCleanupOutcome> RemoveMissingPayloadAndSearchAsync(
         ArrMediaFileMatch match,
         Func<IReadOnlyList<string>, bool>? shouldRequestSearch = null,

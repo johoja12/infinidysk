@@ -562,6 +562,104 @@ namespace NzbWebDAV.Database.Migrations
                     b.ToTable("Par2RepairJobs", (string)null);
                 });
 
+            modelBuilder.Entity("NzbWebDAV.Database.Models.ArrRegrabRequest", b =>
+                {
+                    b.Property<Guid>("Id")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int>("Attempts")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ArrHost")
+                        .HasColumnType("TEXT");
+
+                    b.Property<int?>("ArrFileId")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("ArrMediaIds")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ArrMediaKind")
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("ArrFileRemoved")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<bool>("Blocklisted")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<DateTime?>("CompletedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<Guid?>("DavItemId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DedupKey")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ExpectedLinkTarget")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("LastError")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("LibraryPath")
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("LinkRemoved")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int?>("MigrationBatchIndex")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("MigrationSourceReleaseId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("NextAttemptAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("PreviousLinkTarget")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Reason")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("ReleaseName")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("RequestedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Source")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Status")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("DavItemId");
+
+                    b.HasIndex("DedupKey")
+                        .IsUnique();
+
+                    b.HasIndex("LibraryPath");
+
+                    b.HasIndex("Status");
+
+                    b.ToTable("ArrRegrabRequests", (string)null);
+                });
+
             modelBuilder.Entity("NzbWebDAV.Database.Models.LibraryLinkMap", b =>
                 {
                     b.Property<Guid>("Id")

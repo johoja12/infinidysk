@@ -260,6 +260,17 @@ legacy NzbDav deployment, `/mnt/plex`, Plex, Arr, unrelated InfiniDysk history, 
 the reusable migration tool installation are outside the deletion boundary. Recheck
 the live IDs, row/file counts, and symlink ownership immediately before cleanup.
 
+**Owner-approved exception (issue #134):** for a migration import that failed
+as damaged on Usenet or with missing articles, InfiniDysk's regrab worker may
+remove the matching **symlink** beneath `/mnt/plex` (the configured Library
+Directory). It then asks Sonarr/Radarr to remove the orphaned file record and
+search again. Only a symlink that still points at the failed legacy item is
+removed. The worker inspects it without following it and never removes it
+through a symlinked folder. Every removal is journaled to
+`/opt/infinidysk/config/regrab/library-link-removals.jsonl`, and requests are
+de-duplicated per legacy item. Link targets, the legacy NzbDav data, and every
+other `/mnt/plex` entry remain outside the deletion boundary.
+
 ## Operator checks
 
 ```bash

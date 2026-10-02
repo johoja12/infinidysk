@@ -12,4 +12,7 @@ public class RadarrMovie
 
     [JsonPropertyName("movieFile")]
     public RadarrMovieFile? MovieFile { get; set; }
+
+    [JsonPropertyName("hasFile")]
+    public bool HasFile { get; set; }
 }

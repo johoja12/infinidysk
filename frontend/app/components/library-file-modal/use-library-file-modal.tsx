@@ -4,6 +4,12 @@ import type { LibraryCatalogItem, LibraryFileDetails } from "~/clients/backend-c
 import { MediaPreview } from "~/components/media-preview";
 import { withUrlBase } from "~/utils/url-base";
 import { LibraryFileModal, type LibraryModalFeedback } from "./file-modal";
+import {
+  idleRegrabState,
+  type RegrabPreview,
+  type RegrabRequestView,
+  type RegrabState,
+} from "./regrab";
 
 export type LibraryQuality = "4k" | "1080p" | "720p" | "sd" | "unknown";
 
@@ -87,6 +93,7 @@ export function useLibraryFileModal(options: { prewarmAction?: string } = {}) {
   const [actionPending, setActionPending] = useState(false);
   const [feedback, setFeedback] = useState<LibraryModalFeedback>(null);
   const [resolved, setResolved] = useState<Resolved | null>(null);
+  const [regrab, setRegrab] = useState<RegrabState>(idleRegrabState);
   // Ignores a slow lookup that finishes after another file was opened.
   const request = useRef(0);
 
@@ -97,13 +104,35 @@ export function useLibraryFileModal(options: { prewarmAction?: string } = {}) {
     setShowPreview(false);
     setFeedback(null);
     setResolved(null);
+    setRegrab(idleRegrabState);
     return request.current;
+  }, []);
+
+  const loadRegrab = useCallback((item: LibraryCatalogItem, token: number) => {
+    const query = regrabQuery(item);
+    if (!query) return;
+    setRegrab({ ...idleRegrabState, loading: true });
+    void fetch(withUrlBase(`/api/arr-regrab?${query}`))
+      .then(async (response) => {
+        const body = (await response.json().catch(() => null)) as
+          (RegrabPreview & { error?: string | null }) | null;
+        if (!response.ok || !body) throw new Error(body?.error || "Could not check Sonarr/Radarr.");
+        if (request.current === token) setRegrab({ ...idleRegrabState, preview: body });
+      })
+      .catch((error: unknown) => {
+        if (request.current === token)
+          setRegrab({
+            ...idleRegrabState,
+            error: error instanceof Error ? error.message : "Could not check Sonarr/Radarr.",
+          });
+      });
   }, []);
 
   const open = useCallback(
     (item: LibraryCatalogItem) => {
       const token = reset();
       setSelected(item);
+      loadRegrab(item, token);
       if (item.kind === "internal" && item.davItemId) {
         setDetailsLoading(true);
         void fetch(
@@ -124,7 +153,7 @@ export function useLibraryFileModal(options: { prewarmAction?: string } = {}) {
           });
       }
     },
-    [reset],
+    [reset, loadRegrab],
   );
 
   const openByDavItemId = useCallback(
@@ -148,6 +177,7 @@ export function useLibraryFileModal(options: { prewarmAction?: string } = {}) {
             const item = catalogItemFromDetails(body.details);
             setDetails(body.details);
             setSelected(item);
+            loadRegrab(item, token);
             setResolved((current) => ({
               quality: qualityFromName(item.displayName),
               cachePercentage: current?.cachePercentage ?? fallback.cachePercentage,
@@ -174,7 +204,7 @@ export function useLibraryFileModal(options: { prewarmAction?: string } = {}) {
           if (request.current === token) setDetailsLoading(false);
         });
     },
-    [reset],
+    [reset, loadRegrab],
   );
 
   const close = useCallback(() => {
@@ -242,6 +272,54 @@ export function useLibraryFileModal(options: { prewarmAction?: string } = {}) {
     );
   }, [fetcher, prewarmAction, selected]);
 
+  const onRegrab = useCallback(() => {
+    setRegrab((current) => ({ ...current, confirming: true }));
+  }, []);
+
+  const onRegrabCancel = useCallback(() => {
+    setRegrab((current) => ({ ...current, confirming: false }));
+  }, []);
+
+  const onRegrabConfirm = useCallback(() => {
+    if (!selected) return;
+    const query = regrabBody(selected);
+    if (!query) return;
+    const token = request.current;
+    setRegrab((current) => ({ ...current, confirming: false, pending: true }));
+    setFeedback(null);
+    void fetch(withUrlBase("/api/arr-regrab"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(query),
+    })
+      .then(async (response) => {
+        const body = (await response.json().catch(() => null)) as {
+          error?: string | null;
+          message?: string | null;
+          request?: RegrabRequestView | null;
+        } | null;
+        if (request.current !== token) return;
+        const requestView = body?.request ?? null;
+        setRegrab((current) => ({
+          ...current,
+          pending: false,
+          preview: requestView
+            ? { ...(current.preview ?? { eligible: false }), eligible: false, request: requestView }
+            : current.preview,
+        }));
+        setFeedback(
+          response.ok
+            ? { variant: "success", message: body?.message || "Regrab requested." }
+            : { variant: "danger", message: body?.error || body?.message || "Regrab failed." },
+        );
+      })
+      .catch(() => {
+        if (request.current !== token) return;
+        setRegrab((current) => ({ ...current, pending: false }));
+        setFeedback({ variant: "danger", message: "Regrab request failed." });
+      });
+  }, [selected]);
+
   return {
     selected,
     details,
@@ -265,7 +343,26 @@ export function useLibraryFileModal(options: { prewarmAction?: string } = {}) {
     onRunHealthCheck,
     onRequeue,
     onPrewarm,
+    regrab,
+    onRegrab,
+    onRegrabConfirm,
+    onRegrabCancel,
   };
+}
+
+/** Query string identifying the file for `GET /api/arr-regrab`, or null when it has no library link. */
+export function regrabQuery(item: LibraryCatalogItem): string | null {
+  const body = regrabBody(item);
+  if (!body) return null;
+  return "davItemId" in body
+    ? `davItemId=${encodeURIComponent(body.davItemId)}`
+    : `linkPath=${encodeURIComponent(body.linkPath)}`;
+}
+
+function regrabBody(item: LibraryCatalogItem): { davItemId: string } | { linkPath: string } | null {
+  if (item.davItemId) return { davItemId: item.davItemId };
+  const linkPath = item.mappings[0]?.linkPath;
+  return linkPath ? { linkPath } : null;
 }
 
 export type LibraryFileModalController = ReturnType<typeof useLibraryFileModal>;
@@ -316,6 +413,10 @@ export function LibraryFileModalHost({
         onRunHealthCheck={modal.onRunHealthCheck}
         onRequeue={modal.onRequeue}
         onPrewarm={modal.onPrewarm}
+        regrab={modal.regrab}
+        onRegrab={modal.onRegrab}
+        onRegrabConfirm={modal.onRegrabConfirm}
+        onRegrabCancel={modal.onRegrabCancel}
       />
       {modal.showPreview && effectivePreviewUrl ? (
         <MediaPreview

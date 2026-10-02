@@ -156,6 +156,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
     private readonly ConfigManager _configManager;
     private readonly ArrReplacementSearchBudget _replacementSearchBudget;
     private readonly ArrInstanceBackoff _arrBackoff;
+    private readonly Regrab.ArrRegrabService? _regrabService;
     private readonly UsenetStreamingClient _usenetClient;
     private readonly WebsocketManager _websocketManager;
     private readonly BenchmarkGate _benchmarkGate;
@@ -233,10 +234,12 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         IDbContextFactory<DavDatabaseContext>? dbContextFactory = null,
         TimeProvider? timeProvider = null,
         HealthWorkSchedulePolicy? healthWorkSchedule = null,
-        ArrInstanceBackoff? arrBackoff = null
+        ArrInstanceBackoff? arrBackoff = null,
+        Regrab.ArrRegrabService? regrabService = null
     )
     {
         _configManager = configManager;
+        _regrabService = regrabService;
         _replacementSearchBudget = replacementSearchBudget;
         _arrBackoff = arrBackoff ?? new ArrInstanceBackoff();
         _usenetClient = usenetClient;
@@ -2953,7 +2956,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
     internal sealed record ArrLinkedRepairResult(
         ArrLinkedRepairDecision Decision,
         Guid? RecoveredDownloadId = null,
-        string? RecoveryHost = null);
+        string? RecoveryHost = null,
+        string? RepairHost = null,
+        ArrMediaFileMatch? RepairMatch = null);
 
     /// <summary>
     /// True when <paramref name="candidatePath"/> is the same as <paramref name="rootPath"/> or a
@@ -3173,7 +3178,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                 return new ArrLinkedRepairResult(
                     ArrLinkedRepairDecision.RemoveAndBlocklistSucceeded,
                     persistedRecovery,
-                    recoveryHost);
+                    recoveryHost,
+                    arrClient.Host,
+                    mediaFile);
             }
 
             if (repairOutcome == ArrRepairOutcome.RemoveAndBlocklistSucceededSearchWithheld)
@@ -3181,7 +3188,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                 return new ArrLinkedRepairResult(
                     ArrLinkedRepairDecision.RemoveAndBlocklistSucceededSearchWithheld,
                     persistedRecovery,
-                    recoveryHost);
+                    recoveryHost,
+                    arrClient.Host,
+                    mediaFile);
             }
 
             if (repairOutcome == ArrRepairOutcome.MediaRemovedBlocklistUnconfirmed)
@@ -3620,6 +3629,18 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                     "health-repair",
                     davItem,
                     "health validation failed; Arr media removed and original download blocklisted");
+                if (_regrabService is not null)
+                {
+                    // Health repair already performed the Arr replacement; record it through the
+                    // shared regrab service so every regrab shows the same state in the UI.
+                    await _regrabService.RecordHealthRepairAsync(
+                        davItem,
+                        linkedPath,
+                        arrResult.RepairHost,
+                        arrResult.RepairMatch,
+                        arrDecision is ArrLinkedRepairDecision.RemoveAndBlocklistSucceededSearchWithheld,
+                        CancellationToken.None).ConfigureAwait(false);
+                }
                 RemoveDavItemWithGeneratedSidecars(dbClient, davItem);
                 _failureTracker.ClearFailure(davItem.Id);
                 davItem.UrgentRepairFailures = null;

@@ -961,6 +961,7 @@ const libraryCatalogItemSchema = z.object({
   mappingCount: z.number().int(),
   health: z.string(),
   mappings: z.array(libraryCatalogMappingSchema),
+  regrabStatus: z.string().nullable().optional(),
 });
 
 const libraryCatalogResponseSchema = z.object({

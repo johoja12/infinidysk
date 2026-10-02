@@ -872,6 +872,51 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SuccessfulArrRepair_RecordsStateThroughTheSharedRegrabService()
+    {
+        var segments = NewSegmentIds(3);
+        var sizes = Enumerable.Repeat(10_000L, segments.Length).ToArray();
+        var (item, _) = await AddVideoFileAsync("regrab-state-arr-repair.mkv", segments, sizes);
+        item.ArrDownloadId = Guid.NewGuid();
+        item.NextHealthCheck = DateTimeOffset.UnixEpoch;
+        item.HealthRepairPending = true;
+        await _context.SaveChangesAsync();
+
+        var libraryPath = Path.Join(_configRoot, "library", "regrab-state-arr-repair.strm");
+        await File.WriteAllTextAsync(
+            libraryPath,
+            $"http://localhost:3000/view/.ids/{item.Id}.mkv");
+        using var regrab = new NzbWebDAV.Services.Regrab.ArrRegrabService(
+            _configManager,
+            new ArrReplacementSearchBudget(),
+            new ArrInstanceBackoff())
+        {
+            ContextFactory = () => new DavDatabaseContext(_options),
+        };
+        var fake = NewFakeClient(segments, missing: [0]);
+        var (service, _) = await NewServiceAsync(
+            fake,
+            Par2RepairOutcome.NotRepaired,
+            regrabService: regrab);
+        using var cancellation = new CancellationTokenSource();
+        var arrClient = new PartialRepairArrClient(
+            cancellation, libraryPath, ArrRepairOutcome.RemoveAndBlocklistSucceeded);
+        service.CreateRepairArrClientsOverride = () => [arrClient];
+
+        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, cancellation.Token);
+
+        _context.ChangeTracker.Clear();
+        var request = await _context.ArrRegrabRequests.AsNoTracking().SingleAsync();
+        Assert.Equal(NzbWebDAV.Services.Regrab.ArrRegrabService.SourceHealthRepair, request.Source);
+        Assert.Equal(ArrRegrabStatus.Requested, request.Status);
+        Assert.Equal(item.Id, request.DavItemId);
+        Assert.Equal("movie", request.ArrMediaKind);
+        Assert.Equal(201, request.ArrFileId);
+        Assert.True(request.Blocklisted);
+        Assert.Equal(1, arrClient.RemoveCalls);
+    }
+
+    [Fact]
     public async Task PartialSample_UsesLegacyAbortOnFirstMissPath()
     {
         var segments = NewSegmentIds(HealthCheckService.SampleFloor + 1000);
@@ -1829,7 +1874,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         INntpClient fake,
         Par2RepairOutcome par2Outcome,
         TimeProvider? timeProvider = null,
-        HealthWorkSchedulePolicy? healthWorkSchedule = null)
+        HealthWorkSchedulePolicy? healthWorkSchedule = null,
+        NzbWebDAV.Services.Regrab.ArrRegrabService? regrabService = null)
     {
         await _usenet.ReplaceUnderlyingClientForTestsAsync(fake);
         var par2 = new ScriptedPar2RepairService(_configManager, _patchStore, par2Outcome);
@@ -1845,7 +1891,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             new ArrReplacementSearchBudget(),
             _healthCheckConnectionGate,
             timeProvider: timeProvider,
-            healthWorkSchedule: healthWorkSchedule);
+            healthWorkSchedule: healthWorkSchedule,
+            regrabService: regrabService);
         return (service, par2);
     }
 

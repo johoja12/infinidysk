@@ -26,10 +26,23 @@ Selecting a file opens a details modal without leaving the page. External items 
 - **Run health check** queues all due health checks — not just this file.
 - **Requeue repair** re-queues this file when its latest result needs action.
 - **Prewarm** warms this file into the Native cache (hidden with an explanation when Native cache is inactive).
+- **Regrab** asks Sonarr or Radarr for another copy of the file (see below).
 
 The modal also lists every symlink mapping for the item and its latest health-check result, with a link to **Health** (`/health`) for full history.
 
-The catalog and mapping list are read-only: the modal never edits or deletes library files or symlinks. Health checks, repair requeues, and prewarming schedule backend work without changing the catalog's mappings. Use **Files** (`/explore`) to browse the raw virtual filesystem.
+The catalog and mapping list are read-only. Health checks, repair requeues, and prewarming schedule backend work without changing the catalog's mappings; only **Regrab** removes a library symlink, as described below. Use **Files** (`/explore`) to browse the raw virtual filesystem.
+
+### Regrab a broken file [since unreleased](https://github.com/johoja12/infinidysk/issues/134){ .nzbdav-since }
+
+Use **Regrab** when a file is broken or damaged and you want Sonarr or Radarr to fetch a different release instead of waiting for health checks. It works for internal files and for old-library links (for example, legacy `/mnt/plex` symlinks that still point at a previous NzbDav install), as long as the link sits under the primary Library Directory and a Sonarr/Radarr root folder.
+
+When the modal opens, InfiniDysk looks up the owning Sonarr episode or Radarr movie from the library link path. The button is disabled, with the reason shown, when no Arr instance is enabled, the link is outside the Library Directory or not a symlink, or no Arr media file matches. Selecting **Regrab** shows a confirmation with the release name, the Arr target, and the library link. After you confirm, InfiniDysk:
+
+1. removes **only the library symlink**. The symlink is inspected without following it, must be under the Library Directory, and must not be reached through a symlinked folder. The link target, the legacy NzbDav data, and regular files are never touched;
+2. asks Sonarr/Radarr to remove the now-orphaned file record. If the release's download is known (InfiniDysk provenance or a unique Arr import-history match), it is blocklisted; and
+3. requests a replacement search through the per-item replacement-search budget used by health repair.
+
+Every symlink removal is appended to `/config/regrab/library-link-removals.jsonl`, with the path, previous target, item, release, Arr target, and timestamp, before and after the unlink. The file is owner-readable only. Regrab is idempotent per file: repeated clicks return the existing request. The modal and the Media Library list show **Regrab requested** until Sonarr/Radarr imports a replacement. If Sonarr or Radarr is slow (Sonarr can take longer than 10 seconds) or unreachable, the request is kept and retried in the background with backoff, and the modal says so. Health repair and warming fallbacks that already remove and blocklist a damaged release through Arr record the same state.
 
 ## Settings [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
 

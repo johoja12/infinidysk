@@ -26,7 +26,8 @@ public sealed record LibraryCatalogItemDto(
     long? Size,
     int MappingCount,
     string Health,
-    IReadOnlyList<LibraryCatalogMappingDto> Mappings);
+    IReadOnlyList<LibraryCatalogMappingDto> Mappings,
+    string? RegrabStatus = null);
 
 public sealed record LibraryCatalogResult(
     IReadOnlyList<LibraryCatalogItemDto> Items,
