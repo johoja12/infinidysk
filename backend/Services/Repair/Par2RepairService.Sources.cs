@@ -1,4 +1,6 @@
 using NzbWebDAV.Clients.Usenet;
+using NzbWebDAV.Clients.Usenet.Contexts;
+using UsenetSharp.Models;
 using NzbWebDAV.Utils;
 
 namespace NzbWebDAV.Services.Repair;
@@ -121,7 +123,12 @@ public partial class Par2RepairService
             await _reads.FetchGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var response = await _client.DecodedBodyAsync(_layout.SegmentIds[index], ct).ConfigureAwait(false);
+                // Another post's article (message-id collision) is rejected on each provider so
+                // one holding this file's own article can serve it; otherwise it surfaces as a
+                // missing article and its slices are rebuilt from recovery blocks (#130).
+                UsenetDecodedBodyResponse response;
+                using (YencFileValidationContext.BeginRepairSourceRead(_layout.SegmentIds))
+                    response = await _client.DecodedBodyAsync(_layout.SegmentIds[index], ct).ConfigureAwait(false);
                 await using var stream = response.Stream!;
                 await using var counted = new RepairCountingStream(stream, bytes => _reads.ReadBytes(bytes));
                 var bytes = new byte[length];

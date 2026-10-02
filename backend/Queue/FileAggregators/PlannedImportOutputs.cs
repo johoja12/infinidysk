@@ -1,3 +1,6 @@
+using NzbWebDAV.Clients.Usenet;
+using NzbWebDAV.Database.Models;
+using NzbWebDAV.Models.Nzb;
 using NzbWebDAV.Queue.FileProcessors;
 using NzbWebDAV.Utils;
 
@@ -12,23 +15,33 @@ namespace NzbWebDAV.Queue.FileAggregators;
 /// </summary>
 internal static class PlannedImportOutputs
 {
+    /// <summary>
+    /// One planned mounted output: its name, published size, the release-relative path the
+    /// mount will use, and the posted yEnc files whose articles carry its bytes.
+    /// </summary>
+    internal sealed record PlannedOutput(
+        string Name,
+        long FileSize,
+        string RelativePath,
+        IReadOnlyList<PostedArticleFile> SourceFiles);
+
     internal static long GetLargestVideoFileSize(
         List<BaseProcessor.Result> processorResults,
         string mountName)
     {
-        return PlanNamesAndSizes(processorResults, mountName)
+        return PlanOutputs(processorResults, mountName)
             .Where(x => FilenameUtil.IsVideoFile(x.Name))
             .Select(x => x.FileSize)
             .DefaultIfEmpty(0)
             .Max();
     }
 
-    private static IEnumerable<(string Name, long FileSize)> PlanNamesAndSizes(
+    internal static IEnumerable<PlannedOutput> PlanOutputs(
         List<BaseProcessor.Result> processorResults,
         string mountName)
     {
         foreach (var direct in FileAggregator.PlanDirectFiles(processorResults, mountName))
-            yield return (direct.Name, direct.FileSize);
+            yield return new PlannedOutput(direct.Name, direct.FileSize, direct.RelativePath, [ToPostedFile(direct.NzbFile)]);
 
         var rarGroups = processorResults
             .OfType<RarProcessor.Result>()
@@ -41,24 +54,29 @@ internal static class PlannedImportOutputs
             var sniffedVideoExtension = parts
                 .Select(x => x.SniffedVideoExtension)
                 .FirstOrDefault(x => x is not null);
-            yield return (
-                ImportableVideoNamer.Normalize(
-                                        PathSanitizer.SanitizeComponent(Path.GetFileName(group.Key.PathWithinArchive)),
-                    sniffedVideoExtension,
-                    mountName,
-                      allowBaseRename: rarGroups.Count == 1),
-                RarAggregator.ResolvePublishedFileSize(parts));
+            var name = ImportableVideoNamer.Normalize(
+                PathSanitizer.SanitizeComponent(Path.GetFileName(group.Key.PathWithinArchive)),
+                sniffedVideoExtension,
+                mountName,
+                allowBaseRename: rarGroups.Count == 1);
+            yield return new PlannedOutput(
+                name,
+                RarAggregator.ResolvePublishedFileSize(parts),
+                name,
+                parts.Select(x => x.NzbFile).Distinct().Select(ToPostedFile).ToList());
         }
 
         foreach (var lazy in processorResults.OfType<LazyRarProcessor.Result>())
         {
-            yield return (
-                ImportableVideoNamer.Normalize(
-                    PathSanitizer.SanitizeComponent(Path.GetFileName(lazy.PathInArchive)),
-                    lazy.SniffedVideoExtension,
-                    mountName,
-                    allowBaseRename: true),
-                lazy.TotalFileSize);
+            var name = ImportableVideoNamer.Normalize(
+                PathSanitizer.SanitizeComponent(Path.GetFileName(lazy.PathInArchive)),
+                lazy.SniffedVideoExtension,
+                mountName,
+                allowBaseRename: true);
+            var sources = new List<PostedArticleFile> { ToPostedFile(lazy.FirstPart) };
+            sources.AddRange(lazy.PendingParts.Select(part =>
+                new PostedArticleFile(part.SegmentIds, part.SegmentFallbackIds)));
+            yield return new PlannedOutput(name, lazy.TotalFileSize, name, sources);
         }
 
         foreach (var result in processorResults.OfType<SevenZipProcessor.Result>())
@@ -69,23 +87,44 @@ internal static class PlannedImportOutputs
                 foreach (var sevenZipFile in sevenZipFiles)
                 {
                     var meta = sevenZipFile.DavMultipartFileMeta;
-                    yield return (
-                        ImportableVideoNamer.Normalize(
-                            PathSanitizer.SanitizeComponent(Path.GetFileName(sevenZipFile.PathWithinArchive)),
-                            sevenZipFile.SniffedVideoExtension,
-                            mountName,
-                            allowBaseRename: sevenZipFiles.Count == 1),
+                    var name = ImportableVideoNamer.Normalize(
+                        PathSanitizer.SanitizeComponent(Path.GetFileName(sevenZipFile.PathWithinArchive)),
+                        sevenZipFile.SniffedVideoExtension,
+                        mountName,
+                        allowBaseRename: sevenZipFiles.Count == 1);
+                    yield return new PlannedOutput(
+                        name,
                         meta.AesParams?.DecodedSize
-                            ?? meta.FileParts.Sum(x => x.FilePartByteRange.Count));
+                            ?? meta.FileParts.Sum(x => x.FilePartByteRange.Count),
+                        name,
+                        meta.FileParts.Select(ToPostedFile).ToList());
                 }
             }
         }
 
         foreach (var multipart in processorResults.OfType<MultipartMkvProcessor.Result>())
         {
-            yield return (
-                PathSanitizer.SanitizeComponent(multipart.Filename),
-                multipart.Parts.Sum(x => x.FilePartByteRange.Count));
+            var name = PathSanitizer.SanitizeComponent(multipart.Filename);
+            yield return new PlannedOutput(
+                name,
+                multipart.Parts.Sum(x => x.FilePartByteRange.Count),
+                name,
+                multipart.Parts.Select(ToPostedFile).ToList());
         }
     }
+
+    private static PostedArticleFile ToPostedFile(NzbFile nzbFile)
+    {
+        var rangeIndex = nzbFile.GetSegmentByteRangeIndex();
+        return new PostedArticleFile(
+            nzbFile.GetSegmentIds(),
+            nzbFile.GetSegmentFallbackIds(),
+            rangeIndex.IsTrusted ? rangeIndex.Ranges : null);
+    }
+
+    private static PostedArticleFile ToPostedFile(DavMultipartFile.FilePart part) =>
+        new(
+            part.SegmentIds,
+            part.SegmentFallbackIds,
+            part.SegmentByteRangesTrusted == true ? part.SegmentByteRanges : null);
 }

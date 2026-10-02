@@ -36,7 +36,7 @@ internal enum HealthCheckRefillOutcome
 /// <summary>
 /// This service monitors for health checks
 /// </summary>
-public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
+public partial class HealthCheckService : BackgroundService, IHealthCheckQuiescence
 {
     private const int MaximumMissingSegmentIds = 100_000;
     internal const string MissingPayloadMessagePrefix = "Streaming payload missing.";
@@ -1398,6 +1398,11 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
             // A concurrent request may have already flagged this item urgent (e.g. a
             // playback failure mid-sweep). A routine healthy result must not clobber that
             // durable sentinel; defer to the existing urgent-repair path instead.
+            // STAT passes when a message-id resolves to another upload's article (#130).
+            // Sample the yEnc headers too; damage throws into the missing-article repair path.
+            diagnosticWorker?.SetDiagnosticPhase("Verifying content", _timeProvider.GetUtcNow());
+            await VerifyArticleContentAsync(davItem, payload.Segments, nzbFile, concurrency, ct).ConfigureAwait(false);
+
             if (BeforeHealthyFinalizationOverride is { } beforeHealthyFinalization)
                 await beforeHealthyFinalization(davItem.Id).ConfigureAwait(false);
 
@@ -1474,7 +1479,9 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         {
             diagnosticWorker?.SetDiagnosticPhase("Repairing", _timeProvider.GetUtcNow());
             CompleteHealthProgress(davItem.Id);
-            if (FilenameUtil.IsImportantFileType(davItem.Name))
+            // Foreign-post ids are valid articles of another upload; seeding them into the
+            // missing-article fail-fast cache would reject that unrelated release on import.
+            if (FilenameUtil.IsImportantFileType(davItem.Name) && e is not UsenetContentMismatchException)
             {
                 lock (_missingSegmentIds)
                 {
@@ -1497,7 +1504,12 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
             try
             {
                 par2Outcome = ShouldAttemptPar2Repair()
-                    ? await _par2RepairService.TryPar2RepairAsync(davItem, [e.SegmentId], ct).ConfigureAwait(false)
+                    ? await _par2RepairService.TryPar2RepairAsync(
+                        davItem,
+                        e is UsenetContentMismatchException contentMismatch
+                            ? contentMismatch.DamagedSegmentIds
+                            : [e.SegmentId],
+                        ct).ConfigureAwait(false)
                     : Par2RepairOutcome.NotRepaired;
             }
             catch (MissingFilePayloadException exception)
@@ -2630,7 +2642,10 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
                 : new HealthCheckPayload(
                     new ConcatenatedSegmentView(
                     [
-                        new HealthSegmentPart(nzbFile.SegmentIds, nzbFile.SegmentFallbackIds),
+                        new HealthSegmentPart(
+                            nzbFile.SegmentIds,
+                            nzbFile.SegmentFallbackIds,
+                            nzbFile.SegmentByteRangesTrusted == true ? nzbFile.SegmentByteRanges : null),
                     ]),
                     nzbFile);
         }
@@ -2643,7 +2658,10 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
                 : new HealthCheckPayload(
                     new ConcatenatedSegmentView(
                         rarFile.RarParts
-                            .Select(part => new HealthSegmentPart(part.SegmentIds, part.SegmentFallbackIds))
+                            .Select(part => new HealthSegmentPart(
+                                part.SegmentIds,
+                                part.SegmentFallbackIds,
+                                part.SegmentByteRangesTrusted == true ? part.SegmentByteRanges : null))
                             .ToArray()),
                     null);
         }
@@ -2656,7 +2674,10 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
                 : new HealthCheckPayload(
                     new ConcatenatedSegmentView(
                         multipartFile.Metadata.FileParts
-                            .Select(part => new HealthSegmentPart(part.SegmentIds, part.SegmentFallbackIds))
+                            .Select(part => new HealthSegmentPart(
+                                part.SegmentIds,
+                                part.SegmentFallbackIds,
+                                part.SegmentByteRangesTrusted == true ? part.SegmentByteRanges : null))
                             .ToArray()),
                     null);
         }
@@ -2707,7 +2728,8 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
     /// </summary>
     internal readonly record struct HealthSegmentPart(
         string[] SegmentIds,
-        string[][]? SegmentFallbackIds);
+        string[][]? SegmentFallbackIds,
+        LongRange[]? TrustedSegmentRanges = null);
 
     internal sealed class ConcatenatedSegmentView : IReadOnlyList<string>
     {
@@ -2732,6 +2754,9 @@ public class HealthCheckService : BackgroundService, IHealthCheckQuiescence
         }
 
         public int Count => _partEnds.Length == 0 ? 0 : _partEnds[^1];
+
+        /// <summary>The non-empty posted files in order, for per-file yEnc verification.</summary>
+        public IReadOnlyList<HealthSegmentPart> Parts => _parts;
 
         public string this[int index]
         {

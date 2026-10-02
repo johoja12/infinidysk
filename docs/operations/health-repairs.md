@@ -52,6 +52,20 @@ a WebDAV read that would have failed with `404 Not Found` returns `503 Service U
 `Retry-After` instead, and a gap in the middle of a file is filled for that read only. Neither case
 schedules a repair or records the segment as missing.
 
+### Article content checks [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since }
+
+Alongside STAT, each health check of an imported media file reads the yEnc
+headers of 4–12 sampled articles (first, last, and a spread). An article that
+now resolves to a different upload — a message-id collision STAT cannot see — or
+that is missing even though STAT found it marks the file damaged. Those articles
+are treated as missing for repair: PAR2 rebuilds them when
+[PAR2 repair](../configuration/repairs.md#par2-gap-repair-since-120) is enabled and
+the recovery blocks suffice, otherwise the normal Sonarr/Radarr replacement runs.
+The log shows one line per damaged file.
+
+To check files imported before this release, run
+**Verify Imported Article Content** under [Maintenance](../configuration/maintenance.md).
+
 ### When files are rechecked
 
 After a successful health check, InfiniDysk schedules the next routine check after an

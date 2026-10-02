@@ -705,12 +705,42 @@ public class QueueItemProcessor(
             checkedFullHealth = true;
         }
         var msHealth = stepTimer.ElapsedMilliseconds;
+        stepTimer.Restart();
+
+        // step 3b -- sampled article content verification of the media files this import
+        // mounts (#130). STAT and existence checks pass when a message-id resolves to another
+        // upload's article; reading the sampled yEnc headers does not. Runs for every
+        // category (it is bounded to a few dozen article reads per file) before readiness, so
+        // a damaged release fails into history without holding the finalize lock.
+        var contentTargets = ImportArticleContentValidator.PlanTargets(
+            fileProcessingResults, queueItem.Category, queueItem.JobName, configManager);
+        if (contentTargets.Count > 0)
+        {
+            using var contentAdmissionScope = ct.SetContext(new HealthCheckAdmissionContext(
+                healthCheckConnectionGate,
+                HealthCheckAdmissionPriority.Queue));
+            // Play-on-demand imports are on a viewer's critical path and stream under the same
+            // per-article foreign-post rejection, so they get the lighter health-check sample.
+            var contentBudget = sourceTracker.IsProfileFlow(queueItem.Id)
+                ? ArticleContentSampleBudget.HealthCheck
+                : ArticleContentSampleBudget.Import;
+            await RunStageAsync(
+                    "content-verification",
+                    () => new ImportArticleContentValidator(usenetClient).ValidateAsync(
+                        contentTargets,
+                        contentBudget,
+                        Math.Min(ArticleContentVerifier.DefaultConcurrency, QueueFanOut.GetConcurrency(configManager, ct)),
+                        queueItem.JobName,
+                        ct))
+                .ConfigureAwait(false);
+        }
+        var msContent = stepTimer.ElapsedMilliseconds;
         stepTimer.Stop();
 
         Log.Information(
             "play-timing nzo={NzoId} files={Files} firstSeg={FirstSeg}ms par2={Par2}ms rar={Rar}ms " +
-            "processors={Processors}ms health={Health}ms semWait={SemaphoreWait}ms",
-            queueItem.Id, nzbFiles.Count, msFirstSeg, msPar2, msRar, msProcessors, msHealth,
+            "processors={Processors}ms health={Health}ms content={Content}ms semWait={SemaphoreWait}ms",
+            queueItem.Id, nzbFiles.Count, msFirstSeg, msPar2, msRar, msProcessors, msHealth, msContent,
             ct.GetContext<QueueDownloadContext>()?.SemaphoreWaitMilliseconds ?? 0);
 
         // BODY-level readiness runs before finalization so a slow or damaged probe can

@@ -549,6 +549,14 @@ public sealed class ImportReadinessFinalizeLockTests : IAsyncLifetime
         public override Task<long> GetFileSizeAsync(NzbFile file, CancellationToken ct) =>
             Task.FromResult((long)payload.Length);
 
+        // Import content verification (#130) only parses yEnc headers; keep the gated BODY
+        // for the readiness probe this test is about.
+        public override async Task<UsenetYencHeader> GetYencHeadersAsync(string segmentId, CancellationToken ct)
+        {
+            await using var stream = CreatePayloadStream();
+            return (await stream.GetYencHeadersAsync(ct).ConfigureAwait(false))!;
+        }
+
         public override Task<UsenetDecodedBodyResponse> DecodedBodyAsync(
             SegmentId segmentId, CancellationToken cancellationToken) =>
             DecodedBodyAsync(segmentId, null, cancellationToken);
