@@ -88,15 +88,16 @@ export function VerifyImportedContent() {
           : { method: "POST" },
       );
       const data = (await response.json().catch(() => ({}))) as
-        | ImportedContentSweepState
-        | { error?: string };
+        ImportedContentSweepState | { error?: string };
       if (response.status === 409) {
         setState(data as ImportedContentSweepState);
         setError("The sweep is already running.");
         return;
       }
       if (!response.ok) {
-        throw new Error((data as { error?: string }).error || `Request failed (${response.status})`);
+        throw new Error(
+          (data as { error?: string }).error || `Request failed (${response.status})`,
+        );
       }
       setState(data as ImportedContentSweepState);
     } catch (e) {
@@ -113,10 +114,10 @@ export function VerifyImportedContent() {
   return (
     <div className="space-y-4">
       <p className="text-sm leading-relaxed text-base-content/70">
-        Verify that imported library files still read back as their own upload. Each file has a
-        few dozen articles sampled and their yEnc headers checked; files whose articles now belong
-        to a different post are queued for repair (PAR2 first, otherwise a Sonarr/Radarr
-        replacement). Runs one file at a time at background priority and resumes after a restart.
+        Verify that imported library files still read back as their own upload. Each file has a few
+        dozen articles sampled and their yEnc headers checked; files whose articles now belong to a
+        different post are queued for repair (PAR2 first, otherwise a Sonarr/Radarr replacement).
+        Runs one file at a time at background priority and resumes after a restart.
       </p>
 
       {error && (
