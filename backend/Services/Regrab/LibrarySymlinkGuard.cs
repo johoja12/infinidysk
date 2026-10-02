@@ -37,14 +37,15 @@ public sealed record LibraryLinkCheck(
 /// </summary>
 public static class LibrarySymlinkGuard
 {
+    /// <summary>
+    /// Roots regrab may remove symlinks beneath: only the primary Library Directory
+    /// (<c>media.library-dir</c>, the parent of the Sonarr/Radarr roots). Additional
+    /// <c>media.library-scan-dirs</c> stay read-only scan sources.
+    /// </summary>
     public static IReadOnlyList<string> ConfiguredRoots(ConfigManager config)
     {
-        var roots = new List<string>();
         var libraryDir = config.GetLibraryDir();
-        if (!string.IsNullOrWhiteSpace(libraryDir))
-            roots.Add(libraryDir);
-        roots.AddRange(config.GetMediaLibraryScanDirs());
-        return NormalizeRoots(roots);
+        return string.IsNullOrWhiteSpace(libraryDir) ? [] : NormalizeRoots([libraryDir]);
     }
 
     public static IReadOnlyList<string> NormalizeRoots(IEnumerable<string> roots) =>
@@ -84,7 +85,7 @@ public static class LibrarySymlinkGuard
             .FirstOrDefault();
         if (root is null)
             return new(LibraryLinkInspection.OutsideRoots, path, null, null,
-                "The library path is outside every configured library directory.");
+                "The library path is outside the Library Directory; regrab only removes links there.");
 
         var rootInfo = new DirectoryInfo(root);
         if (rootInfo.LinkTarget is not null)

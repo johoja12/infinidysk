@@ -1197,7 +1197,7 @@ public sealed class ArrRegrabService : IDisposable
                 $"Regrab already recorded ({row.Status}).");
         if (roots.Count == 0)
             return new(failure, MigrationRegrabOutcome.OutsideRoots, null,
-                "Configure the Library Directory (or a library scan directory) that holds the old library links.");
+                "Configure the Library Directory that holds the old library links.");
 
         var checks = roots
             .Select(root => Path.Join(root, failure.LibraryRelativePath.Replace('\\', '/')))
@@ -1221,7 +1221,7 @@ public sealed class ArrRegrabService : IDisposable
             return new(failure, MigrationRegrabOutcome.OutsideRoots, null,
                 checks.First(check => check.Kind is LibraryLinkInspection.SymlinkedParent or LibraryLinkInspection.InvalidPath).Message);
         return new(failure, MigrationRegrabOutcome.SourceLinkMissing, null,
-            "The old library link no longer exists under any configured library directory.");
+            "The old library link no longer exists under the Library Directory.");
     }
 
     private static async Task<Dictionary<string, ArrRegrabRequest>> ExistingMigrationRowsAsync(
