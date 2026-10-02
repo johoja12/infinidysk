@@ -102,6 +102,10 @@ public sealed class NativeCacheCommitQueue : IAsyncDisposable
         try { await Task.WhenAll(_workers).WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); }
         catch (TimeoutException) { }
         await _stopping.CancelAsync().ConfigureAwait(false);
+        // Let cancelled commits report before draining, so each block is reported exactly once
+        // even when shutdown interrupts it. A NAS call that ignores cancellation is not awaited forever.
+        try { await Task.WhenAll(_workers).WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); }
+        catch (TimeoutException) { }
         while (_items.Reader.TryRead(out var item))
         {
             Release(item);
