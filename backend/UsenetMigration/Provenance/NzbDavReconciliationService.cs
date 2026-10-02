@@ -90,6 +90,33 @@ public sealed class NzbDavReconciliationService(
                 .ToArray();
             if (releaseSources.Length != selectedReleaseIds.Count)
                 throw new InvalidDataException($"Release '{storeRef}' is missing selected source leaves.");
+            if (submission is null)
+            {
+                var scannedRelease = await ledger.Releases.AsNoTracking()
+                    .SingleOrDefaultAsync(item => item.StoreRef == storeRef, cancellationToken)
+                    .ConfigureAwait(false);
+                if (scannedRelease is not { Verdict: "red" }
+                    || string.IsNullOrWhiteSpace(scannedRelease.VerdictReasons)
+                    || JsonSerializer.Deserialize<string[]>(scannedRelease.VerdictReasons) is not { Length: > 0 })
+                    throw new InvalidOperationException($"Release '{storeRef}' lacks a submission without a recorded scan exclusion.");
+                if (await ledger.MigratedReleases.AnyAsync(
+                        item => item.SourceType == MigrationSourceTypes.NzbDav && item.SourceReleaseId == storeRef,
+                        cancellationToken).ConfigureAwait(false)
+                    || releaseSources.Any(source => source.FileStatus == "exact" || source.NewDavItemId is not null))
+                    throw new InvalidOperationException($"Scan-excluded release '{storeRef}' has conflicting import provenance.");
+                foreach (var source in releaseSources)
+                {
+                    source.FileStatus = "scan-excluded";
+                    source.Flags = MergeEvidence(package.PackageDigest,
+                        JsonSerializer.Serialize(new
+                        {
+                            method = "scan-exclusion",
+                            reasons = JsonSerializer.Deserialize<string[]>(scannedRelease.VerdictReasons),
+                        }));
+                }
+                failedSourceCount += releaseSources.Length;
+                continue;
+            }
             if (submission?.State is "failed" or "evicted")
             {
                 if (migratedBySource.ContainsKey(storeRef))
@@ -108,7 +135,7 @@ public sealed class NzbDavReconciliationService(
             if (!migratedBySource.TryGetValue(storeRef, out var migrated)
                 || migrated.NzoId is null
                 || !Guid.TryParse(migrated.NzoId, out var importedNzoId))
-                throw new InvalidOperationException($"Run {runId} lacks imported release provenance.");
+                throw new InvalidOperationException($"Run {runId} lacks imported release provenance for '{storeRef}'.");
             if (submission is null
                 || submission.State is not ("completed" or "history_cleared")
                 || !string.Equals(submission.NzoId, migrated.NzoId, StringComparison.OrdinalIgnoreCase))

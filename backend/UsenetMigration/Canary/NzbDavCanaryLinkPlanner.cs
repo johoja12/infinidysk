@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models.UsenetMigration;
 using NzbWebDAV.UsenetMigration.Source;
+using NzbWebDAV.UsenetMigration.Provenance;
 using NzbWebDAV.WebDav;
 
 namespace NzbWebDAV.UsenetMigration.Canary;
@@ -84,6 +85,8 @@ public sealed class NzbDavCanaryLinkPlanner
         var leafById = package.Manifest.Releases.SelectMany(release => release.Leaves)
             .ToDictionary(leaf => leaf.LegacyDavItemId);
 
+        var scanExcludedIds = await NzbDavScanExclusion.VerifiedSourceIdsAsync(
+            context, package.PackageDigest, cancellationToken).ConfigureAwait(false);
         var links = new List<NzbDavCanaryPlanLink>(package.Manifest.SelectedLinks.Count);
         foreach (var selected in package.Manifest.SelectedLinks)
         {
@@ -91,7 +94,8 @@ public sealed class NzbDavCanaryLinkPlanner
             sourceById.TryGetValue(id, out var source);
             if (unlinkedIds?.Contains(selected.LegacyDavItemId) == true)
             {
-                if (source?.FileStatus is not ("import-failed" or "unmatched-target")
+                if (!(source?.FileStatus is "import-failed" or "unmatched-target"
+                      || (source?.FileStatus == "scan-excluded" && scanExcludedIds.Contains(id)))
                     || source.NewDavItemId is not null || migratedById.ContainsKey(id))
                     throw new InvalidDataException($"Unlinked source '{id}' has conflicting correlation state.");
                 continue;
