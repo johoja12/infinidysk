@@ -523,6 +523,78 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         Assert.Equal(0, batch.ValidatedCount);
     }
 
+    [Theory]
+    [InlineData("none")]
+    [InlineData("digest")]
+    [InlineData("reason")]
+    [InlineData("submission")]
+    [InlineData("provenance")]
+    [InlineData("target")]
+    public async Task ScanExclusion_PlanningAndAcknowledgementRequireConsistentRecordedEvidence(string conflict)
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var masterDigest = new string('e', 64);
+        var packagePath = await CreateFullPackageAsync("scan-excluded-ack", masterDigest, 0, 1);
+        var package = await new NzbDavPackageReader().ReadAsync(packagePath);
+        var selected = Assert.Single(package.Manifest.SelectedLinks);
+        var controller = CreateController(harness);
+        await controller.ConnectFull(new NzbDavFullConnectRequest(packagePath, masterDigest, 1, 1, 5, 1));
+        var runId = await harness.Store.BeginRunAsync();
+        await harness.Store.UpdateSessionAsync(session => session.Status = "complete");
+        await using (var db = harness.Mig())
+        {
+            const string storeRef = "nzbdav:release-1";
+            var now = DateTime.UtcNow;
+            db.Releases.Add(new MigrationRelease
+            {
+                StoreRef = storeRef, StoreBasename = "release-1", SubmitFileName = "release.nzb",
+                QueueFileName = "release.nzb", JobName = "release", Verdict = "red", Included = false,
+                VerdictReasons = "[\"inconsistent_source_category\"]", ScannedAt = now,
+            });
+            db.ReleaseFiles.Add(new MigrationReleaseFile
+            {
+                StoreRef = storeRef, MetaPath = "payload", VirtualPath = "/content/a.mkv",
+                FileName = "a.mkv", NormalisedName = "a.mkv", SourceFileId = selected.LegacyDavItemId.ToString(),
+                FileStatus = "scan-excluded", NewDavItemId = conflict == "target" ? Guid.NewGuid().ToString() : null,
+                Flags = JsonSerializer.Serialize(new
+                {
+                    packageSha256 = conflict == "digest" ? new string('f', 64) : package.PackageDigest,
+                    correlation = new
+                    {
+                        method = "scan-exclusion",
+                        reasons = new[] { conflict == "reason" ? "category_unmapped" : "inconsistent_source_category" },
+                    },
+                }),
+            });
+            if (conflict == "submission")
+                db.Submissions.Add(new MigrationSubmission { StoreRef = storeRef, State = "completed", UpdatedAt = now });
+            if (conflict == "provenance")
+                db.MigratedReleases.Add(new MigratedRelease
+                {
+                    SourceType = MigrationSourceTypes.NzbDav, SourceReleaseId = storeRef,
+                    FirstRunId = runId, LastRunId = runId, MigratedAt = now, LastVerifiedAt = now,
+                });
+            await db.SaveChangesAsync();
+        }
+        var generated = await controller.GenerateCanaryPlan();
+        var acknowledged = await controller.AcknowledgePlan(0,
+            new NzbDavBatchPlanAcknowledgementRequest(new string('f', 64), 0, 0));
+        if (conflict == "none")
+        {
+            Assert.IsType<OkObjectResult>(generated);
+            Assert.IsType<FileContentResult>(await controller.DownloadCanaryPlan());
+            Assert.IsType<OkObjectResult>(acknowledged);
+            await using var verify = harness.Mig();
+            Assert.Empty(await verify.CanaryLinks.ToListAsync());
+            Assert.Equal("acknowledged", (await verify.NzbDavBatches.SingleAsync()).Status);
+        }
+        else
+        {
+            Assert.IsType<BadRequestObjectResult>(generated);
+            Assert.IsType<BadRequestObjectResult>(acknowledged);
+        }
+    }
+
     [Fact]
     public async Task AcknowledgePlan_AllowsCompletedImportWithUnmatchedTargetToRemainUnlinked()
     {

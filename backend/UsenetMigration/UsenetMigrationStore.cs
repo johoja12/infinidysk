@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using NzbWebDAV.UsenetMigration.Model;
+using NzbWebDAV.UsenetMigration.Provenance;
 using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models.UsenetMigration;
 using Serilog;
@@ -577,10 +578,13 @@ public sealed class UsenetMigrationStore : IDisposable
                            && submission.State is "completed" or "history_cleared")
             .Select(item => item.SourceFileId!)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        if (exactIds.Count + terminalFailedIds.Count + unmatchedIds.Count != selectedSourceIds.Count
+        var scanExcludedIds = await NzbDavScanExclusion.VerifiedSourceIdsAsync(ctx, packageDigest, ct)
+            .ConfigureAwait(false);
+        if (exactIds.Count + terminalFailedIds.Count + unmatchedIds.Count + scanExcludedIds.Count != selectedSourceIds.Count
             || selectedSourceIds.Any(id => !exactIds.Contains(id)
                                            && !terminalFailedIds.Contains(id)
-                                           && !unmatchedIds.Contains(id)))
+                                           && !unmatchedIds.Contains(id)
+                                           && !scanExcludedIds.Contains(id)))
             throw new InvalidOperationException("Every selected link must be exact or recorded as an unlinked terminal outcome.");
         var unvalidated = unvalidatedExactSourceIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
         var missing = missingSourceIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
