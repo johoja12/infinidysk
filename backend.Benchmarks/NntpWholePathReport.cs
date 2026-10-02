@@ -173,6 +173,7 @@ internal static class NntpWholePathReport
                 _ => throw new ArgumentOutOfRangeException(nameof(scenario)),
             };
             started.Stop();
+            if (bytes.AfterTiming is { } afterTiming) await afterTiming().ConfigureAwait(false);
             process.Refresh();
 
             var serverSnapshot = await server.StopAndGetSnapshotAsync().ConfigureAwait(false);
@@ -308,6 +309,7 @@ internal static class NntpWholePathReport
     /// Streams the corpus through Native Cache read-through exactly as an uncached WebDAV GET
     /// does, then requires every byte to have been committed to the cache by the same read.
     /// </summary>
+#pragma warning disable CA2000 // The store and queue move into AfterTiming (or the catch block) for disposal.
     private static async Task<ReadResult> ReadNativeCacheAsync(
         NntpWholePathScenario scenario,
         int port,
@@ -319,6 +321,8 @@ internal static class NntpWholePathReport
     {
         using var provider = CreateProvider(scenario, port);
         var directory = Directory.CreateTempSubdirectory("native-cold-");
+        NativeCacheStore? store = null;
+        NativeCacheCommitQueue? queue = null;
         try
         {
             var ids = corpus.Articles.Select(article => article.SegmentId).ToArray();
@@ -326,31 +330,73 @@ internal static class NntpWholePathReport
             var ranges = Enumerable.Range(0, ids.Length)
                 .Select(index => new LongRange(index * size, (index + 1) * size)).ToArray();
             var identity = new NativeCacheIdentity("benchmark", "v1", corpus.ExpectedBytes);
-            await using var store = new NativeCacheStore(Path.Join(directory.FullName, "index.db"),
-                [new NativeCacheFolder { Path = directory.FullName, MinFreeBytes = 0 }]);
-            ReadResult result;
-            await using (var stream = new NativeCachedStream(store, identity,
+            var writes = 0;
+            store = new NativeCacheStore(Path.Join(directory.FullName, "index.db"),
+                [new NativeCacheFolder { Path = directory.FullName, MinFreeBytes = 0 }])
+            {
+                BeforeWriteReserveAsync = scenario.CacheStallEveryNthWrite > 0
+                    ? token => Interlocked.Increment(ref writes) % scenario.CacheStallEveryNthWrite == 0
+                        ? Task.Delay(scenario.CacheStallMs, token) : Task.CompletedTask
+                    : null,
+            };
+            queue = new NativeCacheCommitQueue();
+            var backfilled = 0L;
+            var stream = new NativeCachedStream(store, identity,
                 _ => Task.FromResult<Stream>(new NzbFileStream(ids, corpus.ExpectedBytes, provider,
                     scenario.ArticleBufferSize ?? Math.Max(scenario.BatchWidth * 2, 4), ranges,
                     usePipelinedBodyRequests: true, fileName: "loopback.bin", inFlightArticleBudget: budget,
                     streamingBodyBatchWidth: scenario.BatchWidth, segmentByteRangesTrusted: true)),
-                () => true, writeBehind: true))
+                () => true, writeBehind: true, commitQueue: queue,
+                backfill: (_, length) => Interlocked.Add(ref backfilled, length));
+            ReadResult result;
+            try
             {
                 var sink = new HttpLikeCountingSink(responseCopyChunkBytes, copyStartedTimestamp);
                 var sha256 = await sink.CopyFromAsync(stream, verifyHash, CancellationToken.None).ConfigureAwait(false);
                 result = new ReadResult(sink.BytesWritten, sha256, sink.TimeToFirstByte);
             }
-            var cached = await store.GetCoverageAsync(identity).ConfigureAwait(false);
-            if (cached != corpus.ExpectedBytes)
-                throw new InvalidOperationException(
-                    $"Native cache committed {cached}/{corpus.ExpectedBytes} bytes during the uncached read.");
-            return result;
+            catch
+            {
+                await stream.DisposeAsync().ConfigureAwait(false);
+                throw;
+            }
+            // The client has every byte here, as when an HTTP response finishes sending before its
+            // handler disposes the stream. Disposal, trailing commits and verification follow untimed;
+            // every byte must have been saved by this read, without any backfill.
+            var (ownedStore, ownedQueue) = (store, queue);
+            store = null;
+            queue = null;
+            return result with
+            {
+                AfterTiming = async () =>
+                {
+                    try
+                    {
+                        await stream.DisposeAsync().ConfigureAwait(false);
+                        await ownedQueue.DisposeAsync().ConfigureAwait(false);
+                        var cached = await ownedStore.GetCoverageAsync(identity).ConfigureAwait(false);
+                        if (cached != corpus.ExpectedBytes || backfilled != 0)
+                            throw new InvalidOperationException(
+                                $"Native cache committed {cached}/{corpus.ExpectedBytes} bytes during the uncached read " +
+                                $"({backfilled} bytes deferred to backfill).");
+                    }
+                    finally
+                    {
+                        await ownedStore.DisposeAsync().ConfigureAwait(false);
+                        directory.Delete(recursive: true);
+                    }
+                },
+            };
         }
-        finally
+        catch
         {
+            if (queue is not null) await queue.DisposeAsync().ConfigureAwait(false);
+            if (store is not null) await store.DisposeAsync().ConfigureAwait(false);
             directory.Delete(recursive: true);
+            throw;
         }
     }
+#pragma warning restore CA2000
 
 #pragma warning disable CA2000 // MultiProviderNntpClient owns and disposes its MultiConnectionNntpClient and pool.
     private static MultiProviderNntpClient CreateProvider(NntpWholePathScenario scenario, int port)
@@ -472,7 +518,8 @@ internal static class NntpWholePathReport
         value.Gen1Collections / divisor,
         value.Gen2Collections / divisor);
 
-    private readonly record struct ReadResult(long Count, string? Sha256, TimeSpan? TimeToFirstByte);
+    /// <param name="AfterTiming">Verification and cleanup that must not count as client time.</param>
+    private readonly record struct ReadResult(long Count, string? Sha256, TimeSpan? TimeToFirstByte, Func<Task>? AfterTiming = null);
 
     private sealed class CallbackCounts
     {

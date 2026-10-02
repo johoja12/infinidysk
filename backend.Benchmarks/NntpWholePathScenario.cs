@@ -26,6 +26,9 @@ internal sealed record NntpWholePathScenario(
     public int HandshakeDelayMs { get; init; }
     public int? ArticleBufferSize { get; init; }
     public bool PrewarmConnections { get; init; }
+    /// <summary>Native cache layer only: stall every Nth cache block write (a busy NAS).</summary>
+    public int CacheStallEveryNthWrite { get; init; }
+    public int CacheStallMs { get; init; }
 
     public static IReadOnlyList<NntpWholePathScenario> Quick =>
     [
@@ -76,6 +79,15 @@ internal sealed record NntpWholePathScenario(
         {
             HandshakeDelayMs = 250,
             ArticleBufferSize = 40,
+        },
+        // The same playback while every 10th cache block write stalls for 1.5 s, longer than the
+        // response path may wait. Playback must not slow down and every byte must still be cached.
+        new("native-cold-256mib-rtt250-w4-nas-stall", NntpWholePathLayer.NativeCache, false, 342, 768 * 1024, 40, 4, 250, 4_000_000, YencCrcValidationMode.Require)
+        {
+            HandshakeDelayMs = 250,
+            ArticleBufferSize = 40,
+            CacheStallEveryNthWrite = 10,
+            CacheStallMs = 1500,
         },
     ];
 

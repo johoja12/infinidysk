@@ -23,6 +23,7 @@ public sealed class NativeCacheService : IAsyncDisposable
     private Task _initialization = Task.CompletedTask;
     private Task _cleanup = Task.CompletedTask;
     private NativeCacheStore? _store;
+    private NativeCacheCommitQueue? _commitQueue;
     private string? _initializationError;
     private bool _disposed;
     private int _revisionMetadataWarning;
@@ -61,6 +62,20 @@ public sealed class NativeCacheService : IAsyncDisposable
     public string? InitializationError => Volatile.Read(ref _initializationError);
     public bool InitializationPending => !_initialization.IsCompleted;
     public NativeCacheStore? Store => Volatile.Read(ref _store);
+    public long QueuedCommitBytes => Volatile.Read(ref _commitQueue)?.QueuedBytes ?? 0;
+
+    /// <summary>
+    /// Receives (item, offset, length) ranges a foreground stream served without caching. The
+    /// prefetch runtime registers itself here and fills them in later as low-cost warming jobs.
+    /// </summary>
+    public Action<Guid, long, long>? BackfillSink { get; set; }
+
+    private Action<long, long>? BackfillFor(DavItem item)
+    {
+        if (BackfillSink is null) return null;
+        var id = item.Id;
+        return (offset, length) => BackfillSink?.Invoke(id, offset, length);
+    }
     public long ReservedBufferBytes => _bufferSlots is null ? 0 : (Math.Max(1, _capacity - 1) - _bufferSlots.CurrentCount + (_capacity > 1 ? 1 - _hitSlot.CurrentCount : 0)) * (long)NativeCacheStore.BlockSize;
 
     private async Task InitializeStoreAsync(NativeCacheSettings settings, Func<NativeCacheSettings, NativeCacheStore> factory)
@@ -70,7 +85,14 @@ public sealed class NativeCacheService : IAsyncDisposable
             var store = factory(settings);
             lock (_lifetimeGate)
             {
-                if (!_disposed) { Volatile.Write(ref _store, store); return; }
+                if (!_disposed)
+                {
+#pragma warning disable CA2000 // Owned by the service; DisposeAsync drains it before the store closes.
+                    Volatile.Write(ref _commitQueue, new NativeCacheCommitQueue());
+#pragma warning restore CA2000
+                    Volatile.Write(ref _store, store);
+                    return;
+                }
             }
             await store.DisposeAsync().ConfigureAwait(false);
         }
@@ -133,12 +155,14 @@ public sealed class NativeCacheService : IAsyncDisposable
                 if (!admitted)
                 {
                     var overflow = new NativeCacheOverflowStream(store, cached.Identity, open,
-                        () => watch.IsCurrent && cached.Revision.IsCurrent, watch, _capacity > 1 ? _hitSlot : _bufferSlots, Statistics);
+                        () => watch.IsCurrent && cached.Revision.IsCurrent, watch, _capacity > 1 ? _hitSlot : _bufferSlots, Statistics,
+                        BackfillFor(item));
                     admission = null;
                     return overflow;
                 }
                 var stream = new NativeCachedStream(store, cached.Identity, open,
-                    () => watch.IsCurrent && cached.Revision.IsCurrent, admission, background: requireNative, statistics: Statistics, writeBehind: true);
+                    () => watch.IsCurrent && cached.Revision.IsCurrent, admission, background: requireNative, statistics: Statistics, writeBehind: true,
+                    commitQueue: Volatile.Read(ref _commitQueue), backfill: requireNative ? null : BackfillFor(item));
                 admission = null; // The returned stream owns the watch and buffer admission.
                 return stream;
             }
@@ -244,9 +268,16 @@ public sealed class NativeCacheService : IAsyncDisposable
             if (_disposed) return;
             _disposed = true;
             var store = _store;
+            var commitQueue = _commitQueue;
             Volatile.Write(ref _store, null);
+            Volatile.Write(ref _commitQueue, null);
             if (store is not null) _cleanup = Task.Run(async () =>
             {
+                // Drain queued commits before the catalogue closes; unpublished blocks are reported
+                // to their streams' backfill requests.
+                try { if (commitQueue is not null) await commitQueue.DisposeAsync().ConfigureAwait(false); }
+                catch (Exception exception) when (exception is not OutOfMemoryException)
+                { Log.Warning("Native cache commit queue shutdown failed ({ErrorType})", exception.GetType().Name); }
                 try { await store.DisposeAsync().ConfigureAwait(false); }
                 catch (Exception exception) when (exception is not OutOfMemoryException)
                 { Log.Warning("Native cache shutdown failed ({ErrorType})", exception.GetType().Name); }

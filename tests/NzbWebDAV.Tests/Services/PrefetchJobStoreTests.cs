@@ -75,6 +75,20 @@ public sealed class PrefetchJobStoreTests : IDisposable
     }
 
     [Fact]
+    public void BackfillJobs_SurvivePlexPolicyPruning_AndRunFirst()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var watched = Guid.NewGuid();
+        var predicted = Guid.NewGuid();
+        jobs.Enqueue(predicted, "plex:abc:source:def", 10, 0, 0);
+        var backfill = jobs.Enqueue(watched, PrefetchRuntime.BackfillOwner, 60, 4L << 20, 20L << 20);
+        jobs.PruneOwners(PlexPrefetchService.IsSystemOwner);
+        Assert.Single(jobs.List(), job => job.State == "queued");
+        Assert.Equal(backfill.Id, jobs.ClaimNext()!.Id);
+        Assert.Equal("Playback not yet cached", PlexPrefetchService.SourceLabel(PrefetchRuntime.BackfillOwner));
+    }
+
+    [Fact]
     public void ResumedLegacyRanges_AreMergedTransitivelyRegardlessOfCandidateOrder()
     {
         using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));

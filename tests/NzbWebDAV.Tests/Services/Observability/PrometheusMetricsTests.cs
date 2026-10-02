@@ -29,6 +29,24 @@ public sealed class PrometheusMetricsTests
         Assert.DoesNotContain("cache_key=", output);
         Assert.DoesNotContain("folder=", output);
     }
+    [Fact]
+    public async Task NativeCachePhasesAndSkips_AreLabelledByPhaseAndReasonOnly()
+    {
+        var registry = new CollectorRegistry();
+        var metrics = new PrometheusMetrics(registry);
+        metrics.RecordNativeCachePhase("data_fsync", TimeSpan.FromMilliseconds(40));
+        metrics.RecordNativeCachePhase("data_fsync", TimeSpan.FromMilliseconds(1500));
+        metrics.RecordNativeCacheSkip("pending_write_timeout");
+        metrics.RecordNativeCacheSkip("pending_write_timeout");
+        await using var stream = new MemoryStream();
+        await registry.CollectAndExportAsTextAsync(stream);
+        var output = Encoding.UTF8.GetString(stream.ToArray());
+        Assert.Contains("nzbdav_native_cache_phase_seconds_count{phase=\"data_fsync\"} 2", output);
+        Assert.Contains("nzbdav_native_cache_skipped_total{reason=\"pending_write_timeout\"} 2", output);
+        Assert.DoesNotContain("cache_key=", output);
+        Assert.DoesNotContain("item=", output);
+    }
+
     private static readonly string[] SegmentCacheMetricNames =
     [
         "nzbdav_segment_cache_enabled",

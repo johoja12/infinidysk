@@ -1,7 +1,9 @@
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.Data.Sqlite;
+using NzbWebDAV.Services.Observability;
 using Serilog;
 
 namespace NzbWebDAV.Services.NativeCache;
@@ -443,14 +445,23 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
         if (data.Length != Math.Min(BlockSize, identity.Length - offset))
             throw new ArgumentException("Only complete integrity blocks may be published.", nameof(data));
         using var lease = AcquireLease(identity);
+        var commitStarted = Stopwatch.GetTimestamp();
+        var phaseStarted = commitStarted;
         using var placement = await AcquireFillAsync(identity, -1, cancellationToken).ConfigureAwait(false);
+        Phase("placement_wait", ref phaseStarted);
         var selectedWriter = await SelectWriterAsync(identity, RoundAllocation(data.Length), waitForWriter, cancellationToken).ConfigureAwait(false);
-        if (selectedWriter is not { } selection) return false;
+        Phase("writer_wait", ref phaseStarted);
+        if (selectedWriter is not { } selection)
+        {
+            PrometheusMetrics.Current?.RecordNativeCacheSkip("writer_busy");
+            return false;
+        }
         var catalogueHeld = false;
         try
         {
             lock (_leaseLock) if (_scanning.Contains(identity.Key)) return false;
             await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            Phase("gate_wait", ref phaseStarted);
             catalogueHeld = true;
             ObjectDisposedException.ThrowIf(_disposed, this);
             using var lookup = Command("SELECT Folder,ChunkSize FROM Entries WHERE Key=$key", ("$key", identity.Key));
@@ -499,7 +510,9 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
             var softLimit = JournalSoftLimit(identity.Length);
             if (journal.Length >= softLimit) QueueCheckpoint(identity.Key, folder.Id);
             if (journal.Length > softLimit + 65536 - 256) return false;
+            Phase("entry_open", ref phaseStarted);
             await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            Phase("gate_wait", ref phaseStarted);
             catalogueHeld = true;
             // Writers/eviction are serialized separately; readers need only this
             // short local transaction, even while another folder is stalled.
@@ -522,25 +535,31 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
             // in other folders. The writer gate and activity lease protect publication.
             _gate.Release();
             catalogueHeld = false;
+            Phase("catalogue_reserve", ref phaseStarted);
             await using (var stream = directory.OpenFile(DataFileName(offset, chunkSize), FileMode.OpenOrCreate, FileAccess.Write))
             {
                 stream.Position = chunkSize == 0 ? offset : offset % chunkSize;
                 await stream.WriteAsync(data, cancellationToken).ConfigureAwait(false);
+                Phase("data_write", ref phaseStarted);
                 FlushToDisk(stream);
+                Phase("data_fsync", ref phaseStarted);
             }
             // The colocated journal makes explicit scans/imports possible without the local catalogue.
             var record = JsonSerializer.SerializeToUtf8Bytes(new JournalBlock(offset, data.Length, Convert.ToHexString(hash)));
             await journal.WriteAsync(record, cancellationToken).ConfigureAwait(false);
             await journal.WriteAsync("\n"u8.ToArray(), cancellationToken).ConfigureAwait(false);
             FlushToDisk(journal);
+            Phase("journal_fsync", ref phaseStarted);
             if (journal.Length >= softLimit) QueueCheckpoint(identity.Key, folder.Id);
             directory.Flush();
             using (var shard = _roots[folder.Id].OpenDirectory($"v1/{identity.Key[..2]}")) shard.Flush();
             using (var version = _roots[folder.Id].OpenDirectory("v1")) version.Flush();
             _roots[folder.Id].Flush();
+            Phase("dir_fsync", ref phaseStarted);
             var allocated = PhysicalEntryBytes(directory);
             if (!IsVolumeCurrent(folder)) return false;
             await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+            Phase("gate_wait", ref phaseStarted);
             catalogueHeld = true;
             using var transaction = _database.BeginTransaction();
             using (var insert = Command("INSERT OR IGNORE INTO Blocks(Key,Offset,Count,Hash) VALUES($key,$offset,$count,$hash)",
@@ -558,6 +577,8 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
             lock (_leaseLock)
                 if (_reservations.TryGetValue(identity.Key, out var reservation))
                     reservation.Remaining = Math.Max(0, reservation.Remaining - required);
+            Phase("catalogue_commit", ref phaseStarted);
+            Phase("block_commit_total", ref commitStarted);
             return true;
         }
         catch (IOException) { return false; }
@@ -1600,6 +1621,13 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
             return true;
         }
         finally { root?.Dispose(); }
+    }
+
+    private static void Phase(string phase, ref long started)
+    {
+        var now = Stopwatch.GetTimestamp();
+        PrometheusMetrics.Current?.RecordNativeCachePhase(phase, Stopwatch.GetElapsedTime(started, now));
+        started = now;
     }
 
     private bool IsVolumeCurrent(NativeCacheFolder folder)

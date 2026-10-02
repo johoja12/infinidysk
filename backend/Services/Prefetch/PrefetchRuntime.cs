@@ -3,6 +3,7 @@ using Microsoft.Extensions.Hosting;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database.Models;
 using NzbWebDAV.Services.NativeCache;
+using Serilog;
 
 namespace NzbWebDAV.Services.Prefetch;
 
@@ -11,6 +12,10 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
     ActiveReadRegistry activeReads, PlexPlaybackRegistry? playback = null,
     IHostApplicationLifetime? applicationLifetime = null) : BackgroundService
 {
+    /// <summary>Owner of jobs that fill in playback a foreground stream could not cache.</summary>
+    public const string BackfillOwner = "backfill";
+    // Above manual warming (50): someone just watched these bytes.
+    private const int BackfillPriority = 60;
     private readonly Lock _gate = new();
     private PrefetchJobStore? _jobs;
     private PrefetchCoordinator? _coordinator;
@@ -44,6 +49,14 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
             try
             {
                 _jobs = new PrefetchJobStore(Path.Combine(native.ActiveSettings.MetadataPath, "prefetch.db"), settings: Settings);
+                var jobs = _jobs;
+                native.BackfillSink = (itemId, start, length) =>
+                {
+                    try { jobs.Enqueue(itemId, BackfillOwner, BackfillPriority, start, length); }
+                    catch (Exception exception) when (exception is ArgumentException or InvalidOperationException
+                        or ObjectDisposedException or Microsoft.Data.Sqlite.SqliteException)
+                    { Log.Debug(exception, "Could not schedule Native Cache backfill for {ItemId}", itemId); }
+                };
                 _coordinator = new PrefetchCoordinator(_jobs, new NativePrefetchExecutor(scopes, native, config, _jobs, activeReads, playback, Settings),
                     Settings, () => native.ActiveSettings.Folders.Any(folder => folder.Enabled && !folder.ReadOnly)
                         && (!Settings().PauseDuringPlayback || activeReads.Snapshot().Count == 0 && playback?.HasActivePlayback != true),

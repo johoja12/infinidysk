@@ -67,7 +67,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             if (preview is null && _policyRevision != revision)
             {
                 _last.Clear();
-                if (_policyRevision is not null) runtime.Coordinator?.PruneOwners(owner => owner == "manual");
+                if (_policyRevision is not null)
+                    runtime.Coordinator?.PruneOwners(IsSystemOwner);
                 _policyRevision = revision;
             }
             await runtime.WaitForInitializationAsync(deadline.Token).ConfigureAwait(false);
@@ -328,6 +329,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     public static string SourceLabel(string owner) => owner.Split(':') switch
     {
         ["manual"] => "Manual",
+        [PrefetchRuntime.BackfillOwner] => "Playback not yet cached",
         ["read", ..] => "Read activity (unverified)",
         ["plex", _, "source", ..] => "Selected Plex hub/collection",
         ["plex", _, "realtime-next", ..] => "Plex playback prediction",
@@ -343,9 +345,12 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     private static string Owner(string server, string kind, string key) => $"plex:{Hash(server)}:{kind}:{Hash(key)}";
     private static bool UserSelected(PrefetchSettings settings, string server, string user) => settings.Users.Length == 0
         || settings.Users.Contains(server + ":" + user, StringComparer.Ordinal);
+    /// <summary>Owners that are not Plex policy sources and survive every policy change.</summary>
+    internal static bool IsSystemOwner(string owner) => owner is "manual" or PrefetchRuntime.BackfillOwner;
+
     private static bool IsOwnerEnabled(string owner, PrefetchSettings settings, IReadOnlyList<PlexServer> servers)
     {
-        if (owner == "manual") return true;
+        if (IsSystemOwner(owner)) return true;
         if (!settings.Enabled) return false;
         if (owner == "read") return settings.ReadActivityEnabled;
         if (owner == "read:minimum") return settings.ReadActivityEnabled && settings.MinimumWarmEnabled;

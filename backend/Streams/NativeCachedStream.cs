@@ -3,6 +3,7 @@ using System.Diagnostics;
 using Microsoft.Data.Sqlite;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Services.NativeCache;
+using NzbWebDAV.Services.Observability;
 using NzbWebDAV.WebDav.Requests;
 using Serilog;
 using UsenetSharp.Streams;
@@ -29,6 +30,11 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     private long _sourceWindowEnd = -1;
     private long _foregroundWindowBytes = SourceWindowBytes;
     private long _reopenedFillBlock = -1;
+    private bool _abandonLogged;
+    private readonly NativeCacheCommitQueue? _commitQueue;
+    private readonly Action<long, long>? _backfill;
+    private readonly UncachedRangeTracker _uncached;
+    private readonly List<Task> _queuedCommits = [];
     private long? _responseEnd;
     private byte[]? _buffer;
     private long _bufferStart = -1;
@@ -48,8 +54,12 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
 
     public NativeCachedStream(NativeCacheStore store, NativeCacheIdentity identity,
         Func<CancellationToken, Task<Stream>> openSource, Func<bool> generationIsCurrent,
-        IDisposable? bufferAdmission = null, bool background = false, NativeCacheStatistics? statistics = null, bool writeBehind = false)
+        IDisposable? bufferAdmission = null, bool background = false, NativeCacheStatistics? statistics = null, bool writeBehind = false,
+        NativeCacheCommitQueue? commitQueue = null, Action<long, long>? backfill = null)
     {
+        _commitQueue = background ? null : commitQueue;
+        _backfill = background ? null : backfill;
+        _uncached = new UncachedRangeTracker(identity.Length, _backfill, identity.DisplayName ?? identity.ItemId);
         _store = store;
         _identity = identity;
         _openSource = openSource;
@@ -93,7 +103,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         LastReadCacheable = false;
         var expected = (int)Math.Min(NativeCacheStore.BlockSize, Length - blockStart);
         var buffer = _buffer;
-        var count = await CacheIoAsync(false,
+        var count = await CacheIoAsync(false, "probe",
             token => _store.ReadBlockAsync(_identity, blockStart, buffer.AsMemory(0, expected), token),
             cancellationToken).ConfigureAwait(false);
         return count == expected && _generationIsCurrent();
@@ -132,7 +142,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             _activeFill = null;
             if (_pendingWrite is { } pending)
             {
-                try { await CacheIoAsync(true, _ => pending, cancellationToken).ConfigureAwait(false); }
+                try { await CacheIoAsync(true, "pending_write", _ => pending, cancellationToken).ConfigureAwait(false); }
                 catch (TimeoutException) { return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false); }
                 finally { _pendingWrite = null; }
             }
@@ -150,7 +160,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 try
                 {
                     var buffer = _buffer;
-                    _bufferCount = await CacheIoAsync(false, token => _store.ReadBlockAsync(_identity, blockStart,
+                    _bufferCount = await CacheIoAsync(false, "probe", token => _store.ReadBlockAsync(_identity, blockStart,
                         buffer.AsMemory(0, expected), token), cancellationToken).ConfigureAwait(false);
                     _bufferVerified = _bufferCount == expected;
                     _bufferFromCache = _bufferVerified;
@@ -219,6 +229,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                     _activeFill?.Dispose();
                     _activeFill = null;
                     if (exception is not TimeoutException) _statistics?.Fallback();
+                    RecordSkip("fill_source_failure", abandonsResponse: true);
                     return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false);
                 }
             }
@@ -286,6 +297,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 _activeFill?.Dispose();
                 _activeFill = null;
                 if (exception is not TimeoutException) _statistics?.Fallback();
+                RecordSkip("fill_source_failure", abandonsResponse: true);
                 return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false);
             }
         }
@@ -297,6 +309,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false);
         _position += count;
         _servedBytes |= count > 0;
+        _uncached.Served(count);
         LastReadCacheable = _bufferVerified && _generationIsCurrent();
         return count;
     }
@@ -308,6 +321,35 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         {
             _transfer ??= _statistics?.BeginTransfer(_identity.ItemId, _identity.DisplayName, _identity.Length, _background);
             var buffer = _buffer!;
+            if (_commitQueue is not null)
+            {
+                // Playback never waits for NAS durability: the queue publishes a private copy, and a
+                // block it cannot take or publish is scheduled for backfill rather than skipped.
+                var statistics = _statistics;
+                var transfer = _transfer;
+                var backfill = _backfill;
+                var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (_commitQueue.TryEnqueue(_store, _identity, blockStart, buffer.AsSpan(0, expected), committed =>
+                    {
+                        try
+                        {
+                            if (committed) { statistics?.Committed(expected); transfer?.Committed(expected); return; }
+                            PrometheusMetrics.Current?.RecordNativeCacheSkip("commit_failed");
+                            backfill?.Invoke(blockStart, expected);
+                        }
+                        finally { done.TrySetResult(); }
+                    }))
+                {
+                    _queuedCommits.RemoveAll(task => task.IsCompleted);
+                    _queuedCommits.Add(done.Task);
+                }
+                else
+                {
+                    RecordSkip("commit_queue_full", abandonsResponse: false);
+                    _uncached.Note(blockStart, blockStart + expected);
+                }
+                return;
+            }
             if (_writeBehind)
             {
                 // The buffer stays immutable until this write finishes. The next
@@ -316,19 +358,27 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 {
                     try
                     {
+                        var started = Stopwatch.GetTimestamp();
                         if (BeforeCacheIo is not null) await BeforeCacheIo(true, cancellationToken).ConfigureAwait(false);
                         var committed = await _store.WriteBlockAsync(_identity, blockStart, buffer.AsMemory(0, expected),
                             waitForWriter: true, cancellationToken: cancellationToken).ConfigureAwait(false);
+                        RecordPhase("commit", started);
                         if (committed) { _statistics?.Committed(expected); _transfer?.Committed(expected); }
+                        else RecordSkip("commit_rejected", abandonsResponse: false);
                         return committed;
                     }
                     catch (Exception exception) when (exception is IOException or SqliteException or UnauthorizedAccessException or OperationCanceledException)
                     { return false; }
                 }, CancellationToken.None);
             }
-            else if (await CacheIoAsync(true, token => _store.WriteBlockAsync(_identity, blockStart, buffer.AsMemory(0, expected),
+            else if (await CacheIoAsync(true, "commit", token => _store.WriteBlockAsync(_identity, blockStart, buffer.AsMemory(0, expected),
                 waitForWriter: _background, cancellationToken: token), cancellationToken)
                 .ConfigureAwait(false)) { _statistics?.Committed(expected); _transfer?.Committed(expected); }
+            else
+            {
+                RecordSkip("commit_rejected", abandonsResponse: false);
+                _uncached.Note(blockStart, blockStart + expected);
+            }
         }
         catch (Exception exception) when (exception is IOException or SqliteException or UnauthorizedAccessException) { }
     }
@@ -406,19 +456,26 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         {
             _bypassFill = true;
             _statistics?.Fallback(timeout: true);
+            RecordSkip("fill_admission_timeout", abandonsResponse: true);
             return null;
         }
     }
 
-    private async Task<T> CacheIoAsync<T>(bool write, Func<CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
+    private async Task<T> CacheIoAsync<T>(bool write, string phase, Func<CancellationToken, Task<T>> operation,
+        CancellationToken cancellationToken)
     {
         // NAS syscalls can block synchronously and ignore cancellation. Admission
         // bounds both these operations and their buffers; never recycle either
         // until a detached operation has really stopped touching the memory.
+        var queued = Stopwatch.GetTimestamp();
         var io = Task.Run(async () =>
         {
+            var started = Stopwatch.GetTimestamp();
+            RecordPhase("io_start_delay", queued);
             if (BeforeCacheIo is not null) await BeforeCacheIo(write, cancellationToken).ConfigureAwait(false);
-            return await operation(cancellationToken).ConfigureAwait(false);
+            var result = await operation(cancellationToken).ConfigureAwait(false);
+            RecordPhase(phase, started);
+            return result;
         }, CancellationToken.None);
         try
         {
@@ -428,7 +485,11 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         }
         catch (Exception exception) when (exception is TimeoutException or OperationCanceledException)
         {
-            if (exception is TimeoutException) _statistics?.Fallback(timeout: true);
+            if (exception is TimeoutException)
+            {
+                _statistics?.Fallback(timeout: true);
+                RecordSkip($"{phase}_timeout", abandonsResponse: true);
+            }
             var buffer = _buffer;
             var admission = _bufferAdmission;
             _buffer = null;
@@ -440,6 +501,22 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             _ = ReleaseAfterIoAsync(io, buffer, admission);
             throw;
         }
+    }
+
+    private static void RecordPhase(string phase, long started) =>
+        PrometheusMetrics.Current?.RecordNativeCachePhase(phase, Stopwatch.GetElapsedTime(started));
+
+    /// <summary>
+    /// Counts every uncached block by reason and, once per response, tells operators when the
+    /// rest of a foreground response will stream without being cached.
+    /// </summary>
+    private void RecordSkip(string reason, bool abandonsResponse)
+    {
+        PrometheusMetrics.Current?.RecordNativeCacheSkip(reason);
+        if (!abandonsResponse || _background || _abandonLogged) return;
+        _abandonLogged = true;
+        Log.Warning("Native cache stopped caching {Name} at byte {Offset} for the rest of this response. Reason: {Reason}",
+            _identity.DisplayName ?? _identity.ItemId, _position, reason);
     }
 
     private static async Task ReleaseAfterIoAsync(Task io, byte[]? buffer, IDisposable? admission)
@@ -461,12 +538,14 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         var start = _position;
         var count = await _source.ReadAsync(destination[..(int)Math.Min(destination.Length, Length - _position)], cancellationToken).ConfigureAwait(false);
         _statistics?.SourceBytes(count);
+        _uncached.Note(start, start + count);
         for (var block = start / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize;
             block < start + count; block += NativeCacheStore.BlockSize)
             if (block != _lastDirectMissBlock) { _statistics?.Miss(); _lastDirectMissBlock = block; }
         KeepResponseGeneration(); // These bytes came from the source, so they stay valid.
         _position += count;
         _servedBytes |= count > 0;
+        _uncached.Served(count);
         LastReadCacheable = false;
         return count;
     }
@@ -534,6 +613,13 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                             try { await pending.WaitAsync(CacheIoTimeout).ConfigureAwait(false); }
                             catch (TimeoutException) { }
                         }
+                        // The response is over, so a short wait costs playback nothing and lets the
+                        // next reader hit this response's blocks; a slow NAS keeps committing behind it.
+                        if (_queuedCommits.Count > 0)
+                        {
+                            try { await Task.WhenAll(_queuedCommits).WaitAsync(CacheIoTimeout).ConfigureAwait(false); }
+                            catch (TimeoutException) { }
+                        }
                     }
                     finally { Release(); }
                 }
@@ -544,6 +630,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
 
     private void Release()
     {
+        _uncached.Flush();
         _activeFill?.Dispose();
         _activeFill = null;
         if (_pendingWrite is { IsCompleted: false } pending)
