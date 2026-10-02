@@ -1,4 +1,5 @@
 using NzbWebDAV.Clients.RadarrSonarr.BaseModels;
+using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models;
 
 namespace NzbWebDAV.Services.Regrab;
@@ -57,9 +58,22 @@ public sealed record ArrRegrabRequestView(
         row.LinkRemoved,
         row.Blocklisted,
         row.Attempts,
-        row.CreatedAt,
-        row.UpdatedAt,
-        row.RequestedAt);
+        AsUtc(row.CreatedAt),
+        AsUtc(row.UpdatedAt),
+        row.RequestedAt is { } requestedAt ? AsUtc(requestedAt) : null);
+
+    /// <summary>
+    /// SQLite returns the stored UTC values without a kind; PostgreSQL stores them as
+    /// local wall-clock time. Normalize both to UTC so API clients get an explicit offset.
+    /// </summary>
+    internal static DateTime AsUtc(DateTime value) => value.Kind switch
+    {
+        DateTimeKind.Utc => value,
+        DateTimeKind.Local => value.ToUniversalTime(),
+        _ => DatabaseProviderConfig.IsPostgres
+            ? DateTime.SpecifyKind(value, DateTimeKind.Local).ToUniversalTime()
+            : DateTime.SpecifyKind(value, DateTimeKind.Utc),
+    };
 }
 
 public sealed record ArrRegrabPreview(

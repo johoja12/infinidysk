@@ -446,7 +446,7 @@ public sealed class ArrRegrabService : IDisposable
 
         // The Arr calls must not be tied to the HTTP request: a browser that gives up must
         // not cancel a delete Sonarr may already have applied.
-        var processing = ProcessAsync(requestId, CancellationToken.None);
+        var processing = ProcessDetachedAsync(requestId);
         var finished = await Task.WhenAny(processing, Task.Delay(InlineBudget, ct)).ConfigureAwait(false) == processing;
         await using var read = CreateContext();
         var current = await read.ArrRegrabRequests.AsNoTracking()
@@ -519,6 +519,19 @@ public sealed class ArrRegrabService : IDisposable
         finally
         {
             _gate.Release();
+        }
+    }
+
+    private async Task ProcessDetachedAsync(Guid requestId)
+    {
+        try
+        {
+            await ProcessAsync(requestId, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            // The request stays pending; the worker retries it.
+            e.LogWarningKnownOrStack("Regrab request {RequestId} could not be processed inline.", requestId);
         }
     }
 
