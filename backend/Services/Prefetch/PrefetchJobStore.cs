@@ -10,6 +10,14 @@ public sealed record PrefetchJob(string Id, Guid ItemId, string Trigger, int Pri
     public string? Source { get; init; }
     public string? Reason { get; init; }
     public long? FileSize { get; init; }
+    /// <summary>Unix milliseconds when the job first started running; null for jobs recorded before timing existed.</summary>
+    public long? StartedAt { get; init; }
+    /// <summary>Unix milliseconds when the job reached a terminal state.</summary>
+    public long? FinishedAt { get; init; }
+    /// <summary>Milliseconds the job spent running, excluding queued, deferred, and paused time.</summary>
+    public long? ActiveMs { get; init; }
+    /// <summary>Bytes this job fetched and committed to the cache; excludes bytes that were already cached.</summary>
+    public long? WarmedBytes { get; init; }
 }
 
 public sealed record PrefetchEnqueueResult(PrefetchJob Job, bool Created);
@@ -63,10 +71,31 @@ public sealed class PrefetchJobStore : IDisposable
             CREATE TABLE IF NOT EXISTS Verified(ItemId TEXT NOT NULL,Generation TEXT NOT NULL,Start INTEGER NOT NULL,Length INTEGER NOT NULL,
                 At INTEGER NOT NULL,PRIMARY KEY(ItemId,Generation,Start,Length));
             INSERT OR IGNORE INTO State VALUES('paused','false');
+            """);
+        AddMissingJobColumns();
+        Execute("""
+            UPDATE Jobs SET ActiveMs=COALESCE(ActiveMs,0)+MAX(0,Updated-RunStarted),RunStarted=NULL WHERE RunStarted IS NOT NULL;
             DELETE FROM Jobs WHERE State IN ('queued','running','paused') AND Id NOT IN (SELECT Id FROM Owners WHERE Owner='manual');
             UPDATE Jobs SET State='paused',Error='Restored after restart; resume to recheck verified coverage.' WHERE State IN ('running','queued');
             DELETE FROM Deferred WHERE Id NOT IN (SELECT Id FROM Jobs);
             """);
+    }
+
+    // Adds the running time to ActiveMs and stops the run clock. Requires a $now parameter.
+    private const string CloseRunClock = "ActiveMs=CASE WHEN RunStarted IS NULL THEN ActiveMs ELSE COALESCE(ActiveMs,0)+MAX(0,$now-RunStarted) END,RunStarted=NULL";
+
+    /// <summary>
+    /// Additive schema upgrade for databases created before job timing existed. Every column is
+    /// nullable, so older rows read as "not recorded".
+    /// </summary>
+    private void AddMissingJobColumns()
+    {
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var command = Command("PRAGMA table_info(Jobs)"))
+        using (var reader = command.ExecuteReader())
+            while (reader.Read()) existing.Add(reader.GetString(1));
+        foreach (var column in new[] { "StartedAt", "FinishedAt", "ActiveMs", "RunStarted", "WarmedBytes" })
+            if (!existing.Contains(column)) Execute($"ALTER TABLE Jobs ADD COLUMN {column} INTEGER NULL");
     }
 
     public PrefetchJob Enqueue(Guid itemId, string trigger, int priority, long start = 0, long length = 0)
@@ -181,8 +210,10 @@ public sealed class PrefetchJobStore : IDisposable
             if (!IsRunning(id)) return;
             if (consumeAttempt) Execute("INSERT INTO Attempts(Id,Count) SELECT Id,1 FROM Jobs WHERE Id=$id AND State='running' ON CONFLICT(Id) DO UPDATE SET Count=Count+1", ("$id", id));
             Execute("UPDATE Jobs SET State='queued',Error=$reason WHERE Id=$id AND State='running'", ("$id", id), ("$reason", reason[..Math.Min(512, reason.Length)]));
-            Execute("UPDATE Jobs SET State='failed' WHERE Id=$id AND State='queued' AND Id IN (SELECT Id FROM Attempts WHERE Count>$retries)",
-                ("$id", id), ("$retries", _settings?.Invoke().MaxRetries ?? 3));
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            Execute($"UPDATE Jobs SET {CloseRunClock} WHERE Id=$id AND RunStarted IS NOT NULL", ("$id", id), ("$now", now));
+            Execute("UPDATE Jobs SET State='failed',FinishedAt=$now WHERE Id=$id AND State='queued' AND Id IN (SELECT Id FROM Attempts WHERE Count>$retries)",
+                ("$id", id), ("$retries", _settings?.Invoke().MaxRetries ?? 3), ("$now", now));
             Execute("INSERT INTO Deferred(Id,Until) VALUES($id,$until) ON CONFLICT(Id) DO UPDATE SET Until=excluded.Until",
                 ("$id", id), ("$until", DateTimeOffset.UtcNow.Add(delay).ToUnixTimeMilliseconds()));
         });
@@ -198,7 +229,8 @@ public sealed class PrefetchJobStore : IDisposable
             using (var reader = command.ExecuteReader())
                 while (reader.Read()) if (!keep(reader.GetString(1))) removed.Add((reader.GetString(0), reader.GetString(1)));
             foreach (var owner in removed) Execute("DELETE FROM Owners WHERE Id=$id AND Owner=$owner", ("$id", owner.Id), ("$owner", owner.Owner));
-            Execute("UPDATE Jobs SET State='cancelled',Error='All sources disabled.' WHERE State IN ('queued','running','paused') AND Id NOT IN (SELECT Id FROM Owners)");
+            Execute($"UPDATE Jobs SET State='cancelled',Error='All sources disabled.',FinishedAt=$now,{CloseRunClock} WHERE State IN ('queued','running','paused') AND Id NOT IN (SELECT Id FROM Owners)",
+                ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
         });
     }
 
@@ -278,21 +310,25 @@ public sealed class PrefetchJobStore : IDisposable
         lock (_gate)
         {
             if (Paused) return null;
-            Execute("UPDATE Jobs SET State='failed',Error='Intent expired; retry explicitly.' WHERE State='queued' AND Created<$cutoff",
-                ("$cutoff", DateTimeOffset.UtcNow.AddHours(-(_settings?.Invoke().IntentTtlHours ?? 24)).ToUnixTimeMilliseconds()));
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            Execute("UPDATE Jobs SET State='failed',Error='Intent expired; retry explicitly.',FinishedAt=$now WHERE State='queued' AND Created<$cutoff",
+                ("$cutoff", DateTimeOffset.UtcNow.AddHours(-(_settings?.Invoke().IntentTtlHours ?? 24)).ToUnixTimeMilliseconds()), ("$now", now));
             var job = ReadOne("SELECT * FROM Jobs WHERE State='queued' AND ItemId NOT IN (SELECT ItemId FROM Jobs WHERE State='running') AND Id NOT IN (SELECT Id FROM Deferred WHERE Until>$now) ORDER BY Priority DESC,Created,Id LIMIT 1",
-                ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                ("$now", now));
             if (job is null) return null;
-            Execute("UPDATE Jobs SET State='running',Error=NULL WHERE Id=$id", ("$id", job.Id));
-            return job with { State = "running", Error = null };
+            Execute("UPDATE Jobs SET State='running',Error=NULL,StartedAt=COALESCE(StartedAt,$now),RunStarted=$now,ActiveMs=COALESCE(ActiveMs,0),WarmedBytes=COALESCE(WarmedBytes,0) WHERE Id=$id",
+                ("$id", job.Id), ("$now", now));
+            return job with { State = "running", Error = null, StartedAt = job.StartedAt ?? now, ActiveMs = job.ActiveMs ?? 0, WarmedBytes = job.WarmedBytes ?? 0 };
         }
     }
 
-    public void Progress(string id, string generation, long committedBytes)
+    /// <param name="committedBytes">Whole-file cache coverage after this step, including bytes that were already cached.</param>
+    /// <param name="warmedBytes">Bytes this job fetched and committed since its previous progress report.</param>
+    public void Progress(string id, string generation, long committedBytes, long warmedBytes = 0)
     {
-        if (committedBytes < 0 || generation.Length > 512) throw new ArgumentException("Invalid committed progress.");
-        lock (_gate) Execute("UPDATE Jobs SET Generation=$generation,CommittedBytes=$bytes,Updated=$now WHERE Id=$id AND State='running'",
-            ("$generation", generation), ("$bytes", committedBytes), ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), ("$id", id));
+        if (committedBytes < 0 || warmedBytes < 0 || generation.Length > 512) throw new ArgumentException("Invalid committed progress.");
+        lock (_gate) Execute("UPDATE Jobs SET Generation=$generation,CommittedBytes=$bytes,WarmedBytes=COALESCE(WarmedBytes,0)+$warmed,Updated=$now WHERE Id=$id AND State='running'",
+            ("$generation", generation), ("$bytes", committedBytes), ("$warmed", warmedBytes), ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), ("$id", id));
     }
 
     /// <summary>
@@ -359,7 +395,12 @@ public sealed class PrefetchJobStore : IDisposable
                     ("$item", job.ItemId.ToString("N")), ("$id", id), ("$start", job.Start), ("$length", job.Length));
                 if (duplicate is not null) throw new ArgumentException("This file range is already queued.");
             }
-            Execute("UPDATE Jobs SET State=$state,Error=NULL,Updated=$now WHERE Id=$id", ("$state", state), ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), ("$id", id));
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            Execute($"UPDATE Jobs SET State=$state,Error=NULL,Updated=$now,{CloseRunClock},FinishedAt=CASE WHEN $state='cancelled' THEN $now ELSE NULL END WHERE Id=$id",
+                ("$state", state), ("$now", now), ("$id", id));
+            // A retry is a fresh attempt, so its speed and duration are measured from scratch.
+            if (operation == "retry")
+                Execute("UPDATE Jobs SET StartedAt=NULL,ActiveMs=NULL,WarmedBytes=NULL WHERE Id=$id", ("$id", id));
             if (operation is "retry" or "resume")
             {
                 Execute("DELETE FROM Deferred WHERE Id=$id", ("$id", id));
@@ -372,7 +413,7 @@ public sealed class PrefetchJobStore : IDisposable
 
     public void Finish(string id, bool success, string? error)
     {
-        lock (_gate) Execute("UPDATE Jobs SET State=$state,Error=$error,Updated=$now WHERE Id=$id AND State='running'",
+        lock (_gate) Execute($"UPDATE Jobs SET State=$state,Error=$error,Updated=$now,FinishedAt=$now,{CloseRunClock} WHERE Id=$id AND State='running'",
             ("$state", success ? "completed" : "failed"), ("$error", error is null ? DBNull.Value : error[..Math.Min(error.Length, 512)]),
             ("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()), ("$id", id));
     }
@@ -402,7 +443,18 @@ public sealed class PrefetchJobStore : IDisposable
     }
     private static PrefetchJob Read(SqliteDataReader reader) => new(reader.GetString(0), Guid.Parse(reader.GetString(1)),
         reader.GetString(2), reader.GetInt32(3), reader.GetString(4), reader.GetInt64(5), reader.GetInt64(6),
-        reader.IsDBNull(7) ? null : reader.GetString(7), reader.GetInt64(8), reader.IsDBNull(9) ? null : reader.GetString(9), reader.GetInt64(10));
+        reader.IsDBNull(7) ? null : reader.GetString(7), reader.GetInt64(8), reader.IsDBNull(9) ? null : reader.GetString(9), reader.GetInt64(10))
+    {
+        StartedAt = NullableInt64(reader, "StartedAt"),
+        FinishedAt = NullableInt64(reader, "FinishedAt"),
+        ActiveMs = NullableInt64(reader, "ActiveMs"),
+        WarmedBytes = NullableInt64(reader, "WarmedBytes"),
+    };
+    private static long? NullableInt64(SqliteDataReader reader, string column)
+    {
+        var ordinal = reader.GetOrdinal(column);
+        return reader.IsDBNull(ordinal) ? null : reader.GetInt64(ordinal);
+    }
     private long NextCreated(long wallClockMilliseconds)
     {
         using var command = Command("SELECT COALESCE(MAX(Created),0) FROM Jobs");

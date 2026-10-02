@@ -7,7 +7,7 @@ namespace NzbWebDAV.Api.OpenApi;
 /// </summary>
 public static class AdminApiContractCatalog
 {
-    public const string ContractVersion = "2.4.0";
+    public const string ContractVersion = "2.5.0";
     public const string RelativeContractPath = "contracts/openapi/admin-v1.json";
 
     public sealed record Operation(string Method, string Path, string OperationId);

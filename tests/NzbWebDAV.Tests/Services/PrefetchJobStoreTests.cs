@@ -412,5 +412,133 @@ public sealed class PrefetchJobStoreTests : IDisposable
         Assert.Equal(first.Id, jobs.ClaimNext()!.Id);
     }
 
+    [Fact]
+    public void CompletedJob_RecordsTimingAndOnlyTheBytesItWarmed()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var queued = jobs.Enqueue(Guid.NewGuid(), "manual", 0);
+        Assert.Null(queued.StartedAt);
+        Assert.Null(queued.WarmedBytes);
+
+        var before = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        var running = jobs.ClaimNext()!;
+        Assert.InRange(running.StartedAt!.Value, before, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        Assert.Equal(0, running.WarmedBytes);
+
+        // Coverage includes bytes that were already cached; warmed bytes count only this job's fills.
+        jobs.Progress(running.Id, "g1", 900, 0);
+        jobs.Progress(running.Id, "g1", 1_000, 60);
+        jobs.Progress(running.Id, "g1", 1_100, 40);
+        Thread.Sleep(20);
+        jobs.Finish(running.Id, true, null);
+
+        var finished = jobs.List().Single();
+        Assert.Equal("completed", finished.State);
+        Assert.Equal(1_100, finished.CommittedBytes);
+        Assert.Equal(100, finished.WarmedBytes);
+        Assert.Equal(running.StartedAt, finished.StartedAt);
+        Assert.NotNull(finished.FinishedAt);
+        Assert.True(finished.FinishedAt >= finished.StartedAt);
+        Assert.InRange(finished.ActiveMs!.Value, 1, finished.FinishedAt!.Value - finished.StartedAt!.Value);
+    }
+
+    [Fact]
+    public void DeferredTime_IsExcludedFromActiveDurationAndWarmedBytesAccumulateAcrossRuns()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var job = jobs.Enqueue(Guid.NewGuid(), "manual", 0);
+        var firstRun = jobs.ClaimNext()!;
+        jobs.Progress(job.Id, "g1", 50, 50);
+        jobs.Defer(job.Id, "playback has priority", TimeSpan.Zero, consumeAttempt: false);
+        var deferred = jobs.List().Single();
+        Assert.Equal("queued", deferred.State);
+        Assert.Null(deferred.FinishedAt);
+        var activeAfterFirstRun = deferred.ActiveMs!.Value;
+
+        Thread.Sleep(60); // Waiting in the queue must not count as warming time.
+        var secondRun = jobs.ClaimNext()!;
+        Assert.Equal(firstRun.StartedAt, secondRun.StartedAt);
+        jobs.Progress(job.Id, "g1", 80, 30);
+        jobs.Finish(job.Id, false, "source failed");
+
+        var failed = jobs.List().Single();
+        Assert.Equal("failed", failed.State);
+        Assert.Equal(80, failed.WarmedBytes);
+        Assert.True(failed.ActiveMs >= activeAfterFirstRun);
+        Assert.True(failed.ActiveMs < failed.FinishedAt - failed.StartedAt - 50);
+    }
+
+    [Fact]
+    public void Retry_StartsAFreshMeasurement()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var job = jobs.Enqueue(Guid.NewGuid(), "manual", 0);
+        jobs.ClaimNext();
+        jobs.Progress(job.Id, "g1", 10, 10);
+        jobs.Change(job.Id, "cancel");
+        var cancelled = jobs.List().Single();
+        Assert.NotNull(cancelled.FinishedAt);
+        Assert.NotNull(cancelled.ActiveMs);
+
+        jobs.Change(job.Id, "retry");
+        var retried = jobs.List().Single();
+        Assert.Equal("queued", retried.State);
+        Assert.Null(retried.StartedAt);
+        Assert.Null(retried.FinishedAt);
+        Assert.Null(retried.ActiveMs);
+        Assert.Null(retried.WarmedBytes);
+    }
+
+    [Fact]
+    public void LegacyDatabase_GainsNullableTimingColumnsWithoutLosingHistory()
+    {
+        var path = Path.Combine(_root, "legacy.db");
+        Directory.CreateDirectory(_root);
+        using (var legacy = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = path, Pooling = false }.ToString()))
+        {
+            legacy.Open();
+            using var create = legacy.CreateCommand();
+            create.CommandText = """
+                CREATE TABLE Jobs(
+                    Id TEXT PRIMARY KEY,ItemId TEXT NOT NULL,Trigger TEXT NOT NULL,Priority INTEGER NOT NULL,
+                    State TEXT NOT NULL,Start INTEGER NOT NULL,Length INTEGER NOT NULL,Generation TEXT NULL,
+                    CommittedBytes INTEGER NOT NULL DEFAULT 0,Error TEXT NULL,Updated INTEGER NOT NULL,Created INTEGER NOT NULL);
+                INSERT INTO Jobs VALUES('old','0123456789abcdef0123456789abcdef','plex:hub',0,'completed',0,0,'g1',500,NULL,1000,1000);
+                """;
+            create.ExecuteNonQuery();
+        }
+
+        using (var jobs = new PrefetchJobStore(path))
+        {
+            var old = jobs.List().Single();
+            Assert.Equal("completed", old.State);
+            Assert.Equal(500, old.CommittedBytes);
+            Assert.Null(old.StartedAt);
+            Assert.Null(old.FinishedAt);
+            Assert.Null(old.ActiveMs);
+            Assert.Null(old.WarmedBytes);
+        }
+        using (var reopened = new PrefetchJobStore(path)) Assert.Single(reopened.List()); // Upgrade is idempotent.
+    }
+
+    [Fact]
+    public void Restart_FoldsAnInterruptedRunIntoActiveDuration()
+    {
+        var path = Path.Combine(_root, "jobs.db");
+        string id;
+        using (var jobs = new PrefetchJobStore(path))
+        {
+            id = jobs.Enqueue(Guid.NewGuid(), "manual", 0).Id;
+            jobs.ClaimNext();
+            Thread.Sleep(20);
+            jobs.Progress(id, "g1", 10, 10);
+        }
+        using var restored = new PrefetchJobStore(path);
+        var job = restored.List().Single();
+        Assert.Equal("paused", job.State);
+        Assert.True(job.ActiveMs > 0);
+        Assert.Equal(10, job.WarmedBytes);
+    }
+
     public void Dispose() { if (Directory.Exists(_root)) Directory.Delete(_root, true); }
 }

@@ -7,6 +7,7 @@ namespace NzbWebDAV.Api.Controllers.Prefetch;
 
 [ApiController]
 [Route("api/prefetch")]
+[ProducesResponseType(typeof(PrefetchStatusResponse), StatusCodes.Status200OK)]
 public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchService policies, DavDatabaseClient database) : GetOnlyApiController
 {
     protected override async Task<IActionResult> HandleRequest()
@@ -28,19 +29,31 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
         { runtime.ReportMetadataFailure(); }
         var items = (await database.GetItemsByIdsBatchedAsync(jobs.Select(job => job.ItemId).Distinct().ToArray(),
             ct: HttpContext.RequestAborted).ConfigureAwait(false)).ToDictionary(item => item.Id);
-        return Ok(new {
-        available = runtime.Jobs is not null, runtime.InitializationError, runtime.RuntimeError, runtime.Healthy,
-        paused, jobs = jobs.Select(job => job with
-        {
-            DisplayName = items.GetValueOrDefault(job.ItemId)?.Name ?? "Removed media",
-            FileSize = items.GetValueOrDefault(job.ItemId)?.FileSize,
-            Source = PlexPrefetchService.SourceLabel(job.Trigger),
-            Reason = PlexPrefetchService.RangeReason(job.Trigger, job.Length)
-        }),
-        settings = runtime.Settings(), dailyBudgetUsed, policies.LastSuccess, policies.LastError
-        });
+        return Ok(new PrefetchStatusResponse(
+            runtime.Jobs is not null, runtime.InitializationError, runtime.RuntimeError, runtime.Healthy, paused,
+            jobs.Select(job => job with
+            {
+                DisplayName = items.GetValueOrDefault(job.ItemId)?.Name ?? "Removed media",
+                FileSize = items.GetValueOrDefault(job.ItemId)?.FileSize,
+                Source = PlexPrefetchService.SourceLabel(job.Trigger),
+                Reason = PlexPrefetchService.RangeReason(job.Trigger, job.Length)
+            }).ToList(),
+            runtime.Settings(), dailyBudgetUsed, policies.LastSuccess, policies.LastError));
     }
 }
+
+/// <summary>Smart Prefetch queue status and retained job history.</summary>
+public sealed record PrefetchStatusResponse(
+    bool Available,
+    string? InitializationError,
+    string? RuntimeError,
+    bool Healthy,
+    bool Paused,
+    IReadOnlyList<PrefetchJob> Jobs,
+    PrefetchSettings Settings,
+    long DailyBudgetUsed,
+    DateTimeOffset? LastSuccess,
+    string? LastError);
 
 [ApiController]
 [Route("api/prefetch/preview")]

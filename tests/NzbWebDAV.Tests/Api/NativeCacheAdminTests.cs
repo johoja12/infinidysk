@@ -98,6 +98,17 @@ public sealed class NativeCacheAdminTests
         using var cancelled = await client.PostAsJsonAsync("/api/prefetch/operations", new { operation = "cancel", jobId = job.Id });
         cancelled.EnsureSuccessStatusCode();
         Assert.Equal("cancelled", Assert.Single(runtime.Jobs.List()).State);
+        using (var afterCancel = await client.GetAsync("/api/prefetch"))
+        {
+            afterCancel.EnsureSuccessStatusCode();
+            using var cancelledJson = JsonDocument.Parse(await afterCancel.Content.ReadAsStringAsync());
+            var cancelledJob = cancelledJson.RootElement.GetProperty("jobs")[0];
+            Assert.True(cancelledJob.GetProperty("finishedAt").GetInt64() > 0);
+            // The job never ran, so it has no warming speed to report.
+            Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("startedAt").ValueKind);
+            Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("activeMs").ValueKind);
+            Assert.Equal(JsonValueKind.Null, cancelledJob.GetProperty("warmedBytes").ValueKind);
+        }
         using var invalid = await client.PostAsJsonAsync("/api/prefetch/operations", new { operation = "warm", itemIds = new[] { Guid.NewGuid() } });
         Assert.Equal(HttpStatusCode.Accepted, invalid.StatusCode);
         runtime.ReportMetadataFailure();
