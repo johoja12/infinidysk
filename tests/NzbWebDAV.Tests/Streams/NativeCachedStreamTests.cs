@@ -47,10 +47,10 @@ public sealed class NativeCachedStreamTests : IDisposable
         await using var store = CreateStore();
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var admission = new TrackingAdmission();
+        var slots = new NativeBufferSlots(1);
         var identity = new NativeCacheIdentity("write-behind", "v1", 3);
         await using var stream = new NativeCachedStream(store, identity,
-            _ => Task.FromResult<Stream>(new EvidenceStream(true)), () => true, admission, writeBehind: true)
+            _ => Task.FromResult<Stream>(new EvidenceStream(true)), () => true, slots, writeBehind: true)
         {
             CacheIoTimeout = TimeSpan.FromMilliseconds(30),
             BeforeCacheIo = async (write, _) => { if (write) { entered.TrySetResult(); await release.Task; } }
@@ -62,11 +62,12 @@ public sealed class NativeCachedStreamTests : IDisposable
             Assert.Equal(new byte[] { 1, 2, 3 }, bytes);
             await entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
             Assert.Equal(0, await store.GetCoverageAsync(identity));
+            Assert.Equal(1, slots.Held); // The write still reads the buffer, so its slot stays held.
             await stream.DisposeAsync();
-            Assert.False(admission.Disposed.Task.IsCompleted);
+            Assert.Equal(1, slots.Held);
         }
         finally { release.TrySetResult(); }
-        await admission.Disposed.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await WaitUntilAsync(() => slots.Held == 0);
         Assert.Equal(3, await store.GetCoverageAsync(identity));
     }
 
@@ -78,9 +79,11 @@ public sealed class NativeCachedStreamTests : IDisposable
         await using var store = CreateStore();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var admission = new TrackingAdmission();
+        var slots = new NativeBufferSlots(1);
+        // A probe only reads blocks the catalogue has; a commit stalls on a cold block.
+        if (!write) Assert.True(await store.WriteBlockAsync(new("slow", "v1", 3), 0, new byte[] { 1, 2, 3 }));
         await using var stream = new NativeCachedStream(store, new("slow", "v1", 3),
-            _ => Task.FromResult<Stream>(new EvidenceStream(true)), () => true, admission)
+            _ => Task.FromResult<Stream>(new EvidenceStream(true)), () => true, slots)
         {
             CacheIoTimeout = TimeSpan.FromMilliseconds(50),
             BeforeCacheIo = async (isWrite, _) =>
@@ -99,16 +102,20 @@ public sealed class NativeCachedStreamTests : IDisposable
             Assert.Equal(new byte[] { 1, 2, 3 }, bytes);
             Assert.False(stream.LastReadCacheable);
             await stream.DisposeAsync();
-            Assert.False(admission.Disposed.Task.IsCompleted);
+            Assert.Equal(1, slots.Held); // The detached NAS operation still owns the buffer.
         }
         finally { release.TrySetResult(); }
-        await admission.Disposed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => slots.Held == 0);
     }
 
-    private sealed class TrackingAdmission : IDisposable
+    private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 5000)
     {
-        public TaskCompletionSource Disposed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public void Dispose() => Disposed.TrySetResult();
+        var deadline = Environment.TickCount64 + timeoutMs;
+        while (!condition())
+        {
+            if (Environment.TickCount64 > deadline) throw new TimeoutException("Condition was not reached.");
+            await Task.Delay(10);
+        }
     }
 
     [Theory]
@@ -119,10 +126,10 @@ public sealed class NativeCachedStreamTests : IDisposable
         await using var store = CreateStore();
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var admission = new TrackingAdmission();
+        var slots = new NativeBufferSlots(2);
         using var cancellation = new CancellationTokenSource();
         await using var stream = new NativeCachedStream(store, new("cancel", "v1", 3),
-            _ => throw new InvalidOperationException("Cancelled warming opened source"), () => true, admission, background: true)
+            _ => throw new InvalidOperationException("Cancelled warming opened source"), () => true, slots, background: true)
         {
             BeforeCacheIo = async (_, _) => { entered.TrySetResult(); await release.Task; }
         };
@@ -134,10 +141,10 @@ public sealed class NativeCachedStreamTests : IDisposable
             cancellation.Cancel();
             await Assert.ThrowsAnyAsync<OperationCanceledException>(() => read.WaitAsync(TimeSpan.FromSeconds(5)));
             await stream.DisposeAsync();
-            Assert.False(admission.Disposed.Task.IsCompleted);
+            Assert.Equal(1, slots.Held);
         }
         finally { release.TrySetResult(); }
-        await admission.Disposed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await WaitUntilAsync(() => slots.Held == 0);
     }
 
     [Fact]
