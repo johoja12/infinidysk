@@ -47,6 +47,12 @@ public static class BlobStore
     public static Task WriteBlob<T>(Guid id, T blob, CancellationToken cancellationToken = default)
         => Current.WriteBlob(id, blob, cancellationToken);
 
+    public static Task WriteContentPreservingBlob<T>(
+        Guid id,
+        T blob,
+        CancellationToken cancellationToken = default)
+        => Current.WriteContentPreservingBlob(id, blob, cancellationToken);
+
     public static Stream? ReadBlob(Guid id)
         => Current.ReadBlob(id);
 

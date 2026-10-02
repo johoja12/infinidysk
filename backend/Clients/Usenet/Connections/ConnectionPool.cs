@@ -656,7 +656,8 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                         factoryTask, creationReserved, handshakeOwned: true,
                         cancellationReason: _disposeCts.IsCancellationRequested ? "pool shutdown"
                             : cancellationToken.IsCancellationRequested ? "caller cancellation"
-                            : "connection-open deadline expired");
+                            : "connection-open deadline expired",
+                        openBudget: openTimeout, factoryStarted: factoryStarted, openKind: "on-demand");
 #pragma warning restore CA2025
                 }
                 else if (creationReserved)
@@ -755,11 +756,61 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
             => throw new ObjectDisposedException(nameof(ConnectionPool<T>));
     }
 
+    /// <summary>
+    /// One line per pool (provider) per minute: the caller already got a ConnectionOpenTimeoutException
+    /// (and the circuit breaker its failure), so this only explains what the abandoned
+    /// TCP/TLS/authentication attempt cost and how loaded the pool was (#120).
+    /// </summary>
+    private void LogAbandonedOpen(string reason, TimeSpan? openBudget, long? factoryStarted, string openKind)
+    {
+        int live;
+        int idle;
+        lock (_lifecycleLock)
+        {
+            live = _live;
+            idle = _idleConnections.Count;
+        }
+
+        var elapsedMs = factoryStarted is { } started
+            ? (long)Stopwatch.GetElapsedTime(started).TotalMilliseconds
+            : (long?)null;
+        var now = Environment.TickCount64;
+        var last = Interlocked.Read(ref _lastAbandonedOpenLogTicks);
+        if (last != 0 && now - last < AbandonedOpenLogWindowMs)
+        {
+            Interlocked.Increment(ref _suppressedAbandonedOpenLogs);
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _lastAbandonedOpenLogTicks, now, last) != last)
+        {
+            Interlocked.Increment(ref _suppressedAbandonedOpenLogs);
+            return;
+        }
+
+        var suppressed = Interlocked.Exchange(ref _suppressedAbandonedOpenLogs, 0);
+        Log.Warning(
+            "NNTP connection factory stopped for {Provider}. Reason: {Reason}. The {OpenKind} TCP/TLS/login attempt " +
+            "exceeded its {OpenBudgetMs} ms connection-open budget and was abandoned after {ElapsedMs} ms " +
+            "(pool live={Live} idle={Idle} max={Max}; {SuppressedCount} similar events in the previous minute). " +
+            "Slow DNS, TCP or TLS on a loaded host or provider-side throttling usually causes this; the provider " +
+            "circuit breaker counts the failure separately.",
+            _diagnosticName, reason, openKind, (long?)openBudget?.TotalMilliseconds, elapsedMs,
+            live, idle, EffectiveMaxConnections, suppressed);
+    }
+
+    private const long AbandonedOpenLogWindowMs = 60_000;
+    private long _lastAbandonedOpenLogTicks;
+    private long _suppressedAbandonedOpenLogs;
+
     private async Task ObserveLateFactoryCompletionAsync(
         Task<T> factoryTask,
         bool creationReserved,
         bool handshakeOwned,
-        string cancellationReason)
+        string cancellationReason,
+        TimeSpan? openBudget = null,
+        long? factoryStarted = null,
+        string openKind = "on-demand")
     {
         try
         {
@@ -769,9 +820,7 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
         catch (OperationCanceledException)
         {
             if (cancellationReason == "connection-open deadline expired")
-                Log.Warning(
-                    "NNTP connection factory stopped for {Provider}. Reason: {Reason}",
-                    _diagnosticName, cancellationReason);
+                LogAbandonedOpen(cancellationReason, openBudget, factoryStarted, openKind);
             else
                 Log.Debug(
                     "NNTP connection factory stopped for {Provider}. Reason: {Reason}",
@@ -920,7 +969,9 @@ public sealed class ConnectionPool<T> : IDisposable, IAsyncDisposable
                             factoryTask, creationReserved: true, handshakeOwned: true,
                             cancellationReason: _disposeCts.IsCancellationRequested ? "pool shutdown"
                                 : cancellationToken.IsCancellationRequested ? "caller cancellation"
-                                : "connection-open deadline expired");
+                                : "connection-open deadline expired",
+                            openBudget: warmOpenTimeout is null ? null : warmTimeout,
+                            factoryStarted: factoryStarted, openKind: "warm-up");
 #pragma warning restore CA2025
                     }
                     else

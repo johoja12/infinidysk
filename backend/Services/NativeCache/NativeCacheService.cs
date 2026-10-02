@@ -229,6 +229,9 @@ public sealed class NativeCacheService : IAsyncDisposable
     private async Task<(NativeCacheIdentity Identity, RepairRevisionStore.Snapshot Revision)?> GetCurrentIdentityAsync(
         DavItem item, Guid blobId, ContentRevisionTracker.RevisionWatch watch, CancellationToken cancellationToken)
     {
+        if (item.SubType == DavItem.ItemSubType.MultipartFile)
+            return await GetMultipartIdentityAsync(item, blobId, watch).ConfigureAwait(false);
+
         await using var blob = _blobs.ReadBlob(blobId);
         if (blob is null || !watch.IsCurrent) return null;
         var hash = await SHA256.HashDataAsync(blob, cancellationToken).ConfigureAwait(false);
@@ -240,10 +243,31 @@ public sealed class NativeCacheService : IAsyncDisposable
             { DisplayName = item.Name }, revision);
     }
 
+    // Multipart blobs are rewritten in place by lazy RAR resolution, which only fills in byte
+    // ranges for volumes the blob already references. A raw blob hash would start a new cache
+    // generation on every resolved volume, so derive the generation from content-defining
+    // fields instead (v3). Single-blob kinds keep their v2 raw-hash identity.
+    private async Task<(NativeCacheIdentity Identity, RepairRevisionStore.Snapshot Revision)?> GetMultipartIdentityAsync(
+        DavItem item, Guid blobId, ContentRevisionTracker.RevisionWatch watch)
+    {
+        var multipart = await _blobs.ReadBlob<DavMultipartFile>(blobId).ConfigureAwait(false);
+        if (multipart?.Metadata is not { } metadata || !watch.IsCurrent || item.FileSize is not > 0) return null;
+        var content = MultipartContentIdentity.Get(metadata);
+        var revision = _repairs.CaptureNativeRevisions(MultipartSegments(metadata));
+        return (new NativeCacheIdentity(item.Id.ToString("N"),
+            $"v3:{blobId:N}:{content}:{revision.Fingerprint}", item.FileSize.Value)
+            { DisplayName = item.Name }, revision);
+    }
+
+    private static IEnumerable<string> Segments(string[] ids, string[][]? fallbacks) => ids.Concat(
+        fallbacks?.Where(row => row is not null).SelectMany(row => row) ?? []);
+
+    private static IEnumerable<string> MultipartSegments(DavMultipartFile.Meta metadata) =>
+        (metadata.FileParts ?? []).SelectMany(part => Segments(part.SegmentIds, part.SegmentFallbackIds))
+            .Concat((metadata.PendingParts ?? []).SelectMany(part => Segments(part.SegmentIds, part.SegmentFallbackIds)));
+
     private async Task<IEnumerable<string>?> GetSourceSegmentsAsync(DavItem item, Guid blobId)
     {
-        static IEnumerable<string> Segments(string[] ids, string[][]? fallbacks) => ids.Concat(
-            fallbacks?.Where(row => row is not null).SelectMany(row => row) ?? []);
         switch (item.SubType)
         {
             case DavItem.ItemSubType.NzbFile:
@@ -252,11 +276,6 @@ public sealed class NativeCacheService : IAsyncDisposable
             case DavItem.ItemSubType.RarFile:
                 var rar = await _blobs.ReadBlob<DavRarFile>(blobId).ConfigureAwait(false);
                 return rar?.RarParts?.SelectMany(part => Segments(part.SegmentIds, part.SegmentFallbackIds));
-            case DavItem.ItemSubType.MultipartFile:
-                var multipart = await _blobs.ReadBlob<DavMultipartFile>(blobId).ConfigureAwait(false);
-                if (multipart?.Metadata is not { } metadata) return null;
-                return (metadata.FileParts ?? []).SelectMany(part => Segments(part.SegmentIds, part.SegmentFallbackIds))
-                    .Concat((metadata.PendingParts ?? []).SelectMany(part => Segments(part.SegmentIds, part.SegmentFallbackIds)));
             default: return null;
         }
     }

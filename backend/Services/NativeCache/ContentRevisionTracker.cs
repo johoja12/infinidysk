@@ -3,7 +3,9 @@ namespace NzbWebDAV.Services.NativeCache;
 /// <summary>
 /// Active-reader invalidation only: entries disappear when readers close, so a
 /// large library never becomes an all-content in-memory index. Persistent cache
-/// identities use a hash of the source blob, not this process-local notification.
+/// identities use a hash of the source blob (or, for multipart files, of its
+/// content-defining fields), not this process-local notification. Content-preserving
+/// blob writes (lazy RAR volume resolution) deliberately do not publish here.
 /// </summary>
 public static class ContentRevisionTracker
 {
