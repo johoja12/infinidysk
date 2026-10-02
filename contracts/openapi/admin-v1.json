@@ -1809,6 +1809,21 @@
               "string"
             ]
           },
+          "mediaDurationMs": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "null",
+              "string"
+            ]
+          },
+          "missReason": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
           "priority": {
             "format": "int32",
             "pattern": "^-?(?:0|[1-9]\\d*)$",
@@ -1914,6 +1929,18 @@
             "pattern": "^-?(?:0|[1-9]\\d*)$",
             "type": [
               "integer",
+              "string"
+            ]
+          },
+          "viewerPlayer": {
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "viewerUser": {
+            "type": [
+              "null",
               "string"
             ]
           },

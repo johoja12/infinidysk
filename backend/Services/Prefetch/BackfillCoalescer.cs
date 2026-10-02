@@ -1,3 +1,5 @@
+using NzbWebDAV.Streams;
+
 namespace NzbWebDAV.Services.Prefetch;
 
 /// <summary>
@@ -7,6 +9,15 @@ namespace NzbWebDAV.Services.Prefetch;
 /// <see cref="Quiet"/> (or <see cref="MaxDelay"/> passed since its first request), merging
 /// ranges that lie within <see cref="MergeGap"/> of each other into a small bounded set.
 /// </summary>
+public sealed record BackfillDue(Guid ItemId, IReadOnlyList<(long Start, long Length)> Ranges, string Reason)
+{
+    public void Deconstruct(out Guid itemId, out IReadOnlyList<(long Start, long Length)> ranges, out string reason)
+        => (itemId, ranges, reason) = (ItemId, Ranges, Reason);
+
+    public void Deconstruct(out Guid itemId, out IReadOnlyList<(long Start, long Length)> ranges)
+        => (itemId, ranges) = (ItemId, Ranges);
+}
+
 public sealed class BackfillCoalescer(TimeProvider clock)
 {
     public static readonly TimeSpan Quiet = TimeSpan.FromSeconds(45);
@@ -22,6 +33,8 @@ public sealed class BackfillCoalescer(TimeProvider clock)
         public DateTimeOffset Last { get; set; } = first;
         public bool Forced { get; set; }
         public List<(long Start, long End)> Ranges { get; } = [];
+        /// <summary>Uncached bytes per miss reason; the job is labelled with the dominant one.</summary>
+        public Dictionary<string, long> Reasons { get; } = new(StringComparer.Ordinal);
     }
 
     private readonly Lock _gate = new();
@@ -29,7 +42,7 @@ public sealed class BackfillCoalescer(TimeProvider clock)
 
     public int PendingItems { get { lock (_gate) return _pending.Count; } }
 
-    public void Add(Guid itemId, long start, long length)
+    public void Add(Guid itemId, long start, long length, string reason = BackfillMissReasons.UncachedRead)
     {
         if (itemId == Guid.Empty || start < 0 || length <= 0 || start > long.MaxValue - length) return;
         var now = clock.GetUtcNow();
@@ -45,22 +58,28 @@ public sealed class BackfillCoalescer(TimeProvider clock)
                 _pending[itemId] = pending;
             }
             pending.Last = now;
+            if (pending.Reasons.Count < 16 || pending.Reasons.ContainsKey(reason))
+                pending.Reasons[reason] = pending.Reasons.GetValueOrDefault(reason) + length;
             Merge(pending.Ranges, start, start + length);
         }
     }
 
     /// <summary>Removes and returns items that are due, or every pending item when <paramref name="all"/>.</summary>
-    public IReadOnlyList<(Guid ItemId, IReadOnlyList<(long Start, long Length)> Ranges)> TakeDue(bool all = false)
+    public IReadOnlyList<BackfillDue> TakeDue(bool all = false)
     {
         var now = clock.GetUtcNow();
-        var due = new List<(Guid, IReadOnlyList<(long, long)>)>();
+        var due = new List<BackfillDue>();
         lock (_gate)
         {
             foreach (var (itemId, pending) in _pending.ToArray())
             {
                 if (!all && !pending.Forced && now - pending.Last < Quiet && now - pending.First < MaxDelay) continue;
                 _pending.Remove(itemId);
-                due.Add((itemId, pending.Ranges.Select(range => (range.Start, range.End - range.Start)).ToArray()));
+                // A specific cause outranks the generic fallback whenever both were seen.
+                var reason = pending.Reasons.OrderBy(pair => pair.Key == BackfillMissReasons.UncachedRead)
+                    .ThenByDescending(pair => pair.Value).ThenBy(pair => pair.Key, StringComparer.Ordinal)
+                    .Select(pair => pair.Key).FirstOrDefault() ?? BackfillMissReasons.UncachedRead;
+                due.Add(new(itemId, pending.Ranges.Select(range => (range.Start, range.End - range.Start)).ToArray(), reason));
             }
         }
         return due;

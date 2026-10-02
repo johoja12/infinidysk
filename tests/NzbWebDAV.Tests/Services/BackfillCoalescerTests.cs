@@ -1,4 +1,5 @@
 using NzbWebDAV.Services.Prefetch;
+using NzbWebDAV.Streams;
 using NzbWebDAV.Tests.TestUtils;
 
 namespace NzbWebDAV.Tests.Services;
@@ -74,5 +75,20 @@ public sealed class BackfillCoalescerTests
         coalescer.Add(second, 0, 4 * MiB);
         Assert.Equal(first, Assert.Single(coalescer.TakeDue()).ItemId);
         Assert.Equal(second, Assert.Single(coalescer.TakeDue(all: true)).ItemId);
+    }
+
+    [Fact]
+    public void TakeDue_LabelsTheItemWithTheDominantSpecificReason()
+    {
+        var clock = new ControllableTimeProvider(DateTimeOffset.UtcNow);
+        var coalescer = new BackfillCoalescer(clock);
+        var item = Guid.NewGuid();
+        coalescer.Add(item, 0, 64 * MiB); // Generic fallback, most bytes.
+        coalescer.Add(item, 64 * MiB, 4 * MiB, BackfillMissReasons.WriteFailed);
+        coalescer.Add(item, 68 * MiB, 8 * MiB, BackfillMissReasons.BuffersFull);
+        Assert.Equal(BackfillMissReasons.BuffersFull, Assert.Single(coalescer.TakeDue(all: true)).Reason);
+
+        coalescer.Add(item, 0, 4 * MiB);
+        Assert.Equal(BackfillMissReasons.UncachedRead, Assert.Single(coalescer.TakeDue(all: true)).Reason);
     }
 }
