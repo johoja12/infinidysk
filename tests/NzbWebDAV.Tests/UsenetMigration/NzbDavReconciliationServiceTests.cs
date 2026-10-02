@@ -125,6 +125,74 @@ public sealed class NzbDavReconciliationServiceTests : IDisposable
     }
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ReconcileAsync_OnlyAccountsForMissingSubmissionWithRecordedScanExclusion(bool excluded)
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var fixture = await SeedAsync(harness);
+        await using (var db = harness.Mig())
+        {
+            const string storeRef = "nzbdav:path";
+            db.MigratedReleases.Remove(await db.MigratedReleases.SingleAsync(item => item.SourceReleaseId == storeRef));
+            db.Submissions.Remove(await db.Submissions.SingleAsync(item => item.StoreRef == storeRef));
+            var release = await db.Releases.SingleAsync(item => item.StoreRef == storeRef);
+            release.Verdict = excluded ? "red" : "green";
+            release.VerdictReasons = excluded ? "[\"inconsistent_source_category\",\"category_unmapped\"]" : "[]";
+            await db.SaveChangesAsync();
+        }
+        var service = new NzbDavReconciliationService(
+            harness.Store, new NzbDavPackageReader(), fixture.BlobStore)
+        {
+            DavContextFactory = harness.DavFactory,
+        };
+        if (!excluded)
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                service.ReconcileAsync(fixture.RunId, fixture.PackageRoot));
+            return;
+        }
+        var result = await service.ReconcileAsync(fixture.RunId, fixture.PackageRoot);
+        Assert.Equal(4, result.SelectedCount);
+        Assert.Equal(2, result.ExactCount);
+        Assert.Equal(1, result.AmbiguousCount);
+        Assert.Equal(1, result.UnmatchedCount);
+        Assert.Equal(result, await service.ReconcileAsync(fixture.RunId, fixture.PackageRoot));
+        await using var verify = harness.Mig();
+        var source = await verify.ReleaseFiles.SingleAsync(item => item.StoreRef == "nzbdav:path");
+        Assert.Equal("scan-excluded", source.FileStatus);
+        Assert.Null(source.NewDavItemId);
+        Assert.Contains("inconsistent_source_category", source.Flags);
+        Assert.Equal("exact", (await verify.ReleaseFiles.SingleAsync(item => item.StoreRef == "nzbdav:direct")).FileStatus);
+        Assert.Equal(3, await verify.Submissions.CountAsync());
+    }
+
+    [Fact]
+    public async Task ReconcileAsync_RejectsScanExclusionWithExistingExactMapping()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var fixture = await SeedAsync(harness);
+        await using (var db = harness.Mig())
+        {
+            const string storeRef = "nzbdav:direct";
+            db.Submissions.Remove(await db.Submissions.SingleAsync(item => item.StoreRef == storeRef));
+            var release = await db.Releases.SingleAsync(item => item.StoreRef == storeRef);
+            release.Verdict = "red";
+            release.VerdictReasons = "[\"category_unmapped\"]";
+            await db.SaveChangesAsync();
+        }
+        var service = new NzbDavReconciliationService(
+            harness.Store, new NzbDavPackageReader(), fixture.BlobStore)
+        {
+            DavContextFactory = harness.DavFactory,
+        };
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.ReconcileAsync(fixture.RunId, fixture.PackageRoot));
+        await using var verify = harness.Mig();
+        Assert.Equal("exact", (await verify.ReleaseFiles.SingleAsync(item => item.StoreRef == "nzbdav:direct")).FileStatus);
+    }
+
+    [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task ReconcileAsync_RejectsMissingOrMismatchedPackageDigest(bool mismatched)

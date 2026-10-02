@@ -138,12 +138,44 @@ public sealed class NzbDavScanRunnerTests : IDisposable
         Assert.Equal("Outlander.Blood.of.My.Blood.S02E01", release.JobName);
     }
 
+    [Theory]
+    [InlineData("migration-tv", true)]
+    [InlineData("migration-4k", false)]
+    [InlineData(null, false)]
+    public async Task ScanAsync_SharedReleaseRequiresEveryCategoryToMapToSameTarget(string? secondTarget, bool accepted)
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var package = await CreatePackageAsync(secondCategory: "Migration-4K");
+        await harness.Store.UpdateSessionAsync(session =>
+        {
+            session.Status = MigrationSessionStatus.Scanning;
+            session.SourceType = MigrationSourceTypes.NzbDav;
+            session.SourcePackageRoot = package;
+        });
+        await harness.Store.SetCategoryMappingAsync("Migration-TV", "migration-tv", "migrate");
+        if (secondTarget is not null)
+            await harness.Store.SetCategoryMappingAsync("Migration-4K", secondTarget, "migrate");
+        var summary = await new NzbDavScanRunner(harness.Store, new ConfigManager(), new NzbDavPackageReader())
+            .ScanAsync();
+        await using var db = harness.Mig();
+        var release = await db.Releases.SingleAsync();
+        Assert.Equal(accepted ? 1 : 0, summary!.GreenCount);
+        Assert.Equal(accepted ? "green" : "red", release.Verdict);
+        Assert.Equal(accepted ? 1 : 0, await db.Submissions.CountAsync());
+        Assert.Equal(2, await db.ReleaseFiles.CountAsync());
+        if (accepted)
+            Assert.Equal("migration-tv", release.TargetCategory);
+        else
+            Assert.Contains("inconsistent_source_category", release.VerdictReasons);
+    }
+
     private async Task<string> CreatePackageAsync(
         bool excluded = false,
         string? doctype = null,
         string sourceReleaseId = "release-1",
         string? sourceFileName = null,
-        string? sourceJobName = null)
+        string? sourceJobName = null,
+        string? secondCategory = null)
     {
         Directory.CreateDirectory(_root);
         var payload = Path.Join(_root, $"source-{Guid.NewGuid():N}.nzb");
@@ -157,15 +189,25 @@ public sealed class NzbDavScanRunnerTests : IDisposable
         var package = Path.Join(_root, $"package-{Guid.NewGuid():N}");
         var leafId = Guid.NewGuid();
         var blobId = Guid.NewGuid();
+        var leaves = new List<NzbDavExportLeaf>
+        {
+            new(leafId, "/content/a.mkv", 10, sourceReleaseId, null, blobId,
+                NzbDavArticleIdentity.DirectKind, new string('a', 64), "ready", null),
+        };
+        var links = new List<NzbDavSelectedLibraryLink>
+        {
+            new("Migration-TV/a.mkv", "/legacy/.ids/a", leafId),
+        };
+        if (secondCategory is not null)
+        {
+            var secondId = Guid.NewGuid();
+            leaves.Add(leaves[0] with { LegacyDavItemId = secondId, LegacyPath = "/content/4k/a.mkv" });
+            links.Add(new($"{secondCategory}/a.mkv", "/legacy/.ids/b", secondId));
+        }
         await new CanaryPackageWriter(1, 50).WriteAsync(new CanaryExportRequest(
-            "scan-package",
-            package,
-            [new CanaryExportRelease(sourceReleaseId, blobId, payload,
-                [new NzbDavExportLeaf(leafId, "/content/a.mkv", 10, sourceReleaseId, null, blobId,
-                    NzbDavArticleIdentity.DirectKind, new string('a', 64), "ready", null)],
-                SourceFileName: sourceFileName,
-                SourceJobName: sourceJobName)],
-            [new NzbDavSelectedLibraryLink("Migration-TV/a.mkv", "/legacy/.ids/a", leafId)]));
+            "scan-package", package,
+            [new CanaryExportRelease(sourceReleaseId, blobId, payload, leaves,
+                SourceFileName: sourceFileName, SourceJobName: sourceJobName)], links));
         if (excluded)
         {
             var manifestPath = Path.Join(package, "manifest.json");

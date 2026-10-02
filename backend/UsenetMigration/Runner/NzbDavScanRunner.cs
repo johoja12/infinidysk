@@ -45,11 +45,18 @@ public sealed class NzbDavScanRunner(
                 .Select(leaf => TopLevel(selectedById[leaf.LegacyDavItemId].LibraryRelativePath))
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
-            if (categories.Length != 1)
+            var mappings = categories.Select(category => categoryMap.GetValueOrDefault(category)).ToArray();
+            var allMapped = mappings.Length > 0
+                            && mappings.All(mapping => mapping is { Action: "migrate", TargetCategory.Length: > 0 });
+            var targets = mappings.Where(mapping => mapping is not null)
+                .Select(mapping => mapping!.TargetCategory)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            if (categories.Length != 1 && (!allMapped || targets.Length != 1))
                 errors.Add("inconsistent_source_category");
-            var sourceCategory = categories.Length == 1 ? categories[0] : "";
-            categoryMap.TryGetValue(sourceCategory, out var mapping);
-            if (mapping is not { Action: "migrate", TargetCategory.Length: > 0 })
+            var sourceCategory = categories.Order(StringComparer.Ordinal).FirstOrDefault() ?? "";
+            var targetCategory = allMapped && targets.Length == 1 ? targets[0] : null;
+            if (!allMapped)
                 errors.Add("category_unmapped");
             foreach (var leaf in source.Leaves.Where(leaf => leaf.ExtractionStatus != "ready"))
                 errors.Add($"source_exclusion:{leaf.ExclusionReason ?? "unknown"}");
@@ -73,14 +80,14 @@ public sealed class NzbDavScanRunner(
                 JobName = jobName,
                 JobNameDiverges = !string.Equals(jobName, submitName, StringComparison.Ordinal),
                 AltmountCategory = sourceCategory,
-                TargetCategory = mapping?.TargetCategory,
+                TargetCategory = targetCategory,
                 Verdict = errors.Count == 0 ? "green" : "red",
                 VerdictReasons = JsonSerializer.Serialize(errors),
                 MetaFileCount = source.Leaves.Count,
                 TotalBytes = source.Leaves.Sum(leaf => leaf.FileSize),
                 NzbFileCount = document.Files.Count,
                 SegmentCount = document.Files.Sum(file => file.Segments.Count),
-                Included = mapping is { Action: "migrate" },
+                Included = allMapped && targets.Length == 1,
                 ScannedAt = DateTime.UtcNow,
             };
             var files = source.Leaves.Select(leaf => new MigrationReleaseFile
