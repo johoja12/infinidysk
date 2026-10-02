@@ -32,7 +32,8 @@ public sealed record PlexMediaItem(string RatingKey, string Type, string Title, 
     public string? MappingStatus { get; init; }
     public string? MappingReason { get; init; }
 }
-public sealed record PlexSession(string Id, string UserId, string State, string? File, PlexMediaItem Item);
+public sealed record PlexSession(string Id, string UserId, string State, string? File, PlexMediaItem Item,
+    string? UserName = null, string? PlayerName = null);
 public sealed record PlexIdentity(string MachineIdentifier, string Version);
 public sealed record PlexConnection(string Uri, bool Local, bool Relay);
 public sealed record PlexDiscoveredServer(string Id, string Name, string Token, IReadOnlyList<PlexConnection> Connections, string? AccountId = null)

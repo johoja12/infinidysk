@@ -102,7 +102,7 @@ public sealed class NativeCacheCommitQueueTests : IDisposable
         var backfills = new List<(long, long)>();
         var watch = Stopwatch.StartNew();
         await using (var stream = new NativeCachedStream(store, identity, _ => Task.FromResult<Stream>(new CacheableSource(data)),
-            () => true, writeBehind: true, commitQueue: queue, backfill: (start, length) => backfills.Add((start, length)))
+            () => true, writeBehind: true, commitQueue: queue, backfill: (start, length, _) => backfills.Add((start, length)))
             { CacheIoTimeout = TimeSpan.FromMilliseconds(50) })
         {
             var actual = new byte[data.Length];
@@ -126,7 +126,7 @@ public sealed class NativeCacheCommitQueueTests : IDisposable
         var identity = new NativeCacheIdentity("full-queue", "v1", data.Length);
         var backfills = new List<(long Start, long Length)>();
         await using (var stream = new NativeCachedStream(store, identity, _ => Task.FromResult<Stream>(new CacheableSource(data)),
-            () => true, writeBehind: true, commitQueue: queue, backfill: (start, length) => backfills.Add((start, length))))
+            () => true, writeBehind: true, commitQueue: queue, backfill: (start, length, _) => backfills.Add((start, length))))
         {
             var actual = new byte[data.Length];
             await stream.ReadExactlyAsync(actual);
@@ -147,7 +147,7 @@ public sealed class NativeCacheCommitQueueTests : IDisposable
         var identity = new NativeCacheIdentity("probe", "v1", data.Length);
         var backfills = new List<(long, long)>();
         await using (var stream = new NativeCachedStream(store, identity, _ => Task.FromResult<Stream>(new CacheableSource(data)),
-            () => true, writeBehind: true, commitQueue: queue, backfill: (start, length) => backfills.Add((start, length))))
+            () => true, writeBehind: true, commitQueue: queue, backfill: (start, length, _) => backfills.Add((start, length))))
         {
             var probe = new byte[2 * Block];
             await stream.ReadExactlyAsync(probe);

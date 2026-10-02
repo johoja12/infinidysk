@@ -46,7 +46,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     private long _reopenedFillBlock = -1;
     private bool _abandonLogged;
     private readonly NativeCacheCommitQueue? _commitQueue;
-    private readonly Action<long, long>? _backfill;
+    private readonly Action<long, long, string>? _backfill;
     private readonly UncachedRangeTracker _uncached;
     private readonly List<Task> _queuedCommits = [];
     private long? _responseEnd;
@@ -75,7 +75,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     public NativeCachedStream(NativeCacheStore store, NativeCacheIdentity identity,
         Func<CancellationToken, Task<Stream>> openSource, Func<bool> generationIsCurrent,
         NativeBufferSlots? bufferSlots = null, bool background = false, NativeCacheStatistics? statistics = null, bool writeBehind = false,
-        NativeCacheCommitQueue? commitQueue = null, Action<long, long>? backfill = null, IDisposable? ownedResource = null)
+        NativeCacheCommitQueue? commitQueue = null, Action<long, long, string>? backfill = null, IDisposable? ownedResource = null)
     {
         _commitQueue = background ? null : commitQueue;
         _backfill = background ? null : backfill;
@@ -408,6 +408,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         {
             if (_servedBytes) throw new MediaSourceChangedException("Media source changed during this response. Retry the range against the current source.");
             _untrackedSource = true;
+            _uncached.Cause = BackfillMissReasons.SourceChanged;
             _bypassFill = true;
         }
         if (_bypassFill) return await ReadSourceRangeAsync(destination, cancellationToken).ConfigureAwait(false);
@@ -658,7 +659,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                         {
                             if (committed) { statistics?.Committed(expected); transfer?.Committed(expected); return; }
                             PrometheusMetrics.Current?.RecordNativeCacheSkip("commit_failed");
-                            backfill?.Invoke(blockStart, expected);
+                            backfill?.Invoke(blockStart, expected, BackfillMissReasons.WriteFailed);
                         }
                         finally { done.TrySetResult(); }
                     }))
@@ -841,6 +842,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     private void RecordSkip(string reason, bool abandonsResponse)
     {
         PrometheusMetrics.Current?.RecordNativeCacheSkip(reason);
+        _uncached.Cause = BackfillMissReasons.FromSkip(reason);
         if (!abandonsResponse || _background || _abandonLogged) return;
         _abandonLogged = true;
         Log.Warning("Native cache stopped caching {Name} at byte {Offset} for the rest of this response. Reason: {Reason}",
@@ -894,6 +896,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
         if (_servedBytes)
             throw new MediaSourceChangedException("Media source changed during this response. Retry the range against the current source.");
         _untrackedSource = true;
+        _uncached.Cause = BackfillMissReasons.SourceChanged;
         _bypassFill = true;
         _bufferStart = -1;
         _activeFill?.Dispose();

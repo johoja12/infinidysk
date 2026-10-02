@@ -120,7 +120,9 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
                 && UserSelected(settings, server.Id, session.UserId)).Take(32))
             {
                 var owner = Owner(server.Id, "realtime", session.UserId);
-                if (session.Item.ViewOffset > 0) await QueueMediaAsync(server, session.Item, owner, 80, settings, null, ct).ConfigureAwait(false);
+                var viewer = new PlaybackViewer(session.UserName, session.PlayerName, session.Item.Duration);
+                if (session.Item.ViewOffset > 0) await QueueMediaAsync(server, session.Item, owner, 80, settings, null, ct,
+                    resolved: imported => runtime.Viewers.Note(imported.Id, viewer)).ConfigureAwait(false);
                 if (settings.PredictionsEnabled && session.Item.Type == "episode")
                     await QueueNextAsync(server, session.Item, Owner(server.Id, "realtime-next", session.UserId), 90, settings, null, ct).ConfigureAwait(false);
             }
@@ -215,7 +217,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     }
 
     private async Task<bool> QueueMediaAsync(PlexServer server, PlexMediaItem item, string owner, int priority,
-        PrefetchSettings settings, PrefetchSource? source, CancellationToken ct, bool prediction = false)
+        PrefetchSettings settings, PrefetchSource? source, CancellationToken ct, bool prediction = false,
+        Action<DavItem>? resolved = null)
     {
         if (--_remainingCandidates < 0) return false;
         if (!PrefetchPolicy.IsEligible(item, settings, source)) return RejectPreview(item, owner, "Excluded show or disabled media policy.");
@@ -253,6 +256,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             + (mapped.LocalPath is null ? "" : ":local")
             + (prediction ? item.WatchStateUserId is null ? ":watch-unknown" : ":unwatched" : "");
         if (imported is null) return RejectPreview(item, owner, "Mapping does not resolve to an imported media file.");
+        if (_preview is null) resolved?.Invoke(imported);
         if (imported.FileSize is not > 0 || imported.FileSize > runtime.Settings().MaxBytesPerItem
             || imported.FileSize < NativeCacheSettings.MinimumFileBytes(config) || imported.FileBlobId is null)
             return RejectPreview(item, owner, "Imported media is unavailable or exceeds the per-file warming cap.");

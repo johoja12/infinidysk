@@ -63,13 +63,13 @@ public sealed class NativeCacheService : IAsyncDisposable
     /// Receives (item, offset, length) ranges a foreground stream served without caching. The
     /// prefetch runtime registers itself here and fills them in later as low-cost warming jobs.
     /// </summary>
-    public Action<Guid, long, long>? BackfillSink { get; set; }
+    public Action<Guid, long, long, string>? BackfillSink { get; set; }
 
-    private Action<long, long>? BackfillFor(DavItem item)
+    private Action<long, long, string>? BackfillFor(DavItem item)
     {
         if (BackfillSink is null) return null;
         var id = item.Id;
-        return (offset, length) => BackfillSink?.Invoke(id, offset, length);
+        return (offset, length, reason) => BackfillSink?.Invoke(id, offset, length, reason);
     }
     public long ReservedBufferBytes => _bufferSlots?.HeldBytes ?? 0;
 

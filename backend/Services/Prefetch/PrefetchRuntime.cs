@@ -23,6 +23,8 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
     private readonly BackfillCoalescer _backfill = new(clock ?? TimeProvider.System);
     /// <summary>Debounced backfill requests not yet written to the queue.</summary>
     public int PendingBackfillItems => _backfill.PendingItems;
+    /// <summary>Recent Plex playback per item, attached to the backfill jobs that playback causes.</summary>
+    public PlaybackViewerRegistry Viewers { get; } = new(clock ?? TimeProvider.System);
     private readonly Lock _gate = new();
     private PrefetchJobStore? _jobs;
     private PrefetchCoordinator? _coordinator;
@@ -186,7 +188,7 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
         if (due.Count == 0 || Jobs is not { } jobs) return;
         using var scope = scopes.CreateScope();
         var database = scope.ServiceProvider.GetRequiredService<NzbWebDAV.Database.DavDatabaseClient>();
-        foreach (var (itemId, ranges) in due)
+        foreach (var (itemId, ranges, reason) in due)
         {
             try
             {
@@ -195,9 +197,13 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
                 var identity = await CachedIdentityAsync(item, ct).ConfigureAwait(false);
                 if (jobs.IsDamaged(itemId, identity?.Generation, _clock.GetUtcNow())) continue;
                 var since = _clock.GetUtcNow() - BackfillReviveWindow;
+                var viewer = Viewers.Find(itemId);
                 foreach (var (start, length) in ranges)
-                    jobs.EnqueueBackfill(itemId, BackfillOwner, BackfillPriority, start, length,
+                {
+                    var queued = jobs.EnqueueBackfill(itemId, BackfillOwner, BackfillPriority, start, length,
                         identity?.Generation, BackfillCoalescer.MergeGap, since);
+                    jobs.RecordBackfillContext(queued.Job.Id, reason, viewer);
+                }
             }
             catch (Exception exception) when (exception is ArgumentException or InvalidOperationException
                 or ObjectDisposedException or IOException or Microsoft.Data.Sqlite.SqliteException)

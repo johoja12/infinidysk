@@ -374,7 +374,7 @@ internal static class NntpWholePathReport
                     usePipelinedBodyRequests: true, fileName: "loopback.bin", inFlightArticleBudget: budget,
                     streamingBodyBatchWidth: scenario.BatchWidth, segmentByteRangesTrusted: true)),
                 () => true, slots, writeBehind: true, commitQueue: commitQueue,
-                backfill: (_, length) => Interlocked.Add(ref backfilled, length));
+                backfill: (_, length, _) => Interlocked.Add(ref backfilled, length));
             var streams = Enumerable.Range(0, Math.Max(1, scenario.ConcurrentReaders)).Select(_ => CreateStream()).ToArray();
             ReadResult result;
             try

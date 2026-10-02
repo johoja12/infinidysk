@@ -57,23 +57,31 @@ public sealed class PrefetchWarmingOutcomeTests
         var jobs = harness.Runtime.Jobs!;
         // Six per-block skips (commit failures, admission timeouts) from one playback session.
         for (var block = 0; block < 6; block++)
-            harness.Native.BackfillSink!(harness.Item.Id, block * NativeCacheStore.BlockSize, NativeCacheStore.BlockSize);
+            harness.Native.BackfillSink!(harness.Item.Id, block * NativeCacheStore.BlockSize, NativeCacheStore.BlockSize,
+                block == 0 ? BackfillMissReasons.UncachedRead : BackfillMissReasons.BuffersFull);
         Assert.Empty(jobs.List()); // Debounced: nothing is written while the session is active.
         Assert.Equal(1, harness.Runtime.PendingBackfillItems);
 
         await harness.Runtime.FlushBackfillAsync(all: true, CancellationToken.None);
         var job = Assert.Single(jobs.List());
         Assert.Equal((0L, 6L * NativeCacheStore.BlockSize), (job.Start, job.Length));
+        // The specific cause wins over the generic fallback; no Plex session was seen.
+        Assert.Equal(BackfillMissReasons.BuffersFull, job.MissReason);
+        Assert.Null(job.ViewerPlayer);
 
         await harness.Runtime.Coordinator!.RunOnceAsync(CancellationToken.None);
         Assert.Equal("completed", Assert.Single(jobs.List()).State);
 
-        // A later miss of the same revision reopens the completed row instead of adding another.
-        harness.Native.BackfillSink!(harness.Item.Id, 0, NativeCacheStore.BlockSize);
+        // A later miss of the same revision reopens the completed row instead of adding another,
+        // labelled with the latest playback.
+        harness.Runtime.Viewers.Note(harness.Item.Id, new PlaybackViewer("alex", "Living Room TV", 3_120_000));
+        harness.Native.BackfillSink!(harness.Item.Id, 0, NativeCacheStore.BlockSize, BackfillMissReasons.WriteFailed);
         await harness.Runtime.FlushBackfillAsync(all: true, CancellationToken.None);
         var reopened = Assert.Single(jobs.List());
         Assert.Equal(job.Id, reopened.Id);
         Assert.Equal("queued", reopened.State);
+        Assert.Equal(BackfillMissReasons.WriteFailed, reopened.MissReason);
+        Assert.Equal(("alex", "Living Room TV", 3_120_000L), (reopened.ViewerUser, reopened.ViewerPlayer, reopened.MediaDurationMs));
     }
 
     [Fact]
@@ -105,7 +113,7 @@ public sealed class PrefetchWarmingOutcomeTests
         Assert.True(await harness.Runtime.IsKnownDamagedAsync(harness.Item, CancellationToken.None));
 
         // Backfill from playback of the damaged file is suppressed as well.
-        harness.Native.BackfillSink!(harness.Item.Id, 0, 3);
+        harness.Native.BackfillSink!(harness.Item.Id, 0, 3, BackfillMissReasons.UncachedRead);
         await harness.Runtime.FlushBackfillAsync(all: true, CancellationToken.None);
         Assert.Single(jobs.List());
     }

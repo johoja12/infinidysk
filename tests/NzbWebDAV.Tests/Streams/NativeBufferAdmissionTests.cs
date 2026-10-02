@@ -72,7 +72,7 @@ public sealed class NativeBufferAdmissionTests : IDisposable
             await Task.WhenAll(Enumerable.Range(0, readers).Select(index => Task.Run(async () =>
             {
                 await using var stream = Stream(store, ids[index], data[index], slots, queue,
-                    backfill: (_, length) => Interlocked.Add(ref backfills, length));
+                    backfill: (_, length, _) => Interlocked.Add(ref backfills, length));
                 var actual = new byte[data[index].Length];
                 for (var offset = 0; offset < actual.Length;)
                 {
@@ -138,12 +138,13 @@ public sealed class NativeBufferAdmissionTests : IDisposable
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var probes = 0;
         var backfills = new List<(long Start, long Length)>();
+        var reasons = new List<string>();
         try
         {
             await using (var queue = new NativeCacheCommitQueue())
             {
                 await using (var stream = new NativeCachedStream(store, id, _ => Task.FromResult<Stream>(new CacheableSource(data)),
-                    () => true, slots, writeBehind: true, commitQueue: queue, backfill: (start, length) => backfills.Add((start, length)))
+                    () => true, slots, writeBehind: true, commitQueue: queue, backfill: (start, length, reason) => { backfills.Add((start, length)); reasons.Add(reason); })
                 {
                     CacheIoTimeout = TimeSpan.FromMilliseconds(50),
                     BeforeCacheIo = async (write, _) =>
@@ -159,6 +160,7 @@ public sealed class NativeBufferAdmissionTests : IDisposable
                 }
             }
             Assert.Equal(new[] { (0L, (long)Block) }, backfills);
+            Assert.Equal(new[] { BackfillMissReasons.StorageSlow }, reasons);
             Assert.Equal(0, await store.GetMissingRangeBytesAsync(id, Block, data.Length));
             Assert.Equal(1, slots.Held);
         }
@@ -174,18 +176,20 @@ public sealed class NativeBufferAdmissionTests : IDisposable
         var id = new NativeCacheIdentity("busy-fill", "v1", data.Length);
         await SeedLastBlockAsync(store, id, data);
         var backfills = new List<(long Start, long Length)>();
+        var reasons = new List<string>();
         using (await store.AcquireFillAsync(id, 0, CancellationToken.None))
         {
             await using var queue = new NativeCacheCommitQueue();
             await using var stream = new NativeCachedStream(store, id, _ => Task.FromResult<Stream>(new CacheableSource(data)),
                 () => true, new NativeBufferSlots(2), writeBehind: true, commitQueue: queue,
-                backfill: (start, length) => backfills.Add((start, length)))
+                backfill: (start, length, reason) => { backfills.Add((start, length)); reasons.Add(reason); })
             { CacheIoTimeout = TimeSpan.FromMilliseconds(50) };
             var actual = new byte[data.Length];
             await stream.ReadExactlyAsync(actual);
             Assert.Equal(data, actual);
         }
         Assert.Equal(new[] { (0L, (long)Block) }, backfills);
+        Assert.Equal(new[] { BackfillMissReasons.BlockBusy }, reasons);
         Assert.Equal(0, await store.GetMissingRangeBytesAsync(id, Block, data.Length));
     }
 
@@ -212,7 +216,7 @@ public sealed class NativeBufferAdmissionTests : IDisposable
     }
 
     private NativeCachedStream Stream(NativeCacheStore store, NativeCacheIdentity id, byte[] data, NativeBufferSlots slots,
-        NativeCacheCommitQueue queue, TimeSpan? admissionWait = null, Action<long, long>? backfill = null) =>
+        NativeCacheCommitQueue queue, TimeSpan? admissionWait = null, Action<long, long, string>? backfill = null) =>
         new(store, id, _ => Task.FromResult<Stream>(new CacheableSource(data)), () => true, slots,
             writeBehind: true, commitQueue: queue, backfill: backfill)
         { AdmissionWait = admissionWait ?? TimeSpan.FromSeconds(5) };

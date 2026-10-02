@@ -256,7 +256,8 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
         (await ReadPagesAsync(server, "/status/sessions", 1000, ["Video"], ct).ConfigureAwait(false))
         .Select(item => new PlexSession(Attribute(item.Element("Session"), "id") ?? Attribute(item, "sessionKey") ?? "",
             Attribute(item.Element("User"), "id") ?? "", Attribute(item.Element("Player"), "state") ?? "",
-            ParseMedia(item).File, ParseMedia(item))).ToArray();
+            ParseMedia(item).File, ParseMedia(item), Attribute(item.Element("User"), "title"),
+            Attribute(item.Element("Player"), "title") ?? Attribute(item.Element("Player"), "product"))).ToArray();
 
     private async Task<IReadOnlyList<XElement>> ReadPagesAsync(PlexServer server, string path, int limit, string[] elementNames, CancellationToken ct,
         Func<XElement, bool>? include = null)

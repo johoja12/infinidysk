@@ -47,6 +47,17 @@ public sealed record PrefetchJob(string Id, Guid ItemId, string Trigger, int Pri
     /// </summary>
     public IReadOnlyList<PrefetchJobSource>? Sources { get; init; }
     public int? SourceCount { get; init; }
+    /// <summary>
+    /// Backfill jobs only: why playback served these bytes without caching them, as a
+    /// <see cref="NzbWebDAV.Streams.BackfillMissReasons"/> code. Null for other jobs and older rows.
+    /// </summary>
+    public string? MissReason { get; init; }
+    /// <summary>Backfill jobs only: the Plex user who was playing, when Plex reported the session.</summary>
+    public string? ViewerUser { get; init; }
+    /// <summary>Backfill jobs only: the Plex player (device) that was playing.</summary>
+    public string? ViewerPlayer { get; init; }
+    /// <summary>Backfill jobs only: media runtime in milliseconds from Plex, for placing the range in time.</summary>
+    public long? MediaDurationMs { get; init; }
     /// <summary>True for jobs that warm part of a file (backfill, head/tail minimum, resume range).</summary>
     public bool IsRangeJob => Start != 0 || Length != 0;
 }
@@ -132,7 +143,8 @@ public sealed class PrefetchJobStore : IDisposable
         using (var reader = command.ExecuteReader())
             while (reader.Read()) existing.Add(reader.GetString(1));
         foreach (var (column, type) in new[] { ("StartedAt", "INTEGER"), ("FinishedAt", "INTEGER"), ("ActiveMs", "INTEGER"),
-            ("RunStarted", "INTEGER"), ("WarmedBytes", "INTEGER"), ("FailureCode", "TEXT"), ("Remedy", "TEXT") })
+            ("RunStarted", "INTEGER"), ("WarmedBytes", "INTEGER"), ("FailureCode", "TEXT"), ("Remedy", "TEXT"),
+            ("MissReason", "TEXT"), ("ViewerUser", "TEXT"), ("ViewerPlayer", "TEXT"), ("MediaDurationMs", "INTEGER") })
             if (!existing.Contains(column)) Execute($"ALTER TABLE Jobs ADD COLUMN {column} {type} NULL");
     }
 
@@ -193,6 +205,24 @@ public sealed class PrefetchJobStore : IDisposable
             return new PrefetchEnqueueResult(new PrefetchJob(id, itemId, trigger, priority, "queued", start, length, null, 0, null, now), true);
         });
     }
+
+    /// <summary>
+    /// Labels a backfill job with why playback missed the cache and who was playing. The latest
+    /// playback wins for merged or reopened jobs; a known viewer is kept when the new one is unknown.
+    /// </summary>
+    public void RecordBackfillContext(string id, string reason, PlaybackViewer? viewer)
+    {
+        lock (_gate)
+            Execute("""
+                UPDATE Jobs SET MissReason=$reason,ViewerUser=COALESCE($user,ViewerUser),ViewerPlayer=COALESCE($player,ViewerPlayer),
+                MediaDurationMs=COALESCE($duration,MediaDurationMs) WHERE Id=$id
+                """, ("$id", id), ("$reason", reason), ("$user", Bounded(viewer?.User) ?? (object)DBNull.Value),
+                ("$player", Bounded(viewer?.Player) ?? (object)DBNull.Value),
+                ("$duration", viewer is { DurationMs: > 0 } ? viewer.DurationMs : DBNull.Value));
+    }
+
+    private static string? Bounded(string? value) =>
+        string.IsNullOrWhiteSpace(value) ? null : value.Length <= 128 ? value : value[..128];
 
     private sealed record QueuedIntent(PrefetchJob Job, long Created, long Attempts, long? DeferredUntil);
 
@@ -631,6 +661,10 @@ public sealed class PrefetchJobStore : IDisposable
         WarmedBytes = NullableInt64(reader, "WarmedBytes"),
         FailureCode = NullableString(reader, "FailureCode"),
         Remedy = NullableString(reader, "Remedy"),
+        MissReason = NullableString(reader, "MissReason"),
+        ViewerUser = NullableString(reader, "ViewerUser"),
+        ViewerPlayer = NullableString(reader, "ViewerPlayer"),
+        MediaDurationMs = NullableInt64(reader, "MediaDurationMs"),
     };
     private static string? NullableString(SqliteDataReader reader, string column)
     {
