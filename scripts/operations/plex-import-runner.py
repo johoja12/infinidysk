@@ -295,7 +295,14 @@ def record_batch_outcomes(batch_index, correlation, failures):
             continue
         item_id = str(row.get("legacyDavItemId", ""))
         if status == "import-failed":
-            reason = fail_by_id.get(item_id, {}).get("reason", "terminal import failure")
+            failure = fail_by_id.get(item_id, {})
+            reason = failure.get("reason", "terminal import failure")
+            # InfiniDysk regrabs damaged/missing-article failures through Sonarr/Radarr (#134):
+            # it removes the broken library symlink and the Arr file record, then searches.
+            if failure.get("regrabStatus"):
+                status = failure["regrabStatus"]
+                detail = "; ".join(x for x in (failure.get("regrabArrTarget"), failure.get("regrabMessage")) if x)
+                reason = f"{reason} -> {detail}" if detail else reason
         elif status == "scan-excluded":
             reason = "Recorded scan exclusion; existing InfiniDysk links are preserved"
         else:
@@ -308,42 +315,6 @@ def record_batch_outcomes(batch_index, correlation, failures):
         writer.writeheader()
         writer.writerows(rows)
     return report_dir, rows
-
-
-def cleanup_failure_args(batch_index, package, report_dir, historical=False, preflight=False):
-    args = ["cleanup-failed-imports", "--failures", str(report_dir / "import-failures.json"),
-            "--package", str(package), "--mapped-inventory", str(INVENTORY),
-            "--source-root", LIBRARY_ROOT, "--arr-root", LIBRARY_ROOT,
-            "--arr-config", str(CLEANUP_ARR), "--infinidysk-url", HOST,
-            "--legacy-url", "http://127.0.0.1:8081", "--journal",
-            str(report_dir / "failed-cleanup-journal.json")]
-    if historical:
-        args.extend(("--historical-correlation", str(report_dir / "correlation.json"),
-                     "--historical-acknowledgement", str(report_dir / "acknowledgement.json"),
-                     "--skip-changed-historical-sources", "true"))
-    else:
-        args.extend(("--skip-changed-current-sources", "true"))
-    if preflight:
-        args.extend(("--preflight-only", "true"))
-    return args
-
-
-def replay_historical_failures():
-    for index in range(6):
-        report_dir = (Path("/opt/infinidysk-migration/backups/pr88-plex-restart-20260928/"
-                           "batch-0001-reconstructed-evidence") if index == 0
-                      else REPORTS / f"batch-{index + 1:04d}")
-        package = BATCHES / f"batch-{index + 1:04d}"
-        run_tool(f"id64-plex-cleanup-preflight-{index + 1:04d}-20260928",
-                 cleanup_failure_args(index, package, report_dir, True, True), cleanup=True)
-    for index in range(6):
-        report_dir = (Path("/opt/infinidysk-migration/backups/pr88-plex-restart-20260928/"
-                           "batch-0001-reconstructed-evidence") if index == 0
-                      else REPORTS / f"batch-{index + 1:04d}")
-        package = BATCHES / f"batch-{index + 1:04d}"
-        run_tool(f"id64-plex-cleanup-history-{index + 1:04d}-20260928",
-                 cleanup_failure_args(index, package, report_dir, True), cleanup=True)
-        log(f"batch {index + 1} confirmed failure cleanup complete")
 
 
 def write_json_once(path, value):
@@ -471,10 +442,8 @@ def process_batch(batch_index, stage_name, destination, manifest):
         batch_index,
         request("/api/migration/nzbdav/correlation", timeout=3600),
         request("/api/migration/nzbdav/import-failures", timeout=3600))
-    run_tool(f"id64-plex-cleanup-preflight-{batch_index + 1:04d}-20260928",
-             cleanup_failure_args(batch_index, destination, report_dir, preflight=True), cleanup=True)
-    run_tool(f"id64-plex-cleanup-current-{batch_index + 1:04d}-20260928",
-             cleanup_failure_args(batch_index, destination, report_dir), cleanup=True)
+    # Failed imports are no longer cleaned up by deleting the legacy NzbDav item; InfiniDysk
+    # queues a Sonarr/Radarr regrab for them instead (recorded in not-imported.csv above).
     plan_path = plan_zip_and_extract(batch_index, report_dir)
     digest = hashlib.sha256(plan_path.read_bytes()).hexdigest()
     plan = json.loads(plan_path.read_text())
@@ -695,7 +664,6 @@ def main():
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
     reconstruct_first_batch_report()
     prepare_cleanup_credentials()
-    replay_historical_failures()
     full = request("/api/migration/nzbdav/full/status")
     batches = full.get("batches", [])
     next_index = next((int(b["batchIndex"]) for b in batches if b.get("status") != "acknowledged"), len(batches))
