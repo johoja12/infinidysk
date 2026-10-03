@@ -199,6 +199,7 @@ describe("Streaming settings", () => {
     expect(priority.value).toBe("90");
   });
 
+  // Types into many fields; about 4 s normally and over 5 s under coverage on CI runners.
   it("updates segment cache, timeout, buffering, and fallback controls", async () => {
     const user = userEvent.setup();
     render(createElement(StreamingHarness));
@@ -270,7 +271,7 @@ describe("Streaming settings", () => {
     await user.clear(maxEntries);
     await user.type(maxEntries, "8");
     expect(maxEntries.value).toBe("8");
-  });
+  }, 15_000);
 
   it("detects changes to every owned setting", () => {
     for (const key of Object.keys(validConfig)) {
@@ -282,6 +283,23 @@ describe("Streaming settings", () => {
       ).toBe(true);
     }
     expect(isStreamingSettingsUpdated(validConfig, { ...validConfig })).toBe(false);
+  });
+
+  it("accepts empty values the backend treats as its defaults", () => {
+    // An empty stored value means "use the default" on the backend, which skips empty
+    // values on save. The form must not block saving other settings because of them.
+    for (const key of [
+      "usenet.article-buffer-size",
+      "usenet.streaming-priority",
+      "usenet.streaming-segment-timeout-seconds",
+      "usenet.streaming-read-timeout-seconds",
+      "usenet.connection-open-timeout-seconds",
+      "usenet.streaming-write-timeout-seconds",
+      "usenet.streaming-segment-retries",
+    ]) {
+      expect(isStreamingSettingsValid({ ...validConfig, [key]: "" }), key).toBe(true);
+      expect(isStreamingSettingsValid({ ...validConfig, [key]: "-1" }), key).toBe(false);
+    }
   });
 
   it("accepts the default configuration and validation boundaries", () => {

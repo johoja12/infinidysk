@@ -22,6 +22,7 @@ import {
   SabnzbdSettings,
 } from "./sabnzbd/sabnzbd";
 import { isWebdavSettingsUpdated, isWebdavSettingsValid, WebdavSettings } from "./webdav/webdav";
+import { findFirstInvalidField, revealFirstInvalidField } from "./invalid-field";
 import { isQueueSettingsUpdated, isQueueSettingsValid, QueueSettings } from "./queue/queue";
 import {
   isStreamingSettingsUpdated,
@@ -60,7 +61,14 @@ import { SupportSettings } from "./support/support";
 import { isLibrarySettingsUpdated, LibrarySettings } from "./library/library";
 import { NativeCacheSettings } from "./streaming/native-cache";
 import { isNativeCacheSettingsUpdated, nativeSettingsValid } from "./streaming/native-cache-model";
-import { useCallback, useMemo, useState, type Dispatch, type SetStateAction } from "react";
+import {
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from "react";
 import {
   useBlocker,
   useNavigate,
@@ -512,6 +520,14 @@ function Body(props: BodyProps) {
   const saveButtonVariant =
     saveButtonLabel === "Save" ? "primary" : saveButtonLabel === "Saved" ? "success" : "secondary";
   const isSaveButtonDisabled = saveButtonLabel !== "Save";
+  // Invalid settings keep the button usable: it names the first invalid field and jumps to it.
+  const isBlockedByInvalid = saveButtonLabel.startsWith("Invalid ");
+  const [invalidFieldLabel, setInvalidFieldLabel] = useState<string | null>(null);
+  // The invalid field is read from the rendered form, so look again after edits or a tab switch.
+  useLayoutEffect(() => {
+    const label = isBlockedByInvalid ? findFirstInvalidField()?.label || null : null;
+    setInvalidFieldLabel((current) => (current === label ? current : label));
+  }, [isBlockedByInvalid, newConfig, activeTab]);
 
   const onClear = useCallback(() => {
     setNewConfigState(config);
@@ -816,16 +832,25 @@ function Body(props: BodyProps) {
             <Button
               className="min-w-28"
               variant={saveButtonVariant}
-              disabled={isSaveButtonDisabled}
-              onClick={() => void onSave()}
+              disabled={isSaveButtonDisabled && !isBlockedByInvalid}
+              title={isBlockedByInvalid ? "Show the field that needs fixing" : undefined}
+              onClick={() => (isBlockedByInvalid ? revealFirstInvalidField() : void onSave())}
             >
               <Icon
                 name={
-                  isSaving ? "progress_activity" : saveButtonLabel === "Saved" ? "check" : "save"
+                  isSaving
+                    ? "progress_activity"
+                    : saveButtonLabel === "Saved"
+                      ? "check"
+                      : isBlockedByInvalid
+                        ? "error"
+                        : "save"
                 }
                 className={`!text-[18px] ${isSaving ? "animate-spin" : ""}`}
               />
-              {saveButtonLabel}
+              {isBlockedByInvalid && invalidFieldLabel
+                ? `${saveButtonLabel}: ${invalidFieldLabel}`
+                : saveButtonLabel}
             </Button>
           </div>
         )}
