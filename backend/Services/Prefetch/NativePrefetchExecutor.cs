@@ -3,7 +3,6 @@ using NzbWebDAV.Streams;
 using Microsoft.Extensions.DependencyInjection;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database;
-using NzbWebDAV.Clients.Usenet.Concurrency;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Extensions;
 using NzbWebDAV.WebDav.Base;
@@ -55,12 +54,23 @@ public sealed class PrefetchSourceDamagedException(string message, string? segme
     public string? SegmentId { get; } = segmentId;
 }
 
+/// <summary>Extra streams a warming job may fill out of order beside its primary stream.</summary>
+/// <param name="Count">Extra lanes beyond the primary one.</param>
+/// <param name="Open">Opens one more stream for the same file; null when none can be admitted.</param>
+/// <param name="MayStart">Whether an extra lane may start or take another chunk now; while false it waits and rejoins later.</param>
+public sealed record WarmLanes(int Count, Func<CancellationToken, Task<NativeCachedStream?>> Open, Func<bool> MayStart)
+{
+    /// <summary>How often a paused extra lane checks whether it may rejoin.</summary>
+    public TimeSpan ResumeDelay { get; init; } = TimeSpan.FromSeconds(1);
+}
+
 public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCacheService native, ConfigManager config,
     PrefetchJobStore jobs, ActiveReadRegistry activeReads, PlexPlaybackRegistry? playback = null,
     Func<PrefetchSettings>? settingsProvider = null) : IPrefetchExecutor
 {
     /// <summary>How long a damaged-release verdict keeps routine policies from re-enqueueing the item.</summary>
     public static readonly TimeSpan DamagedCooldown = TimeSpan.FromHours(24);
+    private static readonly TimeSpan GovernorInterval = TimeSpan.FromSeconds(1);
     private PrefetchSettings Settings() => settingsProvider?.Invoke()
         ?? PrefetchSettings.Parse(config.GetEffectiveConfigValue(ConfigKeys.SmartPrefetchSettings));
     public async Task ExecuteAsync(PrefetchJob job, CancellationToken ct)
@@ -81,8 +91,11 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         string? generation = null;
         try
         {
-        await using var readScope = BaseStoreStreamFile.BeginReadScope(config, scope.ServiceProvider,
-            SemaphorePriority.Low, settings.ConnectionsPerJob, wireBudget.Token);
+        var usenet = scope.ServiceProvider.GetService<NzbWebDAV.Clients.Usenet.UsenetStreamingClient>();
+        await using var governor = new WarmConnectionGovernor(settings.ConnectionsPerJob,
+            () => usenet?.GetProviderConnectionSnapshots() ?? [], GovernorInterval);
+        await using var readScope = BaseStoreStreamFile.BeginWarmReadScope(config, scope.ServiceProvider,
+            governor.Semaphore, wireBudget.Token);
         Stream admitted;
         try { admitted = await native.WrapAsync(item, token => factory.OpenAsync(item, token), wireBudget.Token, requireNative: true).ConfigureAwait(false); }
         catch (InvalidOperationException) { throw new PrefetchDeferredException("Native cache buffers or metadata are unavailable."); }
@@ -100,17 +113,17 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         var sampling = jobs.HasOwner(job.Id, "manual") ? null : VerificationSample.ForRun(DateTimeOffset.UtcNow);
         // Bytes this run filled since the last progress write; flushed with the next coverage update.
         var unreportedWarmed = 0L;
+        var lanes = WarmLanesFor(item, factory);
         try
         {
             await WarmAsync(native.Store, cached, job.Start, job.Length,
                 async _ => CanContinue() && await wireBudget.PrepareReadAsync(ct).ConfigureAwait(false),
                 bytes =>
                 {
-                    jobs.Progress(job.Id, cached.Identity.Generation, bytes, unreportedWarmed);
-                    unreportedWarmed = 0;
+                    jobs.Progress(job.Id, cached.Identity.Generation, bytes, Interlocked.Exchange(ref unreportedWarmed, 0));
                 }, wireBudget.Token,
                 CanContinue, native.ActiveSettings?.ChunkMb ?? 64, sampling,
-                warmed => unreportedWarmed += warmed).ConfigureAwait(false);
+                warmed => Interlocked.Add(ref unreportedWarmed, warmed), lanes).ConfigureAwait(false);
         }
         catch (PrefetchSourceDamagedException damaged) when (!ct.IsCancellationRequested)
         {
@@ -137,6 +150,26 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
                 ? "Warming accounting failed. Repair local metadata storage and restart; playback remains available."
                 : "Daily provider-payload warming budget exhausted; verified coverage retained.", failureCode: PrefetchFailureCodes.Budget);
         }
+    }
+
+    /// <summary>Most streams one job fills at once.</summary>
+    public const int MaxLanes = 4;
+
+    /// <summary>
+    /// Extra lanes for one job: half the native buffer slots, at most <see cref="MaxLanes"/> in all.
+    /// They run only while nothing is playing and at least half the slots are free, so playback
+    /// always finds buffers; the primary lane alone continues otherwise.
+    /// </summary>
+    private WarmLanes? WarmLanesFor(NzbWebDAV.Database.Models.DavItem item, IDavContentStreamFactory factory)
+    {
+        if (native.BufferSlots is not { } slots) return null;
+        var extra = Math.Clamp(slots.Capacity / 2, 1, MaxLanes) - 1;
+        if (extra == 0) return null;
+        return new WarmLanes(extra,
+            async token => await native.WrapAsync(item, open => factory.OpenAsync(item, open), token, requireNative: true)
+                .ConfigureAwait(false) as NativeCachedStream,
+            () => activeReads.Snapshot().Count == 0 && playback?.HasActivePlayback != true
+                && slots.Free >= (slots.Capacity + 1) / 2);
     }
 
     /// <summary>
@@ -174,7 +207,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
     public static async Task WarmAsync(NativeCacheStore store, NativeCachedStream stream, long start, long length,
         Func<long, ValueTask<bool>> spend, Action<long> progress, CancellationToken ct,
         Func<bool>? canContinue = null, int chunkMb = 64, VerificationSample? sampling = null,
-        Action<long>? warmed = null)
+        Action<long>? warmed = null, WarmLanes? lanes = null)
     {
         if (start < 0 || start >= stream.Length || length < 0 || length > stream.Length - start)
             throw new ArgumentException("The warm range is outside the media file.");
@@ -196,49 +229,167 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
             progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
             return;
         }
-        var probe = new byte[1];
-        // End of the uncached run the source pipeline is currently filling; a skip past
-        // blocks cached meanwhile reseeks the source, so the run is measured again.
-        var runEnd = -1L;
-        var nextSequential = -1L;
-        while (position < end)
+        var chunkBytes = chunkMb * 1024L * 1024L;
+        if (lanes is { Count: > 0 })
+            await WarmInLanesAsync(store, stream, position, end, alignedEnd, chunkBytes, lanes, spend, progress, warmed, ct).ConfigureAwait(false);
+        else
         {
-            var chunkEnd = Math.Min(alignedEnd, position + chunkMb * 1024L * 1024L);
-            var chunkMissing = await store.GetMissingRangeBytesAsync(stream.Identity, position, chunkEnd, ct).ConfigureAwait(false);
-            if (chunkMissing == 0) { position = chunkEnd; continue; }
-            using (var reservation = await store.ReserveWarmAsync(stream.Identity, chunkMissing, ct).ConfigureAwait(false)
-                ?? throw new PrefetchDeferredException("Cache storage: no writable folder has enough unreserved capacity for this warming chunk.", failureCode: PrefetchFailureCodes.CacheStorage))
-            {
-                while (position < chunkEnd)
-                {
-                    position = await store.FindNextMissingOffsetAsync(stream.Identity, position, chunkEnd, ct).ConfigureAwait(false);
-                    if (position >= chunkEnd) break;
-                    ct.ThrowIfCancellationRequested();
-                    if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed; verified coverage must be rechecked.", failureCode: PrefetchFailureCodes.SourceChanged);
-                    var count = Math.Min(NativeCacheStore.BlockSize, stream.Length - position);
-                    if (!await spend(count).ConfigureAwait(false)) throw new PrefetchDeferredException("Daily warming budget exhausted or foreground playback has priority.", failureCode: PrefetchFailureCodes.Budget);
-                    if (position >= runEnd || position != nextSequential)
-                    {
-                        runEnd = await store.FindNextCachedOffsetAsync(stream.Identity, position, alignedEnd, ct).ConfigureAwait(false);
-                        stream.WarmWindowEnd = runEnd;
-                    }
-                    stream.Position = position;
-                    int probed;
-                    try { probed = await stream.ReadWarmProbeAsync(probe, ct).ConfigureAwait(false); }
-                    catch (Exception exception) when (!ct.IsCancellationRequested && ConclusiveDamage(exception, out var segmentId))
-                    { throw new PrefetchSourceDamagedException(DamagedDetail(position), segmentId); }
-                    if (probed != 1 || !stream.LastReadCacheable || !stream.IsSourceCurrent
-                        || await store.FindNextMissingOffsetAsync(stream.Identity, position, Math.Min(position + count, chunkEnd), ct).ConfigureAwait(false) == position)
-                        throw ClassifyProbeFailure(store, stream, reservation, position, probed == 1);
-                    warmed?.Invoke(count);
-                    progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
-                    position = Math.Min(position + count, chunkEnd);
-                    nextSequential = position;
-                }
-            }
+            // One stream keeps its source pipeline across chunk boundaries.
+            var lane = new WarmLane(stream);
+            for (; position < end; position = Math.Min(alignedEnd, position + chunkBytes))
+                await WarmChunkAsync(store, lane, position, Math.Min(alignedEnd, position + chunkBytes), alignedEnd,
+                    spend, progress, warmed, stop: null, shared: null, ct).ConfigureAwait(false);
         }
         if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed before completion.", failureCode: PrefetchFailureCodes.SourceChanged);
         progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
+    }
+
+    /// <summary>One stream filling chunks, with the uncached run its source pipeline is filling.</summary>
+    private sealed class WarmLane(NativeCachedStream stream)
+    {
+        public NativeCachedStream Stream { get; } = stream;
+        public byte[] Probe { get; } = new byte[1];
+        public long RunEnd { get; set; } = -1;
+        public long NextSequential { get; set; } = -1;
+    }
+
+    /// <summary>
+    /// Fills the missing blocks of one chunk in order. <paramref name="windowLimit"/> bounds the
+    /// source window: the range end for a single stream, the chunk end for a lane, so a lane never
+    /// prefetches bytes another lane is filling. Returns early once <paramref name="stop"/> is set.
+    /// </summary>
+    private static async Task WarmChunkAsync(NativeCacheStore store, WarmLane lane, long chunkStart, long chunkEnd,
+        long windowLimit, Func<long, ValueTask<bool>> spend, Action<long> progress, Action<long>? warmed,
+        Func<bool>? stop, IDisposable? shared, CancellationToken ct)
+    {
+        var stream = lane.Stream;
+        var chunkMissing = await store.GetMissingRangeBytesAsync(stream.Identity, chunkStart, chunkEnd, ct).ConfigureAwait(false);
+        if (chunkMissing == 0) return;
+        // Lanes of one file share its single warm reservation and grow it chunk by chunk.
+        using var owned = shared is null ? await store.ReserveWarmAsync(stream.Identity, chunkMissing, ct).ConfigureAwait(false) : null;
+        if (shared is null ? owned is null : !await store.TryExtendWarmAsync(shared, chunkMissing, ct).ConfigureAwait(false))
+            throw new PrefetchDeferredException("Cache storage: no writable folder has enough unreserved capacity for this warming chunk.", failureCode: PrefetchFailureCodes.CacheStorage);
+        var reservation = owned ?? shared!;
+        var position = chunkStart;
+        while (position < chunkEnd)
+        {
+            if (stop?.Invoke() == true) return;
+            position = await store.FindNextMissingOffsetAsync(stream.Identity, position, chunkEnd, ct).ConfigureAwait(false);
+            if (position >= chunkEnd) break;
+            ct.ThrowIfCancellationRequested();
+            if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed; verified coverage must be rechecked.", failureCode: PrefetchFailureCodes.SourceChanged);
+            var count = Math.Min(NativeCacheStore.BlockSize, stream.Length - position);
+            if (!await spend(count).ConfigureAwait(false)) throw new PrefetchDeferredException("Daily warming budget exhausted or foreground playback has priority.", failureCode: PrefetchFailureCodes.Budget);
+            // A skip past blocks cached meanwhile reseeks the source, so the run is measured again.
+            if (position >= lane.RunEnd || position != lane.NextSequential)
+            {
+                lane.RunEnd = await store.FindNextCachedOffsetAsync(stream.Identity, position, windowLimit, ct).ConfigureAwait(false);
+                stream.WarmWindowEnd = lane.RunEnd;
+            }
+            stream.Position = position;
+            int probed;
+            try { probed = await stream.ReadWarmProbeAsync(lane.Probe, ct).ConfigureAwait(false); }
+            catch (Exception exception) when (!ct.IsCancellationRequested && ConclusiveDamage(exception, out var segmentId))
+            { throw new PrefetchSourceDamagedException(DamagedDetail(position), segmentId); }
+            if (probed != 1 || !stream.LastReadCacheable || !stream.IsSourceCurrent
+                || await store.FindNextMissingOffsetAsync(stream.Identity, position, Math.Min(position + count, chunkEnd), ct).ConfigureAwait(false) == position)
+                throw ClassifyProbeFailure(store, stream, reservation, position, probed == 1);
+            warmed?.Invoke(count);
+            progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
+            position = Math.Min(position + count, chunkEnd);
+            lane.NextSequential = position;
+        }
+    }
+
+    /// <summary>
+    /// Fills chunks out of order: the primary stream and up to <see cref="WarmLanes.Count"/> extra
+    /// streams each take the next unfinished chunk, so a slow article stalls only its own lane.
+    /// Extra lanes start, and take each further chunk, only while <see cref="WarmLanes.MayStart"/>
+    /// allows; the primary lane always runs. The first failure stops every lane at its next block
+    /// and is rethrown with its original classification.
+    /// </summary>
+    private static async Task WarmInLanesAsync(NativeCacheStore store, NativeCachedStream primary, long position, long end,
+        long alignedEnd, long chunkBytes, WarmLanes lanes, Func<long, ValueTask<bool>> spend, Action<long> progress,
+        Action<long>? warmed, CancellationToken ct)
+    {
+        using var shared = await store.ReserveWarmAsync(primary.Identity, 0, ct).ConfigureAwait(false)
+            ?? throw new PrefetchDeferredException("Cache storage: no writable folder has enough unreserved capacity for this warming chunk.", failureCode: PrefetchFailureCodes.CacheStorage);
+        var gate = new object();
+        var next = position;
+        Exception? failure = null;
+        bool Stopped() => Volatile.Read(ref failure) is not null;
+        var laneCount = lanes.Count + 1;
+        bool HasWork() { lock (gate) return next < end && !Stopped(); }
+        bool TryTake(out long chunkStart, out long chunkEnd)
+        {
+            lock (gate)
+            {
+                chunkStart = next;
+                chunkEnd = next + TailPiece(alignedEnd - next, chunkBytes, laneCount);
+                if (next >= end || Stopped()) return false;
+                next = chunkEnd;
+                return true;
+            }
+        }
+        // An extra lane yields to playback or short buffers by waiting, not retiring, and
+        // rejoins while unassigned chunks remain. False once there is nothing left to take.
+        async Task<bool> WaitToRunAsync()
+        {
+            while (!lanes.MayStart())
+            {
+                if (!HasWork()) return false;
+                await Task.Delay(lanes.ResumeDelay, ct).ConfigureAwait(false);
+            }
+            return HasWork();
+        }
+        async Task RunAsync(WarmLane lane, bool extra)
+        {
+            while ((!extra || await WaitToRunAsync().ConfigureAwait(false)) && TryTake(out var chunkStart, out var chunkEnd))
+                await WarmChunkAsync(store, lane, chunkStart, chunkEnd, chunkEnd, spend, progress, warmed, Stopped, shared, ct).ConfigureAwait(false);
+        }
+        async Task LaneAsync(bool extra)
+        {
+            NativeCachedStream? opened = null;
+            try
+            {
+                if (extra)
+                {
+                    if (!await WaitToRunAsync().ConfigureAwait(false)) return;
+                    try { opened = await lanes.Open(ct).ConfigureAwait(false); }
+                    catch (Exception exception) when (exception is not OperationCanceledException and not OutOfMemoryException)
+                    {
+                        Log.Debug(exception, "An extra warming lane could not open; the remaining lanes continue");
+                        return;
+                    }
+                    if (opened is null) return;
+                    if (opened.Identity != primary.Identity) return;
+                }
+                await RunAsync(new WarmLane(opened ?? primary), extra).ConfigureAwait(false);
+            }
+            catch (Exception exception) { Interlocked.CompareExchange(ref failure, exception, null); }
+            finally { if (opened is not null) await opened.DisposeAsync().ConfigureAwait(false); }
+        }
+        var running = new List<Task> { LaneAsync(extra: false) };
+        for (var index = 0; index < lanes.Count; index++) running.Add(Task.Run(() => LaneAsync(extra: true), CancellationToken.None));
+        await Task.WhenAll(running).ConfigureAwait(false);
+        if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+
+    /// <summary>Smallest piece the tail of a laned warm is split into.</summary>
+    internal const long MinTailPiece = 2L * NativeCacheStore.BlockSize;
+
+    /// <summary>
+    /// Bytes the next lane takes from <paramref name="remaining"/> unassigned bytes: a whole chunk
+    /// while there is a chunk for every lane, then an equal share per lane rounded up to whole
+    /// blocks (at least <see cref="MinTailPiece"/>), so every lane stays busy to the end.
+    /// </summary>
+    internal static long TailPiece(long remaining, long chunkBytes, int lanes)
+    {
+        if (remaining <= 0) return 0;
+        if (remaining >= chunkBytes * lanes) return Math.Min(chunkBytes, remaining);
+        var share = (remaining + lanes - 1) / lanes;
+        share = (share + NativeCacheStore.BlockSize - 1) / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize;
+        return Math.Min(remaining, Math.Min(chunkBytes, Math.Max(MinTailPiece, share)));
     }
 
     private static string DamagedDetail(long position) =>

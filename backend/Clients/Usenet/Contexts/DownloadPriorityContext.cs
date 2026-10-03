@@ -13,4 +13,10 @@ public record DownloadPriorityContext
     /// each concurrent stream gets its own connection budget.
     /// </summary>
     public PrioritizedSemaphore? StreamSemaphore { get; init; }
+
+    /// <summary>
+    /// Low-priority reads normally share the queue semaphore. Warming sets this so its
+    /// low-priority reads take <see cref="StreamSemaphore"/>, the job's governed budget, instead.
+    /// </summary>
+    public bool StreamSemaphoreAtLowPriority { get; init; }
 }

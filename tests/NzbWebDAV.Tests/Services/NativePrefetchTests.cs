@@ -95,6 +95,162 @@ public sealed class NativePrefetchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SharedWarmReservation_GrowsOnlyWithinFolderQuota()
+    {
+        var folder = Path.Combine(_root, "quota");
+        Directory.CreateDirectory(folder);
+        await using var store = new NativeCacheStore(Path.Combine(_root, "quota.db"),
+            [new NativeCacheFolder { Id = "quota", Path = folder, MinFreeBytes = 0, MaxBytes = 9L * 1024 * 1024 }]);
+        var identity = new NativeCacheIdentity("shared", "revision", 16L * 1024 * 1024);
+
+        using var reservation = await store.ReserveWarmAsync(identity, 0);
+        Assert.NotNull(reservation);
+        Assert.True(await store.TryExtendWarmAsync(reservation!, NativeCacheStore.BlockSize));
+        Assert.False(await store.TryExtendWarmAsync(reservation!, 2L * NativeCacheStore.BlockSize));
+        // A second reservation for the same file is still refused; lanes must share the first.
+        Assert.Null(await store.ReserveWarmAsync(identity, 0));
+    }
+
+    [Fact]
+    public async Task LaneWarm_StalledLaneDoesNotHoldBackOtherChunks()
+    {
+        const int block = NativeCacheStore.BlockSize;
+        var bytes = new byte[4L * block];
+        new Random(4).NextBytes(bytes);
+        var identity = new NativeCacheIdentity("lanes", "revision", bytes.Length);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stalled = new GatedSource(bytes, release.Task);
+        await using var primary = new NativeCachedStream(_store, identity, _ => Task.FromResult<Stream>(stalled), () => true);
+        var lanes = new WarmLanes(2, _ => Task.FromResult<NativeCachedStream?>(new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new VerifiedSource(bytes, true)), () => true)), () => true);
+
+        var warm = NativePrefetchExecutor.WarmAsync(_store, primary, 0, 0, _ => new ValueTask<bool>(true), _ => { },
+            CancellationToken.None, chunkMb: 4, lanes: lanes);
+
+        // The primary lane holds chunk 0; the other lanes fill chunks 1–3 meanwhile.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (await _store.GetCoverageAsync(identity) < 3L * block && DateTime.UtcNow < deadline) await Task.Delay(20);
+        Assert.Equal(3L * block, await _store.GetCoverageAsync(identity));
+        Assert.False(warm.IsCompleted);
+
+        release.SetResult();
+        await warm;
+        Assert.Equal(bytes.Length, await _store.GetCoverageAsync(identity));
+        Assert.Equal(block, stalled.ReadBytes);
+    }
+
+    [Theory]
+    [InlineData(256, 64, 4, 64)] // A chunk for every lane: whole chunks.
+    [InlineData(200, 64, 4, 52)] // Fewer than lanes × chunk left: a quarter each, rounded up to whole blocks.
+    [InlineData(128, 64, 4, 32)]
+    [InlineData(20, 64, 4, 8)]   // At least two blocks per piece.
+    [InlineData(6, 64, 4, 6)]    // Never more than what is left.
+    public void TailPiece_SpreadsTheLastChunksAcrossAllLanes(long remainingMb, long chunkMb, int lanes, long expectedMb)
+    {
+        const long mib = 1024 * 1024;
+        Assert.Equal(expectedMb * mib, NativePrefetchExecutor.TailPiece(remainingMb * mib, chunkMb * mib, lanes));
+    }
+
+    [Fact]
+    public async Task LaneWarm_TailIsSplitSoEveryLaneHasWork()
+    {
+        const int block = NativeCacheStore.BlockSize;
+        var bytes = new byte[8L * block];
+        new Random(8).NextBytes(bytes);
+        var identity = new NativeCacheIdentity("lanes-tail", "revision", bytes.Length);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var primary = new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new GatedSource(bytes, release.Task)), () => true);
+        var lanes = new WarmLanes(2, _ => Task.FromResult<NativeCachedStream?>(new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new VerifiedSource(bytes, true)), () => true)), () => true);
+
+        var warm = NativePrefetchExecutor.WarmAsync(_store, primary, 0, 0, _ => new ValueTask<bool>(true), _ => { },
+            CancellationToken.None, chunkMb: 16, lanes: lanes);
+
+        // Three lanes, 32 MiB left: pieces of 12, 8, 8 and 4 MiB instead of two 16 MiB chunks, so
+        // with the primary stalled on its first 12 MiB the other two lanes fill the remaining 20.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (await _store.GetCoverageAsync(identity) < 5L * block && DateTime.UtcNow < deadline) await Task.Delay(20);
+        Assert.Equal(5L * block, await _store.GetCoverageAsync(identity));
+
+        release.SetResult();
+        await warm;
+        Assert.Equal(bytes.Length, await _store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
+    public async Task LaneWarm_PausedLaneRejoinsWhenPlaybackStops()
+    {
+        const int block = NativeCacheStore.BlockSize;
+        var bytes = new byte[4L * block];
+        new Random(5).NextBytes(bytes);
+        var identity = new NativeCacheIdentity("lanes-resume", "revision", bytes.Length);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var primary = new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new GatedSource(bytes, release.Task)), () => true);
+        var playing = true;
+        var lanes = new WarmLanes(2, _ => Task.FromResult<NativeCachedStream?>(new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new VerifiedSource(bytes, true)), () => true)), () => !Volatile.Read(ref playing))
+        { ResumeDelay = TimeSpan.FromMilliseconds(20) };
+
+        var warm = NativePrefetchExecutor.WarmAsync(_store, primary, 0, 0, _ => new ValueTask<bool>(true), _ => { },
+            CancellationToken.None, chunkMb: 4, lanes: lanes);
+
+        await Task.Delay(300);
+        Assert.Equal(0, await _store.GetCoverageAsync(identity));
+
+        Volatile.Write(ref playing, false);
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (await _store.GetCoverageAsync(identity) < 3L * block && DateTime.UtcNow < deadline) await Task.Delay(20);
+        Assert.Equal(3L * block, await _store.GetCoverageAsync(identity));
+
+        release.SetResult();
+        await warm;
+        Assert.Equal(bytes.Length, await _store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
+    public async Task LaneWarm_PrimaryFinishesAloneWhenExtraLanesCannotRun()
+    {
+        const int block = NativeCacheStore.BlockSize;
+        var bytes = new byte[3L * block];
+        new Random(3).NextBytes(bytes);
+        var identity = new NativeCacheIdentity("lanes-solo", "revision", bytes.Length);
+        var source = new VerifiedSource(bytes, true);
+        await using var primary = new NativeCachedStream(_store, identity, _ => Task.FromResult<Stream>(source), () => true);
+        var opened = 0;
+        var refused = new WarmLanes(2, _ => { Interlocked.Increment(ref opened); throw new InvalidOperationException("No buffers"); }, () => true);
+        var held = new WarmLanes(2, _ => { Interlocked.Increment(ref opened); return Task.FromResult<NativeCachedStream?>(null); }, () => false);
+
+        await NativePrefetchExecutor.WarmAsync(_store, primary, 0, 2L * block, _ => new ValueTask<bool>(true), _ => { },
+            CancellationToken.None, chunkMb: 4, lanes: refused);
+        await NativePrefetchExecutor.WarmAsync(_store, primary, 2L * block, block, _ => new ValueTask<bool>(true), _ => { },
+            CancellationToken.None, chunkMb: 4, lanes: held);
+
+        Assert.Equal(2, opened);
+        Assert.Equal(bytes.Length, source.ReadBytes);
+        Assert.Equal(bytes.Length, await _store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
+    public async Task LaneWarm_DamageInAnExtraLaneFailsTheJobAsDamaged()
+    {
+        const int block = NativeCacheStore.BlockSize;
+        var bytes = new byte[3L * block];
+        var identity = new NativeCacheIdentity("lanes-damaged", "revision", bytes.Length);
+        await using var primary = new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new VerifiedSource(bytes, true)), () => true);
+        var lanes = new WarmLanes(1, _ => Task.FromResult<NativeCachedStream?>(new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new MissingArticleSource(inconclusive: false)), () => true)), () => true);
+
+        var damaged = await Assert.ThrowsAsync<PrefetchSourceDamagedException>(() => NativePrefetchExecutor.WarmAsync(
+            _store, primary, 0, 0, _ => new ValueTask<bool>(true), _ => { }, CancellationToken.None, chunkMb: 4, lanes: lanes));
+
+        Assert.Equal("missing-segment", damaged.SegmentId);
+        Assert.True(await _store.GetCoverageAsync(identity) < bytes.Length);
+    }
+
+    [Fact]
     public async Task WholeFileWarm_ReportsOnlyNewlyFilledBytesAsWarmed()
     {
         var bytes = new byte[NativeCacheStore.BlockSize + 3];
@@ -420,6 +576,19 @@ public sealed class NativePrefetchTests : IAsyncLifetime
         public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
             throw new NzbWebDAV.Exceptions.UsenetArticleNotFoundException("missing-segment")
             { InconclusiveReason = inconclusive ? "A provider timed out." : null };
+    }
+
+    private sealed class GatedSource(byte[] bytes, Task gate) : MemoryStream(bytes), ICacheReadEvidence
+    {
+        public long ReadBytes { get; private set; }
+        public bool LastReadCacheable => true;
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            await gate.WaitAsync(cancellationToken);
+            var read = await base.ReadAsync(buffer, cancellationToken);
+            ReadBytes += read;
+            return read;
+        }
     }
 
     private sealed class VerifiedSource(byte[] bytes, bool verified) : MemoryStream(bytes), ICacheReadEvidence
