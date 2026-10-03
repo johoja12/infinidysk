@@ -94,7 +94,7 @@ describe("mergeReadBursts", () => {
       2_500,
     );
     expect(rows).toHaveLength(1);
-    expect(rows[0].read).toMatchObject({
+    expect(rows[0]?.read).toMatchObject({
       id: "a",
       bytesFetched: 70,
       providers: [{ host: "news.a", nickname: "A", segments: 6 }],

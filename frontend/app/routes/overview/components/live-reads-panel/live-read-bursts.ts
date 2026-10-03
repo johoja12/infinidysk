@@ -73,20 +73,21 @@ export function mergeReadBursts(
 
   for (const [key, current] of byKey) {
     const ordered = [...current].sort((a, b) => a.startedAt - b.startedAt);
-    const existing = next.get(key);
-    const playback: Playback = existing ?? {
-      rowId: ordered[0].id,
-      startedAt: ordered[0].startedAt,
-      done: { bytesRead: 0, bytesFetched: 0, providers: new Map() },
+    const first = ordered[0];
+    if (!first) continue;
+    const playback: Playback = next.get(key) ?? {
+      rowId: first.id,
+      startedAt: first.startedAt,
+      done: { bytesRead: 0, bytesFetched: 0, providers: new Map<string, number>() },
       open: new Map(),
-      last: ordered[0],
+      last: first,
       endedAt: null,
     };
     for (const read of ordered) playback.open.set(read.id, countersOf(read));
     playback.last = ordered.reduce((latest, read) =>
       read.lastActivityAt >= latest.lastActivityAt ? read : latest,
     );
-    playback.startedAt = Math.min(playback.startedAt, ordered[0].startedAt);
+    playback.startedAt = Math.min(playback.startedAt, first.startedAt);
     playback.endedAt = null;
     next.set(key, playback);
   }

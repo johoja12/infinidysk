@@ -234,7 +234,7 @@ function ReadRow({
   read: ActiveRead;
   rate: number;
   history: number[];
-  idle?: boolean;
+  idle?: boolean | undefined;
 }) {
   const display = displayNameForRead(r.fileName, r.path, r.parentDirectoryName);
   // Use the latest read position (what the player is requesting right now) —
