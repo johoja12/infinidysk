@@ -145,7 +145,7 @@ export const numericFields: {
   { key: "MaxQueueAhead", label: "Episodes to queue ahead", min: 1, max: 20 },
   { key: "TvEpisodesPerShow", label: "Episodes per show", min: 1, max: 20 },
   { key: "MaxConcurrentJobs", label: "Concurrent warm jobs", min: 1, max: 4 },
-  { key: "ConnectionsPerJob", label: "Connections per job", min: 1, max: 8 },
+  { key: "ConnectionsPerJob", label: "Minimum connections per job", min: 1, max: 8 },
   { key: "MaxBytesPerItem", label: "Maximum bytes per item", min: 1, max: 100_000_000_000_000 },
   {
     key: "DailyByteBudget",

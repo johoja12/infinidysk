@@ -3,7 +3,6 @@ using NzbWebDAV.Streams;
 using Microsoft.Extensions.DependencyInjection;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database;
-using NzbWebDAV.Clients.Usenet.Concurrency;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Extensions;
 using NzbWebDAV.WebDav.Base;
@@ -61,6 +60,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
 {
     /// <summary>How long a damaged-release verdict keeps routine policies from re-enqueueing the item.</summary>
     public static readonly TimeSpan DamagedCooldown = TimeSpan.FromHours(24);
+    private static readonly TimeSpan GovernorInterval = TimeSpan.FromSeconds(1);
     private PrefetchSettings Settings() => settingsProvider?.Invoke()
         ?? PrefetchSettings.Parse(config.GetEffectiveConfigValue(ConfigKeys.SmartPrefetchSettings));
     public async Task ExecuteAsync(PrefetchJob job, CancellationToken ct)
@@ -81,8 +81,11 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         string? generation = null;
         try
         {
-        await using var readScope = BaseStoreStreamFile.BeginReadScope(config, scope.ServiceProvider,
-            SemaphorePriority.Low, settings.ConnectionsPerJob, wireBudget.Token);
+        var usenet = scope.ServiceProvider.GetService<NzbWebDAV.Clients.Usenet.UsenetStreamingClient>();
+        await using var governor = new WarmConnectionGovernor(settings.ConnectionsPerJob,
+            () => usenet?.GetProviderConnectionSnapshots() ?? [], GovernorInterval);
+        await using var readScope = BaseStoreStreamFile.BeginWarmReadScope(config, scope.ServiceProvider,
+            governor.Semaphore, wireBudget.Token);
         Stream admitted;
         try { admitted = await native.WrapAsync(item, token => factory.OpenAsync(item, token), wireBudget.Token, requireNative: true).ConfigureAwait(false); }
         catch (InvalidOperationException) { throw new PrefetchDeferredException("Native cache buffers or metadata are unavailable."); }

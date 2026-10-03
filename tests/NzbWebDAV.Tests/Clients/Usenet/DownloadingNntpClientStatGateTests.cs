@@ -44,6 +44,40 @@ public class DownloadingNntpClientStatGateTests
         Assert.Equal(0, Volatile.Read(ref inFlight));
     }
 
+    [Theory]
+    [InlineData(true, 3)]
+    [InlineData(false, 1)]
+    public async Task LowPriorityReads_TakeGovernedBudgetOnlyWhenOptedIn(bool governed, int expected)
+    {
+        var gate = new ManualResetEventSlim(false);
+        var inFlight = 0;
+        var fake = new BlockingStatNntpClient(gate,
+            () => Interlocked.Increment(ref inFlight),
+            () => Interlocked.Decrement(ref inFlight));
+        var config = CreateConfig(maxQueueConnections: 1, maxDownloadConnections: 10);
+        using var client = new DownloadingNntpClient(fake, config);
+        using var budget = new NzbWebDAV.Clients.Usenet.Concurrency.PrioritizedSemaphore(3, 3);
+        using var cts = new CancellationTokenSource();
+        using var context = cts.Token.SetContext(new DownloadPriorityContext
+        {
+            Priority = NzbWebDAV.Clients.Usenet.Concurrency.SemaphorePriority.Low,
+            StreamSemaphore = budget,
+            StreamSemaphoreAtLowPriority = governed,
+        });
+
+        var tasks = Enumerable.Range(0, 6)
+            .Select(i => client.StatAsync(new SegmentId($"seg-{i}"), cts.Token))
+            .ToArray();
+
+        await WaitUntilAsync(() => Volatile.Read(ref inFlight) == expected, TimeSpan.FromSeconds(2));
+        await Task.Delay(50);
+        Assert.Equal(expected, Volatile.Read(ref inFlight));
+
+        gate.Set();
+        await Task.WhenAll(tasks);
+        Assert.Equal(0, Volatile.Read(ref inFlight));
+    }
+
     [Fact]
     public async Task QueueBudget_FollowsPresetChangesWithoutRestart()
     {

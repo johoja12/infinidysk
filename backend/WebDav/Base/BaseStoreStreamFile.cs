@@ -87,15 +87,28 @@ public abstract class BaseStoreStreamFile(HttpContext context, ConfigManager con
 
     /// <summary>Shared ownership for response, detached playback, and bounded low-priority warming.</summary>
     public static IAsyncDisposable BeginReadScope(ConfigManager configManager, IServiceProvider services,
-        SemaphorePriority priority, int? connectionLimit, CancellationToken token)
+        SemaphorePriority priority, int? connectionLimit, CancellationToken token) =>
+        BeginReadScope(configManager, services, priority, connectionLimit, governed: null, token);
+
+    /// <summary>
+    /// Low-priority warming scope whose reads take <paramref name="governed"/>, a connection
+    /// budget the caller owns and resizes, instead of the shared queue semaphore.
+    /// </summary>
+    public static IAsyncDisposable BeginWarmReadScope(ConfigManager configManager, IServiceProvider services,
+        PrioritizedSemaphore governed, CancellationToken token) =>
+        BeginReadScope(configManager, services, SemaphorePriority.Low, null, governed, token);
+
+    private static StreamingScope BeginReadScope(ConfigManager configManager, IServiceProvider services,
+        SemaphorePriority priority, int? connectionLimit, PrioritizedSemaphore? governed, CancellationToken token)
     {
-        var streamSemaphore = connectionLimit is { } limit
+        var streamSemaphore = governed ?? (connectionLimit is { } limit
             ? new PrioritizedSemaphore(limit, limit, configManager.GetStreamingPriority())
-            : CreatePerStreamSemaphore(configManager);
+            : CreatePerStreamSemaphore(configManager));
         var downloadPriorityContext = new DownloadPriorityContext()
         {
             Priority = priority,
             StreamSemaphore = streamSemaphore,
+            StreamSemaphoreAtLowPriority = governed is not null,
         };
 #pragma warning disable CA2000 // ownership handle disposes the token-keyed context
         var scopedDownloadPriorityContext = token.SetContext(downloadPriorityContext);
@@ -129,7 +142,7 @@ public abstract class BaseStoreStreamFile(HttpContext context, ConfigManager con
         // and (in auto mode) the provider pool. The per-stream enable toggle is
         // intentionally excluded: the mode is decided once per stream at start.
         EventHandler<ConfigManager.ConfigEventArgs>? onConfigChanged = null;
-        if (connectionLimit is null && streamSemaphore is { } perStreamSemaphore)
+        if (connectionLimit is null && governed is null && streamSemaphore is { } perStreamSemaphore)
         {
             onConfigChanged = (_, e) =>
             {
@@ -152,7 +165,7 @@ public abstract class BaseStoreStreamFile(HttpContext context, ConfigManager con
             scopedDownloadPriorityContext,
             scopedStreamingTimeoutContext,
             scopedSchedulingContext,
-            streamSemaphore);
+            governed is null ? streamSemaphore : null);
     }
 
     // In "per stream" mode each playback session gets its own streaming semaphore

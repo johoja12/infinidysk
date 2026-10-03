@@ -207,6 +207,8 @@ public class DownloadingNntpClient : WrappingNntpClient
 
         var context = cancellationToken.GetContext<DownloadPriorityContext>();
         var priority = context?.Priority ?? SemaphorePriority.Low;
+        if (priority == SemaphorePriority.Low && context is { StreamSemaphoreAtLowPriority: true, StreamSemaphore: { } governed })
+            return (governed, priority);
         var semaphore = priority == SemaphorePriority.High
             ? context?.StreamSemaphore ?? _streamingSemaphore
             : _queueSemaphore;

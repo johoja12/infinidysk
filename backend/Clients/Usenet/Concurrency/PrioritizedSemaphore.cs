@@ -175,6 +175,12 @@ public sealed class PrioritizedSemaphore : IDisposable
         return null;
     }
 
+    /// <summary>Permits currently held, which can exceed the allowed count right after it shrinks.</summary>
+    public int EnteredCount
+    {
+        get { lock (_lock) return _enteredCount; }
+    }
+
     public void UpdateMaxAllowed(int newMaxAllowed)
     {
         List<TaskCompletionSource<bool>>? toRelease = null;
