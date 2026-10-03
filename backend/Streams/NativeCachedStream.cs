@@ -103,6 +103,12 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     /// mismatch, or a different post), or -1. Warming treats repeated failures here as source damage.
     /// </summary>
     internal long LastUnverifiedSourceBlock { get; private set; } = -1;
+    /// <summary>
+    /// End of the contiguous uncached run a warming job is filling, or null. Warm probes size the
+    /// source window to it so consecutive blocks share one NNTP pipeline instead of each block
+    /// rebuilding it from cold and re-fetching the article that straddles the block boundary.
+    /// </summary>
+    internal long? WarmWindowEnd { get; set; }
     public NativeCacheIdentity Identity => _identity;
     public string GenerationIdentity => _identity.Key;
     public bool IsSourceCurrent => _generationIsCurrent();
@@ -749,7 +755,9 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 ? long.MaxValue
                 : SourceWindowBytes;
         }
-        var windowBytes = _background || completeBlock ? NativeCacheStore.BlockSize : _foregroundWindowBytes;
+        var windowBytes = completeBlock && WarmWindowEnd is { } warmEnd && warmEnd > position
+            ? Math.Max(NativeCacheStore.BlockSize, warmEnd - position)
+            : _background || completeBlock ? NativeCacheStore.BlockSize : _foregroundWindowBytes;
         var remaining = Math.Min(Length - position, windowBytes);
         if (_responseEnd is { } responseEnd && responseEnd > position)
         {

@@ -1,0 +1,6 @@
+{"auditReportVersion": 2, "vulnerabilities": {
+  "braces": {"name": "braces", "severity": "high", "range": "*", "via": [
+    {"source": 1, "name": "braces", "title": "braces vulnerable to stack-exhaustion denial of service", "url": "https://github.com/advisories/GHSA-vfj7-8cjw-p6xm", "severity": "high", "range": "*"}]},
+  "micromatch": {"name": "micromatch", "severity": "high", "range": ">=0.2.0", "via": ["braces"]},
+  "minimist": {"name": "minimist", "severity": "moderate", "range": "<1.2.6", "via": [
+    {"source": 2, "name": "minimist", "title": "Prototype pollution", "url": "https://github.com/advisories/GHSA-xvch-5gv4-984h", "severity": "moderate", "range": "<1.2.6"}]}}}

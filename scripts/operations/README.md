@@ -32,4 +32,9 @@ fail as damaged or missing articles: it removes only the broken library symlink
 (journaled in `/config/regrab/library-link-removals.jsonl`) and the Arr file record,
 then requests a search. The runner records the regrab state (`regrab-queued`,
 `regrab-requested`, …) with the Arr target in each batch's `not-imported.csv`.
-Validation-failure cleanup (`cleanup-validation-failures`) is unchanged.
+Links whose new InfiniDysk copy fails bounded-read validation are handled the same
+way: the runner asks InfiniDysk to regrab the old library link
+(`POST /api/arr-regrab` with `source: "migration"`) instead of running
+`cleanup-validation-failures`, and records each outcome in
+`validation-regrab-outcomes.json` and `validation-not-imported.csv`. The runner no
+longer prepares private cleanup credentials (legacy API key, Arr config) at startup.

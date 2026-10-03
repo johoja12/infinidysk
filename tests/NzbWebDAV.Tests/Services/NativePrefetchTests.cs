@@ -76,6 +76,25 @@ public sealed class NativePrefetchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task WholeFileWarm_PositionsSourceOncePerUncachedRun()
+    {
+        const int block = NativeCacheStore.BlockSize;
+        var bytes = new byte[6L * block];
+        new Random(6).NextBytes(bytes);
+        var identity = new NativeCacheIdentity("sequential", "revision", bytes.Length);
+        Assert.True(await _store.WriteBlockAsync(identity, 3L * block, bytes.AsMemory(3 * block, block)));
+        var source = new VerifiedSource(bytes, true);
+        await using var stream = new NativeCachedStream(_store, identity, _ => Task.FromResult<Stream>(source), () => true);
+
+        await NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0, _ => true, _ => { }, CancellationToken.None);
+
+        // One pipeline per uncached run, each window spanning the run, rather than one per block.
+        Assert.Equal([(0L, 3L * block), (4L * block, 2L * block)], source.Positionings);
+        Assert.Equal(5L * block, source.ReadBytes);
+        Assert.Equal(bytes.Length, await _store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
     public async Task WholeFileWarm_ReportsOnlyNewlyFilledBytesAsWarmed()
     {
         var bytes = new byte[NativeCacheStore.BlockSize + 3];
@@ -406,7 +425,18 @@ public sealed class NativePrefetchTests : IAsyncLifetime
     private sealed class VerifiedSource(byte[] bytes, bool verified) : MemoryStream(bytes), ICacheReadEvidence
     {
         public long ReadBytes { get; private set; }
+        /// <summary>Each repositioning with the native read window in force when it happened.</summary>
+        public List<(long Offset, long Window)> Positionings { get; } = [];
         public bool LastReadCacheable => verified;
+        public override long Position
+        {
+            get => base.Position;
+            set
+            {
+                if (NativeCacheReadContext.ReadBudget is { } window) Positionings.Add((value, window));
+                base.Position = value;
+            }
+        }
         public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
         {
             var read = await base.ReadAsync(buffer, cancellationToken);

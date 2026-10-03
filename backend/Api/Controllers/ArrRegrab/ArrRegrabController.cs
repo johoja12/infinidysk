@@ -35,7 +35,16 @@ public sealed class ArrRegrabController(ArrRegrabService regrab) : BaseApiContro
             }
 
             var (davItemId, linkPath) = Parse(body?.DavItemId, body?.LinkPath);
-            var result = await regrab.RequestAsync(davItemId, linkPath, HttpContext.RequestAborted)
+            var source = body?.Source switch
+            {
+                null or "" or ArrRegrabService.SourceManual => ArrRegrabService.SourceManual,
+                ArrRegrabService.SourceMigration => ArrRegrabService.SourceMigration,
+                _ => throw new BadHttpRequestException("Source must be 'manual' or 'migration'."),
+            };
+            var reason = string.IsNullOrWhiteSpace(body?.Reason) ? null : body.Reason.Trim();
+            if (reason is { Length: > 300 })
+                throw new BadHttpRequestException("Reason must be at most 300 characters.");
+            var result = await regrab.RequestAsync(davItemId, linkPath, HttpContext.RequestAborted, source, reason)
                 .ConfigureAwait(false);
             if (result is null)
                 return NotFound(new BaseApiResponse { Status = false, Error = "File not found." });
@@ -95,6 +104,10 @@ public sealed class ArrRegrabRequestBody
 {
     public string? DavItemId { get; init; }
     public string? LinkPath { get; init; }
+    /// <summary>Who asked: <c>manual</c> (default, file details) or <c>migration</c> (batch automation).</summary>
+    public string? Source { get; init; }
+    /// <summary>Why the regrab was requested, recorded on the request (at most 300 characters).</summary>
+    public string? Reason { get; init; }
 }
 
 public sealed class ArrRegrabResponse : BaseApiResponse

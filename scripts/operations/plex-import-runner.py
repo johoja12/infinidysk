@@ -60,51 +60,6 @@ def api_key():
 
 
 KEY = api_key()
-CLEANUP_ENV = None
-CLEANUP_ARR = None
-
-
-def config_value(container, name):
-    if name not in ("api.key", "arr.instances"):
-        raise RuntimeError("Unexpected cleanup configuration key")
-    sql = f'SELECT "ConfigValue" FROM "ConfigItems" WHERE "ConfigName" = $${name}$$ LIMIT 1;\n'
-    result = subprocess.run(
-        ["docker", "exec", "-i", container, "sh", "-c",
-         'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At'],
-        input=sql, text=True, capture_output=True, check=True)
-    value = result.stdout.strip()
-    if not value:
-        raise RuntimeError(f"Missing cleanup configuration {name} in {container}")
-    return value
-
-
-def prepare_cleanup_credentials():
-    global CLEANUP_ENV, CLEANUP_ARR
-    runtime = Path("/run/infinidysk-migration-cleanup")
-    runtime.mkdir(mode=0o700, exist_ok=True)
-    runtime.chmod(0o700)
-    legacy_key = config_value("nzbdav-postgres", "api.key")
-    if not all(re.fullmatch(r"[A-Za-z0-9_-]+", key) for key in (KEY, legacy_key)):
-        raise RuntimeError("Unexpected API key format for private systemd environment file")
-    arr = json.loads(config_value("infinidysk-postgres", "arr.instances"))
-    if not any(item.get("Enabled", True) for kind in ("RadarrInstances", "SonarrInstances")
-               for item in arr.get(kind, [])):
-        raise RuntimeError("No enabled Arr instance configured for cleanup")
-    CLEANUP_ENV = runtime / f"credentials-{os.getpid()}.env"
-    CLEANUP_ARR = runtime / f"arr-{os.getpid()}.json"
-    for path, contents in (
-        (CLEANUP_ENV, f"INFINIDYSK_MIGRATION_API_KEY={KEY}\nNZBDAV_MIGRATION_LEGACY_API_KEY={legacy_key}\n"),
-        (CLEANUP_ARR, json.dumps(arr) + "\n"),
-    ):
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            stream.write(contents)
-
-
-def remove_cleanup_credentials():
-    for path in (CLEANUP_ENV, CLEANUP_ARR):
-        if path is not None:
-            path.unlink(missing_ok=True)
 
 
 def request(path, method="GET", body=None, timeout=3600, accepted=(200,)):
@@ -231,14 +186,10 @@ def ensure_scan_and_run(batch_index, stage_name, destination, manifest):
     return wait_session({"complete"}, batch_index, "import")
 
 
-def run_tool(service, args, cleanup=False, allow_failure=False):
+def run_tool(service, args, allow_failure=False):
     command = ["systemd-run", "--wait", "--pipe", "--collect", f"--unit={service}",
                f"--property=EnvironmentFile={ENV_FILE}", "--property=CPUQuota=50%",
                "--property=Nice=19", "--property=IOWeight=10"]
-    if cleanup:
-        if CLEANUP_ENV is None:
-            raise RuntimeError("Private cleanup credentials were not prepared")
-        command.append(f"--property=EnvironmentFile={CLEANUP_ENV}")
     command.extend((TOOL, *args))
     result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             timeout=8 * 3600)
@@ -368,8 +319,15 @@ def retry_failed_validations(batch_index, journal, original_path):
     return results, resolved_path
 
 
-def cleanup_unreadable_links(batch_index, package, manifest, report_dir, plan_path,
-                             journal, validation_path, failures):
+def regrab_unreadable_links(batch_index, package, manifest, report_dir, failures):
+    """Regrab links whose new InfiniDysk copy failed bounded-read validation.
+
+    The old library link (under LIBRARY_ROOT) still points at the legacy item because
+    promotion excludes these paths. Instead of deleting the legacy NzbDav item, ask
+    InfiniDysk to regrab through Sonarr/Radarr: it removes only that symlink (journaled)
+    and the Arr file record, then searches (#134). Each link is requested independently and
+    its outcome recorded, so a slow or refusing Arr never stalls the batch.
+    """
     selected = {row["libraryRelativePath"]: row for row in manifest["selectedLinks"]}
     release_by_id = {leaf["legacyDavItemId"]: release["sourceReleaseId"]
                      for release in manifest["releases"] for leaf in release["leaves"]}
@@ -384,19 +342,26 @@ def cleanup_unreadable_links(batch_index, package, manifest, report_dir, plan_pa
                      "reason": failure["error"]})
     report = {"status": True, "packageDigest": hashlib.sha256((package / "SHA256SUMS").read_bytes()).hexdigest(),
               "batchIndex": batch_index, "failedCount": len(rows), "failures": rows}
-    report_path = report_dir / "validation-cleanup-failures.json"
-    write_json_once(report_path, report)
-    base = ["cleanup-validation-failures", "--failures", str(report_path),
-            "--package", str(package), "--mapped-inventory", str(INVENTORY),
-            "--source-root", LIBRARY_ROOT, "--arr-root", LIBRARY_ROOT,
-            "--arr-config", str(CLEANUP_ARR), "--infinidysk-url", HOST,
-            "--legacy-url", "http://127.0.0.1:8081", "--journal",
-            str(report_dir / "validation-cleanup-journal.json"),
-            "--validation-plan", str(plan_path), "--validation-journal", str(journal),
-            "--validation-results", str(validation_path)]
-    run_tool(f"id64-plex-unreadable-preflight-{batch_index + 1:04d}-20260928",
-             base + ["--preflight-only", "true"], cleanup=True)
-    run_tool(f"id64-plex-unreadable-cleanup-{batch_index + 1:04d}-20260928", base, cleanup=True)
+    write_json_once(report_dir / "validation-cleanup-failures.json", report)
+    outcomes_path = report_dir / "validation-regrab-outcomes.json"
+    outcomes = json.loads(outcomes_path.read_text()) if outcomes_path.exists() else {}
+    for row in rows:
+        path = row["libraryRelativePath"]
+        if path in outcomes:
+            continue
+        body = {"linkPath": os.path.join(LIBRARY_ROOT, path), "source": "migration",
+                "reason": f"migration validation failed: {row['reason']}"[:300]}
+        try:
+            result = request("/api/arr-regrab", "POST", body, timeout=300, accepted=(200, 404, 409)) or {}
+            regrab = result.get("request") or {}
+            status = f"regrab-{regrab['status']}" if regrab.get("status") else (
+                "regrab-requested" if result.get("status") else "regrab-skipped")
+            message = result.get("message") or result.get("error") or ""
+        except Exception as error:  # a failed request is recorded, never fatal to the batch
+            status, message = "regrab-error", str(error)[:300]
+        outcomes[path] = {"status": status, "message": message}
+        outcomes_path.write_text(json.dumps(outcomes, indent=2, sort_keys=True) + "\n")
+        log(f"batch {batch_index + 1} unreadable link {path}: {status} {message}".rstrip())
     write_json_once(report_dir / "validation-failures.json", failures)
     skipped_csv = report_dir / "validation-not-imported.csv"
     if not skipped_csv.exists():
@@ -405,11 +370,14 @@ def cleanup_unreadable_links(batch_index, package, manifest, report_dir, plan_pa
                                                        "legacyDavItemId", "status", "reason"])
             writer.writeheader()
             for row in rows:
+                outcome = outcomes.get(row["libraryRelativePath"], {})
+                detail = outcome.get("message")
                 writer.writerow({"batchIndex": batch_index,
                                  "libraryRelativePath": row["libraryRelativePath"],
                                  "legacyDavItemId": row["legacyDavItemId"],
-                                 "status": "validation-failed", "reason": row["reason"]})
-    log(f"batch {batch_index + 1} unreadable links cleaned: {len(rows)}")
+                                 "status": outcome.get("status", "validation-failed"),
+                                 "reason": f"{row['reason']} -> {detail}" if detail else row["reason"]})
+    log(f"batch {batch_index + 1} unreadable links handed to regrab: {len(rows)}")
     return [row["legacyDavItemId"] for row in rows]
 
 
@@ -514,9 +482,8 @@ def process_batch(batch_index, stage_name, destination, manifest):
     validation_rejects = []
     excluded_paths = {row["libraryRelativePath"] for row in missing + replaced}
     if failures_validation:
-        validation_rejects = cleanup_unreadable_links(
-            batch_index, destination, manifest, report_dir, plan_path, journal,
-            resolved_path, failures_validation)
+        validation_rejects = regrab_unreadable_links(
+            batch_index, destination, manifest, report_dir, failures_validation)
         excluded_paths.update(row["libraryRelativePath"] for row in failures_validation)
     promotion_journal = filtered_journal(batch_index, journal, excluded_paths) if excluded_paths else journal
     if missing:
@@ -663,7 +630,6 @@ def main():
     REPORTS.mkdir(parents=True, exist_ok=True)
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
     reconstruct_first_batch_report()
-    prepare_cleanup_credentials()
     full = request("/api/migration/nzbdav/full/status")
     batches = full.get("batches", [])
     next_index = next((int(b["batchIndex"]) for b in batches if b.get("status") != "acknowledged"), len(batches))
@@ -704,5 +670,4 @@ if __name__ == "__main__":
             sys.exit(78)
         raise
     finally:
-        remove_cleanup_credentials()
         os.close(lock_fd)

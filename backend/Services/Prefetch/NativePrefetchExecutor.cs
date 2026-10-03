@@ -197,6 +197,10 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
             return;
         }
         var probe = new byte[1];
+        // End of the uncached run the source pipeline is currently filling; a skip past
+        // blocks cached meanwhile reseeks the source, so the run is measured again.
+        var runEnd = -1L;
+        var nextSequential = -1L;
         while (position < end)
         {
             var chunkEnd = Math.Min(alignedEnd, position + chunkMb * 1024L * 1024L);
@@ -213,6 +217,11 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
                     if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed; verified coverage must be rechecked.", failureCode: PrefetchFailureCodes.SourceChanged);
                     var count = Math.Min(NativeCacheStore.BlockSize, stream.Length - position);
                     if (!await spend(count).ConfigureAwait(false)) throw new PrefetchDeferredException("Daily warming budget exhausted or foreground playback has priority.", failureCode: PrefetchFailureCodes.Budget);
+                    if (position >= runEnd || position != nextSequential)
+                    {
+                        runEnd = await store.FindNextCachedOffsetAsync(stream.Identity, position, alignedEnd, ct).ConfigureAwait(false);
+                        stream.WarmWindowEnd = runEnd;
+                    }
                     stream.Position = position;
                     int probed;
                     try { probed = await stream.ReadWarmProbeAsync(probe, ct).ConfigureAwait(false); }
@@ -224,6 +233,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
                     warmed?.Invoke(count);
                     progress(await store.GetCoverageAsync(stream.Identity, ct).ConfigureAwait(false));
                     position = Math.Min(position + count, chunkEnd);
+                    nextSequential = position;
                 }
             }
         }
