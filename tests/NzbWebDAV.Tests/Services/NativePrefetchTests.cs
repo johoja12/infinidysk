@@ -139,6 +139,76 @@ public sealed class NativePrefetchTests : IAsyncLifetime
         Assert.Equal(block, stalled.ReadBytes);
     }
 
+    [Theory]
+    [InlineData(256, 64, 4, 64)] // A chunk for every lane: whole chunks.
+    [InlineData(200, 64, 4, 52)] // Fewer than lanes × chunk left: a quarter each, rounded up to whole blocks.
+    [InlineData(128, 64, 4, 32)]
+    [InlineData(20, 64, 4, 8)]   // At least two blocks per piece.
+    [InlineData(6, 64, 4, 6)]    // Never more than what is left.
+    public void TailPiece_SpreadsTheLastChunksAcrossAllLanes(long remainingMb, long chunkMb, int lanes, long expectedMb)
+    {
+        const long mib = 1024 * 1024;
+        Assert.Equal(expectedMb * mib, NativePrefetchExecutor.TailPiece(remainingMb * mib, chunkMb * mib, lanes));
+    }
+
+    [Fact]
+    public async Task LaneWarm_TailIsSplitSoEveryLaneHasWork()
+    {
+        const int block = NativeCacheStore.BlockSize;
+        var bytes = new byte[8L * block];
+        new Random(8).NextBytes(bytes);
+        var identity = new NativeCacheIdentity("lanes-tail", "revision", bytes.Length);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var primary = new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new GatedSource(bytes, release.Task)), () => true);
+        var lanes = new WarmLanes(2, _ => Task.FromResult<NativeCachedStream?>(new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new VerifiedSource(bytes, true)), () => true)), () => true);
+
+        var warm = NativePrefetchExecutor.WarmAsync(_store, primary, 0, 0, _ => new ValueTask<bool>(true), _ => { },
+            CancellationToken.None, chunkMb: 16, lanes: lanes);
+
+        // Three lanes, 32 MiB left: pieces of 12, 8, 8 and 4 MiB instead of two 16 MiB chunks, so
+        // with the primary stalled on its first 12 MiB the other two lanes fill the remaining 20.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (await _store.GetCoverageAsync(identity) < 5L * block && DateTime.UtcNow < deadline) await Task.Delay(20);
+        Assert.Equal(5L * block, await _store.GetCoverageAsync(identity));
+
+        release.SetResult();
+        await warm;
+        Assert.Equal(bytes.Length, await _store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
+    public async Task LaneWarm_PausedLaneRejoinsWhenPlaybackStops()
+    {
+        const int block = NativeCacheStore.BlockSize;
+        var bytes = new byte[4L * block];
+        new Random(5).NextBytes(bytes);
+        var identity = new NativeCacheIdentity("lanes-resume", "revision", bytes.Length);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var primary = new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new GatedSource(bytes, release.Task)), () => true);
+        var playing = true;
+        var lanes = new WarmLanes(2, _ => Task.FromResult<NativeCachedStream?>(new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new VerifiedSource(bytes, true)), () => true)), () => !Volatile.Read(ref playing))
+        { ResumeDelay = TimeSpan.FromMilliseconds(20) };
+
+        var warm = NativePrefetchExecutor.WarmAsync(_store, primary, 0, 0, _ => new ValueTask<bool>(true), _ => { },
+            CancellationToken.None, chunkMb: 4, lanes: lanes);
+
+        await Task.Delay(300);
+        Assert.Equal(0, await _store.GetCoverageAsync(identity));
+
+        Volatile.Write(ref playing, false);
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (await _store.GetCoverageAsync(identity) < 3L * block && DateTime.UtcNow < deadline) await Task.Delay(20);
+        Assert.Equal(3L * block, await _store.GetCoverageAsync(identity));
+
+        release.SetResult();
+        await warm;
+        Assert.Equal(bytes.Length, await _store.GetCoverageAsync(identity));
+    }
+
     [Fact]
     public async Task LaneWarm_PrimaryFinishesAloneWhenExtraLanesCannotRun()
     {

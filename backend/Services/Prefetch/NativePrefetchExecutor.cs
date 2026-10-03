@@ -57,8 +57,12 @@ public sealed class PrefetchSourceDamagedException(string message, string? segme
 /// <summary>Extra streams a warming job may fill out of order beside its primary stream.</summary>
 /// <param name="Count">Extra lanes beyond the primary one.</param>
 /// <param name="Open">Opens one more stream for the same file; null when none can be admitted.</param>
-/// <param name="MayStart">Whether an extra lane may start or take another chunk now.</param>
-public sealed record WarmLanes(int Count, Func<CancellationToken, Task<NativeCachedStream?>> Open, Func<bool> MayStart);
+/// <param name="MayStart">Whether an extra lane may start or take another chunk now; while false it waits and rejoins later.</param>
+public sealed record WarmLanes(int Count, Func<CancellationToken, Task<NativeCachedStream?>> Open, Func<bool> MayStart)
+{
+    /// <summary>How often a paused extra lane checks whether it may rejoin.</summary>
+    public TimeSpan ResumeDelay { get; init; } = TimeSpan.FromSeconds(1);
+}
 
 public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCacheService native, ConfigManager config,
     PrefetchJobStore jobs, ActiveReadRegistry activeReads, PlexPlaybackRegistry? playback = null,
@@ -314,20 +318,33 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         var next = position;
         Exception? failure = null;
         bool Stopped() => Volatile.Read(ref failure) is not null;
+        var laneCount = lanes.Count + 1;
+        bool HasWork() { lock (gate) return next < end && !Stopped(); }
         bool TryTake(out long chunkStart, out long chunkEnd)
         {
             lock (gate)
             {
                 chunkStart = next;
-                chunkEnd = Math.Min(alignedEnd, next + chunkBytes);
+                chunkEnd = next + TailPiece(alignedEnd - next, chunkBytes, laneCount);
                 if (next >= end || Stopped()) return false;
                 next = chunkEnd;
                 return true;
             }
         }
+        // An extra lane yields to playback or short buffers by waiting, not retiring, and
+        // rejoins while unassigned chunks remain. False once there is nothing left to take.
+        async Task<bool> WaitToRunAsync()
+        {
+            while (!lanes.MayStart())
+            {
+                if (!HasWork()) return false;
+                await Task.Delay(lanes.ResumeDelay, ct).ConfigureAwait(false);
+            }
+            return HasWork();
+        }
         async Task RunAsync(WarmLane lane, bool extra)
         {
-            while ((!extra || lanes.MayStart()) && TryTake(out var chunkStart, out var chunkEnd))
+            while ((!extra || await WaitToRunAsync().ConfigureAwait(false)) && TryTake(out var chunkStart, out var chunkEnd))
                 await WarmChunkAsync(store, lane, chunkStart, chunkEnd, chunkEnd, spend, progress, warmed, Stopped, shared, ct).ConfigureAwait(false);
         }
         async Task LaneAsync(bool extra)
@@ -337,7 +354,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
             {
                 if (extra)
                 {
-                    if (!lanes.MayStart()) return;
+                    if (!await WaitToRunAsync().ConfigureAwait(false)) return;
                     try { opened = await lanes.Open(ct).ConfigureAwait(false); }
                     catch (Exception exception) when (exception is not OperationCanceledException and not OutOfMemoryException)
                     {
@@ -356,6 +373,23 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         for (var index = 0; index < lanes.Count; index++) running.Add(Task.Run(() => LaneAsync(extra: true), CancellationToken.None));
         await Task.WhenAll(running).ConfigureAwait(false);
         if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+    }
+
+    /// <summary>Smallest piece the tail of a laned warm is split into.</summary>
+    internal const long MinTailPiece = 2L * NativeCacheStore.BlockSize;
+
+    /// <summary>
+    /// Bytes the next lane takes from <paramref name="remaining"/> unassigned bytes: a whole chunk
+    /// while there is a chunk for every lane, then an equal share per lane rounded up to whole
+    /// blocks (at least <see cref="MinTailPiece"/>), so every lane stays busy to the end.
+    /// </summary>
+    internal static long TailPiece(long remaining, long chunkBytes, int lanes)
+    {
+        if (remaining <= 0) return 0;
+        if (remaining >= chunkBytes * lanes) return Math.Min(chunkBytes, remaining);
+        var share = (remaining + lanes - 1) / lanes;
+        share = (share + NativeCacheStore.BlockSize - 1) / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize;
+        return Math.Min(remaining, Math.Min(chunkBytes, Math.Max(MinTailPiece, share)));
     }
 
     private static string DamagedDetail(long position) =>

@@ -224,10 +224,12 @@ Warming does not need bytes in playback order. While nothing is playing, a job f
 its missing range out of order in up to four **lanes**: each lane has its own Usenet
 pipeline and takes the next unfinished cache chunk, so one slow or retried article
 holds back only its own chunk instead of the whole job. A job uses at most half the
-native-cache buffer slots (`cache.native.writer-mb` ÷ 4) for lanes. Extra lanes stop
-taking chunks as soon as playback starts or fewer than half the slots are free; the
-first lane finishes the job alone. All lanes share the job's single cache-space
-reservation, which grows chunk by chunk under the same quota and free-space checks.
+native-cache buffer slots (`cache.native.writer-mb` ÷ 4) for lanes. Extra lanes pause
+while anything is playing or fewer than half the slots are free, and rejoin about a
+second after that clears; the first lane always keeps going. Near the end of the range,
+the remaining work is split into smaller pieces (down to 8 MiB) so every lane stays busy
+until the job finishes. All lanes share the job's single cache-space reservation, which
+grows chunk by chunk under the same quota and free-space checks.
 
 Each job's connection budget follows free provider capacity [since unreleased](https://github.com/johoja12/infinidysk/issues/147){ .nzbdav-since }.
 About once a second it is recalculated as the connections the job already holds plus
