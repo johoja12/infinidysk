@@ -27,6 +27,10 @@ import {
 } from "@dnd-kit/sortable";
 import { LiveTiles } from "./components/live-tiles/live-tiles";
 import { LiveReadsPanel } from "./components/live-reads-panel/live-reads-panel";
+import {
+  LibraryFileModalHost,
+  useLibraryFileModal,
+} from "~/components/library-file-modal/use-library-file-modal";
 import { ActivityHeatmap } from "./components/activity-heatmap/activity-heatmap";
 import { ThroughputChart } from "./components/throughput-chart/throughput-chart";
 import { LatencyHistogram } from "./components/latency-histogram/latency-histogram";
@@ -44,7 +48,11 @@ import { mockArrHealthData, mockArrHealthRequested } from "./components/arr-heal
 import { SortableRow } from "./components/sortable-row/sortable-row";
 import { SectionLoadError } from "./components/section-load-error/section-load-error";
 import { Icon, Tooltip } from "~/components/ui";
-import { backendClient, type ArrHealthResponse } from "~/clients/backend-client.server";
+import {
+  backendClient,
+  type ActiveRead,
+  type ArrHealthResponse,
+} from "~/clients/backend-client.server";
 import { useRowOrder } from "./utils/use-row-order";
 import { useMediaQuery } from "~/utils/use-media-query";
 import { hasConfiguredIndexers } from "./utils/has-configured-indexers";
@@ -91,13 +99,17 @@ const DEFAULT_ROW_ORDER = [
 
 /** Shell-only loader — stats load client-side in sections so first paint is instant. */
 export async function loader() {
-  const config = await backendClient.getConfig([
-    "indexers.instances",
-    "arr.instances",
-    "arr.health-enabled",
+  const [config, nativeCacheActive] = await Promise.all([
+    backendClient.getConfig(["indexers.instances", "arr.instances", "arr.health-enabled"]),
+    // Only offers pre-warming in the file modal; Overview works without it.
+    backendClient
+      .getNativeCacheStatus()
+      .then((status) => status.activeMode === "native")
+      .catch(() => false),
   ]);
   return {
     stats: null as OverviewStatsResponse | null,
+    nativeCacheActive,
     hasConfiguredIndexers: hasConfiguredIndexers(
       config.find((item) => item.configName === "indexers.instances")?.configValue,
     ),
@@ -123,6 +135,20 @@ export default function Overview({ loaderData }: Route.ComponentProps) {
   const [stats, setStats] = useState<OverviewStatsResponse>(EMPTY_OVERVIEW_STATS);
   const [window, setWindow] = useState<OverviewWindow>("24h");
   const [editMode, setEditMode] = useState(false);
+  const fileModal = useLibraryFileModal({ prewarmAction: "/library-file" });
+  const { openByDavItemId } = fileModal;
+  // Right now rows open the same file details as Media Library.
+  const openReadFile = useCallback(
+    (read: ActiveRead) => {
+      if (!read.itemId) return;
+      openByDavItemId(read.itemId, {
+        displayName: read.fileName,
+        size: read.fileSize,
+        cachePercentage: null,
+      });
+    },
+    [openByDavItemId],
+  );
   const [connectedAt, setConnectedAt] = useState<number | null>(null);
   const [lastLiveStatsAt, setLastLiveStatsAt] = useState<number | null>(null);
   const [transportFailed, setTransportFailed] = useState(false);
@@ -389,7 +415,13 @@ export default function Overview({ loaderData }: Route.ComponentProps) {
 
   const rowContent = useMemo<Record<string, ReactNode>>(
     () => ({
-      rightNow: <LiveReadsPanel paused={editMode} summary={<LiveTiles tiles={liveTiles} />} />,
+      rightNow: (
+        <LiveReadsPanel
+          paused={editMode}
+          summary={<LiveTiles tiles={liveTiles} />}
+          onOpenFile={openReadFile}
+        />
+      ),
       throughput:
         windowError && !windowLoaded ? (
           <SectionLoadError label="activity" onRetry={() => setWindowRetry((n) => n + 1)} />
@@ -562,6 +594,7 @@ export default function Overview({ loaderData }: Route.ComponentProps) {
       arrHealthError,
       mockArrHealth,
       selectedProvider,
+      openReadFile,
     ],
   );
 
@@ -701,6 +734,7 @@ export default function Overview({ loaderData }: Route.ComponentProps) {
           </SortableContext>
         </DndContext>
       </div>
+      <LibraryFileModalHost modal={fileModal} canPrewarm={loaderData.nativeCacheActive} />
     </div>
   );
 }
