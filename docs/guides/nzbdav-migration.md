@@ -290,7 +290,9 @@ Bind only one completed batch at a time beneath
 `/config/migration-input/...:ro`. Register each full batch with
 `POST /api/migration/nzbdav/full/connect` using its package path, master digest,
 root-specific mapped and recoverable counts, one submit worker, and queue depth
-five. The current settings page does not expose this full-batch registration
+five. This limit counts queued jobs belonging to the migration; unrelated
+Sonarr/Radarr jobs do not block migration submissions. Migration jobs retain
+low priority in the shared download queue. The current settings page does not expose this full-batch registration
 request. Then use **Settings → System → Migration → NzbDav** to scan, submit,
 wait for a terminal run, and reconcile. Pause through the migration UI if
 providers or the queue become unstable; resume the same batch instead of creating

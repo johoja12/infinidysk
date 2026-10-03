@@ -18,6 +18,46 @@ namespace NzbWebDAV.Tests.UsenetMigration;
 
 public sealed class SubmissionWorkerPoolTests
 {
+    [Theory]
+    [InlineData(false, 2)]
+    [InlineData(true, 1)]
+    public async Task SubmitBatch_UnrelatedQueueJobsDoNotConsumeMigrationSlots(bool ownedJob, int expectedSubmissions)
+    {
+        await using var h = await MigrationTestHarness.CreateAsync();
+        await SeedPendingAsync(h, "store-a", "store-b", "store-c");
+        await h.Store.UpdateSessionAsync(s => s.MaxQueueDepth = 2);
+        var existingId = Guid.NewGuid();
+        await using (var dav = h.Dav())
+        {
+            // Same category and name are deliberately insufficient ownership evidence.
+            for (var index = 0; index < 5; index++)
+                dav.QueueItems.Add(new QueueItem
+                {
+                    Id = index == 0 ? existingId : Guid.NewGuid(),
+                    CreatedAt = DateTime.UtcNow,
+                    FileName = index == 0 ? "store-a.nzb" : $"unrelated-{index}.nzb",
+                    JobName = "store-a",
+                    Category = "tv",
+                });
+            await dav.SaveChangesAsync();
+        }
+        if (ownedJob)
+        {
+            await SeedPendingAsync(h, "existing-owned-job");
+            await h.Store.UpdateSessionAsync(s => s.MaxQueueDepth = 2);
+            await using var migration = h.Mig();
+            var existing = await migration.Submissions.SingleAsync(s => s.StoreRef == "existing-owned-job");
+            existing.State = "processing";
+            existing.NzoId = existingId.ToString();
+            await migration.SaveChangesAsync();
+        }
+        using var queueManager = CreateQueueManager();
+        var pool = CreatePool(h, queueManager);
+        pool.SubmitPreparedReleaseOverride = (_, _, _, _) => Task.CompletedTask;
+
+        Assert.Equal(expectedSubmissions, await pool.SubmitBatchAsync(CancellationToken.None));
+    }
+
     [Fact]
     public async Task SubmitBatch_CancelledAfterFirstSubmission_DoesNotSubmitNextPendingRelease()
     {
