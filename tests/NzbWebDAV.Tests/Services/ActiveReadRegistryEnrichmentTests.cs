@@ -5,6 +5,18 @@ namespace NzbWebDAV.Tests.Services;
 
 public class ActiveReadRegistryEnrichmentTests
 {
+    [Fact]
+    public void UpdateInfo_RecordsTheImportedItemAndKeepsItWhenLaterCallsOmitIt()
+    {
+        var registry = new ActiveReadRegistry();
+        var id = registry.GetOrCreate("/content/Movie/a.mkv", "client", "a.mkv", null);
+        var item = Guid.NewGuid();
+        Assert.Null(Assert.Single(registry.Snapshot()).ItemId);
+        registry.UpdateInfo(id, "a.mkv", 100, "/content/Movie/a.mkv", item);
+        registry.UpdateInfo(id, null, null);
+        Assert.Equal(item, Assert.Single(registry.Snapshot()).ItemId);
+    }
+
     [Theory]
     [InlineData("/content/Movie Title/d.mkv", "Movie Title")]
     [InlineData("/content/Movie Title/Disc 1/d.mkv", "Disc 1")]

@@ -1565,6 +1565,8 @@ export type ActiveRead = {
   fileName: string;
   parentDirectoryName?: string | null;
   path: string;
+  /** The imported file being read, when the backend resolved one. */
+  itemId?: string | null;
   startedAt: number;
   lastActivityAt: number;
   bytesRead: number;

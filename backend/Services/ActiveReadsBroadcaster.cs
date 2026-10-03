@@ -95,6 +95,7 @@ public class ActiveReadsBroadcaster(
                 fileName = e.FileName,
                 parentDirectoryName = e.ParentDirectoryName,
                 path = e.Path,
+                itemId = e.ItemId,
                 startedAt = e.StartedAt.ToUnixTimeMilliseconds(),
                 lastActivityAt = e.LastActivityAt.ToUnixTimeMilliseconds(),
                 bytesRead = Interlocked.Read(ref e.BytesRead),

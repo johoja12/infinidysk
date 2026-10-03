@@ -34,9 +34,12 @@ const HISTORY_LIMIT = 60;
 export function LiveReadsPanel({
   paused = false,
   summary,
+  onOpenFile,
 }: {
   paused?: boolean;
   summary?: ReactNode;
+  /** Opens a read's file details; rows link only when the read resolved an imported file. */
+  onOpenFile?: (read: ActiveRead) => void;
 }) {
   const [rows, setRows] = useState<LiveReadRow[]>([]);
   const [mockCount, setMockCount] = useState<number | null>(null);
@@ -110,17 +113,21 @@ export function LiveReadsPanel({
     { enabled: !paused && mockCount == null },
   );
 
-  return <LiveReadsPanelContent rows={rows} summary={summary} paused={paused} />;
+  return (
+    <LiveReadsPanelContent rows={rows} summary={summary} paused={paused} onOpenFile={onOpenFile} />
+  );
 }
 
 export function LiveReadsPanelContent({
   rows,
   summary,
   paused = false,
+  onOpenFile,
 }: {
   rows: LiveReadRow[];
   summary?: ReactNode;
   paused?: boolean;
+  onOpenFile?: ((read: ActiveRead) => void) | undefined;
 }) {
   const displayedRows = [...rows].sort((a, b) => b.read.startedAt - a.read.startedAt);
   const activeCount = rows.filter((row) => !row.idle).length;
@@ -152,7 +159,14 @@ export function LiveReadsPanelContent({
         ) : (
           <ul className="yes-scrollbar m-0 max-h-80 min-h-0 w-full min-w-0 list-none divide-y divide-base-content/10 overflow-x-hidden overflow-y-auto py-0 pr-4 pl-0 [scrollbar-gutter:stable]">
             {displayedRows.map(({ read, rate, history, idle }) => (
-              <ReadRow key={read.id} read={read} rate={rate} history={history} idle={idle} />
+              <ReadRow
+                key={read.id}
+                read={read}
+                rate={rate}
+                history={history}
+                idle={idle}
+                onOpenFile={onOpenFile}
+              />
             ))}
           </ul>
         )}
@@ -230,11 +244,13 @@ function ReadRow({
   rate,
   history,
   idle = false,
+  onOpenFile,
 }: {
   read: ActiveRead;
   rate: number;
   history: number[];
   idle?: boolean | undefined;
+  onOpenFile?: ((read: ActiveRead) => void) | undefined;
 }) {
   const display = displayNameForRead(r.fileName, r.path, r.parentDirectoryName);
   // Use the latest read position (what the player is requesting right now) —
@@ -261,7 +277,20 @@ function ReadRow({
           className="min-w-0 overflow-hidden lg:flex-1"
           content={`${display.name}\n${r.path}`}
         >
-          <span className="block truncate text-xs font-bold text-base-content">{display.name}</span>
+          {onOpenFile && r.itemId ? (
+            <button
+              type="button"
+              className="block max-w-full cursor-pointer truncate text-left text-xs font-bold text-base-content hover:text-primary hover:underline"
+              aria-label={`Open file details for ${display.name}`}
+              onClick={() => onOpenFile(r)}
+            >
+              {display.name}
+            </button>
+          ) : (
+            <span className="block truncate text-xs font-bold text-base-content">
+              {display.name}
+            </span>
+          )}
         </Tooltip>
 
         <div className="flex w-full min-w-0 items-center gap-x-2.5 font-mono text-xs tabular-nums lg:w-auto lg:shrink-0 lg:gap-x-3">

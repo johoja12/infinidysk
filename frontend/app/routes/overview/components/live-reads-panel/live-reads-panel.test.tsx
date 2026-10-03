@@ -225,6 +225,65 @@ describe("LiveReadsPanel", () => {
     expect(markup).toContain("max-sm:hidden");
   });
 
+  it("opens file details from the name of a read that resolved an imported file", () => {
+    const linked = {
+      ...fixtureRead(
+        "l",
+        "Linked.mkv",
+        "/content/Linked.mkv",
+        1,
+        10,
+        "rclone/v1.72.0",
+        "10.0.0.1",
+        [],
+      ),
+      itemId: "item-1",
+    };
+    const unlinked = fixtureRead(
+      "u",
+      "Unlinked.mkv",
+      "/content/Unlinked.mkv",
+      1,
+      10,
+      "rclone/v1.72.0",
+      "10.0.0.1",
+      [],
+    );
+    const onOpenFile = vi.fn();
+    const { getByRole, queryByRole } = render(
+      <LiveReadsPanelContent
+        rows={[
+          { read: linked, rate: 0, history: [] },
+          { read: unlinked, rate: 0, history: [] },
+        ]}
+        onOpenFile={onOpenFile}
+      />,
+    );
+    fireEvent.click(getByRole("button", { name: "Open file details for Linked.mkv" }));
+    expect(onOpenFile).toHaveBeenCalledWith(linked);
+    expect(queryByRole("button", { name: /Unlinked\.mkv/ })).toBeNull();
+  });
+
+  it("keeps names as plain text when no file details can be opened", () => {
+    const read = {
+      ...fixtureRead(
+        "l",
+        "Linked.mkv",
+        "/content/Linked.mkv",
+        1,
+        10,
+        "rclone/v1.72.0",
+        "10.0.0.1",
+        [],
+      ),
+      itemId: "item-1",
+    };
+    const { queryByRole } = render(
+      <LiveReadsPanelContent rows={[{ read, rate: 0, history: [] }]} />,
+    );
+    expect(queryByRole("button", { name: /Linked\.mkv/ })).toBeNull();
+  });
+
   it("marks reads served entirely from the native cache", () => {
     const cached = fixtureRead(
       "c",
