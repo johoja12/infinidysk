@@ -142,9 +142,10 @@ public class ActiveReadRegistry
     /// real filename/size are resolved from the dav store (the path passed to
     /// GetOrCreate is usually an opaque GUID for .ids/-style paths).
     /// </summary>
-    public void UpdateInfo(Guid id, string? fileName, long? fileSize, string? resolvedPath = null)
+    public void UpdateInfo(Guid id, string? fileName, long? fileSize, string? resolvedPath = null, Guid? itemId = null)
     {
         if (!_entries.TryGetValue(id, out var entry)) return;
+        if (itemId is { } item) entry.ItemId = item;
         if (!string.IsNullOrWhiteSpace(fileName)) entry.FileName = fileName;
         if (fileSize is { } size) entry.FileSize = size;
         if (!string.IsNullOrEmpty(resolvedPath))
@@ -209,6 +210,8 @@ public class ActiveReadRegistry
         public string Path { get; init; } = "";
         public string FileName { get; set; } = "";
         public string? ParentDirectoryName { get; set; }
+        /// <summary>The imported file being read, when the request resolved one; opens its details in the UI.</summary>
+        public Guid? ItemId { get; set; }
         public long? FileSize { get; set; }
         public string ClientKey { get; init; } = "";
         public string? ClientUserAgent { get; set; }
