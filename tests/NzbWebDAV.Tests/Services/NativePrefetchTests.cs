@@ -216,18 +216,28 @@ public sealed class NativePrefetchTests : IAsyncLifetime
         var bytes = new byte[3L * block];
         new Random(3).NextBytes(bytes);
         var identity = new NativeCacheIdentity("lanes-solo", "revision", bytes.Length);
-        var source = new VerifiedSource(bytes, true);
+        // The primary lane waits for an extra lane to try opening; otherwise it could take every
+        // chunk first, and extra lanes rightly never open when no work is left.
+        var openAttempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var source = new GatedSource(bytes, openAttempted.Task);
         await using var primary = new NativeCachedStream(_store, identity, _ => Task.FromResult<Stream>(source), () => true);
-        var opened = 0;
-        var refused = new WarmLanes(2, _ => { Interlocked.Increment(ref opened); throw new InvalidOperationException("No buffers"); }, () => true);
-        var held = new WarmLanes(2, _ => { Interlocked.Increment(ref opened); return Task.FromResult<NativeCachedStream?>(null); }, () => false);
+        var refusedOpens = 0;
+        var heldOpens = 0;
+        var refused = new WarmLanes(2, _ =>
+        {
+            Interlocked.Increment(ref refusedOpens);
+            openAttempted.TrySetResult();
+            throw new InvalidOperationException("No buffers");
+        }, () => true);
+        var held = new WarmLanes(2, _ => { Interlocked.Increment(ref heldOpens); return Task.FromResult<NativeCachedStream?>(null); }, () => false);
 
         await NativePrefetchExecutor.WarmAsync(_store, primary, 0, 2L * block, _ => new ValueTask<bool>(true), _ => { },
             CancellationToken.None, chunkMb: 4, lanes: refused);
         await NativePrefetchExecutor.WarmAsync(_store, primary, 2L * block, block, _ => new ValueTask<bool>(true), _ => { },
             CancellationToken.None, chunkMb: 4, lanes: held);
 
-        Assert.Equal(2, opened);
+        Assert.InRange(refusedOpens, 1, 2);
+        Assert.Equal(0, heldOpens);
         Assert.Equal(bytes.Length, source.ReadBytes);
         Assert.Equal(bytes.Length, await _store.GetCoverageAsync(identity));
     }
@@ -238,10 +248,13 @@ public sealed class NativePrefetchTests : IAsyncLifetime
         const int block = NativeCacheStore.BlockSize;
         var bytes = new byte[3L * block];
         var identity = new NativeCacheIdentity("lanes-damaged", "revision", bytes.Length);
+        // The primary lane waits until the extra lane has read its damaged chunk; otherwise it
+        // could warm every chunk from memory before the extra lane starts.
+        var damagedRead = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         await using var primary = new NativeCachedStream(_store, identity,
-            _ => Task.FromResult<Stream>(new VerifiedSource(bytes, true)), () => true);
+            _ => Task.FromResult<Stream>(new GatedSource(bytes, damagedRead.Task)), () => true);
         var lanes = new WarmLanes(1, _ => Task.FromResult<NativeCachedStream?>(new NativeCachedStream(_store, identity,
-            _ => Task.FromResult<Stream>(new MissingArticleSource(inconclusive: false)), () => true)), () => true);
+            _ => Task.FromResult<Stream>(new MissingArticleSource(inconclusive: false, damagedRead)), () => true)), () => true);
 
         var damaged = await Assert.ThrowsAsync<PrefetchSourceDamagedException>(() => NativePrefetchExecutor.WarmAsync(
             _store, primary, 0, 0, _ => new ValueTask<bool>(true), _ => { }, CancellationToken.None, chunkMb: 4, lanes: lanes));
@@ -570,12 +583,15 @@ public sealed class NativePrefetchTests : IAsyncLifetime
         Directory.Delete(_root, true);
     }
 
-    private sealed class MissingArticleSource(bool inconclusive) : MemoryStream(new byte[3]), ICacheReadEvidence
+    private sealed class MissingArticleSource(bool inconclusive, TaskCompletionSource? read = null) : MemoryStream(new byte[3]), ICacheReadEvidence
     {
         public bool LastReadCacheable => false;
-        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            read?.TrySetResult();
             throw new NzbWebDAV.Exceptions.UsenetArticleNotFoundException("missing-segment")
             { InconclusiveReason = inconclusive ? "A provider timed out." : null };
+        }
     }
 
     private sealed class GatedSource(byte[] bytes, Task gate) : MemoryStream(bytes), ICacheReadEvidence
