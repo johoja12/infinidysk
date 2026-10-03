@@ -199,6 +199,7 @@ describe("Streaming settings", () => {
     expect(priority.value).toBe("90");
   });
 
+  // Types into many fields; about 4 s normally and over 5 s under coverage on CI runners.
   it("updates segment cache, timeout, buffering, and fallback controls", async () => {
     const user = userEvent.setup();
     render(createElement(StreamingHarness));
@@ -270,7 +271,7 @@ describe("Streaming settings", () => {
     await user.clear(maxEntries);
     await user.type(maxEntries, "8");
     expect(maxEntries.value).toBe("8");
-  });
+  }, 15_000);
 
   it("detects changes to every owned setting", () => {
     for (const key of Object.keys(validConfig)) {
