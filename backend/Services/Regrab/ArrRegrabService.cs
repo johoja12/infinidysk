@@ -393,7 +393,8 @@ public sealed class ArrRegrabService : IDisposable
     /// item is returned unchanged. Waits up to <see cref="InlineBudget"/> for the Arr calls;
     /// slower instances keep being retried by <see cref="ArrRegrabWorker"/>.
     /// </summary>
-    public async Task<ArrRegrabResult?> RequestAsync(Guid? davItemId, string? linkPath, CancellationToken ct)
+    public async Task<ArrRegrabResult?> RequestAsync(Guid? davItemId, string? linkPath, CancellationToken ct,
+        string source = SourceManual, string? reason = null)
     {
         Guid requestId;
         await using (var ctx = CreateContext())
@@ -425,7 +426,7 @@ public sealed class ArrRegrabService : IDisposable
                 ctx.ArrRegrabRequests.Add(row);
             }
 
-            ResetForNewAttempt(row, SourceManual, subject.ReleaseName, "requested from the file details", now);
+            ResetForNewAttempt(row, source, subject.ReleaseName, reason ?? "requested from the file details", now);
             row.DavItemId = subject.DavItemId;
             row.LibraryPath = resolution.Target?.LibraryPath ?? subject.LinkPaths[0];
             ApplyTarget(row, resolution.Target);

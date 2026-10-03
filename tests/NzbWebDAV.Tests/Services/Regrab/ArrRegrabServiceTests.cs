@@ -157,6 +157,22 @@ public sealed class ArrRegrabServiceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Request_FromMigrationAutomation_RecordsItsSourceAndReason()
+    {
+        var (item, _, _) = await SeedLibraryItemAsync();
+        var service = NewService();
+
+        var result = await service.RequestAsync(item.Id, null, CancellationToken.None,
+            ArrRegrabService.SourceMigration, "migration validation failed: bounded read timed out");
+
+        Assert.True(result!.Accepted, result.Message);
+        var row = await SingleRowAsync();
+        Assert.Equal(ArrRegrabService.SourceMigration, row.Source);
+        Assert.Equal("migration validation failed: bounded read timed out", row.Reason);
+        Assert.Equal(1, _sonarr.RemoveCalls);
+    }
+
+    [Fact]
     public async Task Request_BlocklistsWhenTheDownloadIdIsKnown()
     {
         var downloadId = Guid.NewGuid();
