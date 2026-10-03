@@ -7,6 +7,7 @@ import { useWebsocketTopic } from "~/utils/shared-websocket";
 import { Tooltip } from "~/components/ui";
 import { Sparkline } from "../provider-scoreboard/provider-scoreboard";
 import { mockLiveReadRows, mockReadsRequested } from "./live-reads-panel.mock";
+import { BURST_GRACE_MS, mergeReadBursts, type PlaybackState } from "./live-read-bursts";
 
 const TOPIC_ACTIVE_READS = "ar";
 
@@ -16,6 +17,8 @@ export type LiveReadRow = {
   rate: number;
   /** Recent rate samples (one per broadcast tick) for the sparkline. */
   history: number[];
+  /** The playback's last read ended; the row waits for the next burst before it is dropped. */
+  idle?: boolean;
 };
 
 // The broadcaster ticks once per second; 60 samples ≈ the last minute.
@@ -41,6 +44,22 @@ export function LiveReadsPanel({
   const prevRef = useRef<Map<string, { bytes: number; at: number; rate: number }>>(new Map());
   // Per-session rate samples for the sparkline, keyed by session id.
   const historyRef = useRef<Map<string, number[]>>(new Map());
+  // Playbacks carried across ticks, so a player's bursts of range reads stay one row.
+  const playbacksRef = useRef<PlaybackState>(new Map());
+  // The last reads broadcast; the topic goes quiet once nothing is read, so idle rows expire on a timer.
+  const lastReadsRef = useRef<ActiveRead[]>([]);
+  const hasIdle = rows.some((row) => row.idle);
+
+  useEffect(() => {
+    if (!hasIdle || paused || mockCount != null) return;
+    const timer = setInterval(() => {
+      const merged = mergeReadBursts(playbacksRef.current, lastReadsRef.current, Date.now());
+      playbacksRef.current = merged.state;
+      const alive = new Set(merged.rows.map((row) => row.read.id));
+      setRows((current) => current.filter((row) => alive.has(row.read.id)));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [hasIdle, paused, mockCount]);
 
   useEffect(() => {
     const count = mockReadsRequested();
@@ -62,7 +81,10 @@ export function LiveReadsPanel({
         const next = new Map<string, { bytes: number; at: number; rate: number }>();
         const nextHistory = new Map<string, number[]>();
         const nextRows: LiveReadRow[] = [];
-        for (const r of payload.reads ?? []) {
+        lastReadsRef.current = payload.reads ?? [];
+        const merged = mergeReadBursts(playbacksRef.current, lastReadsRef.current, now);
+        playbacksRef.current = merged.state;
+        for (const { read: r, idle } of merged.rows) {
           const old = prev.get(r.id);
           let rate = old?.rate ?? 0;
           if (old && now > old.at) {
@@ -76,7 +98,7 @@ export function LiveReadsPanel({
           next.set(r.id, { bytes: r.bytesRead, at: now, rate });
           const history = [...(historyRef.current.get(r.id) ?? []), rate].slice(-HISTORY_LIMIT);
           nextHistory.set(r.id, history);
-          nextRows.push({ read: r, rate, history });
+          nextRows.push({ read: r, rate, history, idle });
         }
         prevRef.current = next;
         historyRef.current = nextHistory;
@@ -101,6 +123,7 @@ export function LiveReadsPanelContent({
   paused?: boolean;
 }) {
   const displayedRows = [...rows].sort((a, b) => b.read.startedAt - a.read.startedAt);
+  const activeCount = rows.filter((row) => !row.idle).length;
   const cardRef = useScrollHeightLock(paused);
 
   return (
@@ -113,9 +136,9 @@ export function LiveReadsPanelContent({
         <div className="flex shrink-0 items-center gap-2.5">
           <span className="status status-success animate-pulse" aria-hidden="true" />
           <h3 className="card-title m-0 text-base">Right now</h3>
-          {!summary && rows.length > 0 && (
+          {!summary && activeCount > 0 && (
             <span className="badge badge-ghost badge-sm ml-auto font-mono tabular-nums">
-              {rows.length} active
+              {activeCount} active
             </span>
           )}
         </div>
@@ -128,8 +151,8 @@ export function LiveReadsPanelContent({
           </p>
         ) : (
           <ul className="yes-scrollbar m-0 max-h-80 min-h-0 w-full min-w-0 list-none divide-y divide-base-content/10 overflow-x-hidden overflow-y-auto py-0 pr-4 pl-0 [scrollbar-gutter:stable]">
-            {displayedRows.map(({ read, rate, history }) => (
-              <ReadRow key={read.id} read={read} rate={rate} history={history} />
+            {displayedRows.map(({ read, rate, history, idle }) => (
+              <ReadRow key={read.id} read={read} rate={rate} history={history} idle={idle} />
             ))}
           </ul>
         )}
@@ -206,10 +229,12 @@ function ReadRow({
   read: r,
   rate,
   history,
+  idle = false,
 }: {
   read: ActiveRead;
   rate: number;
   history: number[];
+  idle?: boolean;
 }) {
   const display = displayNameForRead(r.fileName, r.path, r.parentDirectoryName);
   // Use the latest read position (what the player is requesting right now) —
@@ -222,12 +247,15 @@ function ReadRow({
     : null;
   const sessionAge = formatSessionAge(r.startedAt);
   const bytesFetched = r.bytesFetched ?? 0;
+  const fromCache = r.bytesRead > 0 && bytesFetched === 0;
   // Total bytes served well past the current position means the player is
   // re-reading ranges (scrubbing / replaying), not streaming linearly.
   const scrubbing = r.bytesRead > r.currentOffset + Math.max(64_000_000, r.currentOffset * 0.2);
 
   return (
-    <li className="flex min-w-0 flex-col gap-1 overflow-x-hidden py-2 first:pt-0 last:pb-0">
+    <li
+      className={`flex min-w-0 flex-col gap-1 overflow-x-hidden py-2 first:pt-0 last:pb-0${idle ? " opacity-60" : ""}`}
+    >
       <div className="flex min-w-0 flex-col gap-1 lg:flex-row lg:items-center lg:gap-x-4">
         <Tooltip
           className="min-w-0 overflow-hidden lg:flex-1"
@@ -279,6 +307,18 @@ function ReadRow({
           </span>
         </Tooltip>
         {sessionAge && <span className="shrink-0">{sessionAge}</span>}
+        {idle && (
+          <Tooltip
+            content={`The player paused between range reads; this row stays ${BURST_GRACE_MS / 1000} s for its next one`}
+          >
+            <span className="shrink-0 italic">between reads</span>
+          </Tooltip>
+        )}
+        {fromCache && (
+          <Tooltip content="Served entirely from the native cache; nothing was downloaded from Usenet for this playback">
+            <span className="badge badge-success badge-soft badge-xs shrink-0">from cache</span>
+          </Tooltip>
+        )}
         {bytesFetched > 0 && (
           <Tooltip
             className="max-sm:hidden"

@@ -225,6 +225,74 @@ describe("LiveReadsPanel", () => {
     expect(markup).toContain("max-sm:hidden");
   });
 
+  it("marks reads served entirely from the native cache", () => {
+    const cached = fixtureRead(
+      "c",
+      "Cached.mkv",
+      "/content/Cached.mkv",
+      100_000_000,
+      2_000_000_000,
+      "rclone/v1.72.0",
+      "192.168.20.80",
+      [],
+      { bytesRead: 100_000_000, bytesFetched: 0 },
+    );
+    const fetched = fixtureRead(
+      "u",
+      "Uncached.mkv",
+      "/content/Uncached.mkv",
+      100_000_000,
+      2_000_000_000,
+      "rclone/v1.72.0",
+      "192.168.20.80",
+      [{ host: "news.a", segments: 12 }],
+      { bytesRead: 100_000_000, bytesFetched: 120_000_000 },
+    );
+    const html = renderToStaticMarkup(
+      <LiveReadsPanelContent
+        rows={[
+          { read: cached, rate: 0, history: [] },
+          { read: fetched, rate: 0, history: [] },
+        ]}
+      />,
+    );
+    expect(html.match(/from cache/g)).toHaveLength(1);
+  });
+
+  it("dims a playback between reads and leaves it out of the active count", () => {
+    const live = fixtureRead(
+      "l",
+      "Live.mkv",
+      "/content/Live.mkv",
+      1,
+      10,
+      "rclone/v1.72.0",
+      "10.0.0.1",
+      [],
+    );
+    const idle = fixtureRead(
+      "i",
+      "Idle.mkv",
+      "/content/Idle.mkv",
+      1,
+      10,
+      "rclone/v1.72.0",
+      "10.0.0.1",
+      [],
+    );
+    const html = renderToStaticMarkup(
+      <LiveReadsPanelContent
+        rows={[
+          { read: live, rate: 0, history: [] },
+          { read: idle, rate: 0, history: [], idle: true },
+        ]}
+      />,
+    );
+    expect(html).toContain("1 active");
+    expect(html).toContain("between reads");
+    expect(html.match(/opacity-60/g)).toHaveLength(1);
+  });
+
   it("notes total bytes served when the player is scrubbing", () => {
     const markup = renderToStaticMarkup(<LiveReadsPanelContent rows={fixtureRows} />);
 
