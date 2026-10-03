@@ -43,6 +43,32 @@ public sealed class PrefetchPolicyTests
         Assert.Empty(PrefetchPolicy.HistoryCandidates([first, second], settings with { ConfidenceThreshold = 0.9 }, "server", now));
     }
 
+    [Theory]
+    [InlineData(1, 1, true)]   // One watched episode is enough when the minimum is one.
+    [InlineData(2, 1, false)]  // Below the minimum never qualifies.
+    [InlineData(2, 2, true)]
+    [InlineData(3, 3, true)]
+    public void HistoryPrediction_MeetingTheMinimumPassesTheDefaultConfidence(int minimum, int watched, bool predicted)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var settings = new PrefetchSettings { MinEpisodesForPrediction = minimum };
+        var history = Enumerable.Range(1, watched)
+            .Select(index => Episode($"e{index}", 1, index) with { ViewedAt = now.ToUnixTimeSeconds() + index, UserId = "user" })
+            .ToArray();
+        Assert.Equal(predicted, PrefetchPolicy.HistoryCandidates(history, settings, "server", now).Count == 1);
+    }
+
+    [Fact]
+    public void HistoryConfidence_IsHalfAtTheMinimumAndFullAtTwiceIt()
+    {
+        var settings = new PrefetchSettings { MinEpisodesForPrediction = 2 };
+        Assert.Equal(0.25, PrefetchPolicy.Confidence(1, settings));
+        Assert.Equal(0.5, PrefetchPolicy.Confidence(2, settings));
+        Assert.Equal(1, PrefetchPolicy.Confidence(4, settings));
+        Assert.Equal(1, PrefetchPolicy.Confidence(9, settings));
+        Assert.Equal(0.5, PrefetchPolicy.Confidence(1, settings with { MinEpisodesForPrediction = 1 }));
+    }
+
     [Fact]
     public void PartialResumeAndMinimumRanges_AreBoundedWithinMedia()
     {

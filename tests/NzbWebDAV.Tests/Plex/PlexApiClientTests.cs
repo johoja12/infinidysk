@@ -236,6 +236,19 @@ public sealed class PlexApiClientTests
     }
 
     [Fact]
+    public async Task History_TakesTheShowFromGrandparentKeyWhenItHasNoRatingKey()
+    {
+        // The attributes Plex's /status/sessions/history/all returns for an episode: no grandparentRatingKey.
+        using var handler = new FakePlexHandler(_ => Xml("""<MediaContainer><Video accountID="302013334" grandparentKey="/library/metadata/248076" grandparentTitle="Grey's Anatomy" historyKey="/status/sessions/history/1" index="5" key="/library/metadata/248081" librarySectionID="2" parentIndex="22" parentKey="/library/metadata/248077" ratingKey="248081" title="Episode" type="episode" viewedAt="1800000010"/><Video accountID="1" grandparentKey="/library/sections/2" ratingKey="3" type="episode" viewedAt="1800000020"/></MediaContainer>"""));
+        var api = new PlexApiClient(new HttpClient(handler), "installation");
+        var items = await api.GetHistoryAsync(Server(), DateTimeOffset.FromUnixTimeSeconds(1800000000));
+        var episode = items.Single(item => item.RatingKey == "248081");
+        Assert.Equal("248076", episode.ShowRatingKey);
+        Assert.Equal((22, 5), (episode.Season, episode.Episode));
+        Assert.Null(items.Single(item => item.RatingKey == "3").ShowRatingKey);
+    }
+
+    [Fact]
     public async Task LibrariesUsersSourcesAndEpisodes_UseTypedBoundedXmlContracts()
     {
         using var handler = new FakePlexHandler(request => Xml(request.RequestUri!.AbsolutePath switch

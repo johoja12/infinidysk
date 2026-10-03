@@ -397,12 +397,25 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
     }
     private static long? Long(XElement? item, string name) => long.TryParse(Attribute(item, name), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : null;
     private static int? Integer(XElement item, string name) => int.TryParse(Attribute(item, name), NumberStyles.Integer, CultureInfo.InvariantCulture, out var value) ? value : null;
+    /// <summary>
+    /// The episode's show. Library metadata carries <c>grandparentRatingKey</c>; watch history only
+    /// carries <c>grandparentKey="/library/metadata/{ratingKey}"</c>, so its last segment is used.
+    /// </summary>
+    private static string? ShowRatingKey(XElement item)
+    {
+        if (Attribute(item, "grandparentRatingKey") is { Length: > 0 } ratingKey) return ratingKey;
+        var key = Attribute(item, "grandparentKey");
+        if (key is null || !key.StartsWith("/library/metadata/", StringComparison.Ordinal)) return null;
+        var segment = key["/library/metadata/".Length..];
+        return segment.Length > 0 && segment.All(char.IsAsciiDigit) ? segment : null;
+    }
+
     private static PlexMediaItem ParseMedia(XElement item)
     {
         var media = item.Elements("Media").FirstOrDefault(element => Attribute(element, "selected") == "1") ?? item.Element("Media");
         var part = media?.Elements("Part").FirstOrDefault(element => Attribute(element, "selected") == "1") ?? media?.Element("Part");
         return new(Attribute(item, "ratingKey") ?? "", Attribute(item, "type") ?? "", Attribute(item, "title") ?? "",
-            Attribute(item, "grandparentRatingKey"), Integer(item, "parentIndex"), Integer(item, "index"), Attribute(part, "file"),
+            ShowRatingKey(item), Integer(item, "parentIndex"), Integer(item, "index"), Attribute(part, "file"),
             Long(item, "viewOffset") ?? 0, Long(item, "duration") ?? 0, Long(item, "viewedAt"),
             Attribute(item, "accountID") ?? Attribute(item.Element("User"), "id"));
     }
