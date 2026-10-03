@@ -35,7 +35,7 @@ public sealed class SubmissionWorkerPoolTests
                 {
                     Id = index == 0 ? existingId : Guid.NewGuid(),
                     CreatedAt = DateTime.UtcNow,
-                    FileName = "store-a.nzb",
+                    FileName = index == 0 ? "store-a.nzb" : $"unrelated-{index}.nzb",
                     JobName = "store-a",
                     Category = "tv",
                 });
