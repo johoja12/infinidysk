@@ -89,7 +89,12 @@ jobs:
 
       - name: Audit production dependencies
         working-directory: frontend
-        run: npm audit --omit=dev --audit-level=high
+        # npm audit has no exception mechanism; the gate fails on high/critical advisories
+        # unless a justified, expiring entry in scripts/npm-audit-allowlist.json covers them.
+        run: |
+          npm audit --omit=dev --json > /tmp/npm-audit.json || true
+          python3 ../scripts/check-npm-audit.py /tmp/npm-audit.json \
+            --allowlist ../scripts/npm-audit-allowlist.json --level high
 
       - name: Lint
         working-directory: frontend
@@ -259,6 +264,9 @@ jobs:
 
       - name: Verify NuGet vulnerability gate fixtures
         run: bash scripts/test-nuget-vulnerability-gate.sh
+
+      - name: Verify npm audit gate fixtures
+        run: bash scripts/test-npm-audit-gate.sh
 
       - name: Verify performance baseline gate fixtures
         run: bash scripts/test-performance-baseline-gate.sh

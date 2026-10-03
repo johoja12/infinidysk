@@ -1,0 +1,11 @@
+{
+  "$schema_comment": "Temporary npm advisory exceptions for CI. Each entry must name packageId, advisoryUrl, reason, and expiresOn (YYYY-MM-DD). Expired entries are ignored and the finding fails CI.",
+  "exceptions": [
+    {
+      "packageId": "braces",
+      "advisoryUrl": "https://github.com/advisories/GHSA-vfj7-8cjw-p6xm",
+      "reason": "No patched braces release exists (all versions affected). Only reachable through http-proxy-middleware's micromatch pathFilter matching; frontend/server/app.ts configures no pathFilter, so braces never expands any pattern. Remove when a fixed braces/micromatch ships.",
+      "expiresOn": "2026-11-03"
+    }
+  ]
+}
