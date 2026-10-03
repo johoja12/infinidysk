@@ -362,13 +362,24 @@ public sealed class SubmissionWorkerPool(
     }
 
     /// <summary>
-    /// Current NzbDAV queue depth. <see cref="QueueManager"/> has no depth accessor,
-    /// so this counts <c>QueueItems</c> directly.
+    /// Counts queued jobs owned by this migration ledger. Other SAB clients must
+    /// not consume the migration's bounded submission slots.
     /// </summary>
     private async Task<int> CurrentQueueDepthAsync(CancellationToken ct)
     {
+        await using var migrationContext = store.NewContext();
+        var claimedIds = await migrationContext.Submissions.AsNoTracking()
+            .Where(submission => submission.NzoId != null)
+            .Select(submission => submission.NzoId!)
+            .ToListAsync(ct).ConfigureAwait(false);
+        var queueIds = claimedIds.Select(id => Guid.TryParse(id, out var parsed) ? parsed : (Guid?)null)
+            .Where(id => id.HasValue).Select(id => id!.Value).ToArray();
+        if (queueIds.Length == 0)
+            return 0;
+
         await using var davCtx = NewDavContext();
-        return await davCtx.QueueItems.AsNoTracking().CountAsync(ct).ConfigureAwait(false);
+        return await davCtx.QueueItems.AsNoTracking()
+            .CountAsync(item => queueIds.Contains(item.Id), ct).ConfigureAwait(false);
     }
 
     private DavDatabaseContext NewDavContext() => DavDatabaseContexts.Create(DavContextFactory);
