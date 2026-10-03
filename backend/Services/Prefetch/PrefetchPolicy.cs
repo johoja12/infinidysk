@@ -28,10 +28,17 @@ public static class PrefetchPolicy
         var episodes = selected.Where(item => item.Type == "episode" && item.ShowRatingKey is not null)
             .GroupBy(item => (item.UserId, item.ShowRatingKey))
             .Where(group => group.DistinctBy(item => item.RatingKey).Count() >= settings.MinEpisodesForPrediction)
-            .Where(group => Math.Min(1, group.DistinctBy(item => item.RatingKey).Count() / (double)Math.Max(4, settings.MinEpisodesForPrediction)) >= settings.ConfidenceThreshold)
+            .Where(group => Confidence(group.DistinctBy(item => item.RatingKey).Count(), settings) >= settings.ConfidenceThreshold)
             .Select(group => group.First());
         return movies.Concat(episodes).Take(128).ToArray();
     }
+
+    /// <summary>
+    /// Distinct-episode evidence for a show: 0.5 at the configured minimum, 1 at twice the minimum.
+    /// With the default threshold, meeting the minimum is enough; a higher threshold asks for more.
+    /// </summary>
+    public static double Confidence(int distinctEpisodes, PrefetchSettings settings) =>
+        Math.Min(1, distinctEpisodes / (2.0 * Math.Max(1, settings.MinEpisodesForPrediction)));
 
     public static IReadOnlyList<(long Start, long Length)> Ranges(long length, long viewOffset, long duration, PrefetchSettings settings, bool minimum)
     {
