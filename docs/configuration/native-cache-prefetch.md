@@ -179,7 +179,12 @@ server/library/source identities, not display names, and users remain scoped to 
 server. History lookback, minimum distinct episodes, confidence threshold, cooldown,
 queue-ahead count, and episodes per show remain under Advanced settings. History
 confidence is bounded distinct-episode evidence, not a claim that a viewer will watch
-the prediction.
+the prediction: a show watched for exactly the **minimum distinct episodes** scores 0.5
+and twice the minimum scores 1, so with the default 0.5 threshold meeting the minimum
+is enough (a minimum of 1 predicts the next episode after one watched episode), while a
+higher threshold asks for more episodes [since unreleased](https://github.com/johoja12/infinidysk/issues/156){ .nzbdav-since }.
+Watch history identifies each episode's show from Plex's history response, which names
+the show only by its metadata key.
 
 Next-unwatched filtering requires a verified credential for the initiating user.
 Connect selected Plex Home accounts so their server-specific credentials can be
