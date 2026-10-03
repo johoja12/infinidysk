@@ -1028,6 +1028,36 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
         finally { selection.Writer.Release(); }
     }
 
+    /// <summary>
+    /// Grows a <see cref="ReserveWarmAsync"/> reservation by more bytes to fetch, so parallel warming
+    /// lanes of one file share its single reservation. Applies the same quota and free-space checks
+    /// as a new reservation, charging this one at its grown total; false when the folder cannot hold it.
+    /// </summary>
+    [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
+    public async Task<bool> TryExtendWarmAsync(IDisposable reservation, long bytesToFetch, CancellationToken cancellationToken = default)
+    {
+        if (reservation is not WarmReservation warm) throw new ArgumentException("Not a warm reservation.", nameof(reservation));
+        ArgumentOutOfRangeException.ThrowIfNegative(bytesToFetch);
+        var extra = checked(bytesToFetch + ((bytesToFetch + BlockSize - 1) / BlockSize) * (65536 + 4096));
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            long total;
+            lock (_leaseLock)
+            {
+                if (!_reservations.TryGetValue(warm.Key, out var current) || !ReferenceEquals(current, warm)) return false;
+                total = checked(warm.Remaining + extra);
+            }
+            var folder = _folders.FirstOrDefault(candidate => candidate.Id == warm.Folder);
+            if (folder is null || !HasQuota(folder, total, warm.Key)
+                || !CanUseFolder(folder, FreeSpaceRequirement(folder, total, warm.Key))) return false;
+            lock (_leaseLock) warm.Remaining += extra;
+            return true;
+        }
+        finally { _gate.Release(); }
+    }
+
     /// <summary>Display name of the folder a <see cref="ReserveWarmAsync"/> reservation writes to, for diagnostics.</summary>
     public string? ReservationFolderName(IDisposable reservation) => reservation is WarmReservation warm
         ? _folders.FirstOrDefault(folder => folder.Id == warm.Folder)?.Name : null;
@@ -1093,13 +1123,14 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
 
     private sealed class WarmReservation(NativeCacheStore store, string key, string folder, long remaining, IDisposable lease) : IDisposable
     {
+        public string Key { get; } = key;
         public string Folder { get; } = folder;
         public long Remaining { get; set; } = remaining;
         private int _disposed;
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-            lock (store._leaseLock) store._reservations.Remove(key);
+            lock (store._leaseLock) store._reservations.Remove(Key);
             lease.Dispose();
         }
     }
