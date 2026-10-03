@@ -1168,43 +1168,43 @@ function isValidMaxDownloadConnections(value: string | undefined): boolean {
 }
 
 function isValidStreamingPriority(value: string): boolean {
-  if (value.trim() === "") return false;
+  if (value.trim() === "") return true;
   const number = Number(value);
   return Number.isInteger(number) && number >= 0 && number <= 100;
 }
 
 function isValidStreamingSegmentTimeout(value: string): boolean {
-  if (value.trim() === "") return false;
+  if (value.trim() === "") return true;
   const number = Number(value);
   return Number.isInteger(number) && number >= 2 && number <= 40;
 }
 
 function isValidStreamingReadTimeout(value: string): boolean {
-  if (value.trim() === "") return false;
+  if (value.trim() === "") return true;
   const number = Number(value);
   return Number.isInteger(number) && number >= 5 && number <= 120;
 }
 
 function isValidConnectionOpenTimeout(value: string): boolean {
-  if (value.trim() === "") return false;
+  if (value.trim() === "") return true;
   const number = Number(value);
   return Number.isInteger(number) && number >= 1 && number <= 15;
 }
 
 function isValidStreamingWriteTimeout(value: string): boolean {
-  if (value.trim() === "") return false;
+  if (value.trim() === "") return true;
   const number = Number(value);
   return Number.isInteger(number) && number >= 0 && number <= 600;
 }
 
 function isValidStreamingSegmentRetries(value: string): boolean {
-  if (value.trim() === "") return false;
+  if (value.trim() === "") return true;
   const number = Number(value);
   return Number.isInteger(number) && number >= 0 && number <= 5;
 }
 
 function isValidArticleBufferSize(value: string): boolean {
-  return isPositiveInteger(value);
+  return value.trim() === "" || isPositiveInteger(value);
 }
 
 function isValidInFlightArticleBudget(value: string | undefined): boolean {

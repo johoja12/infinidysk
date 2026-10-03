@@ -284,6 +284,23 @@ describe("Streaming settings", () => {
     expect(isStreamingSettingsUpdated(validConfig, { ...validConfig })).toBe(false);
   });
 
+  it("accepts empty values the backend treats as its defaults", () => {
+    // An empty stored value means "use the default" on the backend, which skips empty
+    // values on save. The form must not block saving other settings because of them.
+    for (const key of [
+      "usenet.article-buffer-size",
+      "usenet.streaming-priority",
+      "usenet.streaming-segment-timeout-seconds",
+      "usenet.streaming-read-timeout-seconds",
+      "usenet.connection-open-timeout-seconds",
+      "usenet.streaming-write-timeout-seconds",
+      "usenet.streaming-segment-retries",
+    ]) {
+      expect(isStreamingSettingsValid({ ...validConfig, [key]: "" }), key).toBe(true);
+      expect(isStreamingSettingsValid({ ...validConfig, [key]: "-1" }), key).toBe(false);
+    }
+  });
+
   it("accepts the default configuration and validation boundaries", () => {
     expect(isStreamingSettingsValid(validConfig)).toBe(true);
     expect(
