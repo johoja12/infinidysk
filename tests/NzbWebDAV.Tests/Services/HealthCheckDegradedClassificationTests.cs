@@ -170,6 +170,102 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Repair_FullyCachedVerifiedCopy_KeepsItemAndProtectsCache()
+    {
+        ConfigureAutoRemove(threshold: 2, unlinkedOnly: true);
+        var segments = NewSegmentIds(3);
+        var (item, _) = await AddVideoFileAsync("movie.mkv", segments, [10_000, 10_000, 10_000]);
+        item = await MakeUrgentAsync(item, qualifyingFailures: 3);
+        await using var native = await NewNativeCacheAsync();
+        await SeedNativeCacheAsync(native, item, bytes: 30_000);
+        var (service, _) = await NewServiceAsync(
+            NewFakeClient(segments, missing: []), Par2RepairOutcome.NotRepaired, nativeCache: native);
+
+        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Equal(HealthCheckResult.RepairAction.None, row.RepairStatus);
+        Assert.Contains("keeps playing from the cache", row.Message, StringComparison.Ordinal);
+        var reloaded = ReloadItem(item.Id);
+        Assert.Null(reloaded.UrgentRepairFailures);
+        Assert.True(reloaded.NextHealthCheck > DateTimeOffset.UtcNow.AddDays(6));
+        var identity = await native.GetCurrentCacheIdentityAsync(reloaded);
+        Assert.Equal(identity!.Key, Assert.Single(await native.Store!.ListProtectedAsync(10)).Key);
+    }
+
+    [Fact]
+    public async Task Repair_PartiallyCachedCopy_StillDeletes()
+    {
+        ConfigureAutoRemove(threshold: 2, unlinkedOnly: true);
+        var segments = NewSegmentIds(2);
+        var blockSize = NzbWebDAV.Services.NativeCache.NativeCacheStore.BlockSize;
+        var (item, _) = await AddVideoFileAsync("movie.mkv", segments, [blockSize, 10_000]);
+        item = await MakeUrgentAsync(item, qualifyingFailures: 3);
+        await using var native = await NewNativeCacheAsync();
+        await SeedNativeCacheAsync(native, item, bytes: blockSize);
+        var (service, _) = await NewServiceAsync(
+            NewFakeClient(segments, missing: []), Par2RepairOutcome.NotRepaired, nativeCache: native);
+
+        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+
+        Assert.Equal(HealthCheckResult.RepairAction.Deleted, Assert.Single(GetHealthRows(item.Id)).RepairStatus);
+        Assert.Throws<InvalidOperationException>(() => ReloadItem(item.Id));
+        Assert.Empty(await native.Store!.ListProtectedAsync(10));
+    }
+
+    private async Task<NzbWebDAV.Services.NativeCache.NativeCacheService> NewNativeCacheAsync()
+    {
+        var media = Path.Join(_configRoot, "native-media");
+        Directory.CreateDirectory(media);
+        // The fixture config already latched its active cache mode, so the cache gets its own.
+        var config = new ConfigManager();
+        config.UpdateValues(
+        [
+            new ConfigItem { ConfigName = ConfigKeys.CacheMode, ConfigValue = "native" },
+            new ConfigItem { ConfigName = ConfigKeys.NativeCacheMinFileMb, ConfigValue = "0" },
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.NativeCacheMetadataPath,
+                ConfigValue = Path.Join(_configRoot, "native-index"),
+            },
+            new ConfigItem
+            {
+                ConfigName = ConfigKeys.NativeCacheFolders,
+                ConfigValue = JsonSerializer.Serialize(new[]
+                {
+                    new NzbWebDAV.Services.NativeCache.NativeCacheFolder { Id = "media", Path = media, MinFreeBytes = 0 },
+                }),
+            },
+        ]);
+        var native = new NzbWebDAV.Services.NativeCache.NativeCacheService(
+            config, new FileBlobStore(), _patchStore);
+        Assert.True(await native.WaitForInitializationAsync());
+        return native;
+    }
+
+    /// <summary>Reads the first <paramref name="bytes"/> of the item through the cache so they are committed.</summary>
+    private static async Task SeedNativeCacheAsync(
+        NzbWebDAV.Services.NativeCache.NativeCacheService native, DavItem item, int bytes)
+    {
+        await using var stream = await native.WrapAsync(item,
+            _ => Task.FromResult<Stream>(new CacheableStream(new byte[item.FileSize!.Value])), CancellationToken.None);
+        var buffer = new byte[bytes];
+        var read = 0;
+        while (read < bytes)
+        {
+            var count = await stream.ReadAsync(buffer.AsMemory(read));
+            if (count == 0) break;
+            read += count;
+        }
+        Assert.Equal(bytes, read);
+    }
+
+    private sealed class CacheableStream(byte[] content) : MemoryStream(content), NzbWebDAV.Streams.ICacheReadEvidence
+    {
+        public bool LastReadCacheable => true;
+    }
+
+    [Fact]
     public async Task UrgentRepair_LiveCountBelowThresholdWithoutPersistedQualification_StillDefers()
     {
         ConfigureAutoRemove(threshold: 3, unlinkedOnly: true);
@@ -2222,7 +2318,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Par2RepairOutcome par2Outcome,
         TimeProvider? timeProvider = null,
         HealthWorkSchedulePolicy? healthWorkSchedule = null,
-        NzbWebDAV.Services.Regrab.ArrRegrabService? regrabService = null)
+        NzbWebDAV.Services.Regrab.ArrRegrabService? regrabService = null,
+        NzbWebDAV.Services.NativeCache.NativeCacheService? nativeCache = null)
     {
         await _usenet.ReplaceUnderlyingClientForTestsAsync(fake);
         var par2 = new ScriptedPar2RepairService(_configManager, _patchStore, par2Outcome);
@@ -2239,7 +2336,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             _healthCheckConnectionGate,
             timeProvider: timeProvider,
             healthWorkSchedule: healthWorkSchedule,
-            regrabService: regrabService);
+            regrabService: regrabService,
+            nativeCache: nativeCache);
         return (service, par2);
     }
 
