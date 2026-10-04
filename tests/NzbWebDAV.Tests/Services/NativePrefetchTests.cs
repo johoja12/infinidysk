@@ -460,6 +460,70 @@ public sealed class NativePrefetchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task RecentlyWarm_SkipsUnchangedCacheBeyondTheIntentWindowUntilItsBlocksChange()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs-unchanged.db"));
+        var item = Guid.NewGuid();
+        var identity = new NativeCacheIdentity(item.ToString("N"), "rev-a", 2L * NativeCacheStore.BlockSize);
+        var bytes = new byte[identity.Length];
+        new Random(2).NextBytes(bytes);
+        Assert.Null(await _store.GetCatalogueFingerprintAsync(identity));
+        Assert.True(await _store.WriteBlockAsync(identity, 0, bytes.AsMemory(0, NativeCacheStore.BlockSize)));
+        var fingerprint = await _store.GetCatalogueFingerprintAsync(identity);
+        Assert.NotNull(fingerprint);
+        Assert.Equal(fingerprint, await _store.GetCatalogueFingerprintAsync(identity));
+        jobs.RecordVerified(item, "rev-a", 0, 16, fingerprint);
+        var afterIntentWindow = DateTimeOffset.UtcNow.AddMinutes(1);
+
+        // Outside the intent window, an unchanged catalogue still counts as recently warm.
+        Assert.True(await NativePrefetchExecutor.IsRecentlyWarmAsync(_store, jobs, identity, item, [(0, 16)], afterIntentWindow, CancellationToken.None));
+
+        // Any catalogue change (here a newly cached block) means the file is checked again.
+        Assert.True(await _store.WriteBlockAsync(identity, NativeCacheStore.BlockSize, bytes.AsMemory(NativeCacheStore.BlockSize)));
+        Assert.NotEqual(fingerprint, await _store.GetCatalogueFingerprintAsync(identity));
+        Assert.False(await NativePrefetchExecutor.IsRecentlyWarmAsync(_store, jobs, identity, item, [(0, 16)], afterIntentWindow, CancellationToken.None));
+        // A verification recorded without a fingerprint never skips past the intent window.
+        jobs.RecordVerified(item, "rev-a", 0, 16);
+        Assert.False(await NativePrefetchExecutor.IsRecentlyWarmAsync(_store, jobs, identity, item, [(0, 16)], afterIntentWindow, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task RoutineVerification_DefersUntilTomorrowOnceTheDailyBudgetIsUsed()
+    {
+        var (identity, bytes) = await WriteBlocksAsync("verify-budget", 3);
+        await using var stream = new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new VerifiedSource(bytes, true)), () => true);
+        var spent = 0L;
+        var deferred = await Assert.ThrowsAsync<PrefetchDeferredException>(() => NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0,
+            _ => new ValueTask<bool>(true), _ => { }, CancellationToken.None,
+            verifyBudget: count => { if (spent + count > NativeCacheStore.BlockSize) return false; spent += count; return true; }));
+        Assert.Equal(PrefetchFailureCodes.Budget, deferred.FailureCode);
+        Assert.InRange(deferred.RetryAfter!.Value, TimeSpan.FromTicks(1), TimeSpan.FromDays(1));
+        Assert.Equal(NativeCacheStore.BlockSize, spent);
+
+        // Without a budget (manual warms) the same cache verifies and completes.
+        await NativePrefetchExecutor.WarmAsync(_store, stream, 0, 0, _ => new ValueTask<bool>(true), _ => { }, CancellationToken.None);
+    }
+
+    [Fact]
+    public void VerificationBudget_IsEnforcedPerDayAndSurvivesRestart()
+    {
+        var path = Path.Combine(_root, "jobs-budget.db");
+        using (var jobs = new PrefetchJobStore(path))
+        {
+            Assert.True(jobs.TryConsumeVerificationBytes(60, 100));
+            Assert.False(jobs.TryConsumeVerificationBytes(41, 100));
+            Assert.True(jobs.TryConsumeVerificationBytes(40, 100));
+        }
+        using var reopened = new PrefetchJobStore(path);
+        Assert.False(reopened.TryConsumeVerificationBytes(1, 100));
+        Assert.Equal(TimeSpan.FromHours(1),
+            NativePrefetchExecutor.UntilNextUtcDay(new DateTimeOffset(2026, 10, 4, 23, 0, 0, TimeSpan.Zero)));
+        Assert.Equal(TimeSpan.FromHours(20),
+            NativePrefetchExecutor.UntilNextUtcDay(new DateTimeOffset(2026, 10, 4, 8, 0, 0, TimeSpan.FromHours(4))));
+    }
+
+    [Fact]
     public async Task RecentlyWarm_RequiresRecordedVerificationOfCurrentGenerationAndCompleteCatalogue()
     {
         using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));

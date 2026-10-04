@@ -35,10 +35,13 @@ public static class PrefetchRemedies
     public const string RepairUnavailable = "repair-unavailable";
 }
 
-public sealed class PrefetchDeferredException(string message, bool countsAsFailure = false, string? failureCode = null) : Exception(message)
+public sealed class PrefetchDeferredException(string message, bool countsAsFailure = false, string? failureCode = null,
+    TimeSpan? retryAfter = null) : Exception(message)
 {
     public bool CountsAsFailure { get; } = countsAsFailure;
     public string? FailureCode { get; } = failureCode;
+    /// <summary>When to try again; null uses the coordinator's default short delay.</summary>
+    public TimeSpan? RetryAfter { get; } = retryAfter;
 }
 
 /// <summary>Warming cannot succeed by retrying: the job fails at once with a stable code and remedy.</summary>
@@ -70,6 +73,8 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
 {
     /// <summary>How long a damaged-release verdict keeps routine policies from re-enqueueing the item.</summary>
     public static readonly TimeSpan DamagedCooldown = TimeSpan.FromHours(24);
+    /// <summary>Cached bytes routine warming may re-read for verification per UTC day; manual warms are exempt.</summary>
+    public const long VerificationDailyBytes = 64L * 1024 * 1024 * 1024;
     private static readonly TimeSpan GovernorInterval = TimeSpan.FromSeconds(1);
     private PrefetchSettings Settings() => settingsProvider?.Invoke()
         ?? PrefetchSettings.Parse(config.GetEffectiveConfigValue(ConfigKeys.SmartPrefetchSettings));
@@ -110,7 +115,9 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
                 && (!current.PauseDuringPlayback || activeReads.Snapshot().Count == 0 && playback?.HasActivePlayback != true);
         }
         // A manual request is an explicit ask to prove the cache, so it hashes every block.
-        var sampling = jobs.HasOwner(job.Id, "manual") ? null : VerificationSample.ForRun(DateTimeOffset.UtcNow);
+        var manual = jobs.HasOwner(job.Id, "manual");
+        var sampling = manual ? null : VerificationSample.ForRun(DateTimeOffset.UtcNow);
+        Func<long, bool>? verifyBudget = manual ? null : bytes => jobs.TryConsumeVerificationBytes(bytes, VerificationDailyBytes);
         // Bytes this run filled since the last progress write; flushed with the next coverage update.
         var unreportedWarmed = 0L;
         var lanes = WarmLanesFor(item, factory);
@@ -123,7 +130,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
                     jobs.Progress(job.Id, cached.Identity.Generation, bytes, Interlocked.Exchange(ref unreportedWarmed, 0));
                 }, wireBudget.Token,
                 CanContinue, native.ActiveSettings?.ChunkMb ?? 64, sampling,
-                warmed => Interlocked.Add(ref unreportedWarmed, warmed), lanes).ConfigureAwait(false);
+                warmed => Interlocked.Add(ref unreportedWarmed, warmed), lanes, verifyBudget).ConfigureAwait(false);
         }
         catch (PrefetchSourceDamagedException damaged) when (!ct.IsCancellationRequested)
         {
@@ -136,7 +143,8 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
             throw ReportDamaged(scope.ServiceProvider, item, job, generation, null,
                 "The same source bytes failed verification on every retry: articles are missing, corrupt, or belong to a different post.");
         }
-        jobs.RecordVerified(job.ItemId, cached.Identity.Generation, job.Start, job.Length);
+        var fingerprint = await native.Store.GetCatalogueFingerprintAsync(cached.Identity, ct).ConfigureAwait(false);
+        jobs.RecordVerified(job.ItemId, cached.Identity.Generation, job.Start, job.Length, fingerprint);
         }
         catch (NativeCacheBusyException)
         {
@@ -207,7 +215,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
     public static async Task WarmAsync(NativeCacheStore store, NativeCachedStream stream, long start, long length,
         Func<long, ValueTask<bool>> spend, Action<long> progress, CancellationToken ct,
         Func<bool>? canContinue = null, int chunkMb = 64, VerificationSample? sampling = null,
-        Action<long>? warmed = null, WarmLanes? lanes = null)
+        Action<long>? warmed = null, WarmLanes? lanes = null, Func<long, bool>? verifyBudget = null)
     {
         if (start < 0 || start >= stream.Length || length < 0 || length > stream.Length - start)
             throw new ArgumentException("The warm range is outside the media file.");
@@ -219,9 +227,9 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         var initialMissing = await store.GetMissingRangeBytesAsync(stream.Identity, position, alignedEnd, ct).ConfigureAwait(false);
         await store.RestartPartialWarmAsync(stream.Identity, initialMissing, ct).ConfigureAwait(false);
         // A damaged sampled block suggests more damage nearby, so that run falls back to hashing every block.
-        if (await VerifyExistingRangesAsync(store, stream, position, alignedEnd, canContinue, progress, sampling, ct).ConfigureAwait(false)
+        if (await VerifyExistingRangesAsync(store, stream, position, alignedEnd, canContinue, progress, sampling, verifyBudget, ct).ConfigureAwait(false)
             && sampling is not null)
-            await VerifyExistingRangesAsync(store, stream, position, alignedEnd, canContinue, progress, null, ct).ConfigureAwait(false);
+            await VerifyExistingRangesAsync(store, stream, position, alignedEnd, canContinue, progress, null, verifyBudget, ct).ConfigureAwait(false);
         var missing = await store.GetMissingRangeBytesAsync(stream.Identity, position, alignedEnd, ct).ConfigureAwait(false);
         if (missing == 0)
         {
@@ -392,6 +400,9 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         return Math.Min(remaining, Math.Min(chunkBytes, Math.Max(MinTailPiece, share)));
     }
 
+    /// <summary>Time left until the next UTC midnight, when the daily verification budget resets.</summary>
+    internal static TimeSpan UntilNextUtcDay(DateTimeOffset now) => now.UtcDateTime.Date.AddDays(1) - now.UtcDateTime;
+
     private static string DamagedDetail(long position) =>
         $"Articles near {position / (1024 * 1024)} MiB are missing, corrupt, or belong to a different post on every provider.";
 
@@ -454,10 +465,22 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         Guid itemId, IEnumerable<(long Start, long Length)> ranges, DateTimeOffset since, CancellationToken ct)
     {
         var any = false;
+        string? fingerprint = null;
+        var fingerprintRead = false;
         foreach (var (start, length) in ranges)
         {
             if (start < 0 || length < 0 || start >= identity.Length || length > identity.Length - start) return false;
-            if (!jobs.WasVerifiedSince(itemId, identity.Generation, start, length, since)) return false;
+            if (!jobs.WasVerifiedSince(itemId, identity.Generation, start, length, since))
+            {
+                // Older than the intent window: still skip while the cached blocks are unchanged since
+                // that verification (retained up to 168 hours), so unchanged files are rechecked weekly.
+                if (!fingerprintRead)
+                {
+                    fingerprint = await store.GetCatalogueFingerprintAsync(identity, ct).ConfigureAwait(false);
+                    fingerprintRead = true;
+                }
+                if (fingerprint is null || !jobs.WasVerifiedUnchanged(itemId, identity.Generation, start, length, fingerprint)) return false;
+            }
             var (alignedStart, alignedEnd) = AlignedRange(start, length, identity.Length);
             if (await store.GetMissingRangeBytesAsync(identity, alignedStart, alignedEnd, ct).ConfigureAwait(false) != 0) return false;
             any = true;
@@ -470,7 +493,8 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
     /// Returns true when a block failed and was invalidated for refill.
     /// </summary>
     private static async Task<bool> VerifyExistingRangesAsync(NativeCacheStore store, NativeCachedStream stream,
-        long start, long end, Func<bool>? canContinue, Action<long> progress, VerificationSample? sampling, CancellationToken ct)
+        long start, long end, Func<bool>? canContinue, Action<long> progress, VerificationSample? sampling,
+        Func<long, bool>? verifyBudget, CancellationToken ct)
     {
         // Catalogue coverage is a snapshot. It cannot prove the mounted data still
         // exists or matches its committed hash. Validate only this job's blocks,
@@ -502,6 +526,10 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
                 if (!stream.IsSourceCurrent) throw new PrefetchDeferredException("Source changed before cache verification.", failureCode: PrefetchFailureCodes.SourceChanged);
                 if (canContinue?.Invoke() == false)
                     throw new PrefetchDeferredException("Warming is paused or foreground playback has priority.", failureCode: PrefetchFailureCodes.Busy);
+                if (verifyBudget?.Invoke(range.Count) == false)
+                    throw new PrefetchDeferredException(
+                        $"Today's routine cache verification reads ({VerificationDailyBytes / (1024 * 1024 * 1024)} GiB) are used up; checking resumes tomorrow.",
+                        failureCode: PrefetchFailureCodes.Budget, retryAfter: UntilNextUtcDay(DateTimeOffset.UtcNow));
                 if (!await stream.VerifyCachedBlockAsync(range.Offset, ct).ConfigureAwait(false))
                 {
                     // Missing/truncated/corrupt data invalidates the indexed block

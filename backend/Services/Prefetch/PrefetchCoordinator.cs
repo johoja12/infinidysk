@@ -89,7 +89,7 @@ public sealed class PrefetchCoordinator(PrefetchJobStore store, IPrefetchExecuto
             }
             catch (PrefetchDeferredException exception)
             {
-                store.Defer(job.Id, exception.Message, TimeSpan.FromMinutes(1), exception.CountsAsFailure, exception.FailureCode);
+                store.Defer(job.Id, exception.Message, exception.RetryAfter ?? TimeSpan.FromMinutes(1), exception.CountsAsFailure, exception.FailureCode);
                 return;
             }
             catch (IOException exception)
