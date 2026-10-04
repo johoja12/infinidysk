@@ -637,11 +637,14 @@ def main():
         full = request("/api/migration/nzbdav/full/status")
         if full.get("masterManifestDigest") not in (None, MASTER):
             raise RuntimeError("Active full recovery master differs from the Plex runner")
-        schedule = load_schedule(PRIORITY_SCHEDULE, MASTER, BATCH_COUNT)
-        index = next_batch(full.get("batches", []), BATCH_COUNT, schedule)
-        if index is None:
-            break
-        verify_selected_manifest(schedule, BATCHES, index)
+        try:
+            schedule = load_schedule(PRIORITY_SCHEDULE, MASTER, BATCH_COUNT)
+            index = next_batch(full.get("batches", []), BATCH_COUNT, schedule)
+            if index is None:
+                break
+            verify_selected_manifest(schedule, BATCHES, index)
+        except (ValueError, KeyError, TypeError, StopIteration) as error:
+            raise RuntimeError(f"Invalid Plex priority schedule: {error}") from error
         log(f"selected batch {index + 1}/{BATCH_COUNT}; Plex hub priority={schedule is not None}")
         stage_name, destination, manifest = stage_batch(index)
         ensure_scan_and_run(index, stage_name, destination, manifest, allow_out_of_order=schedule is not None)
@@ -673,7 +676,8 @@ if __name__ == "__main__":
             "no longer matches the sealed mapped inventory",
             "source symlink changed", "Planned source link",
             "Excluded source is present", "missing source evidence changed",
-            "accounted for", "Validation evidence does not match")):
+            "accounted for", "Validation evidence does not match",
+            "Invalid Plex priority schedule", "Active full recovery master differs")):
             sys.exit(78)
         raise
     finally:
