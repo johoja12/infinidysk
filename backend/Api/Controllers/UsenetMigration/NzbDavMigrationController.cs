@@ -109,7 +109,8 @@ public sealed class NzbDavMigrationController(
                     request.RecoverableCount,
                     request.MaxQueueDepth ?? 5,
                     request.SubmitWorkers ?? 1,
-                    categories),
+                    categories,
+                    request.AllowOutOfOrder),
                 HttpContext.RequestAborted).ConfigureAwait(false);
         }
         catch (InvalidOperationException exception)
@@ -139,6 +140,7 @@ public sealed class NzbDavMigrationController(
         {
             status = true,
             recoveryStatus = master.Status,
+            masterManifestDigest = master.ManifestDigest,
             sourceLinkCount = master.SourceLinkCount,
             recoverableCount = master.RecoverableCount,
             coverage = master.SourceLinkCount == 0
@@ -688,7 +690,8 @@ public sealed record NzbDavFullConnectRequest(
     int SourceLinkCount,
     int RecoverableCount,
     int? MaxQueueDepth,
-    int? SubmitWorkers);
+    int? SubmitWorkers,
+    bool AllowOutOfOrder = false);
 public sealed record NzbDavBatchPlanAcknowledgementRequest(
     string? PlanDigest,
     int AppliedCount,

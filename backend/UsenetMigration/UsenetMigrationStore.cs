@@ -33,7 +33,8 @@ internal sealed record NzbDavFullConnectionValues(
     int RecoverableCount,
     int MaxQueueDepth,
     int SubmitWorkers,
-    IReadOnlyList<string> SourceCategories);
+    IReadOnlyList<string> SourceCategories,
+    bool AllowOutOfOrder = false);
 
 internal sealed record NzbDavFullConnectionResult(
     MigrationNzbDavMaster Master,
@@ -389,8 +390,8 @@ public sealed class UsenetMigrationStore : IDisposable
             .Where(item => item.MasterId == master.Id)
             .OrderBy(item => item.BatchIndex)
             .ToListAsync(ct).ConfigureAwait(false);
-        if (values.BatchIndex != batches.Count
-            || batches.Select(item => item.BatchIndex).Where((index, position) => index != position).Any())
+        if (!values.AllowOutOfOrder && (values.BatchIndex != batches.Count
+            || batches.Select(item => item.BatchIndex).Where((index, position) => index != position).Any()))
             throw new InvalidOperationException("Full-library batches must be connected in contiguous index order.");
         if (batches.Any(item => item.Status != "acknowledged"))
             throw new InvalidOperationException(

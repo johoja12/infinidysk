@@ -300,6 +300,48 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task FullConnect_ExplicitPriorityOrderPreservesActiveAndPackageGuards()
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var digest = new string('e', 64);
+        var first = await CreateFullPackageAsync("priority-0", digest, 0, 3);
+        var last = await CreateFullPackageAsync("priority-2", digest, 2, 3);
+        var middle = await CreateFullPackageAsync("priority-1", digest, 1, 3);
+        var changed = await CreateFullPackageAsync("priority-2-changed", digest, 2, 3);
+        var controller = CreateController(harness);
+        var priority = new NzbDavFullConnectRequest(last, digest, 100, 95, 5, 1, true);
+        // Reordering is for remaining batches of an established master.
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(priority));
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(
+            new NzbDavFullConnectRequest(first, digest, 100, 95, 5, 1)));
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(priority));
+        await using (var db = harness.Mig())
+        {
+            var batch = await db.NzbDavBatches.SingleAsync();
+            batch.Status = "acknowledged";
+            await db.SaveChangesAsync();
+        }
+        await harness.Store.UpdateSessionAsync(session => session.Status = "connected");
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(priority with { AllowOutOfOrder = false }));
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(priority with { RecoverableCount = 94 }));
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(priority));
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(priority));
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(priority with { PackagePath = changed }));
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(priority with { PackagePath = middle }));
+        await using (var db = harness.Mig())
+        {
+            var batch = await db.NzbDavBatches.SingleAsync(item => item.BatchIndex == 2);
+            batch.Status = "acknowledged";
+            await db.SaveChangesAsync();
+        }
+        await harness.Store.UpdateSessionAsync(session => session.Status = "connected");
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(priority with { PackagePath = middle }));
+        await using (var db = harness.Mig())
+            Assert.Equal(new[] { 0, 1, 2 }, await db.NzbDavBatches.OrderBy(item => item.BatchIndex)
+                .Select(item => item.BatchIndex).ToArrayAsync());
+    }
+
+    [Fact]
     public async Task FullConnect_AllowsSecondRootMasterAfterFirstIsAcknowledged()
     {
         await using var harness = await MigrationTestHarness.CreateAsync();
