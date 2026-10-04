@@ -754,6 +754,7 @@ public class RadarrSonarrClientTests
             var firstEpisodeFile = new { id = 302, seriesId = 202, path = firstFile };
             var secondEpisodeFile = new { id = 303, seriesId = 202, path = secondFile };
             var handler = CreateHandler(
+                ("GET /api/v3/parse?title=sample-01.mkv", JsonResponse("{}")),
                 ("GET /api/v3/series", JsonResponse(JsonSerializer.Serialize(series))),
                 ("GET /api/v3/episodefile?seriesId=202",
                     JsonResponse(JsonSerializer.Serialize(new[] { firstEpisodeFile }))),
@@ -774,6 +775,7 @@ public class RadarrSonarrClientTests
             Assert.Equal(303, cachedMatch?.FileId);
             Assert.Equal(new[]
             {
+                "GET /api/v3/parse?title=sample-01.mkv",
                 "GET /api/v3/series",
                 "GET /api/v3/episodefile?seriesId=202",
                 "GET /api/v3/episode?episodeFileId=302",
@@ -847,13 +849,15 @@ public class RadarrSonarrClientTests
         string seriesPath)
     {
         var handler = CreateHandler(
+            ("GET /api/v3/parse?title=sample.mkv", JsonResponse(JsonSerializer.Serialize(
+                new { series = new { id = 101, path = seriesPath } }))),
             ("GET /api/v3/series", JsonResponse(JsonSerializer.Serialize(
                 new[] { new { id = 101, path = seriesPath } }))));
         using var httpClient = new HttpClient(handler);
         var client = new TestSonarrClient($"http://sonarr-reject-{scenario}.test", httpClient);
 
         Assert.Null(await client.FindMediaFileAsync(filePath));
-        Assert.Equal(new[] { "GET /api/v3/series" }, handler.Requests);
+        Assert.Equal(new[] { "GET /api/v3/parse?title=sample.mkv", "GET /api/v3/series" }, handler.Requests);
     }
 
     [Fact]

@@ -150,21 +150,16 @@ internal sealed record NntpWholePathScenario(
         };
 
     public static IReadOnlyList<NntpWholePathScenario> ForSet(string set) =>
-        set.Equals("quick", StringComparison.OrdinalIgnoreCase)
-            ? Quick
-            : set.Equals("sustained", StringComparison.OrdinalIgnoreCase)
-                ? Sustained
-                : set.Equals("profile", StringComparison.OrdinalIgnoreCase)
-                    ? Profile
-                    : set.Equals("cold", StringComparison.OrdinalIgnoreCase)
-                        ? Cold
-                        : set.Equals("native-cold", StringComparison.OrdinalIgnoreCase)
-                            ? NativeCold
-                            : throw new ArgumentException(
-                                "--set must be 'quick', 'sustained', 'profile', 'cold', or 'native-cold'.",
-                        : set.Equals("smoothness", StringComparison.OrdinalIgnoreCase)
-                            ? Smoothness
-                            : throw new ArgumentException(
-                                "--set must be 'quick', 'sustained', 'profile', 'cold', or 'smoothness'.",
-                                nameof(set));
+        set.ToLowerInvariant() switch
+        {
+            "quick" => Quick,
+            "sustained" => Sustained,
+            "profile" => Profile,
+            "cold" => Cold,
+            "native-cold" => NativeCold,
+            "smoothness" => Smoothness,
+            _ => throw new ArgumentException(
+                "--set must be 'quick', 'sustained', 'profile', 'cold', 'native-cold', or 'smoothness'.",
+                nameof(set)),
+        };
 }
