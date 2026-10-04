@@ -45,7 +45,7 @@ function library(): PlexCatalogueLibrary {
 }
 
 describe("Plex source presentation", () => {
-  it("renders accessible library and nested collection accordions", async () => {
+  it("renders accessible library accordions with hubs and collections side by side", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     render(
@@ -68,14 +68,41 @@ describe("Plex source presentation", () => {
     await user.click(libraryButton);
     expect(libraryButton.getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByLabelText("Enable TV source On Deck")).toBeTruthy();
-
-    const collections = screen.getByRole("button", { name: "Show TV collections" });
-    expect(collections.getAttribute("aria-expanded")).toBe("false");
-    await user.click(collections);
+    // Collections are visible as soon as the library opens, beside its hubs.
+    expect(screen.getByRole("heading", { name: "Hubs (1)" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Collections (1)" })).toBeTruthy();
     expect(screen.getByLabelText("Enable TV collection Anime")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /collections/i })).toBeNull();
     expect(
       screen.getByLabelText("Enable TV collection Anime").closest("label")?.className,
-    ).toContain("min-h-11");
+    ).toContain("min-h-10");
+  });
+
+  it("shows ten sources per list until Show all is pressed", async () => {
+    const user = userEvent.setup();
+    const base = library();
+    const collections = Array.from({ length: 15 }, (_, index) => ({
+      ...base.collections[0]!,
+      id: `c${index}`,
+      key: `/library/collections/${index}/children`,
+      title: `Collection ${String(index).padStart(2, "0")}`,
+    }));
+    render(
+      <PlexMediaSection
+        type="show"
+        title="TV shows"
+        enabled
+        libraries={[{ ...base, collections }]}
+        settings={parsePrefetchSettings(undefined)}
+        onChange={vi.fn()}
+        onCustomize={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Show TV sources" }));
+    expect(screen.getByLabelText("Enable TV collection Collection 09")).toBeTruthy();
+    expect(screen.queryByLabelText("Enable TV collection Collection 10")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Show all 15 collections" }));
+    expect(screen.getByLabelText("Enable TV collection Collection 14")).toBeTruthy();
   });
 
   it("shows customization only for configured sources", async () => {

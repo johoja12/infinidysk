@@ -26,6 +26,55 @@ type CatalogueInput = {
   disabledLibraries: DisabledPlexLibrary[];
 };
 
+/** Group title for server-wide hubs that belong to no single library. */
+export const HOME_SCREEN_HUBS = "Home screen hubs";
+
+/** A hub backed by a library collection that Plex shows on the home screen. */
+export function isHomeCollection(source: PlexSource): boolean {
+  return source.kind === "hub" && source.key.startsWith("/library/collections/");
+}
+
+export type PlexSourceMatch = { library: PlexCatalogueLibrary; sources: PlexSource[] };
+
+/** Hubs and collections whose title contains the query, grouped by library in catalogue order. */
+export function searchPlexCatalogue(
+  catalogue: { movie: PlexCatalogueLibrary[]; show: PlexCatalogueLibrary[] },
+  query: string,
+): PlexSourceMatch[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return [];
+  return [...catalogue.movie, ...catalogue.show]
+    .map((library) => ({
+      library,
+      sources: [...library.hubs, ...library.collections].filter((source) =>
+        source.title.toLowerCase().includes(needle),
+      ),
+    }))
+    .filter((match) => match.sources.length > 0);
+}
+
+export type EnabledPlexSource = { source: PrefetchSource; libraryTitle: string };
+
+/** Enabled saved sources for one server, labelled with the library they warm from. */
+export function enabledPlexSources(
+  serverId: string,
+  savedSources: PrefetchSource[],
+  catalogue: { movie: PlexCatalogueLibrary[]; show: PlexCatalogueLibrary[] },
+): EnabledPlexSource[] {
+  const libraries = [...catalogue.movie, ...catalogue.show];
+  return savedSources
+    .filter((source) => source.Enabled && source.ServerId === serverId)
+    .map((source) => ({
+      source,
+      libraryTitle:
+        libraries.find(
+          (library) =>
+            library.identity.libraryId === source.LibraryId &&
+            library.identity.type === mediaSection(source.Type),
+        )?.title ?? (source.LibraryId ? "Saved library" : HOME_SCREEN_HUBS),
+    }));
+}
+
 export function mediaSection(type: string): PlexMediaSection | null {
   if (type === "movie") return "movie";
   if (type === "show" || type === "episode") return "show";
@@ -122,16 +171,26 @@ export function buildPlexSourceCatalogue({
     if (type) addGroup({ serverId, libraryId: library.id, type }, library.title);
   }
 
+  // Plex repeats a library's hubs among the server-wide home hubs; each source is listed once.
+  const libraryKeys = new Set(
+    sources
+      .filter(
+        (source) =>
+          source.serverId === serverId && source.libraryId && librariesById.has(source.libraryId),
+      )
+      .map((source) => source.key),
+  );
   const catalogueKeys = new Set<string>();
   for (const source of sources) {
     if (source.serverId !== serverId || catalogueKeys.has(catalogueSourceKey(source))) continue;
+    if (!source.libraryId && libraryKeys.has(source.key)) continue;
     const library = source.libraryId ? librariesById.get(source.libraryId) : undefined;
     const type = library ? mediaSection(library.type) : mediaSection(source.type);
     if (!type) continue;
     catalogueKeys.add(catalogueSourceKey(source));
     const group = addGroup(
       { serverId, libraryId: source.libraryId ?? "", type },
-      library?.title ?? "More from Plex",
+      library?.title ?? HOME_SCREEN_HUBS,
     );
     if (source.kind === "collection") group.collections.push(source);
     else if (source.kind === "hub") group.hubs.push(source);
@@ -151,12 +210,15 @@ export function buildPlexSourceCatalogue({
     const library = source.LibraryId ? librariesById.get(source.LibraryId) : undefined;
     const group = addGroup(
       { serverId, libraryId: source.LibraryId, type },
-      library?.title ?? (source.LibraryId ? "Saved library" : "More from Plex"),
+      library?.title ?? (source.LibraryId ? "Saved library" : HOME_SCREEN_HUBS),
     );
     group.unavailable.push(source);
   }
 
   for (const group of groups.values()) {
+    // A collection Plex promotes to the home screen is also a hub with the same key: list it once.
+    const hubKeys = new Set(group.hubs.map((source) => source.key));
+    group.collections = group.collections.filter((source) => !hubKeys.has(source.key));
     group.hubs.sort(compareSources);
     group.collections.sort((left, right) => left.title.localeCompare(right.title));
     group.unavailable.sort((left, right) => left.Title.localeCompare(right.Title));
