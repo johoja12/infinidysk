@@ -52,7 +52,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
     private readonly int _stripeCount;
     // Producer-only: stripes the next group may use, between 1 and _stripeCount.
     private int _stripeTarget;
-    private int _activeBatches;
+    private readonly List<Task> _activeRemoteBatches = [];
     private readonly InFlightArticleBudget? _budget;
     private long _inFlightPrefetchBytes;
     // Producer-only enqueue progress, read by ShouldStopPrefetch.
@@ -966,13 +966,12 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
                     GetPlannedSegmentBytes(batchStart + slot), cancellationToken).ConfigureAwait(false);
             }
 
-            var (running, admitted) = await IssueBatchAsync(
+            var (running, admitted, usesRemoteConnection) = await IssueBatchAsync(
                     batchStart, Enumerable.Range(0, batchCount).ToArray(), group, cancellationToken)
                 .ConfigureAwait(false);
             await PublishReadyAsync(batchStart, group, cancellationToken).ConfigureAwait(false);
             await admitted.WaitAsync(cancellationToken).ConfigureAwait(false);
-            if (running is { IsCompleted: false })
-                TrackRunningBatch(running);
+            await TrackRunningBatchAsync(running, usesRemoteConnection).ConfigureAwait(false);
             return batchCount;
         }
         catch
@@ -1042,7 +1041,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
                 var runningBefore = issuedBatches.Count(batch => !batch.IsCompleted);
                 var issue = IssueBatchAsync(groupStart, slots, group, cancellationToken);
                 var waited = !issue.IsCompleted;
-                var (lastResponse, admitted) = await issue.ConfigureAwait(false);
+                var (lastResponse, admitted, usesRemoteConnection) = await issue.ConfigureAwait(false);
                 if (!admitted.IsCompleted)
                 {
                     // Local hits returned ahead of remote admission are readable now; the
@@ -1051,18 +1050,17 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
                     var probe = await IssueLocalFrontierAsync(groupStart, group, remaining, cancellationToken)
                         .ConfigureAwait(false);
                     await Task.WhenAll(admitted, probe.Admitted).WaitAsync(cancellationToken).ConfigureAwait(false);
-                    if (probe.Running is { IsCompleted: false })
-                        TrackRunningBatch(probe.Running);
+                    await TrackRunningBatchAsync(probe.Running, probe.UsesRemoteConnection).ConfigureAwait(false);
                     waited = true;
                 }
 
-                if (lastResponse is { IsCompleted: false })
-                    TrackRunningBatch(lastResponse);
+                var remote = await usesRemoteConnection.ConfigureAwait(false);
+                await TrackRunningBatchAsync(lastResponse, usesRemoteConnection).ConfigureAwait(false);
                 // Admitted only once one of this group's own batches finished: the stream
                 // holds fewer connections than stripes, so shrink to what it actually holds.
                 if (waited && issuedBatches.Count(batch => !batch.IsCompleted) < runningBefore)
-                    _stripeTarget = Math.Clamp(Volatile.Read(ref _activeBatches), 1, _stripeCount);
-                if (lastResponse is not null)
+                    _stripeTarget = Math.Clamp(ActiveRemoteBatchCount(), 1, _stripeCount);
+                if (remote && lastResponse is not null)
                     issuedBatches.Add(lastResponse);
                 await PublishReadyAsync(groupStart, group, cancellationToken).ConfigureAwait(false);
             }
@@ -1082,7 +1080,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
     /// wait on another batch's admission. A remote probe is the nearest segment, which is what
     /// narrowing would pick anyway; the caller awaits its admission before tracking it.
     /// </summary>
-    private async Task<(Task? Running, Task Admitted)> IssueLocalFrontierAsync(
+    private async Task<(Task? Running, Task Admitted, Task<bool> UsesRemoteConnection)> IssueLocalFrontierAsync(
         int groupStart,
         PipelinedGroup group,
         List<int> remaining,
@@ -1092,14 +1090,14 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
         {
             var slot = group.Published;
             remaining.Remove(slot);
-            var (running, admitted) = await IssueBatchAsync(groupStart, [slot], group, cancellationToken)
+            var (running, admitted, usesRemoteConnection) = await IssueBatchAsync(groupStart, [slot], group, cancellationToken)
                 .ConfigureAwait(false);
             await PublishReadyAsync(groupStart, group, cancellationToken).ConfigureAwait(false);
-            if (running is null && admitted.IsCompleted) continue;
-            return (running, admitted);
+            if (!await usesRemoteConnection.ConfigureAwait(false)) continue;
+            return (running, admitted, usesRemoteConnection);
         }
 
-        return (null, Task.CompletedTask);
+        return (null, Task.CompletedTask, Task.FromResult(false));
     }
 
     /// <summary>Removes and returns remaining[0], remaining[stride], ... up to width slots.</summary>
@@ -1118,7 +1116,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
     /// Issues one batch. Running completes as the batch nears release (null if already done);
     /// Admitted completes once its remote requests hold a connection.
     /// </summary>
-    private async Task<(Task? Running, Task Admitted)> IssueBatchAsync(
+    private async Task<(Task? Running, Task Admitted, Task<bool> UsesRemoteConnection)> IssueBatchAsync(
         int groupStart,
         int[] slots,
         PipelinedGroup group,
@@ -1126,6 +1124,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
     {
         Task? running = null;
         var admitted = Task.CompletedTask;
+        var usesRemoteConnection = Task.FromResult(false);
         // Known degraded holes never enter a provider batch. They still ask local
         // patch/cache layers first, and their tasks stay in file order with live
         // results so the consumer's segment-boundary contract is unchanged.
@@ -1141,11 +1140,12 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
                 .ConfigureAwait(false);
             liveResponses = fetched.Responses;
             admitted = fetched.Admitted;
+            usesRemoteConnection = fetched.UsesRemoteConnection;
             EnqueueBatchCompletionObserver(fetched.Completion);
             // Responses complete in order and the connection is released only after the last
             // body drains, so the last response is a race-free "about to free" marker.
             if (liveResponses.Length > 0 && !liveResponses[^1].IsCompleted)
-                running = ObserveRemoteResponseAsync(fetched.UsesRemoteConnection, liveResponses[^1]);
+                running = liveResponses[^1];
         }
 
         var liveResponseIndex = 0;
@@ -1167,31 +1167,26 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
                     cancellationToken);
         }
 
-        return (running, admitted);
+        return (running, admitted, usesRemoteConnection);
     }
 
-    private static async Task ObserveRemoteResponseAsync(
-        Task<bool> usesRemoteConnection, Task<UsenetDecodedBodyResponse> response)
+    // Producer-only. Pruning completed response tasks avoids counting a released batch
+    // while its completion continuation is still waiting for a thread-pool worker.
+    private int ActiveRemoteBatchCount()
     {
-        if (await usesRemoteConnection.ConfigureAwait(false))
-            await ((Task)response).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        _activeRemoteBatches.RemoveAll(batch => batch.IsCompleted);
+        return _activeRemoteBatches.Count;
     }
 
-    // Producer-only. Holding more batches at once than the target proves the capacity is back.
-    private void TrackRunningBatch(Task lastResponse)
+    private async Task TrackRunningBatchAsync(Task? lastResponse, Task<bool> usesRemoteConnection)
     {
-        var running = Interlocked.Increment(ref _activeBatches);
-        if (running > _stripeTarget)
-            _stripeTarget = Math.Min(_stripeCount, running);
-        lastResponse.ContinueWith(
-            static (_, state) => ((MultiSegmentStream)state!).ReleaseRunningBatch(),
-            this,
-            CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
+        if (!await usesRemoteConnection.ConfigureAwait(false) || lastResponse is null || lastResponse.IsCompleted)
+            return;
+        ActiveRemoteBatchCount();
+        _activeRemoteBatches.Add(lastResponse);
+        if (_activeRemoteBatches.Count > _stripeTarget)
+            _stripeTarget = Math.Min(_stripeCount, _activeRemoteBatches.Count);
     }
-
-    private void ReleaseRunningBatch() => Interlocked.Decrement(ref _activeBatches);
 
     /// <summary>Publishes the longest file-order prefix of created tasks.</summary>
     private async Task PublishReadyAsync(
