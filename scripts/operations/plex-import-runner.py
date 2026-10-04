@@ -15,6 +15,7 @@ import zipfile
 from pathlib import Path
 
 from existing_id_imports import id_target, skip_existing
+from plex_hub_priority import load_schedule, next_batch, verify_selected_manifest
 
 HOST = "http://192.168.20.65:8080"
 BASE = Path("/mnt/nzbdav-cache3/infinidysk-migration-artifacts/mapped-20260924T214816Z/plex")
@@ -37,6 +38,7 @@ SUBMIT_WORKERS = 1
 REPORTS = BASE / "import-reports"
 JOURNAL_DIR = BASE / "journals"
 POLL_SECONDS = 15
+PRIORITY_SCHEDULE = REPORTS / "plex-hub-priority.json"
 
 
 def log(message):
@@ -136,7 +138,7 @@ def stage_batch(batch_index):
     return stage_name, destination, manifest
 
 
-def ensure_scan_and_run(batch_index, stage_name, destination, manifest):
+def ensure_scan_and_run(batch_index, stage_name, destination, manifest, allow_out_of_order=False):
     state = current_status()
     expected_root = f"/config/migration-input/{stage_name}"
     if state.get("sourcePackageRoot") != expected_root:
@@ -149,6 +151,7 @@ def ensure_scan_and_run(batch_index, stage_name, destination, manifest):
             "recoverableCount": RECOVERABLE_COUNT,
             "maxQueueDepth": MAX_QUEUE_DEPTH,
             "submitWorkers": SUBMIT_WORKERS,
+            "allowOutOfOrder": allow_out_of_order,
         })
         log(f"connected batch {batch_index + 1}: selected={result['selectionCount']} coverage={result['coverage']:.6%}")
         categories = sorted({link["libraryRelativePath"].split("/")[0]
@@ -630,18 +633,25 @@ def main():
     REPORTS.mkdir(parents=True, exist_ok=True)
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
     reconstruct_first_batch_report()
-    full = request("/api/migration/nzbdav/full/status")
-    batches = full.get("batches", [])
-    next_index = next((int(b["batchIndex"]) for b in batches if b.get("status") != "acknowledged"), len(batches))
-    log(f"resuming Plex migration at batch index {next_index}; {BATCH_COUNT} total")
-    for index in range(next_index, BATCH_COUNT):
+    while True:
+        full = request("/api/migration/nzbdav/full/status")
+        if full.get("masterManifestDigest") not in (None, MASTER):
+            raise RuntimeError("Active full recovery master differs from the Plex runner")
+        try:
+            schedule = load_schedule(PRIORITY_SCHEDULE, MASTER, BATCH_COUNT)
+            index = next_batch(full.get("batches", []), BATCH_COUNT, schedule)
+            if index is None:
+                break
+            verify_selected_manifest(schedule, BATCHES, index)
+        except (ValueError, KeyError, TypeError, StopIteration) as error:
+            raise RuntimeError(f"Invalid Plex priority schedule: {error}") from error
+        log(f"selected batch {index + 1}/{BATCH_COUNT}; Plex hub priority={schedule is not None}")
         stage_name, destination, manifest = stage_batch(index)
-        ensure_scan_and_run(index, stage_name, destination, manifest)
+        ensure_scan_and_run(index, stage_name, destination, manifest, allow_out_of_order=schedule is not None)
         process_batch(index, stage_name, destination, manifest)
-        if index + 1 < BATCH_COUNT:
-            health = urllib.request.urlopen(HOST + "/health", timeout=10)
-            if health.status != 200:
-                raise RuntimeError("InfiniDysk health check failed after an acknowledged batch")
+        health = urllib.request.urlopen(HOST + "/health", timeout=10)
+        if health.status != 200:
+            raise RuntimeError("InfiniDysk health check failed after an acknowledged batch")
     write_final_report()
     full = request("/api/migration/nzbdav/full/status")
     save_json(REPORTS / "full-migration-status-final.json", full)
@@ -666,7 +676,8 @@ if __name__ == "__main__":
             "no longer matches the sealed mapped inventory",
             "source symlink changed", "Planned source link",
             "Excluded source is present", "missing source evidence changed",
-            "accounted for", "Validation evidence does not match")):
+            "accounted for", "Validation evidence does not match",
+            "Invalid Plex priority schedule", "Active full recovery master differs")):
             sys.exit(78)
         raise
     finally:
