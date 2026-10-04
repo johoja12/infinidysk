@@ -194,7 +194,11 @@ public sealed class MultiSegmentStreamStripingTests
         for (var index = 16; index < 24; index++)
         {
             client.ReleaseSegment(index);
-            await stream.ReadExactlyAsync(next).AsTask().WaitAsync(Timeout);
+            try { await stream.ReadExactlyAsync(next).AsTask().WaitAsync(Timeout); }
+            catch (TimeoutException)
+            {
+                throw new TimeoutException($"Stalled at segment {index}; batches: {string.Join(";", client.ObservedBatchIndexes.Select(b => string.Join(",", b)))}");
+            }
             Assert.Equal(client.ExpectedConcatenation.AsSpan(index * SegmentSize, SegmentSize).ToArray(), next);
         }
 

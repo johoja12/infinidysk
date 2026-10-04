@@ -1694,7 +1694,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
 
         var row = Assert.Single(GetHealthRows(item.Id));
-        Assert.Equal(HealthCheckResult.HealthResult.Healthy, row.Result);
+        Assert.True(row.Result == HealthCheckResult.HealthResult.Healthy, row.Message);
         Assert.Empty(par2.Requests);
     }
 
@@ -2014,6 +2014,16 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         return new FakeNntpClient(
             present,
             useCachedYencStreams: true,
+            responseHeaderFactory: (id, _) =>
+            {
+                var index = Array.IndexOf(segments, id);
+                return index < 0 ? null : new UsenetYencHeader
+                {
+                    FileName = "fake.bin", FileSize = 128L * segments.Length, LineLength = 128,
+                    PartNumber = index + 1, TotalParts = segments.Length,
+                    PartOffset = 128L * index, PartSize = 128,
+                };
+            },
             decodedStreamFactory: (id, bytes) =>
             {
                 var index = Array.IndexOf(segments, id);

@@ -106,6 +106,7 @@ internal static class LocalDataBatchOverlay
             {
                 Responses = responses,
                 Completion = state.CompleteAsync(publisher, Task.CompletedTask),
+                UsesRemoteConnection = Task.FromResult(false),
             };
 #pragma warning restore CA2025
         }
@@ -192,6 +193,7 @@ internal static class LocalDataBatchOverlay
                 overlayState.CompleteAsync(overlayPublisher, inner.Completion),
                 abandonCts),
             Admitted = inner.Admitted,
+            UsesRemoteConnection = inner.UsesRemoteConnection,
         };
 #pragma warning restore CA2025
     }
@@ -225,6 +227,7 @@ internal static class LocalDataBatchOverlay
                 state.CompleteAsync(publisher, RemoteCompletionAsync(remote)),
                 abandonCts),
             Admitted = RemoteAdmittedAsync(remote),
+            UsesRemoteConnection = RemoteUsesConnectionAsync(remote),
         };
 #pragma warning restore CA2025
     }
@@ -270,6 +273,12 @@ internal static class LocalDataBatchOverlay
                 await DecodedBodyBatchCleanup.AbandonAsync(inner, abandonCts).ConfigureAwait(false);
             throw;
         }
+    }
+
+    private static async Task<bool> RemoteUsesConnectionAsync(Task<UsenetDecodedBodyBatch> remote)
+    {
+        try { return await (await remote.ConfigureAwait(false)).UsesRemoteConnection.ConfigureAwait(false); }
+        catch (Exception e) when (e is not OutOfMemoryException) { return false; }
     }
 
     private static async Task RemoteAdmittedAsync(Task<UsenetDecodedBodyBatch> remote)

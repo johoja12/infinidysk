@@ -1145,7 +1145,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
             // Responses complete in order and the connection is released only after the last
             // body drains, so the last response is a race-free "about to free" marker.
             if (liveResponses.Length > 0 && !liveResponses[^1].IsCompleted)
-                running = liveResponses[^1];
+                running = ObserveRemoteResponseAsync(fetched.UsesRemoteConnection, liveResponses[^1]);
         }
 
         var liveResponseIndex = 0;
@@ -1168,6 +1168,13 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
         }
 
         return (running, admitted);
+    }
+
+    private static async Task ObserveRemoteResponseAsync(
+        Task<bool> usesRemoteConnection, Task<UsenetDecodedBodyResponse> response)
+    {
+        if (await usesRemoteConnection.ConfigureAwait(false))
+            await ((Task)response).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
     }
 
     // Producer-only. Holding more batches at once than the target proves the capacity is back.
@@ -1292,7 +1299,8 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
     private sealed record FetchedBodyBatch(
         Task<UsenetDecodedBodyResponse>[] Responses,
         Task Completion,
-        Task Admitted);
+        Task Admitted,
+        Task<bool> UsesRemoteConnection);
 
     private async Task<FetchedBodyBatch> FetchAttributedBatchResponsesAsync(
         SegmentId[] liveIds,
@@ -1332,7 +1340,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
                 $"Pipelined BODY returned {batch.Responses.Count} responses for {liveIds.Length} requests.");
         }
 
-        return new FetchedBodyBatch(batch.Responses.ToArray(), batch.Completion, batch.Admitted);
+        return new FetchedBodyBatch(batch.Responses.ToArray(), batch.Completion, batch.Admitted, batch.UsesRemoteConnection);
     }
 
     private void EnqueueBatchCompletionObserver(Task completion)
