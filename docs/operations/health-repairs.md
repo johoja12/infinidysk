@@ -90,6 +90,25 @@ may delay when a due routine check actually runs.
 This schedule is independent of **Check older releases less thoroughly**, which changes
 how many segments are checked, not how often checks occur.
 
+### Files kept by the native cache [since unreleased](https://github.com/johoja12/infinidysk/issues/166){ .nzbdav-since }
+
+When articles are missing on Usenet but the [native cache](../configuration/native-cache-prefetch.md)
+holds the whole file, repair does not delete it. Before deleting, InfiniDysk reads back a
+sample of the cached blocks (always the head and tail). If they verify:
+
+- The file stays in the library and keeps playing from the cache.
+- The health result is **Unhealthy** with no repair action, and says the file is served
+  from the cache.
+- The cached copy is protected from eviction, like a pinned file, and is checked again
+  in a week.
+- No Sonarr/Radarr search starts, because the Arr will not replace a file it already has
+  at the same quality. Use **Regrab** in the file details to replace the release.
+
+If the cached copy cannot be read back right now (for example, a cache folder is
+offline), repair waits an hour instead of deleting. Partially cached files, and copies
+whose blocks fail verification, are repaired as usual. Protection is released
+automatically once the file is deleted or replaced by a different release.
+
 ## Health-check retention
 
 Health result rows prune by age (**Maintenance** retention or `DATABASE_HEALTHCHECK_RETENTION_DAYS`). Reset counters from Maintenance when needed.
