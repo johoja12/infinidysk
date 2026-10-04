@@ -294,7 +294,7 @@ public class DavMultipartFileStream : FastReadOnlyStream, ICacheReadEvidence
 
                 var partBudget = budget?.GetPartContribution(
                     part.FilePartByteRange.Count - extraOffset);
-                yield return OpenPartWithNativeIndexAsync(part, extraOffset, i, partBudget, budget, ct);
+                yield return OpenPartWithNativeIndexAsync(part, extraOffset, i, partBudget, ct);
                 i++;
                 continue;
             }
@@ -315,7 +315,7 @@ public class DavMultipartFileStream : FastReadOnlyStream, ICacheReadEvidence
 
     private async Task<Stream> OpenPartWithNativeIndexAsync(
         DavMultipartFile.FilePart part, long extraOffset, int partIndex,
-        long? readBudgetOverride, FiniteMultipartBudget? finiteBudget, CancellationToken ct)
+        long? readBudgetOverride, CancellationToken ct)
     {
         if (NativeCacheReadContext.IsActive && part.SegmentByteRangesTrusted != true &&
             part.VerificationProof is null)
@@ -327,7 +327,7 @@ public class DavMultipartFileStream : FastReadOnlyStream, ICacheReadEvidence
             }
             part = indexed;
         }
-        return OpenPart(part, extraOffset, partIndex, readBudgetOverride, finiteBudget);
+        return OpenPart(part, extraOffset, partIndex, readBudgetOverride);
     }
 
     private async Task<DavMultipartFile.FilePart?> TryBuildNativeIndexAsync(
@@ -475,7 +475,7 @@ public class DavMultipartFileStream : FastReadOnlyStream, ICacheReadEvidence
             0,
             targetIndex,
             budget?.GetPartContribution(part.FilePartByteRange.Count),
-            budget, ct).ConfigureAwait(false);
+            ct).ConfigureAwait(false);
     }
 
     private sealed class FiniteMultipartBudget(long remainingToSchedule)
