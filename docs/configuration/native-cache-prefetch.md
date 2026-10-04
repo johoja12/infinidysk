@@ -446,6 +446,15 @@ cannot identify every scanner. Keep the raw-read trigger off for Plex-only warmi
 After a source repair, native-backed WebDAV files expose a changed modification
 time. Refresh metadata on each rclone mount and reopen the file to revalidate its
 payload. Already-open player buffers remain outside the server's control.
-Repeated whole-file warming still reads/hashes the cached file; only concurrent
-in-flight verification is shared. See the [validation report](../testing/native-cache-followups.md)
+Routine warming of a file that is already cached only re-reads a sample of its
+blocks (the first four, the last two, and 2% of the rest, from 16 up to 128 blocks of
+4 MiB), and a policy refresh skips the file entirely while it was verified within
+**Intent lifetime**. Manual warms still hash every block.
+[Since unreleased](https://github.com/johoja12/infinidysk/issues/45){ .nzbdav-since },
+a file whose cached blocks are unchanged since its last verification is skipped for up
+to seven days even after Intent lifetime passes, so unchanged files are rechecked about
+weekly; refilled, rewritten or partly evicted files warm again as usual. Routine
+rechecks read at most 64 GiB of cached data per UTC day; a job that reaches the limit
+waits until the next day instead of completing unverified. Playback still hashes every
+block it serves. Only concurrent in-flight verification is shared. See the [validation report](../testing/native-cache-followups.md)
 for exact boundaries and upgrade/downgrade notes. Back up `/config` before upgrading.

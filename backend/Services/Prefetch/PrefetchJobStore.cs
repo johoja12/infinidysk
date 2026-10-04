@@ -121,6 +121,7 @@ public sealed class PrefetchJobStore : IDisposable
             INSERT OR IGNORE INTO State VALUES('paused','false');
             """);
         AddMissingJobColumns();
+        AddMissingColumns("Verified", ("Fingerprint", "TEXT"));
         Execute("""
             UPDATE Jobs SET ActiveMs=COALESCE(ActiveMs,0)+MAX(0,Updated-RunStarted),RunStarted=NULL WHERE RunStarted IS NOT NULL;
             DELETE FROM Jobs WHERE State IN ('queued','running','paused') AND Id NOT IN (SELECT Id FROM Owners WHERE Owner='manual');
@@ -136,6 +137,16 @@ public sealed class PrefetchJobStore : IDisposable
     /// Additive schema upgrade for databases created before job timing existed. Every column is
     /// nullable, so older rows read as "not recorded".
     /// </summary>
+    private void AddMissingColumns(string table, params (string Column, string Type)[] columns)
+    {
+        var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var command = Command($"PRAGMA table_info({table})"))
+        using (var reader = command.ExecuteReader())
+            while (reader.Read()) existing.Add(reader.GetString(1));
+        foreach (var (column, type) in columns)
+            if (!existing.Contains(column)) Execute($"ALTER TABLE {table} ADD COLUMN {column} {type} NULL");
+    }
+
     private void AddMissingJobColumns()
     {
         var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -527,17 +538,19 @@ public sealed class PrefetchJobStore : IDisposable
 
     /// <summary>
     /// Records that a completed warm verified every cached block of this range for one cache
-    /// generation, so routine policy refreshes can skip re-reading it within the intent window.
+    /// generation, so routine policy refreshes can skip re-reading it within the intent window,
+    /// or for as long as the catalogue <paramref name="fingerprint"/> stays the same.
     /// </summary>
-    public void RecordVerified(Guid itemId, string generation, long start, long length)
+    public void RecordVerified(Guid itemId, string generation, long start, long length, string? fingerprint = null)
     {
         if (start < 0 || length < 0 || generation is not { Length: > 0 and <= 512 }) throw new ArgumentException("Invalid verified range.");
         var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         lock (_gate)
         Atomic(() =>
         {
-            Execute("INSERT INTO Verified(ItemId,Generation,Start,Length,At) VALUES($item,$generation,$start,$length,$now) ON CONFLICT(ItemId,Generation,Start,Length) DO UPDATE SET At=excluded.At",
-                ("$item", itemId.ToString("N")), ("$generation", generation), ("$start", start), ("$length", length), ("$now", now));
+            Execute("INSERT INTO Verified(ItemId,Generation,Start,Length,At,Fingerprint) VALUES($item,$generation,$start,$length,$now,$fingerprint) ON CONFLICT(ItemId,Generation,Start,Length) DO UPDATE SET At=excluded.At,Fingerprint=excluded.Fingerprint",
+                ("$item", itemId.ToString("N")), ("$generation", generation), ("$start", start), ("$length", length), ("$now", now),
+                ("$fingerprint", (object?)fingerprint ?? DBNull.Value));
             // Bounded bookkeeping: the intent window is at most 168 hours, so older rows are never consulted.
             Execute("DELETE FROM Verified WHERE At<$cutoff", ("$cutoff", DateTimeOffset.UtcNow.AddHours(-168).ToUnixTimeMilliseconds()));
             Execute("DELETE FROM Verified WHERE rowid IN (SELECT rowid FROM Verified ORDER BY At DESC LIMIT -1 OFFSET 4096)");
@@ -559,6 +572,44 @@ public sealed class PrefetchJobStore : IDisposable
                 ("$start", start), ("$length", length));
             return command.ExecuteScalar() is not null;
         }
+    }
+
+    /// <summary>
+    /// True when a retained verification (at most 168 hours old) of this generation contains the range
+    /// and recorded the same catalogue fingerprint: the cached blocks have not changed since.
+    /// </summary>
+    public bool WasVerifiedUnchanged(Guid itemId, string generation, long start, long length, string fingerprint)
+    {
+        lock (_gate)
+        {
+            using var command = Command(
+                "SELECT 1 FROM Verified WHERE ItemId=$item AND Generation=$generation AND Fingerprint=$fingerprint AND Start<=$start " +
+                "AND (Length=0 OR ($length<>0 AND $start+$length<=Start+Length)) LIMIT 1",
+                ("$item", itemId.ToString("N")), ("$generation", generation), ("$fingerprint", fingerprint),
+                ("$start", start), ("$length", length));
+            return command.ExecuteScalar() is not null;
+        }
+    }
+
+    /// <summary>
+    /// Spends <paramref name="bytes"/> of today's (UTC) routine cache-verification reads; false once the
+    /// day's <paramref name="dailyLimit"/> would be exceeded, leaving the total unchanged.
+    /// </summary>
+    public bool TryConsumeVerificationBytes(long bytes, long dailyLimit)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(bytes);
+        var key = "verify-bytes:" + DateTimeOffset.UtcNow.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture);
+        lock (_gate)
+            return Atomic(() =>
+            {
+                using var read = Command("SELECT Value FROM State WHERE Key=$key", ("$key", key));
+                var used = long.TryParse(read.ExecuteScalar() as string, out var value) ? value : 0;
+                if (used + bytes > dailyLimit) return false;
+                Execute("INSERT INTO State(Key,Value) VALUES($key,$value) ON CONFLICT(Key) DO UPDATE SET Value=excluded.Value",
+                    ("$key", key), ("$value", (used + bytes).ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                Execute("DELETE FROM State WHERE Key LIKE 'verify-bytes:%' AND Key<>$key", ("$key", key));
+                return true;
+            });
     }
 
     public void Change(string id, string operation, int? priority = null)

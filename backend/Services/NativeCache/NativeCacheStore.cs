@@ -879,6 +879,36 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
         })).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Digest of an entry's catalogued blocks (offset, length and content hash), or null when none are
+    /// catalogued. Any refill, rewrite or invalidation of a block changes it.
+    /// </summary>
+    [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
+    public async Task<string?> GetCatalogueFingerprintAsync(NativeCacheIdentity identity, CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            using var command = Command("SELECT Offset,Count,Hash FROM Blocks WHERE Key=$key ORDER BY Offset", ("$key", identity.Key));
+            using var reader = command.ExecuteReader();
+            using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            Span<byte> numbers = stackalloc byte[12];
+            var blocks = 0;
+            while (reader.Read())
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(numbers, reader.GetInt64(0));
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(numbers[8..], reader.GetInt32(1));
+                digest.AppendData(numbers);
+                digest.AppendData((byte[])reader.GetValue(2));
+                blocks++;
+            }
+            return blocks == 0 ? null : Convert.ToHexString(digest.GetHashAndReset(), 0, 16);
+        }
+        finally { _gate.Release(); }
+    }
+
     [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
     public async Task<long> GetCoverageAsync(NativeCacheIdentity identity, CancellationToken cancellationToken = default)
     {

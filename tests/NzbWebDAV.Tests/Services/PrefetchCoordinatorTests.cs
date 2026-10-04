@@ -166,6 +166,30 @@ public sealed class PrefetchCoordinatorTests : IDisposable
         Assert.Equal(expected, Assert.Single(store.List()).State);
     }
 
+    [Theory]
+    [InlineData(180, 170, 190)]
+    [InlineData(null, 0, 2)]
+    public async Task Deferral_RetriesAfterTheRequestedDelay(int? retryMinutes, int minMinutes, int maxMinutes)
+    {
+        var path = Path.Combine(_root, "jobs-retry.db");
+        using var store = new PrefetchJobStore(path);
+        var job = store.Enqueue(Guid.NewGuid(), "manual", 0);
+        var retry = retryMinutes is { } minutes ? TimeSpan.FromMinutes(minutes) : (TimeSpan?)null;
+        using var coordinator = new PrefetchCoordinator(store,
+            new CallbackExecutor((_, _) => throw new PrefetchDeferredException("Budget used up.", retryAfter: retry)), () => new(), () => true);
+        var before = DateTimeOffset.UtcNow;
+        await coordinator.RunOnceAsync(CancellationToken.None);
+
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={path};Mode=ReadOnly");
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT Until FROM Deferred WHERE Id=$id";
+        command.Parameters.AddWithValue("$id", job.Id);
+        var until = DateTimeOffset.FromUnixTimeMilliseconds((long)command.ExecuteScalar()!);
+        Assert.InRange(until - before, TimeSpan.FromMinutes(minMinutes), TimeSpan.FromMinutes(maxMinutes));
+        Assert.Equal("queued", Assert.Single(store.List()).State);
+    }
+
     private sealed class FailingExecutor : IPrefetchExecutor
     {
         public Task ExecuteAsync(PrefetchJob job, CancellationToken ct) => throw new IOException("Temporary source failure");
