@@ -4,8 +4,12 @@ import type { DisabledPlexLibrary, PrefetchSource } from "./smart-prefetch-model
 import {
   buildPlexSourceCatalogue,
   catalogueSourceKey,
+  enabledPlexSources,
+  HOME_SCREEN_HUBS,
+  isHomeCollection,
   persistedSourceKey,
   recommendationFor,
+  searchPlexCatalogue,
 } from "./plex-source-catalogue";
 
 const libraries: PlexLibrary[] = [
@@ -167,5 +171,105 @@ describe("Plex source catalogue", () => {
     expect(
       recommendationFor(source({ id: "other", key: "/hubs/other", title: "Recently Added" })),
     ).toBe("recently-added");
+  });
+
+  it("lists each source once: no server-wide repeats and no second copy of home collections", () => {
+    const promoted = "/library/collections/90872/children";
+    const catalogue = buildPlexSourceCatalogue({
+      serverId: "server",
+      libraries,
+      sources: [
+        source({ kind: "hub", key: promoted, title: "Most Watched This Week" }),
+        source({
+          kind: "collection",
+          key: promoted,
+          title: "Most Watched This Week",
+          type: "collection",
+        }),
+        source({
+          kind: "collection",
+          key: "/library/collections/7/children",
+          title: "Alien / Predator",
+          type: "collection",
+        }),
+        source({ libraryId: null, key: promoted, title: "Most Watched This Week" }),
+        source({ libraryId: null, key: "/hubs/home/continueWatching", title: "Continue Watching" }),
+      ],
+      savedSources: [],
+      disabledLibraries: [],
+    });
+    const movies = catalogue.movie.find((library) => library.title === "Movies")!;
+    expect(movies.hubs.map((hub) => hub.title)).toEqual(["Most Watched This Week"]);
+    expect(isHomeCollection(movies.hubs[0]!)).toBe(true);
+    expect(movies.collections.map((collection) => collection.title)).toEqual(["Alien / Predator"]);
+    const home = catalogue.movie.find((library) => library.title === HOME_SCREEN_HUBS)!;
+    expect(home.hubs.map((hub) => hub.title)).toEqual(["Continue Watching"]);
+  });
+
+  it("searches every library case-insensitively and labels enabled sources by library", () => {
+    const catalogue = buildPlexSourceCatalogue({
+      serverId: "server",
+      libraries,
+      sources: [
+        source({
+          kind: "collection",
+          key: "/library/collections/1/children",
+          title: "Most Watched This Week",
+          type: "collection",
+        }),
+        source({
+          libraryId: "3",
+          kind: "collection",
+          key: "/library/collections/2/children",
+          title: "Most watched this month",
+          type: "collection",
+        }),
+        source({ libraryId: "2", key: "/hubs/on-deck", title: "On Deck", type: "show" }),
+      ],
+      savedSources: [
+        saved({
+          Kind: "collection",
+          Key: "/library/collections/2/children",
+          LibraryId: "3",
+          Title: "Most watched this month",
+        }),
+        saved({
+          Key: "/hubs/home/continueWatching",
+          LibraryId: "",
+          Title: "Continue Watching",
+          Enabled: true,
+        }),
+        saved({ Key: "/hubs/off", Title: "Off", Enabled: false }),
+      ],
+      disabledLibraries: [],
+    });
+    const matches = searchPlexCatalogue(catalogue, "  MOST watched ");
+    expect(
+      matches.map((match) => [match.library.title, match.sources.map((s) => s.title)]),
+    ).toEqual([
+      ["Movies", ["Most Watched This Week"]],
+      ["Cinema", ["Most watched this month"]],
+    ]);
+    expect(searchPlexCatalogue(catalogue, " ")).toEqual([]);
+    expect(
+      enabledPlexSources(
+        "server",
+        [
+          saved({
+            Kind: "collection",
+            Key: "/library/collections/2/children",
+            LibraryId: "3",
+            Title: "Most watched this month",
+          }),
+          saved({ Key: "/hubs/home/continueWatching", LibraryId: "", Title: "Continue Watching" }),
+          saved({ Key: "/hubs/off", Title: "Off", Enabled: false }),
+          saved({ ServerId: "other", Title: "Elsewhere" }),
+        ],
+        catalogue,
+      ).map((item) => [item.source.Title, item.libraryTitle]),
+    ).toEqual([
+      ["Most watched this month", "Cinema"],
+      ["Continue Watching", HOME_SCREEN_HUBS],
+    ]);
   });
 });

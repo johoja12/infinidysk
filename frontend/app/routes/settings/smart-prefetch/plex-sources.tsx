@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Alert } from "~/components/ui";
+import { Alert, Button, Input, Tabs } from "~/components/ui";
 import {
   loadPlexBootstrap,
   plexRequest,
@@ -11,8 +11,16 @@ import {
   type PlexSource,
   type PlexUser,
 } from "../plex/plex-api";
-import { buildPlexSourceCatalogue, persistedSourceKey } from "./plex-source-catalogue";
-import { PlexMediaSection } from "./plex-media-section";
+import {
+  buildPlexSourceCatalogue,
+  enabledPlexSources,
+  persistedSourceKey,
+  searchPlexCatalogue,
+  type PlexMediaSection as PlexMediaSectionType,
+} from "./plex-source-catalogue";
+import { enabledSourceCount, PlexMediaSection } from "./plex-media-section";
+import { PlexSourceRow } from "./plex-source-row";
+import { setPersistedSourceEnabled } from "./plex-source-selection";
 import { PlexSourceCustomization } from "./plex-source-customization";
 import { PlexSourceToolbar } from "./plex-source-toolbar";
 import type { PrefetchSettings, PrefetchSource } from "./smart-prefetch-model";
@@ -174,6 +182,20 @@ export function PlexSources({
       }),
     [serverId, libraries, sources, settings.Sources, settings.DisabledLibraries],
   );
+  const [query, setQuery] = useState("");
+  const [chosenSection, setChosenSection] = useState<PlexMediaSectionType | null>(null);
+  const section: PlexMediaSectionType =
+    chosenSection ?? (catalogue.movie.length > 0 || catalogue.show.length === 0 ? "movie" : "show");
+  const matches = useMemo(() => searchPlexCatalogue(catalogue, query), [catalogue, query]);
+  const matchCount = matches.reduce((total, match) => total + match.sources.length, 0);
+  const enabledSources = useMemo(
+    () => enabledPlexSources(serverId, settings.Sources, catalogue),
+    [serverId, settings.Sources, catalogue],
+  );
+  const sectionOn = (type: PlexMediaSectionType) =>
+    catalogue[type].reduce((total, library) => total + enabledSourceCount(library, settings), 0);
+  const customizeSource = (source: PrefetchSource) =>
+    setCustomizing(persistedSourceKey(source.ServerId, source.Kind, source.Key));
   const customizedSource = customizing
     ? settings.Sources.find(
         (source) => persistedSourceKey(source.ServerId, source.Kind, source.Key) === customizing,
@@ -245,31 +267,125 @@ export function PlexSources({
         <Alert variant="info">Only movie and TV libraries can be used for Smart Prefetch.</Alert>
       )}
       {serverId && (catalogue.movie.length > 0 || catalogue.show.length > 0) && (
-        <div className="grid gap-4 xl:grid-cols-2">
-          <PlexMediaSection
-            type="movie"
-            title="Movies"
-            enabled={settings.MovieEnabled}
-            libraries={catalogue.movie}
-            settings={settings}
-            onChange={onChange}
-            onCustomize={(source) =>
-              setCustomizing(persistedSourceKey(source.ServerId, source.Kind, source.Key))
-            }
-            onError={setError}
-          />
-          <PlexMediaSection
-            type="show"
-            title="TV shows"
-            enabled={settings.TvEnabled}
-            libraries={catalogue.show}
-            settings={settings}
-            onChange={onChange}
-            onCustomize={(source) =>
-              setCustomizing(persistedSourceKey(source.ServerId, source.Kind, source.Key))
-            }
-            onError={setError}
-          />
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div className="min-w-0">
+              <h3 className="text-lg font-semibold">Hubs &amp; collections</h3>
+              <p className="text-sm text-base-content/60">
+                Smart Prefetch warms the next items from each source you turn on.
+              </p>
+            </div>
+            <Input
+              type="search"
+              className="w-full max-w-sm"
+              placeholder="Filter all hubs and collections"
+              aria-label="Filter hubs and collections"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+            />
+          </div>
+          <div
+            className="space-y-2 rounded-xl border border-base-content/10 bg-base-200/50 p-3"
+            aria-live="polite"
+          >
+            <h4 className="text-xs font-semibold tracking-wide text-base-content/60 uppercase">
+              On ({enabledSources.length})
+            </h4>
+            {enabledSources.length === 0 ? (
+              <p className="text-sm text-base-content/50">
+                Nothing is on yet. Turn on a hub or collection below.
+              </p>
+            ) : (
+              <ul className="flex flex-wrap gap-2">
+                {enabledSources.map(({ source, libraryTitle }) => (
+                  <li
+                    key={persistedSourceKey(source.ServerId, source.Kind, source.Key)}
+                    className="badge badge-primary badge-soft h-auto max-w-full gap-1 py-1 pr-1"
+                  >
+                    <span className="truncate font-medium">{source.Title}</span>
+                    <span className="truncate text-base-content/60">· {libraryTitle}</span>
+                    <Button
+                      type="button"
+                      size="xsmall"
+                      variant="ghost"
+                      className="btn-circle"
+                      aria-label={`Turn off ${source.Title} in ${libraryTitle}`}
+                      onClick={() => onChange(setPersistedSourceEnabled(settings, source, false))}
+                    >
+                      ×
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          {query.trim() ? (
+            <div className="space-y-4">
+              <p className="text-sm text-base-content/60">
+                {matches.length === 0
+                  ? `No hub or collection matches "${query.trim()}". Plex may name it differently; try fewer letters.`
+                  : `${matchCount} ${matchCount === 1 ? "match" : "matches"} across ${matches.length} ${matches.length === 1 ? "library" : "libraries"}`}
+              </p>
+              {matches.map(({ library, sources: found }) => (
+                <div
+                  key={`${library.identity.libraryId}:${library.identity.type}`}
+                  className="space-y-1"
+                >
+                  <h4 className="text-xs font-semibold tracking-wide text-base-content/60 uppercase">
+                    {library.title} · {library.identity.type === "movie" ? "Movies" : "TV shows"}
+                  </h4>
+                  {found.map((source) => (
+                    <PlexSourceRow
+                      key={`${source.kind}:${source.key}`}
+                      library={library}
+                      source={source}
+                      settings={settings}
+                      onChange={onChange}
+                      onCustomize={customizeSource}
+                      onError={setError}
+                      highlight={query}
+                    />
+                  ))}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <>
+              <Tabs
+                value={section}
+                onChange={setChosenSection}
+                options={[
+                  { id: "movie", label: `Movies · ${sectionOn("movie")} on` },
+                  { id: "show", label: `TV shows · ${sectionOn("show")} on` },
+                ]}
+              />
+              {section === "movie" ? (
+                <PlexMediaSection
+                  key="movie"
+                  type="movie"
+                  title="Movies"
+                  enabled={settings.MovieEnabled}
+                  libraries={catalogue.movie}
+                  settings={settings}
+                  onChange={onChange}
+                  onCustomize={customizeSource}
+                  onError={setError}
+                />
+              ) : (
+                <PlexMediaSection
+                  key="show"
+                  type="show"
+                  title="TV shows"
+                  enabled={settings.TvEnabled}
+                  libraries={catalogue.show}
+                  settings={settings}
+                  onChange={onChange}
+                  onCustomize={customizeSource}
+                  onError={setError}
+                />
+              )}
+            </>
+          )}
         </div>
       )}
       {customizedSource && (
