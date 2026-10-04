@@ -1,24 +1,31 @@
-﻿using UsenetSharp.Streams;
+﻿using System.Buffers;
+using NzbWebDAV.Clients.Usenet.Contexts;
+using UsenetSharp.Streams;
 
 namespace NzbWebDAV.Streams;
 
-public class CombinedStream(
-    IEnumerable<Task<Stream>> streams,
-    bool prefetchNextPart = false,
-    long? prefetchReadBudget = null) : FastReadOnlyNonSeekableStream, ICacheReadEvidence
+/// <param name="readAheadBytes">
+/// When positive, opens the next stream and reads its first bytes once a
+/// <see cref="PaddedLengthStream"/> part has this many bytes or fewer left, so the next
+/// part's download pipeline is running before the boundary.
+/// </param>
+public class CombinedStream(IEnumerable<Task<Stream>> streams, long readAheadBytes = 0) : FastReadOnlyNonSeekableStream, ICacheReadEvidence
 {
-    private const int PrefixBytes = 64 * 1024;
-    private const long MaximumPrefetchLead = 50L * 1024 * 1024;
+    private const int PrimeBufferSize = 64 * 1024;
+
     private readonly IEnumerator<Task<Stream>> _streams = streams.GetEnumerator();
     private Stream? _currentStream;
-    private Task<PrefetchedPart>? _prefetchedPart;
-    private CancellationTokenSource? _prefetchCancellation;
-    private PrefetchedPart? _prefetchedPrefix;
-    private int _prefixPosition;
-    private bool _noNextPart;
+    private Task<PreparedPart?>? _nextPart;
+    private ContextualCancellationTokenSource? _prefetchCts;
+    private byte[]? _primed;
+    private int _primedOffset;
+    private int _primedCount;
+    public bool LastReadCacheable { get; private set; }
+    private bool _primedCacheable;
     private long _position;
     private bool _isDisposed;
-    public bool LastReadCacheable { get; private set; }
+
+    private sealed record PreparedPart(Stream Stream, byte[]? Primed, int PrimedCount, bool Cacheable = false);
 
     public override long Position
     {
@@ -28,110 +35,127 @@ public class CombinedStream(
 
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
     {
-        LastReadCacheable = false;
         if (buffer.Length == 0) return 0;
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (_prefetchedPrefix is { } prefix && _prefixPosition < prefix.Count)
+            if (_currentStream == null && !await OpenNextAsync().ConfigureAwait(false)) return 0;
+
+            if (_primedCount > 0)
             {
-                var count = Math.Min(buffer.Length, prefix.Count - _prefixPosition);
-                prefix.Buffer.AsMemory(_prefixPosition, count).CopyTo(buffer);
-                _prefixPosition += count;
+                var count = Math.Min(_primedCount, buffer.Length);
+                LastReadCacheable = _primedCacheable;
+                _primed.AsMemory(_primedOffset, count).CopyTo(buffer);
+                _primedOffset += count;
+                _primedCount -= count;
+                if (_primedCount == 0) ReturnPrimed();
                 _position += count;
-                LastReadCacheable = prefix.Cacheable;
-                if (_prefixPosition == prefix.Count) _prefetchedPrefix = null;
                 return count;
             }
 
-            if (_currentStream == null)
-            {
-                if (!await OpenNextAsync(cancellationToken).ConfigureAwait(false)) return 0;
-                if (_prefetchedPrefix is not null) continue;
-            }
-
-            // read from our current stream
             var readCount = await _currentStream!.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
             _position += readCount;
             if (readCount > 0)
             {
                 LastReadCacheable = _currentStream is ICacheReadEvidence { LastReadCacheable: true };
-                TryPrefetchNext(cancellationToken);
+                if (_nextPart is null
+                    && _currentStream is PaddedLengthStream part
+                    && (part.ReadAheadBytes > 0 ? part.ReadAheadBytes : readAheadBytes) is > 0 and var window
+                    && part.Length - part.Position <= window
+                    // Next-part leases must never take credits the current tail still needs.
+                        // Unknown inner wrappers report false, declining prefetch.
+                    && ((ISegmentIssueProgress)part).AllSegmentsIssued)
+                {
+                    // Owned by the stream, not the triggering read: only disposal cancels prefetch.
+                    _prefetchCts ??= ContextualCancellationTokenSource.CreateWithContextsOf(cancellationToken);
+                    _nextPart = PrepareNextAsync(_prefetchCts.Token);
+                }
+
                 return readCount;
             }
 
-            // If we couldn't read anything from our current stream,
-            // it's time to advance to the next stream.
             await _currentStream.DisposeAsync().ConfigureAwait(false);
             _currentStream = null;
         }
     }
 
-    private async Task<bool> OpenNextAsync(CancellationToken cancellationToken)
+    private async ValueTask<bool> OpenNextAsync()
     {
-        if (_prefetchedPart is { } pending)
+        PreparedPart? next;
+        if (_nextPart is { } pending)
         {
-            var part = await pending.WaitAsync(cancellationToken).ConfigureAwait(false);
-            _prefetchedPart = null;
-            _prefetchCancellation?.Dispose();
-            _prefetchCancellation = null;
-            _currentStream = part.Stream;
-            _prefetchedPrefix = part.Count > 0 ? part : null;
-            _prefixPosition = 0;
-            return true;
+            // A failed prefetch surfaces here, at the boundary, after every current-part byte.
+            _nextPart = null;
+            next = await pending.ConfigureAwait(false);
+        }
+        else
+        {
+            next = _streams.MoveNext()
+                ? new PreparedPart(await _streams.Current.ConfigureAwait(false), null, 0)
+                : null;
         }
 
-        if (_noNextPart || !_streams.MoveNext()) return false;
-        _currentStream = await _streams.Current.ConfigureAwait(false);
+        if (next is null) return false;
+        _currentStream = next.Stream;
+        _primedCacheable = next.Cacheable;
+        _primed = next.Primed;
+        _primedOffset = 0;
+        _primedCount = next.PrimedCount;
+        if (_primedCount == 0) ReturnPrimed();
         return true;
     }
 
-    private void TryPrefetchNext(CancellationToken cancellationToken)
+    // Reading the first bytes is what starts a lazily-opened part's segment pipeline.
+    private async Task<PreparedPart?> PrepareNextAsync(CancellationToken ct)
     {
-        if (!prefetchNextPart || _prefetchedPart is not null || _noNextPart ||
-            _currentStream is not PaddedLengthStream part)
-            return;
-
-        var remaining = part.Length - part.Position;
-        // Start the next volume once this one has delivered a first chunk. A
-        // provider can take many seconds to open a cold volume; waiting until
-        // the final few MiB still leaves that latency on the response path.
-        // One 64 KiB prefix and the existing NNTP permits bound the overlap.
-        var lead = Math.Min(MaximumPrefetchLead, part.Length);
-        if (remaining > lead || remaining <= 0 ||
-            prefetchReadBudget is { } budget && _position + remaining + PrefixBytes >= budget)
-            return;
-
-        if (!_streams.MoveNext())
-        {
-            _noNextPart = true;
-            return;
-        }
-
-        _prefetchCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        _prefetchedPart = ReadNextPrefixAsync(_streams.Current, _prefetchCancellation.Token);
-    }
-
-    private static async Task<PrefetchedPart> ReadNextPrefixAsync(Task<Stream> open, CancellationToken cancellationToken)
-    {
-        Stream? next = null;
+        if (!_streams.MoveNext()) return null;
+        var opening = _streams.Current;
+        Stream stream;
         try
         {
-            next = await open.ConfigureAwait(false);
-            var prefix = new byte[PrefixBytes];
-            var count = await next.ReadAsync(prefix, cancellationToken).ConfigureAwait(false);
-            return new PrefetchedPart(next, prefix, count,
-                next is ICacheReadEvidence { LastReadCacheable: true });
+            // Only the wait is cancelled; a shared lazy resolution keeps running for others.
+            stream = await opening.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // The open may have completed after cancellation won; the abandoned stream is still ours.
+            _ = DisposeWhenOpenedAsync(opening);
+            throw;
+        }
+
+        var primed = ArrayPool<byte>.Shared.Rent(PrimeBufferSize);
+        try
+        {
+            var count = await stream.ReadAsync(primed.AsMemory(0, PrimeBufferSize), ct).ConfigureAwait(false);
+            return new PreparedPart(stream, primed, count, stream is ICacheReadEvidence { LastReadCacheable: true });
         }
         catch
         {
-            if (next is not null) await next.DisposeAsync().ConfigureAwait(false);
+            ArrayPool<byte>.Shared.Return(primed);
+            await stream.DisposeAsync().ConfigureAwait(false);
             throw;
         }
     }
 
-    private sealed record PrefetchedPart(Stream Stream, byte[] Buffer, int Count, bool Cacheable);
+    private static async Task DisposeWhenOpenedAsync(Task<Stream> opening)
+    {
+        try
+        {
+            await (await opening.ConfigureAwait(false)).DisposeAsync().ConfigureAwait(false);
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            Serilog.Log.Debug(e, "Abandoned next part failed to open or dispose after the combined stream closed");
+        }
+    }
+
+    private void ReturnPrimed()
+    {
+        if (_primed is { } primed) ArrayPool<byte>.Shared.Return(primed);
+        _primed = null;
+        _primedCount = 0;
+    }
 
     public override void Flush()
     {
@@ -147,13 +171,12 @@ public class CombinedStream(
     {
         if (!_isDisposed && disposing)
         {
-            _prefetchCancellation?.Cancel();
-            if (_prefetchedPart is { } pending)
-                _ = DisposePrefetchedAsync(pending);
+            _isDisposed = true;
+            _prefetchCts?.Cancel();
             _streams.Dispose();
             _currentStream?.Dispose();
-            _prefetchCancellation?.Dispose();
-            _isDisposed = true;
+            ReturnPrimed();
+            _ = DisposeNextPartAsync();
         }
         base.Dispose(disposing);
     }
@@ -161,24 +184,36 @@ public class CombinedStream(
     public override async ValueTask DisposeAsync()
     {
         if (_isDisposed) return;
-        if (_prefetchCancellation is { } cancellation)
-            await cancellation.CancelAsync().ConfigureAwait(false);
-        if (_prefetchedPart is { } pending)
-            await DisposePrefetchedAsync(pending).ConfigureAwait(false);
-        if (_currentStream != null) await _currentStream.DisposeAsync().ConfigureAwait(false);
-        _streams.Dispose();
-        _prefetchCancellation?.Dispose();
         _isDisposed = true;
+        if (_prefetchCts is { } prefetchCts) await prefetchCts.CancelAsync().ConfigureAwait(false);
+        if (_currentStream != null) await _currentStream.DisposeAsync().ConfigureAwait(false);
+        ReturnPrimed();
+        // Joined so callers that await teardown (Seek → next read) never overlap prefetch leases.
+        await DisposeNextPartAsync().ConfigureAwait(false);
+        _streams.Dispose();
         GC.SuppressFinalize(this);
         await base.DisposeAsync().ConfigureAwait(false);
     }
 
-    private static async Task DisposePrefetchedAsync(Task<PrefetchedPart> pending)
+    private async Task DisposeNextPartAsync()
     {
-        try { await (await pending.ConfigureAwait(false)).Stream.DisposeAsync().ConfigureAwait(false); }
-        catch (Exception exception) when (exception is not OutOfMemoryException)
+        var pending = _nextPart;
+        _nextPart = null;
+        try
         {
-            // A speculative read may be cancelled after the response stops.
+            if (pending is not null && await pending.ConfigureAwait(false) is { } next)
+            {
+                if (next.Primed is { } primed) ArrayPool<byte>.Shared.Return(primed);
+                await next.Stream.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+        catch (Exception e) when (e is not OutOfMemoryException)
+        {
+            Serilog.Log.Debug(e, "Prefetched part failed to open or dispose after the combined stream closed");
+        }
+        finally
+        {
+            _prefetchCts?.Dispose();
         }
     }
 }

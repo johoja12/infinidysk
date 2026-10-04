@@ -22,7 +22,8 @@ public class ExceptionMiddleware(
     RequestDelegate next,
     ConfigManager configManager,
     StreamingFailureTracker failureTracker,
-    IDbContextFactory<DavDatabaseContext>? dbContextFactory = null)
+    IDbContextFactory<DavDatabaseContext>? dbContextFactory = null,
+    StreamingRepairScheduler? repairScheduler = null)
 {
     private static readonly ConcurrentDictionary<string, (DateTime LastLogged, int SuppressedCount)> RecentMissingArticles = new();
     private static readonly ConcurrentDictionary<string, (DateTime LastLogged, int SuppressedCount)> RecentInconclusiveMissingArticles = new();
@@ -37,12 +38,13 @@ public class ExceptionMiddleware(
     private static int _callCount;
     internal static readonly object CircuitAdmissionRejectedKey = new();
 
-    private readonly StreamingRepairScheduler _repairs = new(configManager, failureTracker, dbContextFactory);
+    private readonly StreamingRepairScheduler _repairScheduler =
+        repairScheduler ?? new(configManager, failureTracker, dbContextFactory);
 
     internal Func<Guid, Task>? RepairScheduleCompletionHook
     {
-        get => _repairs.CompletionHook;
-        set => _repairs.CompletionHook = value;
+        get => _repairScheduler.CompletionHook;
+        set => _repairScheduler.CompletionHook = value;
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -590,7 +592,13 @@ public class ExceptionMiddleware(
 
             // Known download errors carry a human-readable message;
             // reserve full stack traces for unexpected failures.
-            var isKnown = IsKnownDownloadException(e, out var knownError);
+            var isContentLengthOverrun = e is InvalidOperationException &&
+                e.Message.StartsWith(
+                    "Response Content-Length mismatch: too many bytes written (",
+                    StringComparison.Ordinal);
+            var isKnown = IsKnownDownloadException(e, out var knownError) || isContentLengthOverrun;
+            if (isContentLengthOverrun)
+                knownError = e.Message;
             var reason = isKnown ? knownError : e.GetType().Name;
             // Transient segment exhaustion (all retries spent, player will retry the range)
             // and incomplete multipart data are expected operational conditions, so they
@@ -598,6 +606,7 @@ public class ExceptionMiddleware(
             // segments that need repair) stay at Error.
             var knownLevel = isIncompleteData
                              || e is TransientSegmentExhaustionException
+                             || isContentLengthOverrun
                              || e.TryGetCausingException(out MediaSourceChangedException? _)
                 ? LogEventLevel.Warning
                 : LogEventLevel.Error;
@@ -735,7 +744,7 @@ public class ExceptionMiddleware(
 
     private void ScheduleRepair(DavItem davItem, string? segmentId = null)
     {
-        if (_repairs.Schedule(davItem, segmentId) == RepairScheduleOutcome.Disabled
+        if (_repairScheduler.Schedule(davItem, segmentId) == RepairScheduleOutcome.Disabled
             && configManager.GetRepairDisabledReason() is { } repairDisabledReason)
             LogStreamingRepairSkipped(davItem, repairDisabledReason);
     }
