@@ -160,13 +160,22 @@ warming, and retry controls. The Settings activity section links to that page.
 The Settings sections stay collapsed until needed so the everyday setup remains limited to
 Enable, Movies, TV episodes, and the daily GB budget.
 
-Choose a saved server and watching profile, then expand **Movies** or **TV**. Switch
-on a library to use its recommended sources: movie libraries select **Recently
-Added**, while TV libraries select **On Deck** and **Continue Watching** when Plex
-provides them. These defaults apply only the first time a library has no existing
-source choices. Expand **Collections** only when needed; collections remain off by
-default. Use **Customize** for a source's item limit, excluded TV show IDs, and
-preview. Finish with **Apply source changes**, which saves only Smart Prefetch and
+Choose a saved server and watching profile, then pick the **Movies** or **TV shows**
+tab. Switch on a library to use its recommended sources: movie libraries select
+**Recently Added**, while TV libraries select **On Deck** and **Continue Watching**
+when Plex provides them. These defaults apply only the first time a library has no
+existing source choices. Expanding a library shows its hubs and collections side by
+side (the first 10 of each, with **Show all** for longer lists); collections remain
+off by default. Use **Customize** for a source's item limit, excluded TV show IDs, and
+preview.
+
+The source picker [since unreleased](https://github.com/johoja12/infinidysk/issues/160){ .nzbdav-since }
+also has a filter box that searches every hub and collection across libraries, with
+matches grouped by library, and an **On** list of every enabled source labelled with
+its library; remove one there with ×. Each source appears once: a collection Plex
+also shows on the home screen is listed under hubs with a *collection on Home* tag,
+and server-wide home hubs that repeat a library's hubs are left out of **Home screen
+hubs**. Finish with **Apply source changes**, which saves only Smart Prefetch and
 leaves unrelated Settings drafts untouched.
 
 Movie and TV section switches, and each library switch, pause that scope without
