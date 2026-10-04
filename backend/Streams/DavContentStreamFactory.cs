@@ -40,12 +40,24 @@ public sealed class DavContentStreamFactory(
             && file.MissingSegmentIndices is { Length: > 0 }
             ? file.MissingSegmentIndices.Where(index => index > 0 && (uint)index < (uint)file.SegmentIds.Length).ToHashSet()
             : null;
-        return usenet.GetFileStream(file.SegmentIds, item.FileSize!.Value, config.GetArticleBufferSize(),
+        var lease = PlaybackHoleTracker.SetDamageBudget(item.Path,
+            PlaybackDamageBudget.TryCreate(item.Name, file, config));
+        try
+        {
+            var stream = usenet.GetFileStream(file.SegmentIds, item.FileSize!.Value, config.GetArticleBufferSize(),
             file.SegmentByteRanges, config.IsPipelinedBodyRequestsEnabled(), item.Path, file.SegmentFallbackIds, budget,
             useContainerAwareFill: config.IsContainerAwareFillEnabled(), streamingBodyBatchWidth: config.GetStreamingBodyBatchWidth(),
             knownCorruptSegmentIds: corrupt is { Count: > 0 } ? corrupt : null,
             knownMissingSegmentIndices: missing is { Count: > 0 } ? missing : null,
             segmentByteRangesTrusted: file.SegmentByteRangesTrusted == true, verificationProof: file.VerificationProof);
+            stream.PlaybackLease = lease;
+            return stream;
+        }
+        catch
+        {
+            lease?.Dispose();
+            throw;
+        }
     }
 
     public static async Task<Stream> OpenRarAsync(DavItem item, DavDatabaseClient database, UsenetStreamingClient usenet,

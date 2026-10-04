@@ -190,80 +190,168 @@ public class BasicStreamTests
         Assert.Equal(6, stream.Position);
     }
 
-    [Fact]
-    public async Task CombinedStream_PrefetchesOnePaddedPartAndPreservesEveryByte()
+    [Theory]
+    [InlineData(0L, true, false)]
+    [InlineData(6L, true, true)]
+    // An inner stream that does not report its segment progress must decline prefetch.
+    [InlineData(6L, false, false)]
+    public async Task CombinedStream_OpensNextPartWithinReadAheadOfBoundary(
+        long readAheadBytes, bool innerReportsReady, bool expectOpened)
     {
-        const int partSize = 128 * 1024;
-        var firstBytes = Enumerable.Repeat((byte)1, partSize).ToArray();
-        var secondBytes = Enumerable.Range(0, partSize).Select(i => (byte)(i % 251)).ToArray();
-        var nextSource = Frozen(secondBytes);
-        await using var stream = new CombinedStream(
-            [Task.FromResult<Stream>(new PaddedLengthStream(Frozen(firstBytes), partSize, "first")),
-                Task.FromResult<Stream>(new PaddedLengthStream(nextSource, partSize, "second"))],
-            prefetchNextPart: true, prefetchReadBudget: partSize * 2L);
+        var opened = new List<int>();
+        IEnumerable<Task<Stream>> Parts()
+        {
+            for (var i = 0; i < 2; i++)
+            {
+                opened.Add(i);
+                var bytes = Encoding.ASCII.GetBytes("abcdefgh");
+                yield return Task.FromResult<Stream>(new PaddedLengthStream(
+                    innerReportsReady ? new IssuedStream(bytes) : Frozen(bytes), 8, $"part-{i}"));
+            }
+        }
 
-        var firstHalf = new byte[partSize / 2];
-        Assert.Equal(firstHalf.Length, await stream.ReadAsync(firstHalf));
-        Assert.All(firstHalf, value => Assert.Equal((byte)1, value));
-        Assert.Equal(64 * 1024, nextSource.Position);
+        await using var stream = new CombinedStream(Parts(), readAheadBytes);
+        var buffer = new byte[2];
 
-        using var rest = new MemoryStream();
-        await stream.CopyToAsync(rest);
-        Assert.Equal(firstBytes[(partSize / 2)..].Concat(secondBytes), rest.ToArray());
-        Assert.Equal(partSize * 2L, stream.Position);
+        Assert.Equal(2, await stream.ReadAsync(buffer));
+
+        Assert.Equal(expectOpened ? [0, 1] : [0], opened);
+        using var destination = new MemoryStream();
+        await stream.CopyToAsync(destination);
+        Assert.Equal(14, destination.Length);
+        Assert.Equal([0, 1], opened);
     }
 
     [Fact]
-    public async Task CombinedStream_DoesNotPrefetchBeyondTheRequestedBudget()
+    public async Task CombinedStream_NextPartOpenFailureSurfacesAtBoundary()
     {
-        const int partSize = 128 * 1024;
-        var nextSource = Frozen(new byte[partSize]);
-        await using var stream = new CombinedStream(
-            [Task.FromResult<Stream>(new PaddedLengthStream(Frozen(new byte[partSize]), partSize, "first")),
-                Task.FromResult<Stream>(new PaddedLengthStream(nextSource, partSize, "second"))],
-            prefetchNextPart: true, prefetchReadBudget: partSize);
+        IEnumerable<Task<Stream>> Parts()
+        {
+            yield return Task.FromResult<Stream>(
+                new PaddedLengthStream(new IssuedStream(Encoding.ASCII.GetBytes("abcdefgh")), 8, "part-0"));
+            throw new SeekPositionNotFoundException("bad next part");
+        }
 
-        Assert.Equal(partSize / 2, await stream.ReadAsync(new byte[partSize / 2]));
-        Assert.Equal(0, nextSource.Position);
+        await using var stream = new CombinedStream(Parts(), readAheadBytes: 8);
+        var buffer = new byte[8];
+
+        Assert.Equal(2, await stream.ReadAsync(buffer.AsMemory(0, 2)));
+        Assert.Equal(6, await stream.ReadAsync(buffer.AsMemory(2)));
+        Assert.Equal("abcdefgh", Encoding.ASCII.GetString(buffer));
+        await Assert.ThrowsAsync<SeekPositionNotFoundException>(() => stream.ReadAsync(buffer).AsTask());
     }
 
     [Fact]
-    public async Task CombinedStream_DisposeCancelsAnUnusedPrefetch()
+    public async Task CombinedStream_DisposeCancelsAndDisposesInFlightPrefetch()
     {
-        const int partSize = 128 * 1024;
-        var nextSource = new BlockingPrefetchStream();
-        await using var stream = new CombinedStream(
-            [Task.FromResult<Stream>(new PaddedLengthStream(Frozen(new byte[partSize]), partSize, "first")),
-                Task.FromResult<Stream>(new PaddedLengthStream(nextSource, partSize, "second"))],
-            prefetchNextPart: true, prefetchReadBudget: partSize * 2L);
+        var next = new BlockingStream();
+        var streams = new[]
+        {
+            Task.FromResult<Stream>(
+                new PaddedLengthStream(new IssuedStream(Encoding.ASCII.GetBytes("abcdefgh")), 8, "part-0")),
+            Task.FromResult<Stream>(next),
+        };
+        var stream = new CombinedStream(streams, readAheadBytes: 8);
 
-        Assert.Equal(partSize / 2, await stream.ReadAsync(new byte[partSize / 2]));
-        await nextSource.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
-        await stream.DisposeAsync();
-        Assert.True(nextSource.WasDisposed);
+        Assert.Equal(2, await stream.ReadAsync(new byte[2]));
+        await next.ReadStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        await stream.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+        Assert.True(next.Disposed);
     }
 
-    private sealed class BlockingPrefetchStream : MemoryStream
+    [Fact]
+    public async Task CombinedStream_PrefetchSurvivesCancellationOfTriggeringRead()
     {
-        public TaskCompletionSource ReadStarted { get; } =
-            new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public bool WasDisposed { get; private set; }
+        var opening = new TaskCompletionSource<Stream>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var streams = new[]
+        {
+            Task.FromResult<Stream>(
+                new PaddedLengthStream(new IssuedStream(Encoding.ASCII.GetBytes("abcdefgh")), 8, "part-0")),
+            opening.Task,
+        };
+        await using var stream = new CombinedStream(streams, readAheadBytes: 8);
+        using (var trigger = new CancellationTokenSource())
+        {
+            Assert.Equal(2, await stream.ReadAsync(new byte[2], trigger.Token));
+            await trigger.CancelAsync();
+        }
+
+        opening.SetResult(Frozen(Encoding.ASCII.GetBytes("ij")));
+        using var destination = new MemoryStream();
+        await stream.CopyToAsync(destination);
+        Assert.Equal("cdefghij", Encoding.ASCII.GetString(destination.ToArray()));
+    }
+
+    [Fact]
+    public async Task CombinedStream_DisposeDoesNotWaitForPendingLazyOpen()
+    {
+        var opening = new TaskCompletionSource<Stream>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var streams = new[]
+        {
+            Task.FromResult<Stream>(
+                new PaddedLengthStream(new IssuedStream(Encoding.ASCII.GetBytes("abcdefgh")), 8, "part-0")),
+            opening.Task,
+        };
+        var stream = new CombinedStream(streams, readAheadBytes: 8);
+
+        Assert.Equal(2, await stream.ReadAsync(new byte[2]));
+        await stream.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
+
+        var late = new BlockingStream();
+        opening.SetResult(late);
+        await late.DisposedSignal.Task.WaitAsync(TimeSpan.FromSeconds(10));
+    }
+
+    private sealed class BlockingStream : MemoryStream
+    {
+        public TaskCompletionSource ReadStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool Disposed { get; private set; }
+        public TaskCompletionSource DisposedSignal { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
         {
             ReadStarted.TrySetResult();
-            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            await Task.Delay(Timeout.Infinite, cancellationToken);
             return 0;
         }
 
-        public override ValueTask DisposeAsync()
+        protected override void Dispose(bool disposing)
         {
-            WasDisposed = true;
-            return base.DisposeAsync();
+            DisposedSignal.TrySetResult();
+            Disposed = true;
+            base.Dispose(disposing);
         }
     }
 
     private static Stream Frozen(byte[] bytes) => new MemoryStream(bytes, writable: false);
+
+    [Fact]
+    public async Task CombinedStream_PrefetchedBytesPreserveCacheEvidence()
+    {
+        var streams = new[]
+        {
+            Task.FromResult<Stream>(new PaddedLengthStream(new IssuedStream([1, 2, 3, 4]), 4, "first")),
+            Task.FromResult<Stream>(new CacheEvidenceStream([5, 6])),
+        };
+        await using var stream = new CombinedStream(streams, readAheadBytes: 4);
+        var buffer = new byte[2];
+        Assert.Equal(2, await stream.ReadAsync(buffer));
+        Assert.Equal(2, await stream.ReadAsync(buffer));
+        Assert.Equal(2, await stream.ReadAsync(buffer));
+        Assert.Equal(new byte[] { 5, 6 }, buffer);
+        Assert.True(stream.LastReadCacheable);
+    }
+
+    private sealed class CacheEvidenceStream(byte[] bytes) : MemoryStream(bytes, writable: false), ICacheReadEvidence
+    {
+        public bool LastReadCacheable => true;
+    }
+
+    private sealed class IssuedStream(byte[] bytes) : MemoryStream(bytes, writable: false), ISegmentIssueProgress
+    {
+        public bool AllSegmentsIssued => true;
+    }
 
     private static Stream Empty() => new MemoryStream();
 

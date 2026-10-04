@@ -55,10 +55,7 @@ public class MultiConnectionNntpClient(
 {
     private readonly ProviderConnectionAdmission? _connectionAdmission =
         maxTransferConnections is { } transferLimit
-            ? new ProviderConnectionAdmission(
-                () => connectionPool.EffectiveMaxConnections,
-                transferLimit,
-                priorityOdds)
+            ? ProviderConnectionAdmission.ForPool(connectionPool, transferLimit, priorityOdds)
             : null;
     internal Action<ConnectionLock<INntpClient>, Action>? AttachDisposeCallbackForTests
     { get; set; }
@@ -442,7 +439,7 @@ public class MultiConnectionNntpClient(
                         switch (result)
                         {
                             case ArticleBodyResult.Discarded:
-                                LogException(() => connectionLock.Replace("pipelined-body-discarded"));
+                                LogException(() => connectionLock.Discard("pipelined-body-discarded"));
                                 circuitBreaker.ReleaseProbe(probeLease);
                                 result = ArticleBodyResult.NotRetrieved;
                                 break;
@@ -932,7 +929,7 @@ public class MultiConnectionNntpClient(
 
                     if (articleBodyResult == ArticleBodyResult.Discarded)
                     {
-                        LogException(() => connectionLock?.Replace($"body-callback-{name}-discarded"));
+                        LogException(() => connectionLock?.Discard($"body-callback-{name}-discarded"));
                         circuitBreaker.ReleaseProbe(probeLease);
                         articleBodyResult = ArticleBodyResult.NotRetrieved;
                     }
@@ -1412,7 +1409,8 @@ public class MultiConnectionNntpClient(
             return;
         }
 
-        if (exception is ConnectionOpenTimeoutException { FactoryStarted: false })
+        exception.TryGetCausingException(out ConnectionOpenTimeoutException? openTimeout);
+        if (openTimeout is { FactoryStarted: false })
         {
             circuitBreaker.ReleaseProbe(probeLease);
             return;
@@ -1422,12 +1420,21 @@ public class MultiConnectionNntpClient(
         if (exception.TryGetKnownErrorMessage(out var knownReason))
             reason = $"{reason}: {knownReason}";
 
-        if (exception is ConnectionOpenTimeoutException { FactoryStarted: true } openTimeout)
+        if (openTimeout is { FactoryStarted: true })
         {
             RecordProviderConnectionFailure(
                 $"{reason}-phase-{openTimeout.Phase}",
                 probeLease,
                 requiresFreshConnectionProbe: true);
+            return;
+        }
+
+        // The pool narrows itself on a limit rejection; a provider already serving
+        // connections is full, not unhealthy.
+        if (connectionPool.LiveConnections > 0
+            && UsenetConnectionLimitDetector.IsConnectionLimitRejection(exception))
+        {
+            circuitBreaker.ReleaseProbe(probeLease);
             return;
         }
 

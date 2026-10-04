@@ -340,6 +340,7 @@ public sealed partial class Program
                 .AddSingleton<ActiveReadRegistry>()
                 .AddSingleton(sp => new ConcurrentReadTracker(
                     configManager: sp.GetRequiredService<ConfigManager>()))
+                .AddHostedService<SegmentBufferPoolIdleTrimService>()
                 .AddSingleton<SharedStreamRegistry>()
                 .AddSingleton<NzbWebDAV.Services.NativeCache.NativeCacheService>()
                 .AddHostedService<NzbWebDAV.Services.NativeCache.NativeCacheBrowserMaintenance>()

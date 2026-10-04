@@ -3,7 +3,7 @@ using System.Net;
 using System.Text.Json;
 using NzbWebDAV.Clients.RadarrSonarr.BaseModels;
 using NzbWebDAV.Clients.RadarrSonarr.SonarrModels;
-using NzbWebDAV.Utils;
+using NzbWebDAV.Services;
 using Serilog;
 
 namespace NzbWebDAV.Clients.RadarrSonarr;
@@ -267,12 +267,15 @@ public class SonarrClient(string host, string apiKey) : ArrClient(host, apiKey)
 
     private async Task<int?> GetSeriesId(string symlinkOrStrmPath, CancellationToken ct)
     {
-        var parentPaths = PathUtil.GetAllParentDirectories(symlinkOrStrmPath).ToArray();
-        // get series-id from cache
         string? cachedSeriesPath = null;
         var cachedSeriesId = 0;
-        foreach (var parentPath in parentPaths.Reverse())
+        for (var separatorIndex = symlinkOrStrmPath.AsSpan().LastIndexOfAny('/', '\\');
+             separatorIndex >= 0;
+             separatorIndex = symlinkOrStrmPath.AsSpan(0, separatorIndex).LastIndexOfAny('/', '\\'))
         {
+            var parentPath = separatorIndex == 0
+                ? symlinkOrStrmPath[..1]
+                : symlinkOrStrmPath[..separatorIndex];
             if (!SeriesPathToSeriesIdCache.TryGetValue((Host, parentPath), out cachedSeriesId))
                 continue;
 
@@ -280,11 +283,11 @@ public class SonarrClient(string host, string apiKey) : ArrClient(host, apiKey)
             break;
         }
 
-        // if found, verify and return it
         if (cachedSeriesPath != null)
         {
             var series = await GetSeriesOrNull(cachedSeriesId, ct).ConfigureAwait(false);
-            if (series?.Path != null && parentPaths.Contains(series.Path, StringComparer.Ordinal))
+            if (series?.Path != null &&
+                string.Equals(ToSeriesCacheKey(series.Path), cachedSeriesPath, StringComparison.Ordinal))
                 return cachedSeriesId;
             SeriesPathToSeriesIdCache.TryRemove((Host, cachedSeriesPath), out _);
         }
@@ -294,28 +297,31 @@ public class SonarrClient(string host, string apiKey) : ArrClient(host, apiKey)
         if (await TryParseTitleAsync(Path.GetFileName(symlinkOrStrmPath), ct).ConfigureAwait(false) is { } parsed
             && parsed.TryGetProperty("series", out var parsedSeries) && parsedSeries.ValueKind == JsonValueKind.Object
             && parsedSeries.TryGetProperty("id", out var parsedId) && parsedId.TryGetInt32(out var seriesId)
-            && parsedSeries.TryGetProperty("path", out var parsedPath) && parsedPath.GetString() is { } seriesPath
-            && parentPaths.Contains(seriesPath, StringComparer.Ordinal))
+            && parsedSeries.TryGetProperty("path", out var parsedPath) && parsedPath.GetString() is { } parsedSeriesPath
+            && HealthCheckService.IsPathWithinRoot(symlinkOrStrmPath, parsedSeriesPath))
         {
-            SeriesPathToSeriesIdCache[(Host, seriesPath)] = seriesId;
+            SeriesPathToSeriesIdCache[(Host, ToSeriesCacheKey(parsedSeriesPath))] = seriesId;
             return seriesId;
         }
 
-        // otherwise, fetch all series and repopulate the cache
         int? result = null;
-        var matchedPathLength = -1;
+        var resultPathLength = -1;
         foreach (var series in await GetAllSeries(ct).ConfigureAwait(false))
         {
-            SeriesPathToSeriesIdCache[(Host, series.Path!)] = series.Id;
-            if (series.Path != null && series.Path.Length > matchedPathLength
-                && parentPaths.Contains(series.Path, StringComparer.Ordinal))
+            var seriesPath = series.Path!;
+            var cachePath = ToSeriesCacheKey(seriesPath);
+            SeriesPathToSeriesIdCache[(Host, cachePath)] = series.Id;
+            if (HealthCheckService.IsPathWithinRoot(symlinkOrStrmPath, seriesPath) &&
+                cachePath.Length > resultPathLength)
             {
                 result = series.Id;
-                matchedPathLength = series.Path.Length;
+                resultPathLength = cachePath.Length;
             }
         }
 
-        // return the found series-id
         return result;
     }
+
+    private static string ToSeriesCacheKey(string seriesPath) =>
+        seriesPath.Length > 1 ? seriesPath.TrimEnd('/', '\\') : seriesPath;
 }

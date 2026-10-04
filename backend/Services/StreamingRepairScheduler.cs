@@ -33,6 +33,9 @@ public sealed class StreamingRepairScheduler(
     IDbContextFactory<DavDatabaseContext>? dbContextFactory = null)
 {
     private static readonly ConcurrentDictionary<Guid, RepairScheduleReservation> RecentRepairTriggers = new();
+    private static readonly ConcurrentDictionary<Guid, (DateTime LastLogged, int SuppressedCount)> RecentSkippedRepairs = new();
+    private static readonly TimeSpan SkippedLogWindow = TimeSpan.FromSeconds(60);
+    private static int _callCount;
     private static readonly TimeSpan RepairDedupeWindow = TimeSpan.FromMinutes(5);
 
     internal Func<Guid, Task>? CompletionHook { get; set; }
@@ -42,19 +45,31 @@ public sealed class StreamingRepairScheduler(
     /// <paramref name="segmentId"/> when known) and, at the threshold, schedules urgent repair in
     /// the background. The returned outcome reflects the decision, not the database write.
     /// </summary>
-    public RepairScheduleOutcome Schedule(DavItem davItem, string? segmentId = null)
+    public void ScheduleRepair(DavItem davItem, string? segmentId = null)
     {
+        if (Schedule(davItem, segmentId) == RepairScheduleOutcome.Disabled
+            && configManager.GetRepairDisabledReason() is { } reason)
+            LogRepairSkipped(davItem, reason);
+    }
+
+    public void ScheduleRepairIfQualified(DavItem davItem) => Schedule(davItem, null, recordFailure: false);
+
+    public RepairScheduleOutcome Schedule(DavItem davItem, string? segmentId = null, bool recordFailure = true)
+    {
+        CleanupStaleEntries();
         var davItemId = davItem.Id;
         if (configManager.GetRepairDisabledReason() != null) return RepairScheduleOutcome.Disabled;
 
         // Count every distinct streaming failure before applying either threshold or deduplication.
         // Repeated failures must still advance the repair threshold while duplicate DB scheduling
         // writes remain suppressed below.
-        var failureCount = string.IsNullOrEmpty(segmentId)
+        var failureCount = !recordFailure
+            ? failureTracker.GetFailureCount(davItemId)
+            : string.IsNullOrEmpty(segmentId)
             ? failureTracker.RecordUnattributedFailure(davItemId).Count
             : failureTracker.RecordAttributedFailure(davItemId, segmentId).Count;
         var threshold = configManager.GetAutoRemoveAfterFailures();
-        if (!ShouldScheduleUrgentRepair(threshold, failureCount))
+        if ((!recordFailure && failureCount <= 0) || !ShouldScheduleUrgentRepair(threshold, failureCount))
         {
             Log.Information(
                 "Deferring dynamic repair for DavItem {DavItemId} until streaming failure {FailureCount}/{FailureThreshold}",
@@ -89,6 +104,13 @@ public sealed class StreamingRepairScheduler(
             await using var mutationGate = await failureTracker
                 .AcquireMutationGateAsync(davItemId, CancellationToken.None)
                 .ConfigureAwait(false);
+            var currentCount = failureTracker.GetFailureCount(davItemId);
+            if (currentCount <= 0 || !ShouldScheduleUrgentRepair(threshold, currentCount))
+            {
+                RecentRepairTriggers.TryRemove(new KeyValuePair<Guid, RepairScheduleReservation>(davItemId, reservation));
+                return;
+            }
+            failureCount = currentCount;
             await using var dbContext = DavDatabaseContexts.Create(null, dbContextFactory);
             var item = await dbContext.Items.FindAsync(davItemId).ConfigureAwait(false);
             if (item == null)
@@ -175,6 +197,54 @@ public sealed class StreamingRepairScheduler(
             if (kvp.Value.Timestamp < cutoff)
                 RecentRepairTriggers.TryRemove(kvp.Key, out _);
         }
+    }
+
+    private static void LogRepairSkipped(DavItem davItem, string reason)
+    {
+        var now = DateTime.UtcNow;
+        var suppressed = 0;
+        var shouldLog = false;
+        RecentSkippedRepairs.AddOrUpdate(
+            davItem.Id,
+            _ =>
+            {
+                shouldLog = true;
+                return (now, 0);
+            },
+            (_, existing) =>
+            {
+                if (now - existing.LastLogged < SkippedLogWindow)
+                    return (existing.LastLogged, existing.SuppressedCount + 1);
+                shouldLog = true;
+                suppressed = existing.SuppressedCount;
+                return (now, 0);
+            });
+        if (!shouldLog)
+            return;
+
+        if (suppressed > 0)
+            Log.Warning(
+                "Streaming failure for {FilePath} will not trigger repair: {Reason}. Configure Settings > Health & Repairs. (suppressed {SuppressedCount} duplicates in last 60s)",
+                davItem.Path,
+                reason,
+                suppressed);
+        else
+            Log.Warning(
+                "Streaming failure for {FilePath} will not trigger repair: {Reason}. Configure Settings > Health & Repairs.",
+                davItem.Path,
+                reason);
+    }
+
+    private static void CleanupStaleEntries()
+    {
+        if (Interlocked.Increment(ref _callCount) % 100 != 0)
+            return;
+
+        var cutoff = DateTime.UtcNow - TimeSpan.FromMinutes(5);
+        foreach (var kvp in RecentRepairTriggers.Where(kvp => kvp.Value.Timestamp < cutoff))
+            RecentRepairTriggers.TryRemove(kvp.Key, out _);
+        foreach (var kvp in RecentSkippedRepairs.Where(kvp => kvp.Value.LastLogged < cutoff))
+            RecentSkippedRepairs.TryRemove(kvp.Key, out _);
     }
 
     private sealed record RepairScheduleReservation(DateTime Timestamp, bool Committed);

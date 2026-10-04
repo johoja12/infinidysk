@@ -236,25 +236,28 @@ public class DavMultipartFileStream : FastReadOnlyStream, ICacheReadEvidence
             ? NzbWebDAV.WebDav.Requests.RangeContext.GetReadBudget()
             : null);
         var budget = finiteBudget is > 0 ? new FiniteMultipartBudget(finiteBudget.Value) : null;
-        var responseBudget = NativeCacheReadContext.ReadBudget
-            ?? NzbWebDAV.WebDav.Requests.RangeContext.GetReadBudget();
-        // Short, fully mapped archive volumes caused repeated cold-start pauses
-        // at their boundaries. Larger volumes did not benefit in the live A/B
-        // test and can compete with the current reader for provider permits.
-        var prefetchNextPart = !meta.IsLazy && meta.FileParts.Length > 1 &&
-            meta.FileParts.All(part => part.FilePartByteRange.Count is > 0 and <= 64L * 1024 * 1024);
+
         _expectedReadEndExclusive = budget is null
             ? null
             : rangeStart + Math.Min(finiteBudget!.Value, _length - rangeStart);
 
         if (rangeStart == 0)
-            return new CombinedStream(EnumerateFromPart(0, 0, budget, ct),
-                prefetchNextPart: prefetchNextPart, prefetchReadBudget: responseBudget);
+            return new CombinedStream(EnumerateFromPart(0, 0, budget, ct));
 
         var (filePartIndex, filePartOffset) = SeekFilePart(meta, rangeStart);
         return new CombinedStream(EnumerateFromPart(
-            filePartIndex, rangeStart - filePartOffset, budget, ct),
-            prefetchNextPart: prefetchNextPart, prefetchReadBudget: responseBudget);
+            filePartIndex, rangeStart - filePartOffset, budget, ct));
+    }
+
+    // One part's read-ahead window, so prefetch continues into the next volume instead of
+    // draining at every boundary (AltMount and AIOStreams keep one window across volumes).
+    private long GetReadAheadBytes(DavMultipartFile.FilePart part)
+    {
+        if (part.SegmentIds.Length == 0) return 0;
+        var windowSegments = MultiSegmentStream.CalculateTaskWindowSize(
+            _articleBufferSize, _usePipelinedBodyRequests, _streamingBodyBatchWidth);
+        return MultiSegmentStream.SaturatingMultiply(
+            windowSegments, part.SegmentIdByteRange.Count / part.SegmentIds.Length);
     }
 
     // Resolve trailing volumes up to (and including) the one that contains
@@ -381,8 +384,7 @@ public class DavMultipartFileStream : FastReadOnlyStream, ICacheReadEvidence
         DavMultipartFile.FilePart part,
         long extraOffset,
         int partIndex,
-        long? readBudgetOverride = null,
-        FiniteMultipartBudget? finiteBudget = null)
+        long? readBudgetOverride = null)
     {
         if (part.SegmentIdByteRange.StartInclusive != 0 ||
             part.SegmentIdByteRange.Count < 0 ||
@@ -439,7 +441,10 @@ public class DavMultipartFileStream : FastReadOnlyStream, ICacheReadEvidence
                 SeekOffsetWithinPart = extraOffset,
                 DeclaredVolumeLength = effectivePartLength,
                 IsEncrypted = _mpf.Metadata.AesParams is not null,
-            });
+            })
+        {
+            ReadAheadBytes = GetReadAheadBytes(part),
+        };
     }
 
     internal static long GetEffectivePartLength(DavMultipartFile.FilePart part) =>

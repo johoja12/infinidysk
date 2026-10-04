@@ -34,8 +34,12 @@ public class NzbFileStream(
     long? readBudgetOverride = null,
     bool readStartWarmupEnabled = false,
     Par2FileProof? verificationProof = null
-) : FastReadOnlyStream, ICacheReadEvidence
+) : FastReadOnlyStream, ICacheReadEvidence, ISegmentIssueProgress
 {
+    bool ISegmentIssueProgress.AllSegmentsIssued =>
+        verificationProof is null
+        && _innerStream is ISegmentIssueProgress { AllSegmentsIssued: true };
+
     private const long MaximumForwardDrainBytes = 1024 * 1024;
     private const long MinimumPrewarmRangeBytes = 8L * 1024 * 1024;
     private const int MinimumPrewarmConnections = 2;
@@ -56,6 +60,7 @@ public class NzbFileStream(
     private Task? _pendingInnerDispose;
     private Stopwatch? _pendingSeekStopwatch;
     private string? _pendingSeekKind;
+    internal IDisposable? PlaybackLease { get; set; }
     internal Task? PrewarmObservationForTests { get; private set; }
     private readonly LongRange[]? _segmentByteRanges = ValidateAndCloneSegmentByteRanges(
         segmentByteRanges,
@@ -1188,6 +1193,7 @@ public class NzbFileStream(
         {
             if (disposing)
             {
+                PlaybackLease?.Dispose();
                 _verifiedStream?.Dispose();
                 _innerStream?.Dispose();
                 // The prior Seek's teardown is async and cannot be awaited here; observe
@@ -1214,6 +1220,7 @@ public class NzbFileStream(
     {
         if (_disposed) return;
         _disposed = true;
+        PlaybackLease?.Dispose();
         if (_verifiedStream is not null) await _verifiedStream.DisposeAsync().ConfigureAwait(false);
         if (_pendingInnerDispose is { } pending)
         {

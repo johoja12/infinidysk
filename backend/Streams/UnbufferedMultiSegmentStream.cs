@@ -13,8 +13,11 @@ using UsenetSharp.Streams;
 
 namespace NzbWebDAV.Streams;
 
-public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream
+public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream, ISegmentIssueProgress
 {
+    // Holds no article-budget leases.
+    bool ISegmentIssueProgress.AllSegmentsIssued => true;
+
     private const int MaxCorruptionRetries = 3;
     private const int MaxTransportRetries = 2;
 
@@ -313,7 +316,7 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream
                     _fileName, shortId, _openSegmentIndex, remainingExact);
                 _consecutiveZeroFills++;
                 _openSegmentHole = true;
-                var cap = _consecutiveZeroFills >= GapFillLimits.MaxConsecutiveZeroFills;
+                var cap = _consecutiveZeroFills >= PlaybackHoleTracker.ConsecutiveFillLimit(_fileName);
                 var trackerFail = PlaybackHoleTracker.ShouldFailFast(_fileName, out var failFast);
                 if (cap || trackerFail)
                     ExceptionDispatchInfo.Capture(failFast ?? hole).Throw();
@@ -891,7 +894,7 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream
             Par2RepairTriggerSink.ReportCorruption(_fileName, segmentId);
         else if (!inconclusive)
             Par2RepairTriggerSink.Current?.ReportZeroFill(_fileName, segmentId, segmentIndex, fill);
-        var cap = _consecutiveZeroFills >= GapFillLimits.MaxConsecutiveZeroFills;
+        var cap = _consecutiveZeroFills >= PlaybackHoleTracker.ConsecutiveFillLimit(_fileName);
         var trackerFail = PlaybackHoleTracker.ShouldFailFast(_fileName, out var failFast);
         if (cap || trackerFail)
         {

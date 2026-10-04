@@ -41,6 +41,8 @@ internal sealed record NntpWholePathScenario(
     public int CacheWriteDelayMs { get; init; }
     /// <summary>Native cache layer only: commit queue byte budget; null uses the production default.</summary>
     public long? CommitQueueCapacityBytes { get; init; }
+    // Awaits prewarming before the measurement origin instead of racing it at read start.
+    public bool WarmStart { get; init; }
 
     public static IReadOnlyList<NntpWholePathScenario> Quick =>
     [
@@ -127,6 +129,26 @@ internal sealed record NntpWholePathScenario(
         },
     ];
 
+    // Warm, paced connections isolate ordered-delivery stalls from connection-ramp latency.
+    public static IReadOnlyList<NntpWholePathScenario> Smoothness =>
+    [
+        Paced("paced-256mib-w1", batchWidth: 1),
+        Paced("paced-256mib-w4", batchWidth: 4),
+        Paced("paced-256mib-w8", batchWidth: 8),
+        // Fewer connections than the default window can use: scheduling must not
+        // depend on spare capacity to stay steady.
+        Paced("paced-256mib-w4-4conn", batchWidth: 4, connections: 4),
+        // One stripe per buffered article: a full-batch-per-stripe start would fill the whole window.
+        Paced("paced-256mib-w4-40conn", batchWidth: 4, connections: 40),
+    ];
+
+    private static NntpWholePathScenario Paced(string name, int batchWidth, int connections = 20) =>
+        new(name, NntpWholePathLayer.HttpLike, false, 342, 768 * 1024, connections, batchWidth, 40, 6_000_000, YencCrcValidationMode.Require)
+        {
+            ArticleBufferSize = 40,
+            WarmStart = true,
+        };
+
     public static IReadOnlyList<NntpWholePathScenario> ForSet(string set) =>
         set.Equals("quick", StringComparison.OrdinalIgnoreCase)
             ? Quick
@@ -140,5 +162,9 @@ internal sealed record NntpWholePathScenario(
                             ? NativeCold
                             : throw new ArgumentException(
                                 "--set must be 'quick', 'sustained', 'profile', 'cold', or 'native-cold'.",
+                        : set.Equals("smoothness", StringComparison.OrdinalIgnoreCase)
+                            ? Smoothness
+                            : throw new ArgumentException(
+                                "--set must be 'quick', 'sustained', 'profile', 'cold', or 'smoothness'.",
                                 nameof(set));
 }
