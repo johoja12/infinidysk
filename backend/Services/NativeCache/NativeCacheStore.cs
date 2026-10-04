@@ -1680,6 +1680,56 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
         public void Dispose() { if (Interlocked.Exchange(ref _disposed, 1) == 0) store.ReleaseFill(key, state, acquired: true); }
     }
 
+    /// <summary>
+    /// <c>Entries.Pinned</c> value for a copy health checks keep because Usenet no longer has it.
+    /// Eviction treats it like a manual pin (1); maintenance releases it once its item is gone.
+    /// </summary>
+    public const int HealthProtectedPin = 2;
+
+    /// <summary>Protects an entry from eviction as the only remaining copy; a manual pin is left as is.</summary>
+    public async Task ProtectAsync(NativeCacheIdentity identity, CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            Execute("UPDATE Entries SET Pinned=$protected WHERE Key=$key AND Pinned=0",
+                ("$protected", HealthProtectedPin), ("$key", identity.Key));
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>Health-protected entries as (key, item id, generation), at most <paramref name="limit"/>.</summary>
+    [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
+    public async Task<IReadOnlyList<(string Key, string ItemId, string? Generation)>> ListProtectedAsync(int limit, CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            using var command = Command("SELECT Key,ItemId,Generation FROM Entries WHERE Pinned=$protected ORDER BY Key LIMIT $limit",
+                ("$protected", HealthProtectedPin), ("$limit", limit));
+            using var reader = command.ExecuteReader();
+            var entries = new List<(string, string, string?)>();
+            while (reader.Read()) entries.Add((reader.GetString(0), reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetString(2)));
+            return entries;
+        }
+        finally { _gate.Release(); }
+    }
+
+    /// <summary>Returns health-protected entries to normal eviction; manual pins are untouched.</summary>
+    public async Task ReleaseProtectionAsync(IEnumerable<string> keys, CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            foreach (var key in keys)
+                Execute("UPDATE Entries SET Pinned=0 WHERE Key=$key AND Pinned=$protected", ("$key", key), ("$protected", HealthProtectedPin));
+        }
+        finally { _gate.Release(); }
+    }
+
     public async Task SetPinnedAsync(NativeCacheIdentity identity, bool pinned, CancellationToken cancellationToken = default)
     {
         using var placement = await AcquireFillAsync(identity, -1, cancellationToken).ConfigureAwait(false);

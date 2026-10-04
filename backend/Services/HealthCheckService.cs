@@ -48,6 +48,11 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
     internal static readonly TimeSpan HealthCheckInactivityLimit = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan HealthCheckStallDeferral = TimeSpan.FromDays(1);
     private readonly ConcurrentDictionary<Guid, DateTimeOffset> _repairRetryNotBefore = new();
+    private readonly NativeCache.NativeCacheService? _nativeCache;
+    /// <summary>How long a file kept because its cached copy still plays waits before the next check.</summary>
+    internal static readonly TimeSpan CachedCopyRecheck = TimeSpan.FromDays(7);
+    /// <summary>How long repair waits when the cached copy could not be verified right now.</summary>
+    internal static readonly TimeSpan CachedCopyRetry = TimeSpan.FromHours(1);
 
     // Repeated remove-and-blocklist repairs for the same library path in a short window indicate
     // a replacement loop (Arr keeps re-grabbing a release repair keeps rejecting, issue #732).
@@ -248,10 +253,12 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         TimeProvider? timeProvider = null,
         HealthWorkSchedulePolicy? healthWorkSchedule = null,
         ArrInstanceBackoff? arrBackoff = null,
-        Regrab.ArrRegrabService? regrabService = null
+        Regrab.ArrRegrabService? regrabService = null,
+        NativeCache.NativeCacheService? nativeCache = null
     )
     {
         _configManager = configManager;
+        _nativeCache = nativeCache;
         _regrabService = regrabService;
         _replacementSearchBudget = replacementSearchBudget;
         _arrBackoff = arrBackoff ?? new ArrInstanceBackoff();
@@ -3517,6 +3524,59 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         dbClient.Ctx.Items.Remove(davItem);
     }
 
+    /// <summary>
+    /// Keeps an item whose current revision is completely cached and verified: it plays from the native
+    /// cache even though Usenet no longer has it. The cached copy is protected from eviction and checked
+    /// again in a week. When the copy cannot be verified right now, repair is deferred rather than
+    /// deleting a possibly good copy. False lets repair continue (not cached, partial or damaged).
+    /// </summary>
+    private async Task<bool> TryKeepCachedCopyAsync(DavItem davItem, DavDatabaseClient dbClient, CancellationToken ct)
+    {
+        if (_nativeCache?.Store is not { } store) return false;
+        NativeCache.CachedCopyCheck check;
+        try { check = await _nativeCache.CheckCachedCopyAsync(davItem, ct).ConfigureAwait(false); }
+        catch (Exception exception) when (exception is not OperationCanceledException and not OutOfMemoryException)
+        {
+            Log.Warning("Could not check the cached copy of {Path} before repair. Reason: {Reason}", davItem.Path, exception.Message);
+            return false;
+        }
+        var now = _timeProvider.GetUtcNow();
+        switch (check.State)
+        {
+            case NativeCache.CachedCopyState.Verified:
+                await store.ProtectAsync(check.Identity!, ct).ConfigureAwait(false);
+                _failureTracker.ClearFailure(davItem.Id);
+                davItem.UrgentRepairFailures = null;
+                davItem.LastHealthCheck = now;
+                davItem.NextHealthCheck = now + CachedCopyRecheck;
+                Log.Information("Kept {Path}: articles are missing on Usenet but the native cache holds a verified copy.", davItem.Path);
+                await RecordHealthResult(dbClient, davItem,
+                    HealthCheckResult.HealthResult.Unhealthy,
+                    HealthCheckResult.RepairAction.None,
+                    string.Join(" ", [
+                        "Articles are missing on Usenet, but the whole file is in the native cache and verified,",
+                        "so it keeps playing from the cache.",
+                        "The cached copy is protected from eviction and checked again in a week.",
+                        "Use Regrab in the file details to replace the release."
+                    ]), ct).ConfigureAwait(false);
+                return true;
+            case NativeCache.CachedCopyState.Unverifiable:
+                davItem.LastHealthCheck = now;
+                davItem.NextHealthCheck = now + CachedCopyRetry;
+                await RecordHealthResult(dbClient, davItem,
+                    HealthCheckResult.HealthResult.Unhealthy,
+                    HealthCheckResult.RepairAction.ActionNeeded,
+                    string.Join(" ", [
+                        "Articles are missing on Usenet. The native cache has the whole file,",
+                        "but it could not be read back to verify it right now (cache busy or unreachable).",
+                        "Repair is postponed for an hour so a good cached copy is not deleted."
+                    ]), ct).ConfigureAwait(false);
+                return true;
+            default:
+                return false;
+        }
+    }
+
     private async Task Repair(
         DavItem davItem,
         DavDatabaseClient dbClient,
@@ -3550,6 +3610,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                     ]), ct).ConfigureAwait(false);
                 return;
             }
+
+            // A fully cached copy still plays without Usenet: keep the item instead of deleting it.
+            if (await TryKeepCachedCopyAsync(davItem, dbClient, ct).ConfigureAwait(false)) return;
 
             // A missing library link is not proof that the item is orphaned: a FUSE mount can
             // temporarily present a successfully empty or partial view. Only an explicit

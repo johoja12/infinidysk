@@ -194,6 +194,55 @@ public sealed class NativeCacheService : IAsyncDisposable
     }
 
     /// <summary>
+    /// Whether the item's current revision is completely cached and readable: every block is
+    /// catalogued and a sample of blocks (head, tail and a spread, as routine warming checks) reads
+    /// back with its committed hash. Never contacts the source.
+    /// </summary>
+    public async Task<CachedCopyCheck> CheckCachedCopyAsync(DavItem item, CancellationToken cancellationToken = default)
+    {
+        if (Store is not { } store) return new(CachedCopyState.NotCached, null);
+        var identity = await GetCurrentCacheIdentityAsync(item, cancellationToken).ConfigureAwait(false);
+        if (identity is null || identity.Length <= 0) return new(CachedCopyState.NotCached, identity);
+        long missing;
+        try { missing = await store.GetMissingRangeBytesAsync(identity, 0, identity.Length, cancellationToken).ConfigureAwait(false); }
+        catch (Exception exception) when (exception is IOException or Microsoft.Data.Sqlite.SqliteException)
+        { return new(CachedCopyState.Unverifiable, identity); }
+        if (missing >= identity.Length) return new(CachedCopyState.NotCached, identity);
+        if (missing > 0) return new(CachedCopyState.Partial, identity);
+
+        NativeCachedStream stream;
+        try
+        {
+            stream = (NativeCachedStream)await WrapAsync(item,
+                _ => Task.FromException<Stream>(new InvalidOperationException("A cached-copy check never reads the source.")),
+                cancellationToken, requireNative: true).ConfigureAwait(false);
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or NativeCacheBusyException or InvalidCastException)
+        { return new(CachedCopyState.Unverifiable, identity); }
+        await using (stream.ConfigureAwait(false))
+        {
+            if (stream.Identity != identity) return new(CachedCopyState.Unverifiable, identity);
+            var blocks = (identity.Length + NativeCacheStore.BlockSize - 1) / NativeCacheStore.BlockSize;
+            var sample = NzbWebDAV.Services.Prefetch.VerificationSample.ForRun(DateTimeOffset.UtcNow);
+            for (var index = 0L; index < blocks; index++)
+            {
+                if (!sample.Includes(index, blocks)) continue;
+                var offset = index * NativeCacheStore.BlockSize;
+                bool verified;
+                try { verified = await stream.VerifyCachedBlockAsync(offset, cancellationToken).ConfigureAwait(false); }
+                catch (Exception exception) when (exception is IOException or TimeoutException or UnauthorizedAccessException)
+                { return new(CachedCopyState.Unverifiable, identity); }
+                if (verified) continue;
+                // A bad block is invalidated (now missing); an unreachable volume keeps its catalogue entry.
+                var next = await store.FindNextMissingOffsetAsync(identity, offset,
+                    Math.Min(identity.Length, offset + NativeCacheStore.BlockSize), cancellationToken).ConfigureAwait(false);
+                return new(next == offset ? CachedCopyState.Damaged : CachedCopyState.Unverifiable, identity);
+            }
+        }
+        return new(CachedCopyState.Verified, identity);
+    }
+
+    /// <summary>
     /// The cache identity of the item's current source revision, without admitting a buffer or
     /// opening the source. Null when the cache is inactive or the revision is unknown or changing.
     /// </summary>
@@ -299,3 +348,8 @@ public sealed class NativeCacheService : IAsyncDisposable
         // no native handle; let remaining leases release them before collection.
     }
 }
+
+public enum CachedCopyState { NotCached, Partial, Verified, Unverifiable, Damaged }
+
+/// <summary>Result of <see cref="NativeCacheService.CheckCachedCopyAsync"/> with the revision it checked.</summary>
+public sealed record CachedCopyCheck(CachedCopyState State, NativeCacheIdentity? Identity);
