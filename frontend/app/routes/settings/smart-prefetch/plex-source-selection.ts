@@ -166,3 +166,20 @@ export function setSourceEnabled(
     error: null,
   };
 }
+
+/** Turns a saved source on or off by its persisted identity, wherever it appears. */
+export function setPersistedSourceEnabled(
+  settings: PrefetchSettings,
+  source: PrefetchSource,
+  enabled: boolean,
+): PrefetchSettings {
+  const key = persistedSourceKey(source.ServerId, source.Kind, source.Key);
+  return {
+    ...settings,
+    Sources: settings.Sources.map((candidate) =>
+      persistedSourceKey(candidate.ServerId, candidate.Kind, candidate.Key) === key
+        ? { ...candidate, Enabled: enabled }
+        : candidate,
+    ),
+  };
+}

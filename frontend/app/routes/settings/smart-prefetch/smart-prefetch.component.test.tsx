@@ -332,7 +332,6 @@ describe("Smart Prefetch settings", () => {
     await waitFor(() => expect(screen.getByRole("option", { name: "Home" })).toBeTruthy());
     await userEvent.selectOptions(screen.getByLabelText("Plex source server"), "server");
     await userEvent.click(await screen.findByRole("button", { name: "Show TV sources" }));
-    await userEvent.click(screen.getByRole("button", { name: "Show TV collections" }));
     await userEvent.click(await screen.findByLabelText("Enable TV collection Anime"));
     const config = JSON.parse(screen.getByTestId("config").textContent) as Record<string, string>;
     expect(parsePrefetchSettings(config["smart-prefetch.settings"]).Sources[0]).toMatchObject({
@@ -345,6 +344,27 @@ describe("Smart Prefetch settings", () => {
     expect(await screen.findByText("Episode one")).toBeTruthy();
     expect(screen.getByText(/unmapped.*No exact configured path mapping/)).toBeTruthy();
   });
+  it("finds a collection by search, shows it as on, and turns it off from the chip", async () => {
+    vi.stubGlobal("fetch", fakeApi(true));
+    render(<Harness />);
+    await waitFor(() => expect(screen.getByRole("option", { name: "Home" })).toBeTruthy());
+    await userEvent.selectOptions(screen.getByLabelText("Plex source server"), "server");
+    await userEvent.type(await screen.findByLabelText("Filter hubs and collections"), "ANI");
+    expect(screen.getByText("1 match across 1 library")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "TV · TV shows" })).toBeTruthy();
+    await userEvent.click(screen.getByLabelText("Enable TV collection Anime"));
+    expect(screen.getByRole("heading", { name: "On (1)" })).toBeTruthy();
+    await userEvent.click(screen.getByRole("button", { name: "Turn off Anime in TV" }));
+    expect(screen.getByRole("heading", { name: "On (0)" })).toBeTruthy();
+    const config = JSON.parse(screen.getByTestId("config").textContent) as Record<string, string>;
+    expect(parsePrefetchSettings(config["smart-prefetch.settings"]).Sources[0]?.Enabled).toBe(
+      false,
+    );
+    await userEvent.clear(screen.getByLabelText("Filter hubs and collections"));
+    await userEvent.type(screen.getByLabelText("Filter hubs and collections"), "zzz");
+    expect(screen.getByText(/No hub or collection matches "zzz"/)).toBeTruthy();
+  });
+
   it("keeps draft sources and the previous catalogue when a forced refresh partially fails", async () => {
     const base = fakeApi();
     vi.stubGlobal(

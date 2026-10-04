@@ -1,16 +1,17 @@
 import { useState } from "react";
 import { Button, Toggle } from "~/components/ui";
+import type { PlexSource } from "../plex/plex-api";
 import type { PrefetchSettings, PrefetchSource } from "./smart-prefetch-model";
 import {
   persistedSourceKey,
   type PlexCatalogueLibrary,
   type PlexMediaSection as PlexMediaSectionType,
 } from "./plex-source-catalogue";
-import {
-  setLibraryEnabled,
-  setMediaSectionEnabled,
-  setSourceEnabled,
-} from "./plex-source-selection";
+import { PlexSourceRow } from "./plex-source-row";
+import { setLibraryEnabled, setMediaSectionEnabled } from "./plex-source-selection";
+
+/** Rows shown per hub or collection list before "Show all". */
+export const SOURCE_LIST_LIMIT = 10;
 
 type PlexMediaSectionProps = {
   type: PlexMediaSectionType;
@@ -27,6 +28,19 @@ function controlId(type: string, libraryId: string, suffix: string): string {
   return `plex-${type}-${libraryId || "global"}-${suffix}`.replaceAll(/[^a-zA-Z0-9_-]/g, "-");
 }
 
+/** Enabled saved sources among a library's hubs and collections. */
+export function enabledSourceCount(library: PlexCatalogueLibrary, settings: PrefetchSettings) {
+  const keys = new Set(
+    [...library.hubs, ...library.collections].map((source) =>
+      persistedSourceKey(source.serverId, source.kind, source.key),
+    ),
+  );
+  return settings.Sources.filter(
+    (source) =>
+      source.Enabled && keys.has(persistedSourceKey(source.ServerId, source.Kind, source.Key)),
+  ).length;
+}
+
 export function PlexMediaSection({
   type,
   title,
@@ -38,30 +52,66 @@ export function PlexMediaSection({
   onError,
 }: PlexMediaSectionProps) {
   const [openLibraries, setOpenLibraries] = useState<Set<string>>(new Set());
-  const [openCollections, setOpenCollections] = useState<Set<string>>(new Set());
+  const [expandedLists, setExpandedLists] = useState<Set<string>>(new Set());
   const [manualChoice, setManualChoice] = useState<string | null>(null);
-  const enabledSources = settings.Sources.filter(
-    (source) =>
-      source.Enabled &&
-      (type === "movie" ? source.Type === "movie" : source.Type !== "movie") &&
-      libraries.some(
-        (library) =>
-          library.enabled &&
-          library.identity.serverId === source.ServerId &&
-          library.identity.libraryId === source.LibraryId,
-      ),
-  ).length;
-  const toggleOpen = (current: Set<string>, update: (value: Set<string>) => void, key: string) => {
+  const enabledSources = libraries
+    .filter((library) => library.enabled)
+    .reduce((total, library) => total + enabledSourceCount(library, settings), 0);
+  const toggle = (current: Set<string>, update: (value: Set<string>) => void, key: string) => {
     const next = new Set(current);
     if (next.has(key)) next.delete(key);
     else next.add(key);
     update(next);
   };
+
+  const sourceList = (library: PlexCatalogueLibrary, label: string, sources: PlexSource[]) => {
+    const listKey = `${library.identity.libraryId}:${library.identity.type}:${label}`;
+    const showAll = expandedLists.has(listKey) || sources.length <= SOURCE_LIST_LIMIT + 2;
+    const shown = showAll ? sources : sources.slice(0, SOURCE_LIST_LIMIT);
+    return (
+      <div className="flex min-w-0 flex-col gap-1">
+        <h4 className="text-xs font-semibold tracking-wide text-base-content/60 uppercase">
+          {label} ({sources.length})
+        </h4>
+        {sources.length === 0 ? (
+          <p className="text-sm text-base-content/50">
+            Plex returned no {label.toLowerCase()} for this library.
+          </p>
+        ) : (
+          <>
+            {shown.map((source) => (
+              <PlexSourceRow
+                key={`${source.kind}:${source.key}`}
+                library={library}
+                source={source}
+                settings={settings}
+                onChange={onChange}
+                onCustomize={onCustomize}
+                onError={onError}
+              />
+            ))}
+            {!showAll && (
+              <Button
+                type="button"
+                size="small"
+                variant="ghost"
+                className="self-start text-primary"
+                onClick={() => toggle(expandedLists, setExpandedLists, listKey)}
+              >
+                Show all {sources.length} {label.toLowerCase()}
+              </Button>
+            )}
+          </>
+        )}
+      </div>
+    );
+  };
+
   return (
-    <section className="space-y-3 rounded-2xl border border-base-content/15 bg-base-200/35 p-4">
+    <section className="space-y-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h3 className="text-xl font-semibold">{title}</h3>
+          <h3 className="text-lg font-semibold">{title}</h3>
           <p className="text-xs text-base-content/60">
             {enabledSources} source{enabledSources === 1 ? "" : "s"} enabled
           </p>
@@ -80,27 +130,29 @@ export function PlexMediaSection({
           const key = `${library.identity.libraryId}:${library.identity.type}`;
           const isOpen = openLibraries.has(key);
           const panelId = controlId(type, library.identity.libraryId, "sources");
-          const collectionsOpen = openCollections.has(key);
-          const collectionsId = controlId(type, library.identity.libraryId, "collections");
+          const on = enabledSourceCount(library, settings);
           return (
             <div key={key} className="rounded-xl border border-base-content/15 bg-base-100/70">
               <div className="flex min-h-14 flex-wrap items-center gap-2 px-3 py-2">
                 <Button
-                  className="min-h-11 flex-1 justify-start"
+                  className="min-h-11 min-w-0 flex-1 justify-start"
                   variant="ghost"
                   aria-label={`Show ${library.title} sources`}
                   aria-expanded={isOpen}
                   aria-controls={panelId}
-                  onClick={() => toggleOpen(openLibraries, setOpenLibraries, key)}
+                  onClick={() => toggle(openLibraries, setOpenLibraries, key)}
                 >
-                  {isOpen ? "▾" : "▸"} {library.title}
+                  <span aria-hidden="true">{isOpen ? "▾" : "▸"}</span>
+                  <span className="truncate">{library.title}</span>
                 </Button>
-                <span className="text-xs text-base-content/55">
+                {on > 0 && <span className="badge badge-success badge-soft badge-sm">{on} on</span>}
+                <span className="text-xs whitespace-nowrap text-base-content/55 tabular-nums max-sm:hidden">
                   {library.hubs.length} hubs · {library.collections.length} collections
                 </span>
                 <Toggle
                   className="min-h-11"
-                  label={`Enable ${title} library ${library.title}`}
+                  aria-label={`Enable ${title} library ${library.title}`}
+                  label=""
                   checked={library.enabled}
                   onChange={(event) => {
                     const result = setLibraryEnabled(settings, library, event.target.checked);
@@ -115,103 +167,24 @@ export function PlexMediaSection({
                 />
               </div>
               {isOpen && (
-                <div id={panelId} className="space-y-2 border-t border-base-content/10 p-3">
+                <div id={panelId} className="space-y-3 border-t border-base-content/10 p-3">
                   {manualChoice === key && (
                     <p className="text-sm text-warning">
                       No recommended source is available. Choose a source below.
                     </p>
                   )}
                   {library.hubs.length === 0 &&
-                    library.collections.length === 0 &&
-                    library.unavailable.length === 0 && (
-                      <p className="text-sm text-base-content/60">
-                        No compatible hubs or collections returned by Plex.
-                      </p>
-                    )}
-                  {library.hubs.map((source) => {
-                    const persisted = settings.Sources.find(
-                      (item) =>
-                        persistedSourceKey(item.ServerId, item.Kind, item.Key) ===
-                        persistedSourceKey(source.serverId, source.kind, source.key),
-                    );
-                    return (
-                      <div key={source.key} className="flex min-h-11 flex-wrap items-center gap-2">
-                        <Toggle
-                          className="min-h-11 flex-1"
-                          label={`Enable ${library.title} source ${source.title}`}
-                          checked={persisted?.Enabled ?? false}
-                          onChange={(event) => {
-                            const result = setSourceEnabled(
-                              settings,
-                              library,
-                              source,
-                              event.target.checked,
-                            );
-                            onError?.(result.error);
-                            if (!result.error) onChange(result.settings);
-                          }}
-                        />
-                        {persisted?.Enabled && (
-                          <Button type="button" onClick={() => onCustomize(persisted)}>
-                            Customize {source.title}
-                          </Button>
-                        )}
-                      </div>
-                    );
-                  })}
-                  {library.collections.length > 0 && (
-                    <div className="rounded-lg border border-base-content/10">
-                      <Button
-                        className="min-h-11 w-full justify-start"
-                        variant="ghost"
-                        aria-label={`Show ${library.title} collections`}
-                        aria-expanded={collectionsOpen}
-                        aria-controls={collectionsId}
-                        onClick={() => toggleOpen(openCollections, setOpenCollections, key)}
-                      >
-                        {collectionsOpen ? "▾" : "▸"} Collections ({library.collections.length})
-                      </Button>
-                      {collectionsOpen && (
-                        <div
-                          id={collectionsId}
-                          className="space-y-1 border-t border-base-content/10 p-2"
-                        >
-                          {library.collections.map((source) => {
-                            const persisted = settings.Sources.find(
-                              (item) =>
-                                persistedSourceKey(item.ServerId, item.Kind, item.Key) ===
-                                persistedSourceKey(source.serverId, source.kind, source.key),
-                            );
-                            return (
-                              <div
-                                key={source.key}
-                                className="flex min-h-11 flex-wrap items-center gap-2"
-                              >
-                                <Toggle
-                                  className="min-h-11 flex-1"
-                                  label={`Enable ${library.title} collection ${source.title}`}
-                                  checked={persisted?.Enabled ?? false}
-                                  onChange={(event) => {
-                                    const result = setSourceEnabled(
-                                      settings,
-                                      library,
-                                      source,
-                                      event.target.checked,
-                                    );
-                                    onError?.(result.error);
-                                    if (!result.error) onChange(result.settings);
-                                  }}
-                                />
-                                {persisted?.Enabled && (
-                                  <Button type="button" onClick={() => onCustomize(persisted)}>
-                                    Customize {source.title}
-                                  </Button>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
+                  library.collections.length === 0 &&
+                  library.unavailable.length === 0 ? (
+                    <p className="text-sm text-base-content/60">
+                      No compatible hubs or collections returned by Plex.
+                    </p>
+                  ) : (
+                    <div className="grid gap-x-6 gap-y-4 lg:grid-cols-2">
+                      {sourceList(library, "Hubs", library.hubs)}
+                      {library.collections.length > 0 || library.identity.libraryId
+                        ? sourceList(library, "Collections", library.collections)
+                        : null}
                     </div>
                   )}
                   {library.unavailable.length > 0 && (
