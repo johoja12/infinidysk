@@ -830,6 +830,12 @@ public sealed class HealthCheckCoordinatorTests
                 allowRepairs: false,
                 maximumCount: 5,
                 CancellationToken.None);
+            var nextChecks = await harness.Service.SelectNextHealthCheckIdsAsync(
+                [],
+                allowChecks: true,
+                allowRepairs: false,
+                maximumCount: 1,
+                CancellationToken.None);
             var repairsOnly = await harness.Service.SelectNextHealthCheckIdsAsync(
                 [],
                 allowChecks: false,
@@ -840,7 +846,9 @@ public sealed class HealthCheckCoordinatorTests
             Assert.Equal(
                 [urgent.Id, pendingRepair.Id, neverChecked.Id, forced.Id, scheduled.Id],
                 unrestricted);
-            Assert.Equal([neverChecked.Id, forced.Id, scheduled.Id], checksOnly);
+            // Selections alternate between forced rechecks and never-checked files.
+            Assert.Equal([forced.Id, neverChecked.Id, scheduled.Id], checksOnly);
+            Assert.Equal([neverChecked.Id], nextChecks);
             Assert.Equal([urgent.Id, pendingRepair.Id], repairsOnly);
         }
         finally

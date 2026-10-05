@@ -252,6 +252,20 @@ public sealed class HealthCheckQueueItemsQueryTests : IAsyncLifetime
                 unlinkedScheduled.Id,
             ],
             orderedIds);
+
+        var forcedFirstIds = await HealthCheckService.GetHealthCheckQueueItems(_dbClient, forcedFirst: true)
+            .Select(x => x.Id)
+            .ToListAsync();
+
+        Assert.Equal(
+            [
+                historyLinkedUrgent.Id,
+                pendingRepair.Id,
+                historyLinkedForced.Id,
+                uncheckedItem.Id,
+                unlinkedScheduled.Id,
+            ],
+            forcedFirstIds);
     }
 
     private static DavItem NewUsenetFile(

@@ -49,6 +49,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
     private static readonly TimeSpan HealthCheckStallDeferral = TimeSpan.FromDays(1);
     private readonly ConcurrentDictionary<Guid, DateTimeOffset> _repairRetryNotBefore = new();
     private readonly NativeCache.NativeCacheService? _nativeCache;
+    private long _healthCheckSelections;
     /// <summary>How long a file kept because its cached copy still plays waits before the next check.</summary>
     internal static readonly TimeSpan CachedCopyRecheck = TimeSpan.FromDays(7);
     /// <summary>How long repair waits when the cached copy could not be verified right now.</summary>
@@ -498,7 +499,10 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         await using var dbContext = CreateContext();
         var dbClient = new DavDatabaseClient(dbContext);
         var currentDateTime = _timeProvider.GetUtcNow();
-        IQueryable<DavItem> queue = GetHealthCheckQueueItems(dbClient)
+        // Alternate selections between forced rechecks and never-checked files: a large initial
+        // scan cannot hold back a recheck the operator asked for, nor a library-wide re-run new imports.
+        var forcedFirst = (Interlocked.Increment(ref _healthCheckSelections) & 1) == 0;
+        IQueryable<DavItem> queue = GetHealthCheckQueueItems(dbClient, forcedFirst)
             .Where(item =>
                 item.NextHealthCheck == null ||
                 item.NextHealthCheck < currentDateTime ||
@@ -1098,16 +1102,16 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         (item.NextHealthCheck is null || item.NextHealthCheck == ForcedRecheckSentinel) &&
         FilenameUtil.IsHealthCheckCandidate(item.Name);
 
-    public static IOrderedQueryable<DavItem> GetHealthCheckQueueItems(DavDatabaseClient dbClient)
+    public static IOrderedQueryable<DavItem> GetHealthCheckQueueItems(DavDatabaseClient dbClient, bool forcedFirst = false)
     {
         // Playback-triggered urgent and schedule-deferred repairs stay first. Never-checked
-        // files come next so routine rechecks cannot starve the initial scan, then
-        // operator-forced rechecks (newest release first), then routine scheduled rechecks.
+        // files and operator-forced rechecks (newest release first) come next, in the order
+        // the caller picks, then routine scheduled rechecks so they cannot starve either.
         return GetHealthCheckQueueItemsQuery(dbClient)
             .OrderBy(x =>
                 x.NextHealthCheck == DateTimeOffset.UnixEpoch || x.HealthRepairPending ? 0 :
-                x.NextHealthCheck == null ? 1 :
-                x.NextHealthCheck == ForcedRecheckSentinel ? 2 : 3)
+                x.NextHealthCheck == null ? (forcedFirst ? 2 : 1) :
+                x.NextHealthCheck == ForcedRecheckSentinel ? (forcedFirst ? 1 : 2) : 3)
             .ThenBy(x => x.NextHealthCheck)
             .ThenByDescending(x => x.ReleaseDate)
             .ThenBy(x => x.Id);
