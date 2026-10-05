@@ -108,8 +108,8 @@ public sealed class PrefetchLiveStatusTests : IDisposable
     [InlineData("backfill", "Playback not yet cached", "backfill")]
     [InlineData("finish-watched", "Finish partially watched", "finish-watched")]
     [InlineData("read", "Read activity", "read")]
-    [InlineData("plex:s:realtime-next:u:episode:x:unwatched", "Next episode · realtime", "plex-realtime-next")]
-    [InlineData("plex:s:history-next:u:episode:x", "Next episode · history", "plex-history-next")]
+    [InlineData("plex:s:realtime-next:u:episode:x:unwatched", "Next episode · realtime · Unknown user", "plex-realtime-next")]
+    [InlineData("plex:s:history-next:u:episode:x", "Next episode · history · Unknown user", "plex-history-next")]
     [InlineData("plex:s:realtime:u:movie:x", "Playing now", "plex-realtime")]
     [InlineData("plex:s:history:u:movie:x", "Watch history", "plex-history")]
     [InlineData("something-new", "Background warming", "other")]
@@ -124,6 +124,27 @@ public sealed class PrefetchLiveStatusTests : IDisposable
             ["manual", HubOwner(), "plex:s:realtime:u:movie:x", "manual", "plex:s2:realtime:u2:movie:y"], settings, [Server], limit: 2);
         Assert.Equal(3, count);
         Assert.Equal(new[] { "Playing now", "Popular TV This Year" }, sources.Select(source => source.Label));
+    }
+
+    [Fact]
+    public void Predictions_ResolveTheOwningUserAndKeepMultipleViewers()
+    {
+        var alice = PlexPrefetchService.Owner(Server.Id, "history-next", "alice-id") + ":episode:x:unwatched";
+        var bob = PlexPrefetchService.Owner(Server.Id, "realtime-next", "bob-id") + ":episode:x:minimum";
+        var names = new Dictionary<string, string>
+        {
+            [PlexPrefetchService.Hash(Server.Id) + ":" + PlexPrefetchService.Hash("alice-id")] = "Alice",
+            [PlexPrefetchService.Hash(Server.Id) + ":" + PlexPrefetchService.Hash("bob-id")] = "Bob",
+        };
+        var (sources, count) = PlexPrefetchService.DescribeOwners([alice, bob, alice], new(), [Server], userNames: names);
+        Assert.Equal(2, count);
+        Assert.Contains(sources, source => source.Label == "Next episode · history · Alice");
+        Assert.Contains(sources, source => source.Label == "Next episode · realtime · Bob · head/tail");
+        Assert.Equal("Next episode · history · Unknown user",
+            PlexPrefetchService.DescribeOwner(alice, new(), [Server], new Dictionary<string, string>
+            {
+                [PlexPrefetchService.Hash("different-server") + ":" + PlexPrefetchService.Hash("alice-id")] = "Wrong user",
+            }).Label);
     }
 
     public void Dispose() { if (Directory.Exists(_root)) Directory.Delete(_root, true); }

@@ -11,7 +11,7 @@ namespace NzbWebDAV.Api.Controllers.Prefetch;
 [Route("api/prefetch")]
 [ProducesResponseType(typeof(PrefetchStatusResponse), StatusCodes.Status200OK)]
 public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchService policies, DavDatabaseClient database,
-    ConfigManager config) : GetOnlyApiController
+    ConfigManager config, PlexCatalogueService catalogue) : GetOnlyApiController
 {
     protected override async Task<IActionResult> HandleRequest()
     {
@@ -39,12 +39,34 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
         IReadOnlyList<PlexServer> servers;
         try { servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers)); }
         catch (ArgumentException) { servers = []; }
+        // Only resolve servers represented by retained predictions. Catalogue snapshots coalesce
+        // refreshes and retain last-good names; a slow Plex server must not hold up queue status.
+        var predictionServers = owners.Values.SelectMany(value => value).Concat(jobs.Select(job => job.Trigger))
+            .Select(owner => owner.Split(':'))
+            .Where(parts => parts.Length >= 4 && parts[0] == "plex" && parts[2] is "history-next" or "realtime-next")
+            .Select(parts => parts[1]).ToHashSet(StringComparer.Ordinal);
+        using var lookupTimeout = CancellationTokenSource.CreateLinkedTokenSource(HttpContext.RequestAborted);
+        lookupTimeout.CancelAfter(TimeSpan.FromSeconds(3));
+        var userSnapshots = await Task.WhenAll(servers.Where(server => server.Enabled && predictionServers.Contains(PlexPrefetchService.Hash(server.Id)))
+            .Select(async server =>
+            {
+                try
+                {
+                    var snapshot = await catalogue.GetUsersAsync(server, ct: lookupTimeout.Token).ConfigureAwait(false);
+                    return snapshot.Data.Select(user => new KeyValuePair<string, string>(
+                        PlexPrefetchService.Hash(server.Id) + ":" + PlexPrefetchService.Hash(user.Id), user.Name)).ToArray();
+                }
+                catch (OperationCanceledException) when (!HttpContext.RequestAborted.IsCancellationRequested)
+                { return Array.Empty<KeyValuePair<string, string>>(); }
+            })).ConfigureAwait(false);
+        var userNames = userSnapshots.SelectMany(snapshot => snapshot).GroupBy(pair => pair.Key, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.First().Value, StringComparer.Ordinal);
         return Ok(new PrefetchStatusResponse(
             runtime.Jobs is not null, runtime.InitializationError, runtime.RuntimeError, runtime.Healthy, paused,
             jobs.Select(job =>
             {
                 var (sources, count) = PlexPrefetchService.DescribeOwners(
-                    owners.GetValueOrDefault(job.Id) ?? [job.Trigger], settings, servers);
+                    owners.GetValueOrDefault(job.Id) ?? [job.Trigger], settings, servers, userNames: userNames);
                 return job with
                 {
                     DisplayName = items.GetValueOrDefault(job.ItemId)?.Name ?? "Removed media",
