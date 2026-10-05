@@ -46,6 +46,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     public DateTimeOffset? LastSuccess { get; private set; }
     public string? LastError { get; private set; }
     private bool _previewComplete;
+    private bool _plexUnavailable;
     public void RequestSync() => Interlocked.Exchange(ref _requested, 1);
 
     public Task SyncAsync(bool force, CancellationToken ct) => RunAsync(force, null, ct);
@@ -61,11 +62,13 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         var preview = new List<PrefetchPrediction>();
         var complete = false;
         string? error = null;
-        await RunAsync(true, preview, ct, (success, failure) => { complete = success; error = failure; }).ConfigureAwait(false);
-        return new(preview, complete, error);
+        var plexUnavailable = false;
+        await RunAsync(true, preview, ct, (success, failure, unavailable) =>
+        { complete = success; error = failure; plexUnavailable = unavailable; }).ConfigureAwait(false);
+        return new(preview, complete, error, plexUnavailable);
     }
 
-    private async Task RunAsync(bool force, List<PrefetchPrediction>? preview, CancellationToken ct, Action<bool, string?>? completed = null)
+    private async Task RunAsync(bool force, List<PrefetchPrediction>? preview, CancellationToken ct, Action<bool, string?, bool>? completed = null)
     {
         if (!await _sync.WaitAsync(0, ct).ConfigureAwait(false))
         {
@@ -73,6 +76,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             return;
         }
         _preview = preview;
+        _plexUnavailable = false;
+        var queryingPlex = false;
         if (preview is not null) _previewComplete = false;
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(preview is null ? TimeSpan.FromMinutes(2) : TimeSpan.FromSeconds(20));
@@ -101,13 +106,15 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             LastError = null;
             _remainingCandidates = preview is null ? 2048 : 100;
             var enabled = servers.Where(server => server.Enabled).ToArray();
+            queryingPlex = true;
             for (var index = 0; index < enabled.Length; index++)
             {
                 var server = enabled[(_serverCursor + index) % enabled.Length];
                 try { await SyncServerAsync(server, settings, force, deadline.Token).ConfigureAwait(false); }
-                catch (PlexRequestException) { LastError = "A Plex server could not be refreshed. Other servers and cached content remain available."; }
+                catch (PlexRequestException) { _plexUnavailable = true; LastError = "A Plex server could not be refreshed. Other servers and cached content remain available."; }
                 finally { if (index == enabled.Length - 1) _serverCursor = (_serverCursor + 1) % Math.Max(1, enabled.Length); }
             }
+            queryingPlex = false;
             if (settings.ReadActivityEnabled)
             {
                 // Raw reads are low-confidence hints only. They never enter the verified Plex registry.
@@ -125,10 +132,10 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             else _previewComplete = LastError is null;
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-        { LastError = "Policy refresh reached its bounded time window; remaining sources will be retried."; _serverCursor++; }
+        { _plexUnavailable |= queryingPlex; LastError = "Policy refresh reached its bounded time window; remaining sources will be retried."; _serverCursor++; }
         catch (Exception exception) when (exception is IOException or Microsoft.Data.Sqlite.SqliteException or InvalidOperationException)
         { runtime.ReportMetadataFailure(); LastError = runtime.RuntimeError; }
-        finally { completed?.Invoke(_previewComplete, LastError); _preview = null; _sync.Release(); }
+        finally { completed?.Invoke(_previewComplete, LastError, _plexUnavailable); _preview = null; _sync.Release(); }
     }
 
     private async Task SyncServerAsync(PlexServer server, PrefetchSettings settings, bool force, CancellationToken ct)
@@ -137,35 +144,35 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         {
             try
             {
-            var sessions = await api.GetSessionsAsync(server, ct).ConfigureAwait(false);
-            if (_preview is null) _playback.Record(server.Id, sessions, TimeSpan.FromSeconds(settings.VerifiedSessionExpirySeconds));
-            foreach (var session in sessions.Where(session => session.State is "playing" or "paused"
-                && UserSelected(settings, server.Id, session.UserId)).Take(32))
-            {
-                var owner = Owner(server.Id, "realtime", session.UserId);
-                var viewer = new PlaybackViewer(session.UserName, session.PlayerName, session.Item.Duration);
-                if (session.Item.ViewOffset > 0) await QueueMediaAsync(server, session.Item, owner, 80, settings, null, ct,
-                    resolved: imported => runtime.Viewers.Note(imported.Id, viewer)).ConfigureAwait(false);
-                if (settings.PredictionsEnabled && session.Item.Type == "episode")
-                    await QueueNextAsync(server, session.Item, Owner(server.Id, "realtime-next", session.UserId), 90, settings, null, ct).ConfigureAwait(false);
+                var sessions = await api.GetSessionsAsync(server, ct).ConfigureAwait(false);
+                if (_preview is null) _playback.Record(server.Id, sessions, TimeSpan.FromSeconds(settings.VerifiedSessionExpirySeconds));
+                foreach (var session in sessions.Where(session => session.State is "playing" or "paused"
+                    && UserSelected(settings, server.Id, session.UserId)).Take(32))
+                {
+                    var owner = Owner(server.Id, "realtime", session.UserId);
+                    var viewer = new PlaybackViewer(session.UserName, session.PlayerName, session.Item.Duration);
+                    if (session.Item.ViewOffset > 0) await QueueMediaAsync(server, session.Item, owner, 80, settings, null, ct,
+                        resolved: imported => runtime.Viewers.Note(imported.Id, viewer)).ConfigureAwait(false);
+                    if (settings.PredictionsEnabled && session.Item.Type == "episode")
+                        await QueueNextAsync(server, session.Item, Owner(server.Id, "realtime-next", session.UserId), 90, settings, null, ct).ConfigureAwait(false);
+                }
             }
-            }
-            catch (PlexRequestException) { LastError = "Plex playback could not be refreshed; other source policies remain available."; }
+            catch (PlexRequestException) { _plexUnavailable = true; LastError = "Plex playback could not be refreshed; other source policies remain available."; }
         }
         if (settings.HistoryEnabled && Due("history:" + server.Id, TimeSpan.FromMinutes(settings.SyncIntervalMinutes), force))
         {
             try
             {
-            var history = await api.GetHistoryAsync(server, DateTimeOffset.UtcNow.AddDays(-settings.LookbackDays), 1000, ct).ConfigureAwait(false);
-            foreach (var item in PrefetchPolicy.HistoryCandidates(history, settings, server.Id, DateTimeOffset.UtcNow))
-            {
-                var owner = Owner(server.Id, "history", item.UserId ?? "");
-                if (item.Type == "movie" || item.ViewOffset > 0) await QueueMediaAsync(server, item, owner, 40, settings, null, ct).ConfigureAwait(false);
-                if (settings.PredictionsEnabled && item.Type == "episode")
-                    await QueueNextAsync(server, item, Owner(server.Id, "history-next", item.UserId ?? ""), 50, settings, null, ct).ConfigureAwait(false);
+                var history = await api.GetHistoryAsync(server, DateTimeOffset.UtcNow.AddDays(-settings.LookbackDays), 1000, ct).ConfigureAwait(false);
+                foreach (var item in PrefetchPolicy.HistoryCandidates(history, settings, server.Id, DateTimeOffset.UtcNow))
+                {
+                    var owner = Owner(server.Id, "history", item.UserId ?? "");
+                    if (item.Type == "movie" || item.ViewOffset > 0) await QueueMediaAsync(server, item, owner, 40, settings, null, ct).ConfigureAwait(false);
+                    if (settings.PredictionsEnabled && item.Type == "episode")
+                        await QueueNextAsync(server, item, Owner(server.Id, "history-next", item.UserId ?? ""), 50, settings, null, ct).ConfigureAwait(false);
+                }
             }
-            }
-            catch (PlexRequestException) { LastError = "Plex history could not be refreshed; other source policies remain available."; }
+            catch (PlexRequestException) { _plexUnavailable = true; LastError = "Plex history could not be refreshed; other source policies remain available."; }
         }
         foreach (var source in settings.Sources.Where(source => source.Enabled && source.ServerId == server.Id
             && !settings.IsLibraryDisabled(source)))
@@ -194,7 +201,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
                     else await QueueMediaAsync(server, item, owner, 20, settings, source, ct).ConfigureAwait(false);
                 }
             }
-            catch (PlexRequestException) { LastError = "A selected Plex source could not be refreshed; its previous cache is retained."; }
+            catch (PlexRequestException) { _plexUnavailable = true; LastError = "A selected Plex source could not be refreshed; its previous cache is retained."; }
         }
     }
 
@@ -228,8 +235,15 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     {
         if (_preview is { Count: < 100 } preview)
             preview.Add(new(imported?.Id ?? Guid.Empty, imported?.Name ?? item.Title, SourceLabel(owner), reason, 0, 0, imported?.FileSize ?? 0)
-                { Eligible = false, PlexRatingKey = item.RatingKey, Owner = owner,
-                    ShowTitle = item.ShowTitle, EpisodeTitle = item.Title, Season = item.Season, Episode = item.Episode });
+            {
+                Eligible = false,
+                PlexRatingKey = item.RatingKey,
+                Owner = owner,
+                ShowTitle = item.ShowTitle,
+                EpisodeTitle = item.Title,
+                Season = item.Season,
+                Episode = item.Episode
+            });
         return false;
     }
 
@@ -242,9 +256,18 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         if (item.File is null)
         {
             var details = await api.GetMetadataAsync(server, item.RatingKey, ct).ConfigureAwait(false);
-            item = details with { ViewOffset = item.ViewOffset, Duration = item.Duration > 0 ? item.Duration : details.Duration,
-                UserId = item.UserId, ViewedAt = item.ViewedAt, ShowRatingKey = details.ShowRatingKey ?? item.ShowRatingKey,
-                ShowTitle = details.ShowTitle ?? item.ShowTitle, Season = details.Season ?? item.Season, Episode = details.Episode ?? item.Episode, WatchStateUserId = item.WatchStateUserId };
+            item = details with
+            {
+                ViewOffset = item.ViewOffset,
+                Duration = item.Duration > 0 ? item.Duration : details.Duration,
+                UserId = item.UserId,
+                ViewedAt = item.ViewedAt,
+                ShowRatingKey = details.ShowRatingKey ?? item.ShowRatingKey,
+                ShowTitle = details.ShowTitle ?? item.ShowTitle,
+                Season = details.Season ?? item.Season,
+                Episode = details.Episode ?? item.Episode,
+                WatchStateUserId = item.WatchStateUserId
+            };
         }
         if (item.File is null || PrefetchPathResolver.Map(item.File, server.PathMappings) is not { } mapped)
             return RejectPreview(item, owner, "No exact configured path mapping for this Plex media.");
@@ -281,8 +304,15 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         var accepted = await QueueImportedAsync(imported, scopedOwner, priority, item.ViewOffset, item.Duration, settings, ct).ConfigureAwait(false);
         if (_preview is { } preview)
             for (var index = previewStart; index < preview.Count; index++)
-                preview[index] = preview[index] with { Owner = scopedOwner, PlexRatingKey = item.RatingKey,
-                    ShowTitle = item.ShowTitle, EpisodeTitle = item.Title, Season = item.Season, Episode = item.Episode };
+                preview[index] = preview[index] with
+                {
+                    Owner = scopedOwner,
+                    PlexRatingKey = item.RatingKey,
+                    ShowTitle = item.ShowTitle,
+                    EpisodeTitle = item.Title,
+                    Season = item.Season,
+                    Episode = item.Episode
+                };
         return accepted;
     }
 
@@ -497,8 +527,13 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         var parts = owner.Split(':');
         if (parts.Length is < 6 or > 9 || parts[0] != "plex") return false;
         foreach (var qualifier in parts.Skip(6))
-            if (!(qualifier switch { "minimum" => settings.MinimumWarmEnabled, "local" => settings.WarmLocalFiles,
-                "unwatched" or "watch-unknown" => true, _ => false })) return false;
+            if (!(qualifier switch
+            {
+                "minimum" => settings.MinimumWarmEnabled,
+                "local" => settings.WarmLocalFiles,
+                "unwatched" or "watch-unknown" => true,
+                _ => false
+            })) return false;
         if (parts[4] == "movie" ? !settings.MovieEnabled : !settings.TvEnabled) return false;
         var server = servers.FirstOrDefault(server => server.Enabled && Hash(server.Id) == parts[1]);
         if (server is null) return false;

@@ -1,16 +1,17 @@
 using Microsoft.Extensions.Hosting;
 using NzbWebDAV.Config;
+using NzbWebDAV.Database;
 using NzbWebDAV.Services.Plex;
 
 namespace NzbWebDAV.Services.Prefetch;
 
 public sealed record PredictionSnapshot(IReadOnlyList<PrefetchPrediction> Predictions, DateTimeOffset? UpdatedAt,
-    bool HasSnapshot, bool Refreshing, bool Stale, string? Error);
-public sealed record PredictionRefresh(IReadOnlyList<PrefetchPrediction> Predictions, bool Complete, string? Error);
+    bool HasSnapshot, bool Refreshing, bool Stale, string? Error, bool PlexUnavailable = false, string? Warning = null);
+public sealed record PredictionRefresh(IReadOnlyList<PrefetchPrediction> Predictions, bool Complete, string? Error, bool PlexUnavailable = false);
 
 /// <summary>One bounded read-only refresh shared by all visitors. No request owns its lifetime.</summary>
 public sealed class PredictionSnapshotCache(Func<string> revision, Func<CancellationToken, Task<PredictionRefresh>> fetch,
-    TimeProvider clock, CancellationToken stoppingToken)
+    TimeProvider clock, CancellationToken stoppingToken, PredictionSnapshotStore? store = null)
 {
     private readonly object _gate = new();
     private string? _revision;
@@ -19,6 +20,8 @@ public sealed class PredictionSnapshotCache(Func<string> revision, Func<Cancella
     private DateTimeOffset _retryAt;
     private Task? _refresh;
     private string? _error;
+    private bool _restored;
+    private bool _plexUnavailable;
 
     public PredictionSnapshot Get()
     {
@@ -31,6 +34,14 @@ public sealed class PredictionSnapshotCache(Func<string> revision, Func<Cancella
                 _predictions = [];
                 _updatedAt = null;
                 _error = null;
+                _plexUnavailable = false;
+                var saved = store?.Load(current);
+                _restored = saved is not null;
+                if (saved is not null)
+                {
+                    _predictions = saved.Predictions;
+                    _updatedAt = saved.UpdatedAt;
+                }
                 _retryAt = DateTimeOffset.MinValue;
             }
             var now = clock.GetUtcNow();
@@ -40,7 +51,8 @@ public sealed class PredictionSnapshotCache(Func<string> revision, Func<Cancella
                 _refresh = Task.Run(() => RefreshAsync(current), CancellationToken.None);
             }
             return new(_predictions, _updatedAt, _updatedAt is not null, _refresh is { IsCompleted: false },
-                _error is not null || _updatedAt is null || now - _updatedAt >= TimeSpan.FromMinutes(1), _error);
+                _restored || _error is not null || _updatedAt is null || now - _updatedAt >= TimeSpan.FromMinutes(1),
+                _error, _plexUnavailable, store?.Warning);
         }
     }
 
@@ -63,11 +75,14 @@ public sealed class PredictionSnapshotCache(Func<string> revision, Func<Cancella
         lock (_gate)
         {
             if (_revision != expected || revision() != expected) return;
+            _plexUnavailable = !result.Complete && result.PlexUnavailable;
             _error = result.Complete ? null : result.Error ?? "Prediction refresh is incomplete. Retrying shortly.";
             if (result.Complete)
             {
                 _predictions = result.Predictions.ToArray();
                 _updatedAt = clock.GetUtcNow();
+                _restored = false;
+                store?.Save(new(1, expected, _updatedAt.Value, _predictions));
             }
             _retryAt = clock.GetUtcNow().AddSeconds(result.Complete ? 60 : 30);
         }
@@ -78,7 +93,8 @@ public sealed class PredictionSnapshotService(PlexPrefetchService policies, Conf
     PlexCatalogueService catalogue, PrefetchRuntime runtime, IHostApplicationLifetime lifetime)
 {
     private readonly PredictionSnapshotCache _cache = new(policies.PreviewRevision,
-        ct => RefreshAsync(policies, config, catalogue, runtime, ct), TimeProvider.System, lifetime.ApplicationStopping);
+        ct => RefreshAsync(policies, config, catalogue, runtime, ct), TimeProvider.System, lifetime.ApplicationStopping,
+        new PredictionSnapshotStore(Path.Combine(DavDatabaseContext.ConfigPath, "prefetch-predictions.json")));
 
     public PredictionSnapshot Get() => _cache.Get();
 
@@ -86,7 +102,7 @@ public sealed class PredictionSnapshotService(PlexPrefetchService policies, Conf
         PlexCatalogueService catalogue, PrefetchRuntime runtime, CancellationToken ct)
     {
         var pass = await policies.PreviewSnapshotAsync(ct).ConfigureAwait(false);
-        if (!pass.Complete) return new([], false, pass.Error);
+        if (!pass.Complete) return new([], false, pass.Error, pass.PlexUnavailable);
         var predictions = pass.Predictions;
         var servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers));
         var hashes = predictions.Select(prediction => prediction.Owner?.Split(':'))

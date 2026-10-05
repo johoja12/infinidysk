@@ -42,6 +42,7 @@ export function PredictionResults({
     refreshing?: boolean;
     stale?: boolean;
     error?: string;
+    plexUnavailable?: boolean;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -115,9 +116,16 @@ export function PredictionResults({
         </span>
       </div>
       {error && (
-        <div className="alert alert-error text-sm" role="alert">
-          {error}
-          {snapshot?.hasSnapshot && " Showing the last successful results."}
+        <div
+          className={`alert ${snapshot?.plexUnavailable ? "alert-warning" : "alert-error"} text-sm`}
+          role="alert"
+        >
+          {snapshot?.plexUnavailable
+            ? "Plex is unavailable or did not respond. Retrying automatically."
+            : error}
+          {snapshot?.hasSnapshot
+            ? " Showing the last successful results."
+            : snapshot?.plexUnavailable && " No saved prediction results are available yet."}
         </div>
       )}
       {snapshot?.warning && <div className="alert alert-warning text-sm">{snapshot.warning}</div>}
