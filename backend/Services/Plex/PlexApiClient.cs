@@ -417,6 +417,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
         return new(Attribute(item, "ratingKey") ?? "", Attribute(item, "type") ?? "", Attribute(item, "title") ?? "",
             ShowRatingKey(item), Integer(item, "parentIndex"), Integer(item, "index"), Attribute(part, "file"),
             Long(item, "viewOffset") ?? 0, Long(item, "duration") ?? 0, Long(item, "viewedAt"),
-            Attribute(item, "accountID") ?? Attribute(item.Element("User"), "id"));
+            Attribute(item, "accountID") ?? Attribute(item.Element("User"), "id"))
+            { ShowTitle = Attribute(item, "grandparentTitle") };
     }
 }

@@ -178,7 +178,31 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
         using var handler = new FakePlexHandler(_ => PlexApiClientTests.Xml("""<MediaContainer><Video ratingKey="movie" type="movie" title="Unmapped movie"><Media><Part file="/elsewhere/movie.mkv"/></Media></Video></MediaContainer>"""));
         using var policy = Policy(handler);
         var preview = await policy.PreviewAsync(CancellationToken.None);
-        Assert.Contains("mapping", Assert.Single(preview).Reason, StringComparison.OrdinalIgnoreCase);
+        var candidate = Assert.Single(preview);
+        Assert.Contains("mapping", candidate.Reason, StringComparison.OrdinalIgnoreCase);
+        Assert.NotNull(candidate.Owner);
+        Assert.Equal("Unmapped movie", candidate.EpisodeTitle);
+        Assert.DoesNotContain("owner", JsonSerializer.Serialize(candidate, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }), StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(_runtime.Jobs!.List());
+    }
+
+    [Fact]
+    public async Task Preview_NextEpisodeCarriesShowAndViewerOwnerWithoutQueueMutation()
+    {
+        var itemId = await AddItem("episode.mkv");
+        Set(ConfigKeys.SmartPrefetchSettings, JsonSerializer.Serialize(new PrefetchSettings
+        { Enabled = true, RealtimeEnabled = true, PredictionsEnabled = true, MaxQueueAhead = 1 }));
+        using var handler = new FakePlexHandler(request => PlexApiClientTests.Xml(request.Uri.AbsolutePath == "/status/sessions"
+            ? """<MediaContainer><Video ratingKey="current" type="episode" title="Jetrel" grandparentRatingKey="show" parentIndex="1" index="15"><User id="owner" title="Sam"/><Player state="playing"/><Session id="session"/></Video></MediaContainer>"""
+            : """<MediaContainer><Video ratingKey="next" type="episode" title="Learning Curve" grandparentTitle="Voyager" grandparentRatingKey="show" parentIndex="1" index="16"><Media><Part file="/plex/episode.mkv"/></Media></Video></MediaContainer>"""));
+        using var policy = Policy(handler);
+        var preview = await policy.PreviewAsync(CancellationToken.None);
+        var candidate = Assert.Single(preview.Where(candidate => candidate.ItemId == itemId));
+        Assert.Equal("Voyager", candidate.ShowTitle);
+        Assert.Equal("Learning Curve", candidate.EpisodeTitle);
+        Assert.Equal(1, candidate.Season);
+        Assert.Equal(16, candidate.Episode);
+        Assert.StartsWith(PlexPrefetchService.Owner("machine", "realtime-next", "owner"), candidate.Owner);
         Assert.Empty(_runtime.Jobs!.List());
     }
 
