@@ -24,6 +24,8 @@ it("filters live predictions by viewer and current coverage, and opens the selec
               viewer: "Sam",
               attribution: { label: "Next episode · history · Sam", category: "plex-history-next" },
               reason: "Next unwatched episode",
+              watchedStatus: "verified",
+              serverName: "Living room",
               eligible: true,
             },
             {
@@ -62,6 +64,7 @@ it("filters live predictions by viewer and current coverage, and opens the selec
   await waitFor(() =>
     expect(screen.getByRole("button", { name: "Fully cached · 1" })).toBeTruthy(),
   );
+  expect(screen.getByText("Sam · Living room: Verified next-unwatched")).toBeTruthy();
   fireEvent.change(screen.getByRole("combobox", { name: "Filter prediction viewer" }), {
     target: { value: "Alice" },
   });
@@ -82,7 +85,7 @@ it("filters live predictions by viewer and current coverage, and opens the selec
   ).toBe(true);
 });
 
-it("renders saved predictions during failed refreshes and identifies only affected viewers", async () => {
+it("renders saved predictions during failed refreshes without repeated connection warnings", async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn((input: RequestInfo | URL) =>
@@ -102,7 +105,7 @@ it("renders saved predictions during failed refreshes and identifies only affect
                       displayName: "Voyager",
                       viewer: "Alice",
                       attribution: { label: "Next episode · Alice", category: "plex-history-next" },
-                      reason: "Mapping unresolved",
+                      reason: "Whole-file warming; watched status unknown",
                       watchedStatus: "unconnected",
                       watchedWarning: "Connect this profile",
                       serverName: "Living room",
@@ -119,10 +122,11 @@ it("renders saved predictions during failed refreshes and identifies only affect
   await screen.findByText("Voyager");
   expect(screen.getByRole("alert").textContent).toContain("Showing the last successful results");
   expect(screen.getByText(/Updated .*Refreshing/).textContent).toContain("Previous results");
-  expect(screen.getByText(/Alice · Living room: Chronological candidate/)).toBeTruthy();
-  expect(screen.getByRole("link", { name: "Plex connections" }).getAttribute("href")).toBe(
-    "/settings?tab=streaming#plex-connections",
-  );
+  expect(screen.getByText("Whole-file warming")).toBeTruthy();
+  expect(screen.queryByText(/watched status unknown/)).toBeNull();
+  expect(screen.queryByText(/Chronological candidate/)).toBeNull();
+  expect(screen.queryByText("Connect this profile")).toBeNull();
+  expect(screen.queryByRole("link", { name: "Plex connections" })).toBeNull();
   await waitFor(() =>
     expect(screen.getByRole("button", { name: "Not in library · 1" })).toBeTruthy(),
   );

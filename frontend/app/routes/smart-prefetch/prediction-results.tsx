@@ -309,30 +309,22 @@ function PredictionRow({
         </div>
         <div className="min-w-0">
           <SourceBubbles sources={group.sources} fallback="Next episode" />
-          <p className="mt-2 text-xs text-base-content/55">{group.reasons.join(" · ")}</p>
-          {group.watchStates.map((watch) => (
-            <p
-              key={`${watch.viewer}:${watch.server}:${watch.status}`}
-              className={`mt-2 text-xs ${watch.status === "verified" ? "text-success" : "text-warning"}`}
-            >
-              {watch.viewer}
-              {watch.server ? ` · ${watch.server}` : ""}:{" "}
-              {watch.status === "verified"
-                ? "Verified next-unwatched"
-                : "Chronological candidate · watched status unverified"}
-              {watch.warning && (
-                <span className="block">
-                  {watch.warning}{" "}
-                  <a
-                    className="link"
-                    href={withUrlBase("/settings?tab=streaming#plex-connections")}
-                  >
-                    Plex connections
-                  </a>
-                </span>
-              )}
-            </p>
-          ))}
+          <p className="mt-2 text-xs text-base-content/55">
+            {group.reasons
+              .map((reason) => reason.replace("; watched status unknown", ""))
+              .join(" · ")}
+          </p>
+          {group.watchStates
+            .filter((watch) => watch.status === "verified")
+            .map((watch) => (
+              <p
+                key={`${watch.viewer}:${watch.server}:${watch.status}`}
+                className="mt-2 text-xs text-success"
+              >
+                {watch.viewer}
+                {watch.server ? ` · ${watch.server}` : ""}: Verified next-unwatched
+              </p>
+            ))}
         </div>
         <div>
           <div className="mb-2 flex justify-between gap-2 text-xs">
@@ -388,7 +380,10 @@ function PredictionRow({
         <summary className="cursor-pointer text-xs text-info">Prediction details</summary>
         <div className="mt-3 space-y-2 text-xs text-base-content/65">
           <p>
-            Predicted for {group.viewers.join(", ")}. {group.reasons.join(" · ")}
+            Predicted for {group.viewers.join(", ")}.{" "}
+            {group.reasons
+              .map((reason) => reason.replace("; watched status unknown", ""))
+              .join(" · ")}
           </p>
           {cache.data && !cache.data.complete && (
             <p>
