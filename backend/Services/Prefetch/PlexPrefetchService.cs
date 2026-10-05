@@ -21,6 +21,9 @@ public sealed record PrefetchPrediction(Guid ItemId, string DisplayName, string 
     public int? Season { get; init; }
     public int? Episode { get; init; }
     public string? Viewer { get; init; }
+    public string? WatchedStatus { get; init; }
+    public string? WatchedWarning { get; init; }
+    public string? ServerName { get; init; }
     public PrefetchJobSource? Attribution { get; init; }
     [System.Text.Json.Serialization.JsonIgnore]
     public string? Owner { get; init; }
@@ -38,10 +41,11 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     private int _serverCursor;
     private string? _policyRevision;
     private string? _passRevision;
-    private readonly Dictionary<string, IReadOnlyList<PlexDiscoveredServer>> _userResources = new(StringComparer.Ordinal);
+    private PlexViewerResolver? _viewerResolver;
     private List<PrefetchPrediction>? _preview;
     public DateTimeOffset? LastSuccess { get; private set; }
     public string? LastError { get; private set; }
+    private bool _previewComplete;
     public void RequestSync() => Interlocked.Exchange(ref _requested, 1);
 
     public Task SyncAsync(bool force, CancellationToken ct) => RunAsync(force, null, ct);
@@ -52,7 +56,16 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         return preview;
     }
 
-    private async Task RunAsync(bool force, List<PrefetchPrediction>? preview, CancellationToken ct)
+    public async Task<PredictionRefresh> PreviewSnapshotAsync(CancellationToken ct)
+    {
+        var preview = new List<PrefetchPrediction>();
+        var complete = false;
+        string? error = null;
+        await RunAsync(true, preview, ct, (success, failure) => { complete = success; error = failure; }).ConfigureAwait(false);
+        return new(preview, complete, error);
+    }
+
+    private async Task RunAsync(bool force, List<PrefetchPrediction>? preview, CancellationToken ct, Action<bool, string?>? completed = null)
     {
         if (!await _sync.WaitAsync(0, ct).ConfigureAwait(false))
         {
@@ -60,6 +73,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             return;
         }
         _preview = preview;
+        if (preview is not null) _previewComplete = false;
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(preview is null ? TimeSpan.FromMinutes(2) : TimeSpan.FromSeconds(20));
         try
@@ -71,7 +85,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
                 ? servers.Where(server => server.Enabled).Select(server => server.Id).ToArray() : []);
             var revision = ConfigurationRevision(settings, servers);
             _passRevision = revision;
-            _userResources.Clear();
+            _viewerResolver = new(api, PlexSettings.ParseAccounts(config.GetEffectiveConfigValue(ConfigKeys.PlexAccounts)));
             if (preview is null && _policyRevision != revision)
             {
                 _last.Clear();
@@ -80,10 +94,10 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
                 _policyRevision = revision;
             }
             await runtime.WaitForInitializationAsync(deadline.Token).ConfigureAwait(false);
+            if (!settings.Enabled) { LastError = null; if (preview is not null) _previewComplete = true; return; }
             var jobs = runtime.Jobs;
-            if (jobs is null) return;
+            if (jobs is null) { LastError = "Activate Native Cache and restart to load prediction results."; return; }
             if (preview is null) runtime.Coordinator!.PruneOwners(owner => IsOwnerEnabled(owner, settings, servers));
-            if (!settings.Enabled) return;
             LastError = null;
             _remainingCandidates = preview is null ? 2048 : 100;
             var enabled = servers.Where(server => server.Enabled).ToArray();
@@ -108,12 +122,13 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             if (settings.FinishWatchedEnabled && preview is null)
                 await QueueFinishWatchedAsync(settings, deadline.Token).ConfigureAwait(false);
             if (preview is null) LastSuccess = DateTimeOffset.UtcNow;
+            else _previewComplete = LastError is null;
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         { LastError = "Policy refresh reached its bounded time window; remaining sources will be retried."; _serverCursor++; }
         catch (Exception exception) when (exception is IOException or Microsoft.Data.Sqlite.SqliteException or InvalidOperationException)
         { runtime.ReportMetadataFailure(); LastError = runtime.RuntimeError; }
-        finally { _preview = null; _sync.Release(); }
+        finally { completed?.Invoke(_previewComplete, LastError); _preview = null; _sync.Release(); }
     }
 
     private async Task SyncServerAsync(PlexServer server, PrefetchSettings settings, bool force, CancellationToken ct)
@@ -189,29 +204,22 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         if (_remainingCandidates <= 0 || !settings.TvEnabled || !PrefetchPolicy.IsEligible(current, settings, source)) return;
         var show = current.ShowRatingKey ?? (current.Type == "show" ? current.RatingKey : null);
         if (show is null) return;
-        var userServer = await UserServerAsync(server, current.UserId, ct).ConfigureAwait(false);
-        if (userServer is null) LastError = "Watched status is unknown for a selected user. Connect that Plex/Home account to verify next-unwatched predictions; chronological candidates remain available.";
-        var episodes = await api.GetNextEpisodesAsync(userServer ?? server, current, 20, ct).ConfigureAwait(false);
+        var resolution = await _viewerResolver!.ResolveAsync(server, current.UserId, ct).ConfigureAwait(false);
+        var episodes = await api.GetNextEpisodesAsync(resolution.Server ?? server with { AccountId = null }, current, 20, ct).ConfigureAwait(false);
         var remaining = Math.Min(settings.MaxQueueAhead, settings.TvEpisodesPerShow);
         foreach (var item in PrefetchPolicy.NextEpisodes(current, episodes, 20))
-            if (await QueueMediaAsync(server, item, owner, priority, settings, source, ct, prediction: true).ConfigureAwait(false) && --remaining == 0) break;
+        {
+            var before = _preview?.Count ?? 0;
+            var queued = await QueueMediaAsync(server, item, owner, priority, settings, source, ct, prediction: true).ConfigureAwait(false);
+            if (_preview is { } preview)
+                for (var index = before; index < preview.Count; index++)
+                    preview[index] = preview[index] with { WatchedStatus = resolution.Status, WatchedWarning = resolution.Message, ServerName = server.Name };
+            if (queued && --remaining == 0) break;
+        }
     }
 
-    private async Task<PlexServer?> UserServerAsync(PlexServer server, string? user, CancellationToken ct)
-    {
-        if (string.IsNullOrEmpty(user)) return null;
-        if (server.AccountId == user) return server;
-        var account = PlexSettings.ParseAccounts(config.GetEffectiveConfigValue(ConfigKeys.PlexAccounts)).FirstOrDefault(account => account.Id == user);
-        if (account is null) return null;
-        if (!_userResources.TryGetValue(user, out var resources))
-        {
-            try { resources = await api.DiscoverAsync(account.Token, ct).ConfigureAwait(false); }
-            catch (PlexRequestException) { resources = []; }
-            _userResources[user] = resources;
-        }
-        var resource = resources.FirstOrDefault(resource => resource.Id == server.Id);
-        return resource is null ? null : server with { AccountId = user, Token = resource.Token };
-    }
+    public string PreviewRevision() => ConfigurationRevision(runtime.Settings(),
+        PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers)));
 
     private string ConfigurationRevision(PrefetchSettings settings, IReadOnlyList<PlexServer> servers) =>
         Hash(JsonSerializer.Serialize(settings) + JsonSerializer.Serialize(servers) + config.GetEffectiveConfigValue(ConfigKeys.PlexAccounts));

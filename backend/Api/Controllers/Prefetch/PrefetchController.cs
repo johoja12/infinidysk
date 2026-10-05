@@ -144,6 +144,18 @@ public sealed class PrefetchPreviewController(PlexPrefetchService policies, Conf
     }
 }
 
+
+[ApiController]
+[Route("api/prefetch/predictions")]
+[ProducesResponseType(typeof(PredictionSnapshot), StatusCodes.Status200OK)]
+public sealed class PredictionSnapshotController(PredictionSnapshotService snapshots) : GetOnlyApiController
+{
+    protected override Task<IActionResult> HandleRequest()
+    {
+        return Task.FromResult<IActionResult>(Ok(snapshots.Get()));
+    }
+}
+
 [ApiController]
 [Route("api/prefetch/operations")]
 [RequestSizeLimit(64 * 1024)]

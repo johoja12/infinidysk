@@ -54,7 +54,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
                     }
                     catch (ArgumentException) { /* Unsafe advertised candidates are not selectable. */ }
                 }
-            result.Add(new(id, Text(item, "name") ?? "Plex", Text(item, "accessToken") ?? token, connections));
+            result.Add(new(id, Text(item, "name") ?? "Plex", Text(item, "accessToken") ?? token, connections) { Owned = Boolean(item, "owned") });
         }
         return result;
     }
@@ -80,7 +80,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
         var name = Text(item, "username") ?? Text(item, "title");
         if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(name))
             throw new PlexRequestException("Plex returned an invalid account identity.");
-        return new(id, name, token);
+        return new(id, name, token) { NumericId = ScalarText(item, "id") };
     }
 
     public async Task<IReadOnlyList<PlexHomeUser>> GetHomeUsersAsync(string accountToken, CancellationToken ct = default)
@@ -333,7 +333,7 @@ public sealed class PlexApiClient(HttpClient http, string installationId)
             using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, bounded).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
                 throw new PlexRequestException(response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
-                    ? "Plex authorization failed; reconnect or update the server token." : "Plex request failed.");
+                    ? "Plex authorization failed; reconnect or update the server token." : "Plex request failed.", response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden);
             if (response.Content.Headers.ContentLength > MaximumResponseBytes) throw new PlexRequestException("Plex response exceeded the size limit.");
             await using var stream = await response.Content.ReadAsStreamAsync(bounded).ConfigureAwait(false);
             using var output = new MemoryStream();

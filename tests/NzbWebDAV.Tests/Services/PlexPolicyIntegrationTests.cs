@@ -140,7 +140,9 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
         SetPolicy("show", ["machine:child"]);
         using var handler = new FakePlexHandler(request =>
         {
-            if (request.RequestUri!.Host == "plex.tv")
+            if (request.RequestUri!.AbsolutePath == "/api/v2/user")
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("""{"uuid":"child","id":42,"username":"Child"}""") };
+            if (request.RequestUri.Host == "plex.tv")
                 return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("""[{"clientIdentifier":"machine","name":"Plex","provides":"server","accessToken":"child-server-token","connections":[{"uri":"http://plex.test","local":true}]}]""") };
             if (request.RequestUri.AbsolutePath == "/hubs/source") return PlexApiClientTests.Xml("""<MediaContainer><Directory ratingKey="show" type="show" title="Show"/></MediaContainer>""");
             if (request.RequestUri.AbsolutePath.EndsWith("/allLeaves", StringComparison.Ordinal))
@@ -208,6 +210,34 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
         Assert.Equal(1, candidate.Season);
         Assert.Equal(16, candidate.Episode);
         Assert.StartsWith(PlexPrefetchService.Owner("machine", "realtime-next", "owner"), candidate.Owner);
+        Assert.Empty(_runtime.Jobs!.List());
+    }
+
+    [Fact]
+    public async Task Preview_UnresolvedConnectedIdentityNeverUsesOwnerWatchedState()
+    {
+        var itemId = await AddItem("episode.mkv");
+        Set(ConfigKeys.PlexAccounts, JsonSerializer.Serialize(new[] { new PlexAccount("owner", "Sam", "replaced-token") }));
+        Set(ConfigKeys.SmartPrefetchSettings, JsonSerializer.Serialize(new PrefetchSettings
+        { Enabled = true, RealtimeEnabled = true, PredictionsEnabled = true, MaxQueueAhead = 1 }));
+        using var handler = new FakePlexHandler(request =>
+        {
+            if (request.RequestUri!.AbsolutePath == "/api/v2/user")
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("""{"uuid":"different-account","id":42,"username":"Sam"}""") };
+            if (request.RequestUri.AbsolutePath == "/status/sessions")
+                return PlexApiClientTests.Xml("""<MediaContainer><Video ratingKey="current" type="episode" title="Current" grandparentRatingKey="show" parentIndex="1" index="15"><User id="owner" title="Sam"/><Player state="playing"/><Session id="session"/></Video></MediaContainer>""");
+            Assert.DoesNotContain("unwatched", request.RequestUri.Query, StringComparison.Ordinal);
+            return PlexApiClientTests.Xml(request.RequestUri.AbsolutePath == "/library/metadata/show/children"
+                ? """<MediaContainer><Directory ratingKey="season" type="season" index="1"/></MediaContainer>"""
+                : """<MediaContainer><Video ratingKey="next" type="episode" title="Next" grandparentRatingKey="show" parentIndex="1" index="16" viewCount="1"><Media><Part file="/plex/episode.mkv"/></Media></Video></MediaContainer>""");
+        });
+        using var policy = Policy(handler);
+        var pass = await policy.PreviewSnapshotAsync(CancellationToken.None);
+        Assert.True(pass.Complete);
+        var candidate = Assert.Single(pass.Predictions, candidate => candidate.ItemId == itemId);
+        Assert.Equal("identity-unresolved", candidate.WatchedStatus);
+        Assert.Contains("connected account identity", candidate.WatchedWarning);
+        Assert.Contains(":watch-unknown", candidate.Owner);
         Assert.Empty(_runtime.Jobs!.List());
     }
 

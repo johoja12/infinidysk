@@ -350,6 +350,7 @@ public sealed partial class Program
                 .AddHostedService(sp => sp.GetRequiredService<NzbWebDAV.Services.Prefetch.PrefetchRuntime>())
                 .AddSingleton(_ => new NzbWebDAV.Services.Prefetch.PlexPlaybackRegistry(TimeProvider.System))
                 .AddSingleton<NzbWebDAV.Services.Prefetch.PlexPrefetchService>()
+                .AddSingleton<NzbWebDAV.Services.Prefetch.PredictionSnapshotService>()
                 .AddHostedService(sp => sp.GetRequiredService<NzbWebDAV.Services.Prefetch.PlexPrefetchService>())
                 .AddScoped<DavContentStreamFactory>()
                 .AddScoped<IDavContentStreamFactory>(sp => sp.GetRequiredService<DavContentStreamFactory>())
