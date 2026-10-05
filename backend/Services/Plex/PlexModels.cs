@@ -22,6 +22,8 @@ public sealed record PlexUser(string Id, string Name);
 public sealed record PlexHomeUser(string Id, string Name, bool Protected, bool Admin);
 public sealed record PlexAccount(string Id, string Name, string Token)
 {
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? NumericId { get; init; }
     public override string ToString() => "PlexAccount { credentials = [redacted] }";
 }
 public sealed record PlexSource(string ServerId, string? LibraryId, string Kind, string Id, string Key, string Title, string Type);
@@ -39,6 +41,7 @@ public sealed record PlexIdentity(string MachineIdentifier, string Version);
 public sealed record PlexConnection(string Uri, bool Local, bool Relay);
 public sealed record PlexDiscoveredServer(string Id, string Name, string Token, IReadOnlyList<PlexConnection> Connections, string? AccountId = null)
 {
+    public bool Owned { get; init; }
     public override string ToString() => $"PlexDiscoveredServer {{ Id = {Id}, credentials = [redacted] }}";
 }
 public sealed record PlexPin(int Id, string Code, int ExpiresIn, string? AuthToken)
@@ -52,4 +55,7 @@ public sealed record PlexLoginStart(string Handle, string Url, DateTimeOffset Ex
 public sealed record PlexLoginStatus(string State, DateTimeOffset? ExpiresAt);
 public sealed record PlexServerHandle(string Handle, string Id, string Name, IReadOnlyList<PlexConnection> Connections);
 
-public sealed class PlexRequestException(string message) : Exception(message);
+public sealed class PlexRequestException(string message, bool authorizationFailed = false) : Exception(message)
+{
+    public bool AuthorizationFailed { get; } = authorizationFailed;
+}

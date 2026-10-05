@@ -27,6 +27,7 @@ public sealed class NativeCacheAdminTests
     [InlineData("/api/native-cache/evictions")]
     [InlineData("/api/prefetch")]
     [InlineData("/api/prefetch/preview")]
+    [InlineData("/api/prefetch/predictions")]
     public async Task CacheAndPrefetchViews_RequireAuthentication(string path)
     {
         await using var factory = new NzbDavWebApplicationFactory();

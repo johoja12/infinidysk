@@ -140,7 +140,9 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
         SetPolicy("show", ["machine:child"]);
         using var handler = new FakePlexHandler(request =>
         {
-            if (request.RequestUri!.Host == "plex.tv")
+            if (request.RequestUri!.AbsolutePath == "/api/v2/user")
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("""{"uuid":"child","id":42,"username":"Child"}""") };
+            if (request.RequestUri.Host == "plex.tv")
                 return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("""[{"clientIdentifier":"machine","name":"Plex","provides":"server","accessToken":"child-server-token","connections":[{"uri":"http://plex.test","local":true}]}]""") };
             if (request.RequestUri.AbsolutePath == "/hubs/source") return PlexApiClientTests.Xml("""<MediaContainer><Directory ratingKey="show" type="show" title="Show"/></MediaContainer>""");
             if (request.RequestUri.AbsolutePath.EndsWith("/allLeaves", StringComparison.Ordinal))
