@@ -8,8 +8,8 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 it("filters live predictions by viewer and current coverage, and opens the selected file without warming", async () => {
-  const fetch = vi.fn<typeof globalThis.fetch>(async (input) => {
-    const url = String(input);
+  const fetch = vi.fn<typeof globalThis.fetch>((input) => {
+    const url = input instanceof Request ? input.url : input.toString();
     const data = url.includes("/preview")
       ? {
           predictions: [
@@ -48,7 +48,7 @@ it("filters live predictions by viewer and current coverage, and opens the selec
           complete: true,
           ranges: [{ offset: 0, count: url.includes("file-a") ? 100 : 20 }],
         };
-    return new Response(JSON.stringify(data));
+    return Promise.resolve(new Response(JSON.stringify(data)));
   });
   vi.stubGlobal("fetch", fetch);
   const openByDavItemId = vi.fn();
