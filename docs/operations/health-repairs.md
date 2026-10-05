@@ -228,3 +228,7 @@ pass over every video, audio, and archive file in the library, including files s
 SAB history — no history rows are deleted, and existing health-check results are kept. Checks run
 a few files at a time, pause while the download queue is processing, and can generate significant
 Usenet (STAT) traffic on large libraries. Track progress on the **Health** page.
+
+Re-run files take turns with files that have never been checked [since unreleased](https://github.com/johoja12/infinidysk/issues/171){ .nzbdav-since }.
+A large import still being scanned does not hold back a re-run for days, and a library-wide re-run
+does not hold back newly imported files. Urgent repairs from playback still go first.
