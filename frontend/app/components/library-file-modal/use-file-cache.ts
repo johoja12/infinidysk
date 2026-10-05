@@ -27,7 +27,7 @@ type CacheState = {
 };
 
 /** Refresh only the open file; never reuse another file's coverage or range map. */
-export function useFileCache(itemId: string | null) {
+export function useFileCache(itemId: string | null, refreshMs = 5000) {
   const [state, setState] = useState<CacheState | null>(null);
   useEffect(() => {
     if (!itemId) return;
@@ -47,7 +47,7 @@ export function useFileCache(itemId: string | null) {
         if (!abort.signal.aborted)
           setState({ itemId, data: null, error: "Cache ranges could not be loaded." });
       } finally {
-        if (!abort.signal.aborted) refresh = setTimeout(() => void load(), 5000);
+        if (!abort.signal.aborted) refresh = setTimeout(() => void load(), refreshMs);
       }
     }
     void load();
@@ -55,7 +55,7 @@ export function useFileCache(itemId: string | null) {
       abort.abort();
       clearTimeout(refresh);
     };
-  }, [itemId]);
+  }, [itemId, refreshMs]);
   const current = itemId && state?.itemId === itemId ? state : null;
   return {
     loading: !!itemId && current === null,

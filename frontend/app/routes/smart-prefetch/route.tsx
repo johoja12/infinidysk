@@ -4,6 +4,7 @@ import { useIsReadOnly } from "~/auth/authorization";
 import { Icon } from "~/components/ui";
 import { settingsPath } from "~/navigation/settings-tabs";
 import { withUrlBase } from "~/utils/url-base";
+import { PredictionResults } from "./prediction-results";
 import { PrefetchQueue } from "~/components/prefetch-queue";
 import {
   LibraryFileModalHost,
@@ -323,7 +324,8 @@ export default function SmartPrefetchActivityPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [view, setView] = useState<"activity" | "history">("activity");
+  const [view, setView] = useState<"activity" | "history" | "predictions">("activity");
+  const [predictionRefresh, setPredictionRefresh] = useState(0);
   const [historyKind, setHistoryKind] = useState<HistoryKind>("warming");
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("all");
@@ -413,14 +415,17 @@ export default function SmartPrefetchActivityPage() {
           </p>
           <h1 className="mt-1 text-3xl font-bold tracking-tight">Smart Prefetch</h1>
           <p className="mt-1 text-sm text-base-content/65">
-            Follow warming in real time and review recent outcomes.
+            Follow warming in real time, review recent outcomes, and see what’s predicted next.
           </p>
         </div>
         <div className="flex gap-2">
           <button
             type="button"
             className="btn btn-sm btn-outline"
-            onClick={() => void refresh().catch((cause) => setError(String(cause)))}
+            onClick={() => {
+              setPredictionRefresh((value) => value + 1);
+              void refresh().catch((cause) => setError(String(cause)));
+            }}
           >
             <Icon name="refresh" /> Refresh
           </button>
@@ -509,159 +514,174 @@ export default function SmartPrefetchActivityPage() {
         >
           Warming history · {history.length}
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={view === "predictions"}
+          className={`tab ${view === "predictions" ? "tab-active" : ""}`}
+          onClick={() => setView("predictions")}
+        >
+          Prediction results
+        </button>
       </div>
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-semibold">
-            {view === "activity" ? "Current warming" : "Warming history"}
-          </h2>
-          <p className="text-xs text-base-content/55">
-            {view === "activity"
-              ? "Current queue jobs refresh every 10 seconds."
-              : historyKind === "gaps"
-                ? "Small ranges playback had to stream straight from Usenet because they weren't cached. Each fill caches only that range — it does not mean the whole file is cached."
-                : "Policy, manual and finish-watched warming. Coverage is for the whole file."}
-          </p>
-          {view === "history" && historyKind === "warming" && (
-            <p className="mt-1 max-w-3xl text-xs text-base-content/55">
-              The cache keeps what was played plus the files your prefetch policies select.
-              Partially cached files fill in when they are played
-              {status?.settings?.finishWatchedEnabled
-                ? ", and after you have watched part of them."
-                : "; turn on finishing partially watched files in Prefetch settings to complete them automatically."}
-            </p>
-          )}
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <input
-            className="input input-sm input-bordered w-56"
-            type="search"
-            aria-label={`Search ${view}`}
-            placeholder="Search media…"
-            value={search}
-            onChange={(event) => {
-              setSearch(event.target.value);
-              setPage(0);
-            }}
-          />
-          <select
-            className="select select-sm select-bordered"
-            aria-label={`Filter ${view}`}
-            value={filter}
-            onChange={(event) => {
-              setFilter(event.target.value);
-              setPage(0);
-            }}
-          >
-            {view === "activity"
-              ? filterStates.map((state) => (
-                  <option value={state} key={state}>
-                    {state === "all" ? "All states" : state}
-                  </option>
-                ))
-              : Object.entries(historyKind === "gaps" ? gapFilters : warmingFilters).map(
-                  ([value, label]) => (
-                    <option value={value} key={value}>
-                      {label}
-                    </option>
-                  ),
-                )}
-          </select>
-        </div>
-      </div>
-      {view === "activity" ? (
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_19rem]">
-          <JobList
-            title="Warming queue"
-            jobs={pageJobs}
-            total={visible.length}
-            loaded={status !== null}
-            page={shownPage}
-            lastPage={lastPage}
-            onPage={setPage}
-            onOpen={(job) => openJob(fileModal, job)}
-          />
-          <div className="space-y-4">
-            <section className="space-y-3 rounded-xl border border-base-content/10 bg-base-200/50 p-4">
-              <h3 className="font-semibold">Queue controls</h3>
-              <p className="text-xs text-base-content/60">
-                Warming yields to foreground playback and respects provider limits.
-              </p>
-              <div className="flex justify-between text-xs">
-                <span>State</span>
-                <strong>
-                  {status?.paused ? "Paused" : unavailable ? "Unavailable" : "Active"}
-                </strong>
-              </div>
-              <div className="flex justify-between text-xs">
-                <span>Concurrency</span>
-                <strong>
-                  {running} of {status?.settings?.maxConcurrentJobs ?? "—"} jobs
-                </strong>
-              </div>
-              <button
-                type="button"
-                className="btn btn-sm btn-outline w-full"
-                disabled={readOnly || busy || unavailable}
-                onClick={() => void operate(status?.paused ? "resume-all" : "pause-all")}
-              >
-                {status?.paused ? "Resume all warming" : "Pause all warming"}
-              </button>
-              <button
-                type="button"
-                className="btn btn-sm btn-outline w-full"
-                disabled={readOnly || busy || unavailable}
-                onClick={() => void operate("sync")}
-              >
-                Sync Plex policies now
-              </button>
-            </section>
-            <section className="rounded-xl border border-base-content/10 bg-base-200/50 p-4">
-              <h3 className="font-semibold">Why a job might wait</h3>
-              <p className="mt-2 text-xs text-base-content/60">
-                Active playback, provider limits, exhausted budget, and unavailable sources can
-                pause warming.
-              </p>
-            </section>
-          </div>
-        </div>
+      {view === "predictions" ? (
+        <PredictionResults jobs={jobs} modal={fileModal} refreshKey={predictionRefresh} />
       ) : (
         <>
-          <div className="tabs tabs-box w-fit" role="tablist" aria-label="Warming history kind">
-            {(
-              [
-                ["warming", "Prefetch warming", warmingHistory.length],
-                ["gaps", "Playback gap fills", gapHistory.length],
-              ] as const
-            ).map(([kind, label, count]) => (
-              <button
-                key={kind}
-                type="button"
-                role="tab"
-                aria-selected={historyKind === kind}
-                className={`tab gap-2 ${historyKind === kind ? "tab-active" : ""}`}
-                onClick={() => {
-                  setHistoryKind(kind);
-                  setFilter("all");
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <h2 className="text-lg font-semibold">
+                {view === "activity" ? "Current warming" : "Warming history"}
+              </h2>
+              <p className="text-xs text-base-content/55">
+                {view === "activity"
+                  ? "Current queue jobs refresh every 10 seconds."
+                  : historyKind === "gaps"
+                    ? "Small ranges playback had to stream straight from Usenet because they weren't cached. Each fill caches only that range — it does not mean the whole file is cached."
+                    : "Policy, manual and finish-watched warming. Coverage is for the whole file."}
+              </p>
+              {view === "history" && historyKind === "warming" && (
+                <p className="mt-1 max-w-3xl text-xs text-base-content/55">
+                  The cache keeps what was played plus the files your prefetch policies select.
+                  Partially cached files fill in when they are played
+                  {status?.settings?.finishWatchedEnabled
+                    ? ", and after you have watched part of them."
+                    : "; turn on finishing partially watched files in Prefetch settings to complete them automatically."}
+                </p>
+              )}
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <input
+                className="input input-sm input-bordered w-56"
+                type="search"
+                aria-label={`Search ${view}`}
+                placeholder="Search media…"
+                value={search}
+                onChange={(event) => {
+                  setSearch(event.target.value);
+                  setPage(0);
+                }}
+              />
+              <select
+                className="select select-sm select-bordered"
+                aria-label={`Filter ${view}`}
+                value={filter}
+                onChange={(event) => {
+                  setFilter(event.target.value);
                   setPage(0);
                 }}
               >
-                {label}
-                <span className="badge badge-sm">{count}</span>
-              </button>
-            ))}
+                {view === "activity"
+                  ? filterStates.map((state) => (
+                      <option value={state} key={state}>
+                        {state === "all" ? "All states" : state}
+                      </option>
+                    ))
+                  : Object.entries(historyKind === "gaps" ? gapFilters : warmingFilters).map(
+                      ([value, label]) => (
+                        <option value={value} key={value}>
+                          {label}
+                        </option>
+                      ),
+                    )}
+              </select>
+            </div>
           </div>
-          <JobList
-            title={historyKind === "gaps" ? "Playback gap fills" : "Recent outcomes"}
-            summary={median === null ? null : `median ${formatSpeed(median)}`}
-            jobs={pageJobs}
-            total={visible.length}
-            loaded={status !== null}
-            page={shownPage}
-            lastPage={lastPage}
-            onPage={setPage}
-            onOpen={(job) => openJob(fileModal, job)}
-          />
+          {view === "activity" ? (
+            <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_19rem]">
+              <JobList
+                title="Warming queue"
+                jobs={pageJobs}
+                total={visible.length}
+                loaded={status !== null}
+                page={shownPage}
+                lastPage={lastPage}
+                onPage={setPage}
+                onOpen={(job) => openJob(fileModal, job)}
+              />
+              <div className="space-y-4">
+                <section className="space-y-3 rounded-xl border border-base-content/10 bg-base-200/50 p-4">
+                  <h3 className="font-semibold">Queue controls</h3>
+                  <p className="text-xs text-base-content/60">
+                    Warming yields to foreground playback and respects provider limits.
+                  </p>
+                  <div className="flex justify-between text-xs">
+                    <span>State</span>
+                    <strong>
+                      {status?.paused ? "Paused" : unavailable ? "Unavailable" : "Active"}
+                    </strong>
+                  </div>
+                  <div className="flex justify-between text-xs">
+                    <span>Concurrency</span>
+                    <strong>
+                      {running} of {status?.settings?.maxConcurrentJobs ?? "—"} jobs
+                    </strong>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline w-full"
+                    disabled={readOnly || busy || unavailable}
+                    onClick={() => void operate(status?.paused ? "resume-all" : "pause-all")}
+                  >
+                    {status?.paused ? "Resume all warming" : "Pause all warming"}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-sm btn-outline w-full"
+                    disabled={readOnly || busy || unavailable}
+                    onClick={() => void operate("sync")}
+                  >
+                    Sync Plex policies now
+                  </button>
+                </section>
+                <section className="rounded-xl border border-base-content/10 bg-base-200/50 p-4">
+                  <h3 className="font-semibold">Why a job might wait</h3>
+                  <p className="mt-2 text-xs text-base-content/60">
+                    Active playback, provider limits, exhausted budget, and unavailable sources can
+                    pause warming.
+                  </p>
+                </section>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="tabs tabs-box w-fit" role="tablist" aria-label="Warming history kind">
+                {(
+                  [
+                    ["warming", "Prefetch warming", warmingHistory.length],
+                    ["gaps", "Playback gap fills", gapHistory.length],
+                  ] as const
+                ).map(([kind, label, count]) => (
+                  <button
+                    key={kind}
+                    type="button"
+                    role="tab"
+                    aria-selected={historyKind === kind}
+                    className={`tab gap-2 ${historyKind === kind ? "tab-active" : ""}`}
+                    onClick={() => {
+                      setHistoryKind(kind);
+                      setFilter("all");
+                      setPage(0);
+                    }}
+                  >
+                    {label}
+                    <span className="badge badge-sm">{count}</span>
+                  </button>
+                ))}
+              </div>
+              <JobList
+                title={historyKind === "gaps" ? "Playback gap fills" : "Recent outcomes"}
+                summary={median === null ? null : `median ${formatSpeed(median)}`}
+                jobs={pageJobs}
+                total={visible.length}
+                loaded={status !== null}
+                page={shownPage}
+                lastPage={lastPage}
+                onPage={setPage}
+                onOpen={(job) => openJob(fileModal, job)}
+              />
+            </>
+          )}
         </>
       )}
       <LibraryFileModalHost

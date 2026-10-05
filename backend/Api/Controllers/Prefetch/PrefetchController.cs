@@ -98,13 +98,50 @@ public sealed record PrefetchStatusResponse(
 
 [ApiController]
 [Route("api/prefetch/preview")]
-public sealed class PrefetchPreviewController(PlexPrefetchService policies) : GetOnlyApiController
+public sealed class PrefetchPreviewController(PlexPrefetchService policies, ConfigManager config,
+    PlexCatalogueService catalogue, PrefetchRuntime runtime) : GetOnlyApiController
 {
-    protected override async Task<IActionResult> HandleRequest() => Ok(new
+    protected override async Task<IActionResult> HandleRequest()
     {
-        predictions = await policies.PreviewAsync(HttpContext.RequestAborted).ConfigureAwait(false),
-        warning = policies.LastError
-    });
+        var ct = HttpContext.RequestAborted;
+        var predictions = await policies.PreviewAsync(ct).ConfigureAwait(false);
+        IReadOnlyList<PlexServer> servers;
+        try { servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers)); }
+        catch (ArgumentException) { servers = []; }
+        var serverHashes = predictions.Select(prediction => prediction.Owner?.Split(':'))
+            .Where(parts => parts is { Length: >= 4 } && parts[0] == "plex")
+            .Select(parts => parts![1]).ToHashSet(StringComparer.Ordinal);
+        using var lookupTimeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        lookupTimeout.CancelAfter(TimeSpan.FromSeconds(3));
+        var snapshots = await Task.WhenAll(servers.Where(server => server.Enabled && serverHashes.Contains(PlexPrefetchService.Hash(server.Id)))
+            .Select(async server =>
+            {
+                try
+                {
+                    var snapshot = await catalogue.GetUsersAsync(server, ct: lookupTimeout.Token).ConfigureAwait(false);
+                    return snapshot.Data.Select(user => new KeyValuePair<string, string>(
+                        PlexPrefetchService.Hash(server.Id) + ":" + PlexPrefetchService.Hash(user.Id), user.Name)).ToArray();
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                { return Array.Empty<KeyValuePair<string, string>>(); }
+            })).ConfigureAwait(false);
+        var names = snapshots.SelectMany(snapshot => snapshot).GroupBy(pair => pair.Key, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.First().Value, StringComparer.Ordinal);
+        return Ok(new
+        {
+            predictions = predictions.Select(prediction =>
+            {
+                var parts = prediction.Owner?.Split(':');
+                return prediction with
+                {
+                    Attribution = PlexPrefetchService.DescribeOwner(prediction.Owner ?? "", runtime.Settings(), servers, names),
+                    Viewer = parts is { Length: >= 4 } && parts[2] is "history-next" or "realtime-next"
+                        ? names.GetValueOrDefault(parts[1] + ":" + parts[3]) ?? "Unknown user" : null
+                };
+            }).ToArray(),
+            warning = policies.LastError
+        });
+    }
 }
 
 [ApiController]

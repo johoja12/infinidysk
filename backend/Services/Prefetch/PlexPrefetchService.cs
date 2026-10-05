@@ -16,6 +16,14 @@ public sealed record PrefetchPrediction(Guid ItemId, string DisplayName, string 
 {
     public bool Eligible { get; init; } = true;
     public string? PlexRatingKey { get; init; }
+    public string? ShowTitle { get; init; }
+    public string? EpisodeTitle { get; init; }
+    public int? Season { get; init; }
+    public int? Episode { get; init; }
+    public string? Viewer { get; init; }
+    public PrefetchJobSource? Attribution { get; init; }
+    [System.Text.Json.Serialization.JsonIgnore]
+    public string? Owner { get; init; }
 }
 
 public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api, PrefetchRuntime runtime,
@@ -208,11 +216,12 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     private string ConfigurationRevision(PrefetchSettings settings, IReadOnlyList<PlexServer> servers) =>
         Hash(JsonSerializer.Serialize(settings) + JsonSerializer.Serialize(servers) + config.GetEffectiveConfigValue(ConfigKeys.PlexAccounts));
 
-    private bool RejectPreview(PlexMediaItem item, string owner, string reason)
+    private bool RejectPreview(PlexMediaItem item, string owner, string reason, DavItem? imported = null)
     {
         if (_preview is { Count: < 100 } preview)
-            preview.Add(new(Guid.Empty, item.Title, SourceLabel(owner), reason, 0, 0, 0)
-                { Eligible = false, PlexRatingKey = item.RatingKey });
+            preview.Add(new(imported?.Id ?? Guid.Empty, imported?.Name ?? item.Title, SourceLabel(owner), reason, 0, 0, imported?.FileSize ?? 0)
+                { Eligible = false, PlexRatingKey = item.RatingKey, Owner = owner,
+                    ShowTitle = item.ShowTitle, EpisodeTitle = item.Title, Season = item.Season, Episode = item.Episode });
         return false;
     }
 
@@ -227,7 +236,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             var details = await api.GetMetadataAsync(server, item.RatingKey, ct).ConfigureAwait(false);
             item = details with { ViewOffset = item.ViewOffset, Duration = item.Duration > 0 ? item.Duration : details.Duration,
                 UserId = item.UserId, ViewedAt = item.ViewedAt, ShowRatingKey = details.ShowRatingKey ?? item.ShowRatingKey,
-                Season = details.Season ?? item.Season, Episode = details.Episode ?? item.Episode, WatchStateUserId = item.WatchStateUserId };
+                ShowTitle = details.ShowTitle ?? item.ShowTitle, Season = details.Season ?? item.Season, Episode = details.Episode ?? item.Episode, WatchStateUserId = item.WatchStateUserId };
         }
         if (item.File is null || PrefetchPathResolver.Map(item.File, server.PathMappings) is not { } mapped)
             return RejectPreview(item, owner, "No exact configured path mapping for this Plex media.");
@@ -259,8 +268,14 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         if (_preview is null) resolved?.Invoke(imported);
         if (imported.FileSize is not > 0 || imported.FileSize > runtime.Settings().MaxBytesPerItem
             || imported.FileSize < NativeCacheSettings.MinimumFileBytes(config) || imported.FileBlobId is null)
-            return RejectPreview(item, owner, "Imported media is unavailable or exceeds the per-file warming cap.");
-        return await QueueImportedAsync(imported, scopedOwner, priority, item.ViewOffset, item.Duration, settings, ct).ConfigureAwait(false);
+            return RejectPreview(item, owner, "Imported media is unavailable or exceeds the per-file warming cap.", imported);
+        var previewStart = _preview?.Count ?? 0;
+        var accepted = await QueueImportedAsync(imported, scopedOwner, priority, item.ViewOffset, item.Duration, settings, ct).ConfigureAwait(false);
+        if (_preview is { } preview)
+            for (var index = previewStart; index < preview.Count; index++)
+                preview[index] = preview[index] with { Owner = scopedOwner, PlexRatingKey = item.RatingKey,
+                    ShowTitle = item.ShowTitle, EpisodeTitle = item.Title, Season = item.Season, Episode = item.Episode };
+        return accepted;
     }
 
     /// <summary>
