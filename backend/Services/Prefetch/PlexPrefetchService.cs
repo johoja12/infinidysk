@@ -216,10 +216,10 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     private string ConfigurationRevision(PrefetchSettings settings, IReadOnlyList<PlexServer> servers) =>
         Hash(JsonSerializer.Serialize(settings) + JsonSerializer.Serialize(servers) + config.GetEffectiveConfigValue(ConfigKeys.PlexAccounts));
 
-    private bool RejectPreview(PlexMediaItem item, string owner, string reason)
+    private bool RejectPreview(PlexMediaItem item, string owner, string reason, DavItem? imported = null)
     {
         if (_preview is { Count: < 100 } preview)
-            preview.Add(new(Guid.Empty, item.Title, SourceLabel(owner), reason, 0, 0, 0)
+            preview.Add(new(imported?.Id ?? Guid.Empty, imported?.Name ?? item.Title, SourceLabel(owner), reason, 0, 0, imported?.FileSize ?? 0)
                 { Eligible = false, PlexRatingKey = item.RatingKey, Owner = owner,
                     ShowTitle = item.ShowTitle, EpisodeTitle = item.Title, Season = item.Season, Episode = item.Episode });
         return false;
@@ -268,7 +268,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         if (_preview is null) resolved?.Invoke(imported);
         if (imported.FileSize is not > 0 || imported.FileSize > runtime.Settings().MaxBytesPerItem
             || imported.FileSize < NativeCacheSettings.MinimumFileBytes(config) || imported.FileBlobId is null)
-            return RejectPreview(item, owner, "Imported media is unavailable or exceeds the per-file warming cap.");
+            return RejectPreview(item, owner, "Imported media is unavailable or exceeds the per-file warming cap.", imported);
         var previewStart = _preview?.Count ?? 0;
         var accepted = await QueueImportedAsync(imported, scopedOwner, priority, item.ViewOffset, item.Duration, settings, ct).ConfigureAwait(false);
         if (_preview is { } preview)

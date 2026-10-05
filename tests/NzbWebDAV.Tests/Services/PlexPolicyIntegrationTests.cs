@@ -186,18 +186,23 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
         Assert.Empty(_runtime.Jobs!.List());
     }
 
-    [Fact]
-    public async Task Preview_NextEpisodeCarriesShowAndViewerOwnerWithoutQueueMutation()
+    [Theory]
+    [InlineData(500L, true)]
+    [InlineData(50L, false)]
+    public async Task Preview_NextEpisodeCarriesShowAndViewerOwnerWithoutQueueMutation(long cap, bool eligible)
     {
         var itemId = await AddItem("episode.mkv");
         Set(ConfigKeys.SmartPrefetchSettings, JsonSerializer.Serialize(new PrefetchSettings
-        { Enabled = true, RealtimeEnabled = true, PredictionsEnabled = true, MaxQueueAhead = 1 }));
+        { Enabled = true, RealtimeEnabled = true, PredictionsEnabled = true, MaxQueueAhead = 1, MaxBytesPerItem = cap }));
         using var handler = new FakePlexHandler(request => PlexApiClientTests.Xml(request.RequestUri!.AbsolutePath == "/status/sessions"
             ? """<MediaContainer><Video ratingKey="current" type="episode" title="Jetrel" grandparentRatingKey="show" parentIndex="1" index="15"><User id="owner" title="Sam"/><Player state="playing"/><Session id="session"/></Video></MediaContainer>"""
+            : request.RequestUri.AbsolutePath == "/library/metadata/show/children"
+                ? """<MediaContainer><Directory ratingKey="season" type="season" index="1"/></MediaContainer>"""
             : """<MediaContainer><Video ratingKey="next" type="episode" title="Learning Curve" grandparentTitle="Voyager" grandparentRatingKey="show" parentIndex="1" index="16"><Media><Part file="/plex/episode.mkv"/></Media></Video></MediaContainer>"""));
         using var policy = Policy(handler);
         var preview = await policy.PreviewAsync(CancellationToken.None);
-        var candidate = Assert.Single(preview.Where(candidate => candidate.ItemId == itemId));
+        var candidate = Assert.Single(preview, candidate => candidate.ItemId == itemId);
+        Assert.Equal(eligible, candidate.Eligible);
         Assert.Equal("Voyager", candidate.ShowTitle);
         Assert.Equal("Learning Curve", candidate.EpisodeTitle);
         Assert.Equal(1, candidate.Season);
