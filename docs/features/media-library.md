@@ -10,6 +10,10 @@ The default **File table** lists one media item per row. Use the visible **All m
 
 Choose **Grouped browse** to return to show/movie cards and expand a group into its files. Switching views keeps applicable filters. An unavailable Plex index does not hide files from **All media**; unmatched titles remain blank until a reliable Plex match is available.
 
+## File cache ranges [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since }
+
+The file **Details** modal shows cached byte ranges across the full file. Highlighted sections are verified cached bytes; gaps remain uncached. The map and **Native Cache** percentage refresh every five seconds while the modal is open. Loading or unavailable range data is shown explicitly. Very fragmented maps show only the first 1,024 contiguous ranges and label the remaining space as gaps or unloaded; the percentage still counts all verified bytes.
+
 ## Grouped browsing [since 1.5.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.5.0){ .nzbdav-since }
 
 The **TV shows** and **Movies** tabs classify files by matching their symlink filename against metadata from enabled Plex servers. A Plex episode match goes under TV shows; a Plex movie match goes under Movies. Recognized library folders, including `TV-*` and `Movies-*`, organize matched files into groups. If the folder does not match the Plex media type, the Plex show or movie title supplies the group. Expand a group to see its files and their mappings without leaving the page; large groups have their own inline file pages. The **Unmatched** tab lists files with no unambiguous Plex filename match, including external-only links when Plex does not recognize their filenames.

@@ -1,3 +1,5 @@
+import { CacheRangeMap } from "~/components/cache-range-map";
+import { useFileCache } from "./use-file-cache";
 import { Alert, Badge, Button, Icon, Modal } from "~/components/ui";
 import { formatFileSize } from "~/utils/file-size";
 import type { LibraryCatalogItem, LibraryFileDetails } from "~/clients/backend-client.server";
@@ -43,6 +45,11 @@ export type LibraryFileModalProps = {
 export function LibraryFileModal(props: LibraryFileModalProps) {
   const { item, details, detailsLoading, detailsError, previewUrl, canPrewarm } = props;
   const libraryUnavailable = props.libraryUnavailable ?? null;
+  const cache = useFileCache(item.kind === "internal" ? (item.davItemId ?? null) : null);
+  const cachePercentage =
+    cache.data && cache.data.length > 0
+      ? Math.floor(Math.min(100, (cache.data.cachedBytes * 100) / cache.data.length))
+      : null;
   const latest = details?.latestHealth ?? null;
   const downloadUrl = previewUrl
     ? `${previewUrl}${previewUrl.includes("?") ? "&" : "?"}download=true`
@@ -97,10 +104,35 @@ export function LibraryFileModal(props: LibraryFileModalProps) {
           <Fact label="Quality" value={qualityLabel} />
           <Fact
             label="Native Cache"
-            value={props.cachePercentage == null ? "Unavailable" : `${props.cachePercentage}%`}
+            value={
+              cache.loading
+                ? "Loading…"
+                : cachePercentage == null
+                  ? "Unavailable"
+                  : `${cachePercentage}%`
+            }
           />
           <Fact label="Mappings" value={String(item.mappingCount)} />
         </div>
+
+        <section className="rounded-xl border border-base-content/10 bg-base-200 p-4">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-base-content/55">
+            Cached byte ranges
+          </h3>
+          {cache.data ? (
+            <CacheRangeMap
+              file={cache.data}
+              ranges={cache.data.ranges}
+              complete={cache.data.complete}
+            />
+          ) : (
+            <p role="status" className="mt-2 text-sm text-base-content/60">
+              {cache.loading
+                ? "Loading cache ranges…"
+                : (cache.error ?? "Cache ranges are unavailable for this file.")}
+            </p>
+          )}
+        </section>
 
         {details ? (
           <div className="grid gap-3 sm:grid-cols-3">

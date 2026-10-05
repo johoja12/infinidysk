@@ -19,6 +19,7 @@ public sealed class NativeCacheAdminTests
     [InlineData("/api/native-cache")]
     [InlineData("/api/native-cache/entries?folderId=disk")]
     [InlineData("/api/native-cache/ranges?key=test")]
+    [InlineData("/api/native-cache/file-ranges?itemId=11111111-1111-1111-1111-111111111111")]
     [InlineData("/api/native-cache/summary")]
     [InlineData("/api/native-cache/files")]
     [InlineData("/api/native-cache/activity")]
@@ -187,6 +188,40 @@ public sealed class NativeCacheAdminTests
         Assert.Equal(HttpStatusCode.BadRequest, rejected.StatusCode);
         using var unpin = await client.PostAsJsonAsync("/api/native-cache/operations", new { operation = "pin", cacheKey = identity.Key, pinned = false });
         unpin.EnsureSuccessStatusCode();
+        var blobId = Guid.NewGuid();
+        var itemId = Guid.NewGuid();
+        var blobs = factory.Services.GetRequiredService<IBlobStore>();
+        await blobs.WriteBlob(blobId, new DavNzbFile { Id = blobId, SegmentIds = ["range-map-segment"] });
+        var item = new DavItem { Id = itemId, IdPrefix = itemId.ToString("N")[..5], Name = "range-map.mkv",
+            Path = "/range-map.mkv", Type = DavItem.ItemType.UsenetFile, SubType = DavItem.ItemSubType.NzbFile,
+            FileBlobId = blobId, FileSize = 3 };
+        await factory.AddDavItemsAsync(item);
+        var currentIdentity = await native.GetCurrentCacheIdentityAsync(item);
+        Assert.NotNull(currentIdentity);
+        using (var emptyMap = await client.GetAsync($"/api/native-cache/file-ranges?itemId={itemId}"))
+        {
+            emptyMap.EnsureSuccessStatusCode();
+            using var payload = JsonDocument.Parse(await emptyMap.Content.ReadAsStringAsync());
+            Assert.True(payload.RootElement.GetProperty("available").GetBoolean());
+            Assert.Empty(payload.RootElement.GetProperty("ranges").EnumerateArray());
+            Assert.Equal(0, payload.RootElement.GetProperty("cachedBytes").GetInt64());
+        }
+        Assert.True(await store.WriteBlockAsync(currentIdentity, 0, new byte[] { 1, 2, 3 }));
+        using (var fullMap = await client.GetAsync($"/api/native-cache/file-ranges?itemId={itemId}"))
+        {
+            fullMap.EnsureSuccessStatusCode();
+            using var payload = JsonDocument.Parse(await fullMap.Content.ReadAsStringAsync());
+            Assert.Equal(3, payload.RootElement.GetProperty("length").GetInt64());
+            Assert.Equal(3, payload.RootElement.GetProperty("cachedBytes").GetInt64());
+            Assert.True(payload.RootElement.GetProperty("complete").GetBoolean());
+            Assert.Single(payload.RootElement.GetProperty("ranges").EnumerateArray());
+        }
+        using (var missingMap = await client.GetAsync($"/api/native-cache/file-ranges?itemId={Guid.NewGuid()}"))
+            Assert.Equal(HttpStatusCode.NotFound, missingMap.StatusCode);
+        using (var invalidMap = await client.GetAsync("/api/native-cache/file-ranges?itemId=invalid"))
+            Assert.Equal(HttpStatusCode.BadRequest, invalidMap.StatusCode);
+        // Keep the existing exact-entry eviction assertions focused on their original entry.
+        await store.EvictKeyAsync("disk", currentIdentity.Key);
         using var evict = await client.PostAsJsonAsync("/api/native-cache/operations",
             new { operation = "evict", folderId = "disk", cacheKey = identity.Key, confirmCacheKey = identity.Key });
         Assert.Equal(HttpStatusCode.Accepted, evict.StatusCode);

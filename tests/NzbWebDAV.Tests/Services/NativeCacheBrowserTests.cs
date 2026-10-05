@@ -8,6 +8,32 @@ public sealed class NativeCacheBrowserTests : IDisposable
     public NativeCacheBrowserTests() => Directory.CreateDirectory(_root);
 
     [Fact]
+    public async Task RangeMap_MergesAdjacentBlocks_KeepsGaps_AndSeparatesSourceRevisions()
+    {
+        var path = Path.Combine(_root, "ranges");
+        Directory.CreateDirectory(path);
+        await using var store = new NativeCacheStore(Path.Combine(_root, "ranges.db"),
+            [new NativeCacheFolder { Id = "disk", Path = path, MinFreeBytes = 0 }]);
+        var block = NativeCacheStore.BlockSize;
+        var identity = new NativeCacheIdentity("movie", "v1", 4L * block + 3);
+        var empty = await store.GetRangeMapAsync(identity);
+        Assert.Empty(empty.Ranges);
+        Assert.Equal(0, empty.CachedBytes);
+        Assert.True(empty.Complete);
+        Assert.True(await store.WriteBlockAsync(identity, 0, new byte[block]));
+        Assert.True(await store.WriteBlockAsync(identity, block, new byte[block]));
+        Assert.True(await store.WriteBlockAsync(identity, 4L * block, new byte[3]));
+        var map = await store.GetRangeMapAsync(identity);
+        Assert.Equal(identity.Length, map.Length);
+        Assert.Equal(2L * block + 3, map.CachedBytes);
+        Assert.Equal(new[] { new NativeCacheDisplayRange(0, 2L * block), new NativeCacheDisplayRange(4L * block, 3) }, map.Ranges);
+        Assert.True(map.Complete);
+        var changed = await store.GetRangeMapAsync(identity with { Generation = "v2" });
+        Assert.Empty(changed.Ranges);
+        Assert.Equal(0, changed.CachedBytes);
+    }
+
+    [Fact]
     public async Task Browser_FiltersSparseFiles_PagesNames_AndReportsOnlyConfirmedEvictions()
     {
         var path = Path.Combine(_root, "media");

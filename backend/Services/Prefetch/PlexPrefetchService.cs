@@ -391,11 +391,17 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
     /// store a hash of the source, so the title is found by matching the same hashes against the
     /// configured sources; a removed source falls back to the generic label.
     /// </summary>
-    public static PrefetchJobSource DescribeOwner(string owner, PrefetchSettings settings, IReadOnlyList<PlexServer> servers)
+    public static PrefetchJobSource DescribeOwner(string owner, PrefetchSettings settings, IReadOnlyList<PlexServer> servers,
+        IReadOnlyDictionary<string, string>? userNames = null)
     {
         var parts = owner.Split(':');
         var minimum = parts.Length > 1 && parts[^1] == "minimum";
         string WithRange(string label) => minimum ? label + " · head/tail" : label;
+        string WithUser(string label)
+        {
+            var name = parts.Length >= 4 ? userNames?.GetValueOrDefault(parts[1] + ":" + parts[3]) : null;
+            return WithRange(label + " · " + (string.IsNullOrWhiteSpace(name) ? "Unknown user" : name));
+        }
         return parts switch
         {
             ["manual"] => new("Manual", "manual"),
@@ -404,8 +410,8 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             ["read", ..] => new(WithRange("Read activity"), "read"),
             ["plex", var server, "source", var key, ..] => new(WithRange(SourceTitle(server, key, settings, servers)
                 ?? "Selected Plex hub/collection"), "plex-source"),
-            ["plex", _, "realtime-next", ..] => new(WithRange("Next episode · realtime"), "plex-realtime-next"),
-            ["plex", _, "history-next", ..] => new(WithRange("Next episode · history"), "plex-history-next"),
+            ["plex", _, "realtime-next", ..] => new(WithUser("Next episode · realtime"), "plex-realtime-next"),
+            ["plex", _, "history-next", ..] => new(WithUser("Next episode · history"), "plex-history-next"),
             ["plex", _, "realtime", ..] => new(WithRange("Playing now"), "plex-realtime"),
             ["plex", _, "history", ..] => new(WithRange("Watch history"), "plex-history"),
             _ => new("Background warming", "other"),
@@ -423,9 +429,10 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
 
     /// <summary>Distinct sources of one job, most specific category first, capped at <paramref name="limit"/>.</summary>
     public static (IReadOnlyList<PrefetchJobSource> Sources, int Count) DescribeOwners(IEnumerable<string> owners,
-        PrefetchSettings settings, IReadOnlyList<PlexServer> servers, int limit = 8)
+        PrefetchSettings settings, IReadOnlyList<PlexServer> servers, int limit = 8,
+        IReadOnlyDictionary<string, string>? userNames = null)
     {
-        var distinct = owners.Select(owner => DescribeOwner(owner, settings, servers)).Distinct()
+        var distinct = owners.Select(owner => DescribeOwner(owner, settings, servers, userNames)).Distinct()
             .OrderBy(source => Array.IndexOf(SourceCategories, source.Category)).ThenBy(source => source.Label, StringComparer.Ordinal)
             .ToArray();
         return (distinct.Take(limit).ToArray(), distinct.Length);

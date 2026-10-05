@@ -315,14 +315,22 @@ describe("Smart Prefetch activity page", () => {
         ok: true,
         json: () =>
           Promise.resolve(
-            input.includes("/library-file")
+            input.includes("/native-cache/file-ranges")
               ? {
-                  details,
-                  previewUrl: "/view/content/Series.S01E01.1080p.mkv?downloadKey=k",
-                  libraryRoot: "/mnt/plex",
-                  unavailableReason: null,
+                  available: true,
+                  length: details.size,
+                  cachedBytes: details.size,
+                  ranges: [{ offset: 0, count: details.size }],
+                  complete: true,
                 }
-              : response,
+              : input.includes("/library-file")
+                ? {
+                    details,
+                    previewUrl: "/view/content/Series.S01E01.1080p.mkv?downloadKey=k",
+                    libraryRoot: "/mnt/plex",
+                    unavailableReason: null,
+                  }
+                : response,
           ),
       }),
     );
@@ -356,14 +364,16 @@ describe("Smart Prefetch activity page", () => {
           ok: true,
           json: () =>
             Promise.resolve(
-              input.includes("/library-file")
-                ? {
-                    details: null,
-                    previewUrl: null,
-                    libraryRoot: null,
-                    unavailableReason: "This file is not in the Media Library.",
-                  }
-                : response,
+              input.includes("/native-cache/file-ranges")
+                ? { available: false }
+                : input.includes("/library-file")
+                  ? {
+                      details: null,
+                      previewUrl: null,
+                      libraryRoot: null,
+                      unavailableReason: "This file is not in the Media Library.",
+                    }
+                  : response,
             ),
         }),
       ),
@@ -378,7 +388,7 @@ describe("Smart Prefetch activity page", () => {
     const dialog = await screen.findByRole("dialog");
     expect(await within(dialog).findByText("This file is not in the Media Library.")).toBeTruthy();
     expect(within(dialog).getByText("Movie warming")).toBeTruthy();
-    expect(within(dialog).getByText("50%")).toBeTruthy();
+    expect(within(dialog).getByText("Unavailable")).toBeTruthy();
     expect(within(dialog).queryByRole("button", { name: /Requeue repair/ })).toBeNull();
     expect(within(dialog).queryByRole("button", { name: /Run health check/ })).toBeNull();
   });

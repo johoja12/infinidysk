@@ -274,6 +274,10 @@ A hub or collection removed from the settings shows as *Selected Plex
 hub/collection*. A job requested by several sources shows two bubbles and `+N`; hover
 over `+N` to see the rest.
 
+### Prediction viewers [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since }
+
+Prediction bubbles include the Plex user whose activity triggered the prediction, for example **Next episode · history · Alice**. When multiple viewers contribute to the same job, each resolved viewer has a separate source bubble. Long names wrap and remain available in the bubble tooltip. If the owning user's name cannot be resolved, the bubble shows **Unknown user**.
+
 ### Range jobs and backfill [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since }
 
 Some jobs warm only part of a file: **Playback not yet cached** (backfill),

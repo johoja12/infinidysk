@@ -39,7 +39,8 @@ export function SourceBubbles({
       {shown.map((source) => (
         <span
           key={`${source.category}:${source.label}`}
-          className={`badge badge-sm badge-soft rounded-full ${sourceBubbleClass(source.category)}`}
+          className={`badge badge-sm badge-soft h-auto max-w-full whitespace-normal break-words rounded-full py-1 ${sourceBubbleClass(source.category)}`}
+          title={source.label}
           data-category={source.category}
         >
           {source.label}
