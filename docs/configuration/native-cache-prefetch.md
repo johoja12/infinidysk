@@ -141,6 +141,27 @@ container-visible local library path. Similar-looking prefixes do not match. Ena
 an exact imported DAV item. Ordinary local files are skipped: this option does not
 create another rclone warmer or an arbitrary filesystem cache.
 
+## Prediction results [since unreleased](https://github.com/johoja12/infinidysk/issues/177){ .nzbdav-since }
+
+Open **Smart Prefetch → Prediction results** to inspect predicted episodes and live
+whole-file cache coverage. The latest successful prediction snapshot appears on
+reopening the tab while a shared background refresh checks Plex. Its timestamp,
+refresh progress, and any failure remain visible. Failed or incomplete refreshes
+retain previous results; a successful empty refresh clears them. Snapshots are held
+in memory until restart and invalidated when accounts, servers, or policies change.
+
+Each viewer is marked **Verified next-unwatched** or **Chronological candidate**.
+Unverified viewers receive a specific explanation and a link to Plex connections
+when appropriate. Account names alone never authorize watched-state queries;
+InfiniDysk verifies the authenticated account's identity and access to that server.
+
+**Not in library** means the prediction has no resolved imported file. **Cache
+unavailable** means a mapped file exists but Native Cache cannot report coverage.
+Loading and failed cache requests have their own states and show no percentage.
+**Not cached** requires a successful query confirming zero cached bytes. Cache
+coverage continues refreshing independently of prediction snapshots, including
+files excluded from warming by the size cap. Viewing results does not enqueue work.
+
 ## Select policies and inspect work
 
 The normal Smart Prefetch view contains only the master switch, movie and TV
