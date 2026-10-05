@@ -192,7 +192,7 @@ public sealed class PlexPolicyIntegrationTests : IAsyncLifetime
         var itemId = await AddItem("episode.mkv");
         Set(ConfigKeys.SmartPrefetchSettings, JsonSerializer.Serialize(new PrefetchSettings
         { Enabled = true, RealtimeEnabled = true, PredictionsEnabled = true, MaxQueueAhead = 1 }));
-        using var handler = new FakePlexHandler(request => PlexApiClientTests.Xml(request.Uri.AbsolutePath == "/status/sessions"
+        using var handler = new FakePlexHandler(request => PlexApiClientTests.Xml(request.RequestUri!.AbsolutePath == "/status/sessions"
             ? """<MediaContainer><Video ratingKey="current" type="episode" title="Jetrel" grandparentRatingKey="show" parentIndex="1" index="15"><User id="owner" title="Sam"/><Player state="playing"/><Session id="session"/></Video></MediaContainer>"""
             : """<MediaContainer><Video ratingKey="next" type="episode" title="Learning Curve" grandparentTitle="Voyager" grandparentRatingKey="show" parentIndex="1" index="16"><Media><Part file="/plex/episode.mkv"/></Media></Video></MediaContainer>"""));
         using var policy = Policy(handler);
