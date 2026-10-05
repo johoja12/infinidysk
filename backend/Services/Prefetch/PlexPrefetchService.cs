@@ -205,7 +205,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
         var show = current.ShowRatingKey ?? (current.Type == "show" ? current.RatingKey : null);
         if (show is null) return;
         var resolution = await _viewerResolver!.ResolveAsync(server, current.UserId, ct).ConfigureAwait(false);
-        var episodes = await api.GetNextEpisodesAsync(resolution.Server ?? server, current, 20, ct).ConfigureAwait(false);
+        var episodes = await api.GetNextEpisodesAsync(resolution.Server ?? server with { AccountId = null }, current, 20, ct).ConfigureAwait(false);
         var remaining = Math.Min(settings.MaxQueueAhead, settings.TvEpisodesPerShow);
         foreach (var item in PrefetchPolicy.NextEpisodes(current, episodes, 20))
         {
