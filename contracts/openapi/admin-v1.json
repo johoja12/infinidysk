@@ -1736,6 +1736,10 @@
           "hasSnapshot": {
             "type": "boolean"
           },
+          "plexUnavailable": {
+            "default": false,
+            "type": "boolean"
+          },
           "predictions": {
             "items": {
               "$ref": "#/components/schemas/PrefetchPrediction"
@@ -1750,6 +1754,12 @@
           },
           "updatedAt": {
             "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "warning": {
             "type": [
               "null",
               "string"
