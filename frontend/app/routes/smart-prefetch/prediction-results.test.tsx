@@ -122,7 +122,8 @@ it("renders saved predictions during failed refreshes without repeated connectio
   await screen.findByText("Voyager");
   expect(screen.getByRole("alert").textContent).toContain("Showing the last successful results");
   expect(screen.getByText(/Updated .*Refreshing/).textContent).toContain("Previous results");
-  expect(screen.getByText("Whole-file warming; watched status unknown")).toBeTruthy();
+  expect(screen.getByText("Whole-file warming")).toBeTruthy();
+  expect(screen.queryByText(/watched status unknown/)).toBeNull();
   expect(screen.queryByText(/Chronological candidate/)).toBeNull();
   expect(screen.queryByText("Connect this profile")).toBeNull();
   expect(screen.queryByRole("link", { name: "Plex connections" })).toBeNull();

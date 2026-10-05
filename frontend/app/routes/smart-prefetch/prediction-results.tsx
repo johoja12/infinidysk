@@ -309,7 +309,11 @@ function PredictionRow({
         </div>
         <div className="min-w-0">
           <SourceBubbles sources={group.sources} fallback="Next episode" />
-          <p className="mt-2 text-xs text-base-content/55">{group.reasons.join(" · ")}</p>
+          <p className="mt-2 text-xs text-base-content/55">
+            {group.reasons
+              .map((reason) => reason.replace("; watched status unknown", ""))
+              .join(" · ")}
+          </p>
           {group.watchStates
             .filter((watch) => watch.status === "verified")
             .map((watch) => (
@@ -376,7 +380,10 @@ function PredictionRow({
         <summary className="cursor-pointer text-xs text-info">Prediction details</summary>
         <div className="mt-3 space-y-2 text-xs text-base-content/65">
           <p>
-            Predicted for {group.viewers.join(", ")}. {group.reasons.join(" · ")}
+            Predicted for {group.viewers.join(", ")}.{" "}
+            {group.reasons
+              .map((reason) => reason.replace("; watched status unknown", ""))
+              .join(" · ")}
           </p>
           {cache.data && !cache.data.complete && (
             <p>
