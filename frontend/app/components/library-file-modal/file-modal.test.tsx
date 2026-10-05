@@ -30,6 +30,20 @@ vi.mock("~/components/media-preview", () => ({
   ),
 }));
 
+vi.mock("./use-file-cache", () => ({
+  useFileCache: () => ({
+    loading: false,
+    error: null,
+    data: {
+      available: true,
+      length: 2048,
+      cachedBytes: 1536,
+      ranges: [{ offset: 512, count: 1536 }],
+      complete: true,
+    },
+  }),
+}));
+
 const item: LibraryCatalogItem = {
   kind: "internal",
   davItemId: "11111111-1111-1111-1111-111111111111",
@@ -74,6 +88,7 @@ describe("LibraryFileModal", () => {
     expect(screen.getByRole("dialog", { name: "detail-film.mkv" })).toBeTruthy();
     expect(screen.getAllByText("/mnt/plex/movies/detail-film.mkv")).toHaveLength(2);
     expect(screen.getByText("75%")).toBeTruthy();
+    expect(screen.getByRole("img", { name: "1 verified ranges; 1 known gaps" })).toBeTruthy();
     expect(screen.getByText(/no health checks recorded/i)).toBeTruthy();
   });
 

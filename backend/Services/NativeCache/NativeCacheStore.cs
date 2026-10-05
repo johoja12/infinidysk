@@ -975,6 +975,41 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
         finally { _gate.Release(); }
     }
 
+    /// <summary>A bounded display map and coverage from the same catalogue snapshot.</summary>
+    [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
+    public async Task<NativeCacheRangeMap> GetRangeMapAsync(NativeCacheIdentity identity, CancellationToken ct = default)
+    {
+        await _gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            using var command = Command("SELECT Offset,Count FROM Blocks WHERE Key=$key ORDER BY Offset", ("$key", identity.Key));
+            using var reader = command.ExecuteReader();
+            var ranges = new List<NativeCacheDisplayRange>();
+            long cachedBytes = 0;
+            long start = 0, end = 0;
+            var complete = true;
+            void AddRange()
+            {
+                if (end <= start) return;
+                cachedBytes += end - start;
+                if (ranges.Count < 1024) ranges.Add(new(start, end - start));
+                else complete = false;
+            }
+            while (reader.Read())
+            {
+                ct.ThrowIfCancellationRequested();
+                var offset = Math.Clamp(reader.GetInt64(0), 0, identity.Length);
+                var rangeEnd = offset + Math.Min(reader.GetInt64(1), identity.Length - offset);
+                if (offset > end) { AddRange(); start = offset; end = rangeEnd; }
+                else end = Math.Max(end, rangeEnd);
+            }
+            AddRange();
+            return new(identity.Length, cachedBytes, ranges, complete);
+        }
+        finally { _gate.Release(); }
+    }
+
     [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
     public async Task SetPinnedKeyAsync(string key, bool pinned, CancellationToken ct = default)
     {
@@ -2117,3 +2152,6 @@ public sealed record NativeCacheProbeResult(string FileSystem, string Capability
     bool DurableWriteVerified, long AvailableBytes, string? Error);
 
 public sealed record NativeCacheVerifiedRange(long Offset, int Count);
+
+public sealed record NativeCacheDisplayRange(long Offset, long Count);
+public sealed record NativeCacheRangeMap(long Length, long CachedBytes, IReadOnlyList<NativeCacheDisplayRange> Ranges, bool Complete);

@@ -87,3 +87,26 @@ public sealed class NativeCacheRangesController(NativeCacheService native) : Get
         return Ok(new { ranges, nextAfter = ranges.Count == limit ? (long?)ranges[^1].Offset : null });
     }
 }
+
+[ApiController]
+[Route("api/native-cache/file-ranges")]
+public sealed class NativeCacheFileRangesController(NativeCacheService native, DavDatabaseClient database) : GetOnlyApiController
+{
+    protected override async Task<IActionResult> HandleRequest()
+    {
+        var ct = HttpContext.RequestAborted;
+        if (!Guid.TryParse(HttpContext.Request.Query["itemId"], out var itemId))
+            throw new ArgumentException("Select an imported file to view cache ranges.");
+        await native.WaitForInitializationAsync(ct).ConfigureAwait(false);
+        var item = await database.GetFileById(itemId.ToString()).ConfigureAwait(false);
+        if (item is null) return NotFound(new { error = "The selected file is no longer available." });
+        var identity = await native.GetCurrentCacheIdentityAsync(item, ct).ConfigureAwait(false);
+        if (identity is null || native.Store is not { } store)
+            return Ok(new { available = false });
+        var map = await store.GetRangeMapAsync(identity, ct).ConfigureAwait(false);
+        // A repair/source change during the read invalidates the entire display snapshot.
+        if (await native.GetCurrentCacheIdentityAsync(item, ct).ConfigureAwait(false) != identity)
+            return Ok(new { available = false });
+        return Ok(new { available = true, map.Length, map.CachedBytes, map.Ranges, map.Complete });
+    }
+}
