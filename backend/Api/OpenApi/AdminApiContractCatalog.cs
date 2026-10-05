@@ -62,6 +62,7 @@ public static class AdminApiContractCatalog
             "post-api-arr-regrab-migration-failures-dry-run"),
         new("GET", "/api/native-cache/summary", "get-api-native-cache-summary"),
         new("GET", "/api/native-cache/files", "get-api-native-cache-files"),
+        new("GET", "/api/native-cache/file-ranges", "get-api-native-cache-file-ranges"),
         new("GET", "/api/native-cache/activity", "get-api-native-cache-activity"),
         new("GET", "/api/native-cache/transfers", "get-api-native-cache-transfers"),
         new("GET", "/api/native-cache/evictions", "get-api-native-cache-evictions"),

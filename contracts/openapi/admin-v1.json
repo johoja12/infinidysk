@@ -11250,6 +11250,80 @@
         ]
       }
     },
+    "/api/native-cache/file-ranges": {
+      "get": {
+        "operationId": "get-api-native-cache-file-ranges",
+        "responses": {
+          "200": {
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Bad request."
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized."
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Forbidden."
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not found."
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Conflict."
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unexpected server error. Detail is sanitized; use traceId."
+          }
+        },
+        "summary": "Native Cache File Ranges",
+        "tags": [
+          "NativeCacheFileRanges"
+        ]
+      }
+    },
     "/api/native-cache/files": {
       "get": {
         "operationId": "get-api-native-cache-files",
@@ -16994,6 +17068,9 @@
     },
     {
       "name": "NativeCacheRanges"
+    },
+    {
+      "name": "NativeCacheFileRanges"
     },
     {
       "name": "ListWebdavDirectory"
