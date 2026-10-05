@@ -10,7 +10,8 @@ const snapshot = {
   ranges: [{ offset: 50, count: 50 }],
   complete: true,
 };
-const response = (data: unknown) => ({ ok: true, json: async () => data });
+const response = (data: unknown) =>
+  new Response(JSON.stringify(data), { headers: { "Content-Type": "application/json" } });
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
@@ -19,9 +20,9 @@ afterEach(() => {
 
 describe("file modal cache ranges", () => {
   it("loads authoritative coverage and discards the previous file on selection change", async () => {
-    let finishSecond: ((value: unknown) => void) | undefined;
+    let finishSecond: ((value: Response) => void) | undefined;
     const fetch = vi
-      .fn()
+      .fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(response(snapshot))
       .mockImplementationOnce(
         () =>
@@ -35,14 +36,15 @@ describe("file modal cache ranges", () => {
     });
     expect(result.current.loading).toBe(true);
     await waitFor(() => expect(result.current.data?.cachedBytes).toBe(50));
-    const signal = fetch.mock.calls[0]![1].signal as AbortSignal;
+    const signal = fetch.mock.calls[0]![1]?.signal as AbortSignal;
     rerender({ id: "second" });
     expect(signal.aborted).toBe(true);
     expect(result.current.data).toBeNull();
     expect(result.current.loading).toBe(true);
-    await act(async () => {
+    act(() => {
       finishSecond?.(response({ ...snapshot, cachedBytes: 0, ranges: [] }));
     });
+    await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.data?.ranges).toEqual([]);
     expect(result.current.data?.cachedBytes).toBe(0);
   });
@@ -50,14 +52,14 @@ describe("file modal cache ranges", () => {
   it("refreshes warming coverage and stops polling after close", async () => {
     vi.useFakeTimers();
     const fetch = vi
-      .fn()
+      .fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(response(snapshot))
       .mockResolvedValue(
         response({ ...snapshot, cachedBytes: 100, ranges: [{ offset: 0, count: 100 }] }),
       );
     vi.stubGlobal("fetch", fetch);
     const { result, unmount } = renderHook(() => useFileCache("file"));
-    await act(async () => {});
+    await act(() => Promise.resolve());
     expect(result.current.data?.cachedBytes).toBe(50);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(5000);
@@ -70,7 +72,7 @@ describe("file modal cache ranges", () => {
 
   it("distinguishes unavailable and failed requests from an empty cache", async () => {
     const fetch = vi
-      .fn()
+      .fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(response({ available: false }))
       .mockRejectedValueOnce(new Error("offline"));
     vi.stubGlobal("fetch", fetch);
