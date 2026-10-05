@@ -177,3 +177,36 @@ it("distinguishes loading from a successfully empty prediction snapshot", async 
   await screen.findByText(/No next-episode predictions/);
   expect(screen.queryByText("Loading prediction results…")).toBeNull();
 });
+
+it.each([true, false])("explains Plex outages with saved results = %s", async (hasSnapshot) => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() =>
+      Promise.resolve(
+        new Response(
+          JSON.stringify({
+            predictions: [],
+            hasSnapshot,
+            stale: true,
+            refreshing: false,
+            error: "Policy refresh reached its bounded time window",
+            plexUnavailable: true,
+            updatedAt: hasSnapshot ? "2026-10-05T12:00:00Z" : null,
+          }),
+        ),
+      ),
+    ),
+  );
+  render(<PredictionResults jobs={[]} refreshKey={0} modal={{} as LibraryFileModalController} />);
+  const alert = await screen.findByRole("alert");
+  expect(alert.textContent).toContain(
+    "Plex is unavailable or did not respond. Retrying automatically.",
+  );
+  expect(alert.textContent).toContain(
+    hasSnapshot
+      ? "Showing the last successful results."
+      : "No saved prediction results are available yet.",
+  );
+  expect(alert.className).toContain("alert-warning");
+  expect(alert.textContent).not.toContain("bounded time window");
+});

@@ -72,6 +72,84 @@ public sealed class PredictionSnapshotTests
         Assert.False(failed.Get().HasSnapshot);
     }
 
+    [Fact]
+    public async Task RestartRestoresTimestampAndRowsDuringOutageThenRecovers()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(directory, "predictions.json");
+        try
+        {
+            var clock = new Clock();
+            var candidate = Candidate() with { Viewer = "Alice", ServerName = "Living room" };
+            var original = new PredictionSnapshotCache(() => "one", _ => Task.FromResult(new PredictionRefresh([candidate], true, null)),
+                clock, CancellationToken.None, new(path));
+            original.Get();
+            await Eventually(() => original.Get().HasSnapshot && !original.Get().Refreshing);
+            var timestamp = original.Get().UpdatedAt;
+            clock.Now += TimeSpan.FromSeconds(10);
+            var next = new PredictionRefresh([], false, "Timed out", true);
+            var restarted = new PredictionSnapshotCache(() => "one", _ => Task.FromResult(next), clock, CancellationToken.None, new(path));
+            var restored = restarted.Get();
+            Assert.True(restored.HasSnapshot);
+            Assert.True(restored.Stale);
+            Assert.Equal(timestamp, restored.UpdatedAt);
+            Assert.Equal("Alice", Assert.Single(restored.Predictions).Viewer);
+            await Eventually(() => restarted.Get().PlexUnavailable);
+            Assert.Equal(candidate, Assert.Single(new PredictionSnapshotStore(path).Load("one")!.Predictions));
+            next = new([], true, null);
+            clock.Now += TimeSpan.FromSeconds(31);
+            restarted.Get();
+            await Eventually(() => restarted.Get().Predictions.Count == 0 && restarted.Get().Error is null);
+            Assert.False(restarted.Get().PlexUnavailable);
+            Assert.False(restarted.Get().Stale);
+            Assert.Empty(new PredictionSnapshotStore(path).Load("one")!.Predictions);
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Fact]
+    public void SavedResultsAreIgnoredAfterAccountChangeAndCorruptFilesAreNonfatal()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(directory, "predictions.json");
+        try
+        {
+            var store = new PredictionSnapshotStore(path);
+            store.Save(new(1, "old-account", new Clock().Now, [Candidate()]));
+            Assert.Null(store.Load("new-account"));
+            var cache = new PredictionSnapshotCache(() => "new-account", _ => throw new InvalidOperationException(),
+                new Clock(), new CancellationToken(true), store);
+            Assert.False(cache.Get().HasSnapshot);
+            File.WriteAllText(path, "{broken");
+            Assert.Null(store.Load("old-account"));
+            Assert.NotNull(store.Warning);
+            File.WriteAllText(path, new string('x', 2 * 1024 * 1024 + 1));
+            Assert.Null(store.Load("old-account"));
+            Assert.NotNull(store.Warning);
+            store.Save(new(1, "new-account", new Clock().Now, []));
+            Assert.NotNull(store.Load("new-account"));
+            Assert.Null(store.Warning);
+        }
+        finally { Directory.Delete(directory, true); }
+    }
+
+    [Fact]
+    public async Task FailedPersistenceKeepsSuccessfulInMemoryResultsAndReportsWarning()
+    {
+        var blocker = Path.GetTempFileName();
+        try
+        {
+            var cache = new PredictionSnapshotCache(() => "one", _ => Task.FromResult(new PredictionRefresh([Candidate()], true, null)),
+                new Clock(), CancellationToken.None, new(Path.Combine(blocker, "predictions.json")));
+            cache.Get();
+            await Eventually(() => cache.Get().HasSnapshot);
+            Assert.Single(cache.Get().Predictions);
+            Assert.Null(cache.Get().Error);
+            Assert.NotNull(cache.Get().Warning);
+        }
+        finally { File.Delete(blocker); }
+    }
+
     private static PrefetchPrediction Candidate() => new(Guid.NewGuid(), "Episode", "History", "Next", 0, 10, 100);
     private static async Task Eventually(Func<bool> condition)
     {
