@@ -41,7 +41,7 @@ describe("prediction results", () => {
       { ...prediction, itemId: "00000000-0000-0000-0000-000000000000", plexRatingKey: "2" },
     ]);
     expect(groups).toHaveLength(2);
-    expect(cacheState(groups[0]!, null, [])).toBe("unavailable");
+    expect(cacheState(groups[0]!, null, [])).toBe("missing");
   });
   it("uses current cache coverage after eviction, even when historical warming completed", () => {
     const group = groupPredictions([prediction])[0]!;
@@ -57,4 +57,31 @@ describe("prediction results", () => {
     expect(cacheState(group, cache, [{ itemId: "file", state: "running" }])).toBe("warming");
     expect(cacheState(group, { ...cache, cachedBytes: 100 }, [])).toBe("ready");
   });
+});
+
+it("separates unknown coverage from a missing mapping, loading and failed requests", () => {
+  const group = groupPredictions([prediction])[0]!;
+  expect(cacheState(group, null, [])).toBe("unavailable");
+  expect(cacheState(group, null, [], { loading: true, error: null })).toBe("loading");
+  expect(cacheState(group, null, [], { loading: false, error: "Failed" })).toBe("error");
+  expect(cacheState({ ...group, itemId: null }, null, [], { loading: true, error: null })).toBe(
+    "missing",
+  );
+});
+
+it("keeps each viewer's watched-state warning when predictions share a file", () => {
+  const group = groupPredictions([
+    { ...prediction, watchedStatus: "verified", serverName: "Plex" },
+    {
+      ...prediction,
+      viewer: "Alice",
+      watchedStatus: "unconnected",
+      watchedWarning: "Connect this profile",
+      serverName: "Plex",
+    },
+  ])[0]!;
+  expect(group.watchStates).toEqual([
+    { viewer: "Sam", status: "verified", server: "Plex", warning: undefined },
+    { viewer: "Alice", status: "unconnected", server: "Plex", warning: "Connect this profile" },
+  ]);
 });

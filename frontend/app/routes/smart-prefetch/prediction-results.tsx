@@ -18,7 +18,10 @@ const labels = {
   warming: "Warming",
   queued: "Not cached",
   partial: "Partially cached",
-  unavailable: "Unavailable",
+  unavailable: "Cache unavailable",
+  missing: "Not in library",
+  loading: "Loading cache",
+  error: "Cache request failed",
 };
 type State = keyof typeof labels;
 
@@ -34,7 +37,11 @@ export function PredictionResults({
   const [snapshot, setSnapshot] = useState<{
     predictions: Prediction[];
     warning?: string;
-    updated: number;
+    updatedAt?: string;
+    hasSnapshot?: boolean;
+    refreshing?: boolean;
+    stale?: boolean;
+    error?: string;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
@@ -45,23 +52,25 @@ export function PredictionResults({
   useEffect(() => {
     const abort = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
+    let pollingMs = 60_000;
     async function load() {
       try {
-        const response = await fetch(withUrlBase("/api/prefetch/preview"), {
+        const response = await fetch(withUrlBase("/api/prefetch/predictions"), {
           signal: abort.signal,
         });
         if (!response.ok)
           throw new Error(`Could not load prediction results (${response.status}).`);
-        const body = (await response.json()) as { predictions: Prediction[]; warning?: string };
+        const body = (await response.json()) as NonNullable<typeof snapshot>;
+        pollingMs = body.refreshing || body.hasSnapshot === false ? 2_000 : 60_000;
         if (!abort.signal.aborted) {
-          setSnapshot({ ...body, updated: Date.now() });
-          setError(null);
+          setSnapshot(body);
+          setError(body.error ?? null);
         }
       } catch (cause) {
         if (!abort.signal.aborted)
           setError(cause instanceof Error ? cause.message : "Could not load predictions.");
       } finally {
-        if (!abort.signal.aborted) timer = setTimeout(() => void load(), 60_000);
+        if (!abort.signal.aborted) timer = setTimeout(() => void load(), pollingMs);
       }
     }
     void load();
@@ -96,15 +105,19 @@ export function PredictionResults({
           </p>
         </div>
         <span className="text-xs text-base-content/50">
-          {snapshot
-            ? `Updated ${new Date(snapshot.updated).toLocaleTimeString()}`
-            : "Loading predictions…"}
+          {snapshot?.updatedAt
+            ? `Updated ${new Date(snapshot.updatedAt).toLocaleTimeString()}`
+            : error
+              ? "No successful snapshot yet"
+              : "Loading predictions…"}
+          {snapshot?.refreshing && " · Refreshing…"}
+          {snapshot?.hasSnapshot && snapshot.stale && " · Previous results"}
         </span>
       </div>
       {error && (
         <div className="alert alert-error text-sm" role="alert">
           {error}
-          {snapshot && " Showing the last successful results."}
+          {snapshot?.hasSnapshot && " Showing the last successful results."}
         </div>
       )}
       {snapshot?.warning && <div className="alert alert-warning text-sm">{snapshot.warning}</div>}
@@ -197,8 +210,10 @@ export function PredictionResults({
         ))}
         {!filtered.length && (
           <p className="p-8 text-center text-sm text-base-content/55">
-            {!snapshot
-              ? "Loading prediction results…"
+            {!snapshot || snapshot.hasSnapshot === false
+              ? error
+                ? "Prediction refresh failed. Retrying shortly."
+                : "Loading prediction results…"
               : !groups.length
                 ? "No next-episode predictions. Enable Plex predictions and select viewing users in Prefetch settings."
                 : "No predictions match these filters."}
@@ -258,7 +273,10 @@ function PredictionRow({
     return () => clearTimeout(timer);
   }, [delay]);
   const cache = useFileCache(enabled && group.itemId ? group.itemId : null, 30_000);
-  const state = cacheState(group, cache.data, jobs);
+  const state = cacheState(group, cache.data, jobs, {
+    loading: !enabled || cache.loading,
+    error: cache.error,
+  });
   useEffect(() => onState(state), [state, onState]);
   const percent = cache.data
     ? Math.min(100, Math.floor((cache.data.cachedBytes / cache.data.length) * 100))
@@ -284,6 +302,29 @@ function PredictionRow({
         <div className="min-w-0">
           <SourceBubbles sources={group.sources} fallback="Next episode" />
           <p className="mt-2 text-xs text-base-content/55">{group.reasons.join(" · ")}</p>
+          {group.watchStates.map((watch) => (
+            <p
+              key={`${watch.viewer}:${watch.server}:${watch.status}`}
+              className={`mt-2 text-xs ${watch.status === "verified" ? "text-success" : "text-warning"}`}
+            >
+              {watch.viewer}
+              {watch.server ? ` · ${watch.server}` : ""}:{" "}
+              {watch.status === "verified"
+                ? "Verified next-unwatched"
+                : "Chronological candidate · watched status unverified"}
+              {watch.warning && (
+                <span className="block">
+                  {watch.warning}{" "}
+                  <a
+                    className="link"
+                    href={withUrlBase("/settings?tab=streaming#plex-connections")}
+                  >
+                    Plex connections
+                  </a>
+                </span>
+              )}
+            </p>
+          ))}
         </div>
         <div>
           <div className="mb-2 flex justify-between gap-2 text-xs">
@@ -296,7 +337,7 @@ function PredictionRow({
                     : "text-base-content/65"
               }
             >
-              {cache.loading || !enabled ? "Loading cache…" : labels[state]}
+              {labels[state]}
             </strong>
             <strong>{percent === null ? "—" : `${percent}%`}</strong>
           </div>
@@ -327,7 +368,10 @@ function PredictionRow({
             </>
           ) : (
             <p className="text-xs text-base-content/50">
-              {cache.error ?? (group.itemId ? "Cache coverage unavailable" : "No mapped file")}
+              {cache.error ??
+                (group.itemId
+                  ? "Native Cache coverage is unavailable for this mapped file."
+                  : "No mapped imported file. Review the mapping in prediction details.")}
             </p>
           )}
         </div>
