@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { z } from "zod";
 import type { CacheRange } from "~/components/cache-range-map";
 import { withUrlBase } from "~/utils/url-base";
 
@@ -9,6 +10,16 @@ export type FileCacheMap = {
   ranges: CacheRange[];
   complete: boolean;
 };
+const cacheResponse = z.discriminatedUnion("available", [
+  z.object({ available: z.literal(false) }),
+  z.object({
+    available: z.literal(true),
+    length: z.number().positive(),
+    cachedBytes: z.number().nonnegative(),
+    ranges: z.array(z.object({ offset: z.number().nonnegative(), count: z.number().positive() })),
+    complete: z.boolean(),
+  }),
+]);
 type CacheState = {
   itemId: string | null;
   data: FileCacheMap | null;
@@ -29,7 +40,7 @@ export function useFileCache(itemId: string | null) {
           signal: abort.signal,
         });
         if (!response.ok) throw new Error("Cache ranges could not be loaded.");
-        const data = (await response.json()) as FileCacheMap | { available: false };
+        const data = cacheResponse.parse(await response.json());
         if (!abort.signal.aborted)
           setState({ itemId, data: data.available ? data : null, error: null });
       } catch {

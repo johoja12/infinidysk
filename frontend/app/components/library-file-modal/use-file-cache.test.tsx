@@ -70,6 +70,16 @@ describe("file modal cache ranges", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
+  it("treats malformed successful responses as unavailable instead of crashing the modal", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof globalThis.fetch>().mockResolvedValue(response({ available: true })),
+    );
+    const { result } = renderHook(() => useFileCache("file"));
+    await waitFor(() => expect(result.current.error).toBe("Cache ranges could not be loaded."));
+    expect(result.current.data).toBeNull();
+  });
+
   it("distinguishes unavailable and failed requests from an empty cache", async () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
