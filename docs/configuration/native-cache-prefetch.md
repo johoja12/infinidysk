@@ -147,8 +147,10 @@ Open **Smart Prefetch → Prediction results** to inspect predicted episodes and
 whole-file cache coverage. The latest successful prediction snapshot appears on
 reopening the tab while a shared background refresh checks Plex. Its timestamp,
 refresh progress, and any failure remain visible. Failed or incomplete refreshes
-retain previous results; a successful empty refresh clears them. Snapshots are held
-in memory until restart and invalidated when accounts, servers, or policies change.
+retain previous results; a successful empty refresh clears them. Snapshots are
+invalidated when accounts, servers, or policies change.
+
+Persistence across restarts [since unreleased](https://github.com/johoja12/infinidysk/issues/181){ .nzbdav-since }: the last complete snapshot is saved under `/config` and restored with its original timestamp when the configuration still matches. Restored results are marked **Previous results** until a fresh refresh succeeds. When Plex is unreachable or does not respond, the tab explains that it will retry automatically and shows saved predictions if available. A first-time installation or changed configuration has no saved results to show until Plex responds. Corrupt or unwritable snapshot files produce a warning; in-memory results, cached media, and existing warming jobs remain available.
 
 Each viewer is marked **Verified next-unwatched** or **Chronological candidate**.
 Unverified viewers receive a specific explanation and a link to Plex connections
