@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from concurrent.futures import ThreadPoolExecutor
 import csv
 import fcntl
 import hashlib
@@ -15,7 +16,7 @@ import zipfile
 from pathlib import Path
 
 from existing_id_imports import id_target, skip_existing
-from plex_hub_priority import load_schedule, next_batch, verify_selected_manifest
+from plex_hub_priority import load_schedule, next_pipeline_batch, verify_selected_manifest
 
 HOST = "http://192.168.20.65:8080"
 BASE = Path("/mnt/nzbdav-cache3/infinidysk-migration-artifacts/mapped-20260924T214816Z/plex")
@@ -203,6 +204,26 @@ def run_tool(service, args, allow_failure=False):
     return result
 
 
+def run_validation_tool(service, args, allow_failure=False):
+    unit = service + ".service"
+    state = subprocess.run(["systemctl", "show", unit, "--property=ActiveState", "--value"],
+                           capture_output=True, text=True).stdout.strip()
+    if state in ("active", "activating"):
+        description = subprocess.check_output(
+            ["systemctl", "show", unit, "--property=Description", "--value"], text=True).strip()
+        if description != " ".join((TOOL, *args)):
+            raise RuntimeError("active validation unit differs from the requested batch operation")
+        log(f"adopting existing validation unit {unit}")
+        while state in ("active", "activating", "deactivating"):
+            time.sleep(2)
+            state = subprocess.run(["systemctl", "show", unit, "--property=ActiveState", "--value"],
+                                   capture_output=True, text=True).stdout.strip()
+        output = Path(args[args.index("--output") + 1])
+        if output.exists():
+            return
+    run_tool(service, args, allow_failure=allow_failure)
+
+
 def save_json(path, value):
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -307,7 +328,7 @@ def retry_failed_validations(batch_index, journal, original_path):
             raise RuntimeError("validation retry does not match the applied journal")
         write_json_once(retry_journal, source)
         if not retry_result.exists():
-            run_tool(f"id64-plex-retry-{batch_index + 1:04d}-{attempt}-20260928", [
+            run_validation_tool(f"id64-plex-retry-{batch_index + 1:04d}-{attempt}-20260928", [
                 "validate-links", "--journal", str(retry_journal), "--output", str(retry_result),
                 "--max-read-bytes", "65536", "--timeout-seconds", "20",
                 "--workers", str(VALIDATION_WORKERS)], allow_failure=True)
@@ -425,7 +446,6 @@ def process_batch(batch_index, stage_name, destination, manifest):
     if exact_count != plan.get("actionableCount"):
         raise RuntimeError(f"plan actionable count mismatch: {exact_count} != {plan.get('actionableCount')}")
     journal = JOURNAL_DIR / f"batch-{batch_index + 1:04d}.json"
-    validated_path = JOURNAL_DIR / f"batch-{batch_index + 1:04d}-validated.json"
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
     prior = json.loads(journal.read_text()) if journal.exists() else {"links": []}
     prior_applied = {row["libraryRelativePath"] for row in prior["links"]
@@ -498,8 +518,42 @@ def process_batch(batch_index, stage_name, destination, manifest):
                        for row in plan["links"] if row.get("applyStatus") == "planned"}
     missing_ids = [missing_by_path[row["libraryRelativePath"]] for row in missing]
     replaced_ids = [missing_by_path[row["libraryRelativePath"]] for row in replaced]
+    request(f"/api/migration/nzbdav/full/batches/{batch_index}/checkpoint-validation", "POST", {
+        "planDigest": digest})
+    log(f"batch {batch_index + 1}/{BATCH_COUNT} frozen for background validation")
+
+
+def finish_batch(batch_index, destination, manifest):
+    # Resume entirely from immutable, per-batch artifacts. The singleton import
+    # session may already belong to the next batch.
+    report_dir = REPORTS / f"batch-{batch_index + 1:04d}"
+    plan_path = report_dir / "plan" / "plan.json"
+    check = subprocess.run(["sha256sum", "-c", "SHA256SUMS"], cwd=plan_path.parent,
+                           capture_output=True, text=True)
+    if check.returncode:
+        raise RuntimeError("frozen validation plan checksum failed")
+    digest = hashlib.sha256(plan_path.read_bytes()).hexdigest()
+    plan = json.loads(plan_path.read_text())
+    journal = JOURNAL_DIR / f"batch-{batch_index + 1:04d}.json"
+    validated_path = JOURNAL_DIR / f"batch-{batch_index + 1:04d}-validated.json"
+    journal_data = json.loads(journal.read_text())
+    if journal_data.get("planSha256") != digest or journal_data.get("sourceRoot") != LIBRARY_ROOT \
+            or journal_data.get("libraryRoot") != TARGET_LIBRARY or journal_data.get("targetRoot") != TARGET_ROOT:
+        raise RuntimeError("frozen journal differs from its sealed plan and roots")
+    exact_count = plan["actionableCount"]
+    applied = sum(row.get("status") == "applied" for row in journal_data["links"])
+    missing = [row for row in journal_data["links"] if row.get("status") == "source-missing"]
+    replaced = [row for row in journal_data["links"] if row.get("status") == "source-replaced"]
+    if applied + len(missing) + len(replaced) != exact_count or len(journal_data["links"]) != exact_count:
+        raise RuntimeError("frozen validation journal has incomplete link accounting")
+    missing_by_path = {row["libraryRelativePath"]: row["legacyDavItemId"]
+                       for row in plan["links"] if row.get("applyStatus") == "planned"}
+    missing_ids = [missing_by_path[row["libraryRelativePath"]] for row in missing]
+    replaced_ids = [missing_by_path[row["libraryRelativePath"]] for row in replaced]
+    with (report_dir / "not-imported.csv").open(newline="", encoding="utf-8") as stream:
+        excluded = list(csv.DictReader(stream))
     if not validated_path.exists():
-        run_tool(f"id64-plex-validate-{batch_index + 1:04d}-20260927", [
+        run_validation_tool(f"id64-plex-validate-{batch_index + 1:04d}-20260927", [
             "validate-links", "--journal", str(journal), "--output", str(validated_path),
             "--max-read-bytes", "65536", "--timeout-seconds", "20",
                 "--workers", str(VALIDATION_WORKERS)], allow_failure=True)
@@ -661,25 +715,44 @@ def main():
     REPORTS.mkdir(parents=True, exist_ok=True)
     JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
     reconstruct_first_batch_report()
-    while True:
-        full = request("/api/migration/nzbdav/full/status")
-        if full.get("masterManifestDigest") not in (None, MASTER):
-            raise RuntimeError("Active full recovery master differs from the Plex runner")
-        try:
-            schedule = load_schedule(PRIORITY_SCHEDULE, MASTER, BATCH_COUNT)
-            index = next_batch(full.get("batches", []), BATCH_COUNT, schedule)
-            if index is None:
-                break
-            verify_selected_manifest(schedule, BATCHES, index)
-        except (ValueError, KeyError, TypeError, StopIteration) as error:
-            raise RuntimeError(f"Invalid Plex priority schedule: {error}") from error
-        log(f"selected batch {index + 1}/{BATCH_COUNT}; Plex hub priority={schedule is not None}")
-        stage_name, destination, manifest = stage_batch(index)
-        ensure_scan_and_run(index, stage_name, destination, manifest, allow_out_of_order=schedule is not None)
-        process_batch(index, stage_name, destination, manifest)
-        health = urllib.request.urlopen(HOST + "/health", timeout=10)
-        if health.status != 200:
-            raise RuntimeError("InfiniDysk health check failed after an acknowledged batch")
+    with ThreadPoolExecutor(max_workers=1) as validator:
+        validation = None
+        while True:
+            if validation is not None and validation.done():
+                validation.result()  # A failed validator stops further batch admission.
+                validation = None
+            full = request("/api/migration/nzbdav/full/status")
+            if full.get("masterManifestDigest") not in (None, MASTER):
+                raise RuntimeError("Active full recovery master differs from the Plex runner")
+            try:
+                schedule = load_schedule(PRIORITY_SCHEDULE, MASTER, BATCH_COUNT)
+                validating, index = next_pipeline_batch(full.get("batches", []), BATCH_COUNT, schedule)
+                if validation is None and validating is not None:
+                    verify_selected_manifest(schedule, BATCHES, validating)
+                    _, destination, manifest = stage_batch(validating)
+                    validation = validator.submit(finish_batch, validating, destination, manifest)
+                if index is None:
+                    if validation is not None:
+                        validation.result()
+                        validation = None
+                        continue
+                    break
+                verify_selected_manifest(schedule, BATCHES, index)
+            except (ValueError, KeyError, TypeError, StopIteration) as error:
+                raise RuntimeError(f"Invalid Plex pipeline schedule: {error}") from error
+            log(f"selected import batch {index + 1}/{BATCH_COUNT}; background validation={validating}")
+            stage_name, destination, manifest = stage_batch(index)
+            ensure_scan_and_run(index, stage_name, destination, manifest, allow_out_of_order=schedule is not None)
+            # Only one frozen validation slot exists. Preserve this completed
+            # import's singleton evidence until the older validator acknowledges.
+            if validation is not None:
+                validation.result()
+                validation = None
+            process_batch(index, stage_name, destination, manifest)
+            validation = validator.submit(finish_batch, index, destination, manifest)
+            health = urllib.request.urlopen(HOST + "/health", timeout=10)
+            if health.status != 200:
+                raise RuntimeError("InfiniDysk health check failed before pipeline admission")
     write_final_report()
     full = request("/api/migration/nzbdav/full/status")
     save_json(REPORTS / "full-migration-status-final.json", full)
