@@ -303,7 +303,7 @@ recorded `unmatched-target` correlation. Neither a failed nor an unmatched
 file receives a parallel link. Keep unmatched source files in the legacy
 library; run the failed-import cleanup below for confirmed failures.
 
-### Two-batch pipeline [since unreleased](https://github.com/johoja12/infinidysk/pulls){ .nzbdav-since }
+### Two-batch pipeline [since unreleased](https://github.com/johoja12/infinidysk/pull/185){ .nzbdav-since }
 
 The advanced `scripts/operations/plex-import-runner.py` runner can import batch B
 while batch A validates. It retains two submission workers, queue depth ten,
