@@ -34,7 +34,8 @@ SOURCE_COUNT = 41324
 RECOVERABLE_COUNT = 26265
 BATCH_COUNT = 92
 MAX_QUEUE_DEPTH = 10
-SUBMIT_WORKERS = 1
+SUBMIT_WORKERS = 2
+VALIDATION_WORKERS = 4
 REPORTS = BASE / "import-reports"
 JOURNAL_DIR = BASE / "journals"
 POLL_SECONDS = 15
@@ -308,7 +309,8 @@ def retry_failed_validations(batch_index, journal, original_path):
         if not retry_result.exists():
             run_tool(f"id64-plex-retry-{batch_index + 1:04d}-{attempt}-20260928", [
                 "validate-links", "--journal", str(retry_journal), "--output", str(retry_result),
-                "--max-read-bytes", "65536", "--timeout-seconds", "20"], allow_failure=True)
+                "--max-read-bytes", "65536", "--timeout-seconds", "20",
+                "--workers", str(VALIDATION_WORKERS)], allow_failure=True)
         if not retry_result.exists():
             raise RuntimeError("validation retry produced no durable result")
         by_path = {row["libraryRelativePath"]: row for row in json.loads(retry_result.read_text())}
@@ -442,6 +444,31 @@ def process_batch(batch_index, stage_name, destination, manifest):
         current_target = os.readlink(source)
         if current_target != row["originalLegacyTarget"] and id_target(LIBRARY_ROOT, row["libraryRelativePath"], TARGET_ROOT) is not None:
             replaced_paths[row["libraryRelativePath"]] = current_target
+    # Durable source-replaced entries are already accounted for, including a
+    # different legacy NZB now owning the path. Do not rediscover them as new
+    # apply work: verify the sealed journal and the unchanged source instead.
+    recorded_replaced = [row for row in prior["links"] if row.get("status") == "source-replaced"]
+    if recorded_replaced:
+        if prior.get("planSha256") != digest or prior.get("sourceRoot") != LIBRARY_ROOT \
+                or prior.get("libraryRoot") != TARGET_LIBRARY or prior.get("targetRoot") != TARGET_ROOT:
+            raise RuntimeError("recorded replacement journal does not match the sealed plan and roots")
+        planned_by_path = {row["libraryRelativePath"]: row for row in pending_links}
+        for row in recorded_replaced:
+            relative = row["libraryRelativePath"]
+            planned = planned_by_path.get(relative)
+            source = os.path.join(LIBRARY_ROOT, relative)
+            output = os.path.join(TARGET_LIBRARY, relative)
+            if planned is None or row.get("sourceLinkPath") != source \
+                    or row.get("linkPath") != output \
+                    or row.get("observedSourceTarget") != planned["originalLegacyTarget"] \
+                    or row.get("targetPath") != os.path.join(TARGET_ROOT, planned["newRelativeTarget"]) \
+                    or row.get("expectedFileSize") != planned["expectedFileSize"] \
+                    or not os.path.islink(source) \
+                    or os.readlink(source) != row.get("replacementSourceTarget") \
+                    or row["replacementSourceTarget"] == planned["originalLegacyTarget"] \
+                    or os.path.lexists(output):
+                raise RuntimeError("recorded source replacement changed; reconcile before resuming")
+            replaced_paths[relative] = row["replacementSourceTarget"]
     missing_file = report_dir / "missing-source-paths.json"
     if missing_paths:
         write_json_once(missing_file, missing_paths)
@@ -474,7 +501,8 @@ def process_batch(batch_index, stage_name, destination, manifest):
     if not validated_path.exists():
         run_tool(f"id64-plex-validate-{batch_index + 1:04d}-20260927", [
             "validate-links", "--journal", str(journal), "--output", str(validated_path),
-            "--max-read-bytes", "65536", "--timeout-seconds", "20"], allow_failure=True)
+            "--max-read-bytes", "65536", "--timeout-seconds", "20",
+                "--workers", str(VALIDATION_WORKERS)], allow_failure=True)
     if not validated_path.exists():
         raise RuntimeError(f"batch {batch_index + 1} validation produced no durable result")
     validations, resolved_path = retry_failed_validations(batch_index, journal, validated_path)
