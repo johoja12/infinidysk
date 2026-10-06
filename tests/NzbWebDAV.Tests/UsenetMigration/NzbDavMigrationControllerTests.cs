@@ -382,14 +382,15 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
     {
         await using var harness = await MigrationTestHarness.CreateAsync();
         var master = new string('e', 64);
-        var first = await CreateFullPackageAsync("pipeline-0", master, 0, 3);
-        var second = await CreateFullPackageAsync("pipeline-1", master, 1, 3, libraryPath: "Migration-TV/b.mkv");
-        var third = await CreateFullPackageAsync("pipeline-2", master, 2, 3, libraryPath: "Migration-TV/c.mkv");
+        var first = await CreateFullPackageAsync("pipeline-0", master, 0, 3, includeSecondRelease: true);
+        var second = await CreateFullPackageAsync("pipeline-1", master, 1, 3, libraryPath: "Migration-TV/c.mkv");
+        var third = await CreateFullPackageAsync("pipeline-2", master, 2, 3, libraryPath: "Migration-TV/d.mkv");
         var overlapping = await CreateFullPackageAsync("pipeline-overlap", master, 1, 3);
         var controller = CreateController(harness);
-        Assert.IsType<OkObjectResult>(await controller.ConnectFull(new(first, master, 3, 3, 10, 2)));
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(new(first, master, 4, 4, 10, 2)));
         var package = await new NzbDavPackageReader().ReadAsync(first);
-        var selected = Assert.Single(package.Manifest.SelectedLinks);
+        var selected = package.Manifest.SelectedLinks[0];
+        var excluded = package.Manifest.SelectedLinks[1];
         var duplicateSource = await CreateFullPackageAsync("pipeline-duplicate-id", master, 1, 3,
             libraryPath: "Migration-TV/other.mkv", sourceId: selected.LegacyDavItemId);
         var run = await harness.Store.BeginRunAsync();
@@ -418,8 +419,22 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
                 NewDavItemId = Guid.NewGuid().ToString()
             });
             db.Submissions.Add(new MigrationSubmission { StoreRef = "proof", State = "processing", UpdatedAt = DateTime.UtcNow });
+            db.Releases.Add(new MigrationRelease
+            {
+                StoreRef = "unlinked", StoreBasename = "unlinked", SubmitFileName = "unlinked.nzb",
+                QueueFileName = "unlinked.nzb", JobName = "unlinked", VerdictReasons = "[]", ScannedAt = DateTime.UtcNow,
+            });
+            db.ReleaseFiles.Add(new MigrationReleaseFile
+            {
+                StoreRef = "unlinked", MetaPath = "payload", VirtualPath = "/content/b.mkv",
+                FileName = "b.mkv", NormalisedName = "b.mkv", SourceFileId = excluded.LegacyDavItemId.ToString(),
+                FileStatus = "import-failed",
+            });
+            db.Submissions.Add(new MigrationSubmission { StoreRef = "unlinked", State = "failed", UpdatedAt = DateTime.UtcNow });
             await db.SaveChangesAsync();
         }
+        // Canonical plans include only exact links, while the registered package
+        // and frozen terminal evidence include failures and other unlinked outcomes.
         var plan = new NzbDavCanaryPlan(1, run, package.PackageDigest, DateTimeOffset.UtcNow, 1, 1, true,
             [new(selected.LibraryRelativePath, selected.OriginalTarget, selected.LegacyDavItemId,
                 10, "exact", "proof", ".ids/target", "planned")]);
@@ -430,7 +445,26 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         Assert.IsType<BadRequestObjectResult>(await controller.CheckpointValidation(0, new(digest)));
         await using (var db = harness.Mig())
         {
-            (await db.Submissions.SingleAsync()).State = "completed";
+            (await db.Submissions.SingleAsync(item => item.StoreRef == "proof")).State = "completed";
+            await db.SaveChangesAsync();
+        }
+        // A thin plan must still include every exact success. A package subset
+        // is accepted only when the omitted source has a proven unlinked outcome.
+        await using (var db = harness.Mig())
+        {
+            var extra = await db.ReleaseFiles.SingleAsync(item => item.StoreRef == "unlinked");
+            extra.FileStatus = "exact";
+            extra.NewDavItemId = Guid.NewGuid().ToString();
+            (await db.Submissions.SingleAsync(item => item.StoreRef == "unlinked")).State = "completed";
+            await db.SaveChangesAsync();
+        }
+        Assert.IsType<BadRequestObjectResult>(await controller.CheckpointValidation(0, new(digest)));
+        await using (var db = harness.Mig())
+        {
+            var extra = await db.ReleaseFiles.SingleAsync(item => item.StoreRef == "unlinked");
+            extra.FileStatus = "import-failed";
+            extra.NewDavItemId = null;
+            (await db.Submissions.SingleAsync(item => item.StoreRef == "unlinked")).State = "failed";
             await db.SaveChangesAsync();
         }
         await using (var db = harness.Mig())
@@ -446,10 +480,10 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         }
         Assert.IsType<BadRequestObjectResult>(await controller.CheckpointValidation(0, new(new string('0', 64))));
         Assert.IsType<OkObjectResult>(await controller.CheckpointValidation(0, new(digest)));
-        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(new(overlapping, master, 3, 3, 10, 2)));
-        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(new(duplicateSource, master, 3, 3, 10, 2)));
-        Assert.IsType<OkObjectResult>(await controller.ConnectFull(new(second, master, 3, 3, 10, 2)));
-        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(new(third, master, 3, 3, 10, 2)));
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(new(overlapping, master, 4, 4, 10, 2)));
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(new(duplicateSource, master, 4, 4, 10, 2)));
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(new(second, master, 4, 4, 10, 2)));
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(new(third, master, 4, 4, 10, 2)));
         // A real next scan removes the singleton release/submission proof. The frozen
         // package and exact IDs must remain sufficient across controller restart.
         await using (var db = harness.Mig())

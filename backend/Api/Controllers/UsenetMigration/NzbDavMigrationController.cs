@@ -202,13 +202,14 @@ public sealed class NzbDavMigrationController(
         catch (JsonException exception) { throw new BadHttpRequestException("Immutable canary plan is invalid.", exception); }
         if (plan is null || !plan.IsValid || plan.SchemaVersion != NzbDavCanaryPlan.CurrentSchemaVersion
             || plan.RunId != runId || plan.SourcePackageDigest != package.PackageDigest
-            || plan.SelectedCount != package.Manifest.SelectedLinks.Count
+            || plan.SelectedCount > package.Manifest.SelectedLinks.Count
             || plan.Links is null || plan.Links.Count != plan.SelectedCount
             || plan.ActionableCount != plan.Links.Count(link => link.NewRelativeTarget is not null)
             || plan.Links.Any(link => link.NewRelativeTarget is not null
                 && (link.CorrelationStatus != "exact" || link.ApplyStatus != "planned"))
+            || plan.Links.Select(link => link.LegacyDavItemId).Distinct().Count() != plan.SelectedCount
             || !plan.Links.Select(link => link.LegacyDavItemId).ToHashSet()
-                .SetEquals(package.Manifest.SelectedLinks.Select(link => link.LegacyDavItemId)))
+                .IsSubsetOf(package.Manifest.SelectedLinks.Select(link => link.LegacyDavItemId)))
             throw new BadHttpRequestException("Checkpoint plan disagrees with the verified package.");
         string state;
         try
