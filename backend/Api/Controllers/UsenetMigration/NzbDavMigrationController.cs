@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text.Json;
 using System.IO.Compression;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
@@ -22,6 +24,7 @@ public sealed class NzbDavMigrationController(
     NzbDavReconciliationService? reconciliation = null,
     ArrRegrabService? regrab = null) : UsenetMigrationBaseController
 {
+    private static readonly JsonSerializerOptions PlanJsonOptions = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
     private readonly NzbDavPackageReader _packageReader = new();
     private readonly Action _interruptScan = () => runner?.InterruptScan();
     private readonly Action _interruptSubmissions = () => runner?.InterruptSubmissionBatch();
@@ -110,7 +113,9 @@ public sealed class NzbDavMigrationController(
                     request.MaxQueueDepth ?? 5,
                     request.SubmitWorkers ?? 1,
                     categories,
-                    request.AllowOutOfOrder),
+                    request.AllowOutOfOrder,
+                    package.Manifest.SelectedLinks.Select(link => link.LibraryRelativePath).ToArray(),
+                    package.Manifest.SelectedLinks.Select(link => link.LegacyDavItemId.ToString()).ToArray()),
                 HttpContext.RequestAborted).ConfigureAwait(false);
         }
         catch (InvalidOperationException exception)
@@ -161,6 +166,64 @@ public sealed class NzbDavMigrationController(
         });
     });
 
+    [HttpPost("api/migration/nzbdav/full/batches/{index:int}/checkpoint-validation")]
+    public Task<IActionResult> CheckpointValidation(int index,
+        [FromBody] NzbDavBatchValidationCheckpointRequest request) => GuardedAsync(async () =>
+    {
+        if (request is null || !IsSha256(request.PlanDigest))
+            throw new BadHttpRequestException("A lowercase SHA-256 plan digest is required.");
+        NzbDavBatchValidationCheckpoint? checkpoint;
+        try { checkpoint = await store.GetNzbDavBatchCheckpointAsync(index, HttpContext.RequestAborted).ConfigureAwait(false); }
+        catch (InvalidOperationException exception) { throw new BadHttpRequestException(exception.Message, exception); }
+        var session = await RequireNzbDavSessionAsync().ConfigureAwait(false);
+        var package = await ReadPackageAsync(checkpoint?.PackageRoot ?? session.SourcePackageRoot!).ConfigureAwait(false);
+        var runId = checkpoint?.RunId ?? session.CurrentRunId;
+        if (runId is null || package.Manifest.BatchIndex != index
+            || package.Manifest.MasterManifestDigest is null)
+            throw new BadHttpRequestException("Checkpoint must belong to the terminal active batch.");
+        var directory = NzbDavCanaryPlanWriter.GetPlanDirectory(
+            Path.Join(DavDatabaseContext.ConfigPath, "migration-output", "nzbdav"),
+            runId.Value, package.PackageDigest);
+        var path = Path.Join(directory, "plan.json");
+        if (!System.IO.File.Exists(path) || new FileInfo(path).LinkTarget is not null)
+            throw new BadHttpRequestException("An immutable canary plan is required before checkpointing.");
+        var bytes = await System.IO.File.ReadAllBytesAsync(path, HttpContext.RequestAborted).ConfigureAwait(false);
+        var digest = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+        var checksums = await System.IO.File.ReadAllTextAsync(Path.Join(directory, "SHA256SUMS"), HttpContext.RequestAborted)
+            .ConfigureAwait(false);
+        if (digest != request.PlanDigest || checksums.Trim() != $"{digest}  plan.json")
+            throw new BadHttpRequestException("Checkpoint digest disagrees with the immutable canary plan.");
+        NzbDavCanaryPlan? plan;
+        try
+        {
+            plan = JsonSerializer.Deserialize<NzbDavCanaryPlan>(bytes,
+            PlanJsonOptions);
+        }
+        catch (JsonException exception) { throw new BadHttpRequestException("Immutable canary plan is invalid.", exception); }
+        if (plan is null || !plan.IsValid || plan.SchemaVersion != NzbDavCanaryPlan.CurrentSchemaVersion
+            || plan.RunId != runId || plan.SourcePackageDigest != package.PackageDigest
+            || plan.SelectedCount != package.Manifest.SelectedLinks.Count
+            || plan.Links is null || plan.Links.Count != plan.SelectedCount
+            || plan.ActionableCount != plan.Links.Count(link => link.NewRelativeTarget is not null)
+            || plan.Links.Any(link => link.NewRelativeTarget is not null
+                && (link.CorrelationStatus != "exact" || link.ApplyStatus != "planned"))
+            || !plan.Links.Select(link => link.LegacyDavItemId).ToHashSet()
+                .SetEquals(package.Manifest.SelectedLinks.Select(link => link.LegacyDavItemId)))
+            throw new BadHttpRequestException("Checkpoint plan disagrees with the verified package.");
+        string state;
+        try
+        {
+            state = await store.FreezeNzbDavBatchAsync(package.Manifest.MasterManifestDigest, index,
+                package.RootPath, package.PackageDigest, runId.Value, digest,
+                plan.Links.Where(link => link.NewRelativeTarget is not null).Select(link => link.LegacyDavItemId.ToString()).ToArray(),
+                package.Manifest.SelectedLinks.Select(link => link.LegacyDavItemId.ToString()).ToArray(),
+                package.Manifest.SelectedLinks.Select(link => link.LibraryRelativePath).ToArray(),
+                HttpContext.RequestAborted).ConfigureAwait(false);
+        }
+        catch (InvalidOperationException exception) { throw new BadHttpRequestException(exception.Message, exception); }
+        return Ok(new { status = true, batchIndex = index, state, planDigest = digest });
+    });
+
     [HttpPost("api/migration/nzbdav/full/batches/{index:int}/acknowledge-plan")]
     public Task<IActionResult> AcknowledgePlan(
         int index,
@@ -171,7 +234,10 @@ public sealed class NzbDavMigrationController(
         if (request.AppliedCount < 0 || request.ValidatedCount < 0)
             throw new BadHttpRequestException("Applied and validated counts cannot be negative.");
         var session = await RequireNzbDavSessionAsync().ConfigureAwait(false);
-        var package = await ReadPackageAsync(session.SourcePackageRoot!).ConfigureAwait(false);
+        string? frozenRoot;
+        try { frozenRoot = (await store.GetNzbDavBatchCheckpointAsync(index, HttpContext.RequestAborted).ConfigureAwait(false))?.PackageRoot; }
+        catch (InvalidOperationException exception) { throw new BadHttpRequestException(exception.Message, exception); }
+        var package = await ReadPackageAsync(frozenRoot ?? session.SourcePackageRoot!).ConfigureAwait(false);
         if (package.Manifest.SchemaVersion != NzbDavExportManifest.CurrentSchemaVersion
             || package.Manifest.MasterManifestDigest is null
             || package.Manifest.BatchIndex != index)
@@ -722,3 +788,5 @@ public sealed record NzbDavCorrelationReport(
     int AmbiguityCount,
     int ExactCount,
     IReadOnlyList<NzbDavCorrelationRow> Rows);
+
+public sealed record NzbDavBatchValidationCheckpointRequest(string? PlanDigest);

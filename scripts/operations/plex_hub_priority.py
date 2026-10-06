@@ -172,6 +172,19 @@ def next_batch(batches, batch_count, schedule=None):
     return next((index for index in order if index not in indices), None)
 
 
+def next_pipeline_batch(batches, batch_count, schedule=None):
+    """Return the frozen validator and the import slot; never admit a third batch."""
+    validating = [b for b in batches if b.get('status') == 'validating']
+    importing = [b for b in batches if b.get('status') not in ('acknowledged', 'validating')]
+    if len(validating) > 1 or len(importing) > 1:
+        raise ValueError('Two-batch pipeline has conflicting occupied slots')
+    # The validation slot stays registered (and is never imported again). This
+    # local scheduling projection only allows selection of the other slot.
+    selection = [dict(b, status='acknowledged') if b.get('status') == 'validating' else b for b in batches]
+    index = next_batch(selection, batch_count, schedule)
+    return (int(validating[0]['batchIndex']) if validating else None), index
+
+
 def verify_selected_manifest(schedule, batches_root, index):
     if schedule is None:
         return

@@ -334,6 +334,7 @@ public sealed class MigrationNzbDavBatch
     public int SelectionCount { get; set; }
     public string Status { get; set; } = "pending";
     public long? RunId { get; set; }
+    public string? ValidationCheckpointJson { get; set; }
     public string? PlanDigest { get; set; }
     public int AppliedCount { get; set; }
     public int ValidatedCount { get; set; }

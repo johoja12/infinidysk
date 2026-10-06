@@ -4,7 +4,7 @@ import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from plex_hub_priority import (build_schedule, collect_files, load_schedule,
-    local_relative, next_batch, paged, plex_get, tier, verify_selected_manifest)
+    local_relative, next_batch, next_pipeline_batch, paged, plex_get, tier, verify_selected_manifest)
 
 
 class PlexHubPriorityTests(unittest.TestCase):
@@ -41,6 +41,29 @@ class PlexHubPriorityTests(unittest.TestCase):
                         [{'batchIndex': -1}], [{'batchIndex': 5}]):
             with self.assertRaises(ValueError):
                 next_batch(batches, 5)
+
+    def test_two_slot_pipeline_resumes_and_respects_priority(self):
+        batches = [{'batchIndex': 0, 'status': 'validating'}]
+        self.assertEqual(next_pipeline_batch(batches, 3), (0, 1))
+        self.assertEqual(next_pipeline_batch(batches, 3, {'order': [2, 0, 1]}), (0, 2))
+        batches.append({'batchIndex': 1, 'status': 'running'})
+        self.assertEqual(next_pipeline_batch(batches, 3), (0, 1))
+        batches[0]['status'] = 'acknowledged'
+        self.assertEqual(next_pipeline_batch(batches, 3), (None, 1))
+        batches[1]['status'] = 'validating'
+        batches.append({'batchIndex': 2, 'status': 'acknowledged'})
+        self.assertEqual(next_pipeline_batch(batches, 3), (1, None))
+        batches[1]['status'] = 'acknowledged'
+        self.assertEqual(next_pipeline_batch(batches, 3), (None, None))
+
+    def test_pipeline_rejects_third_slot_duplicate_or_two_validators(self):
+        for statuses in (['validating', 'running', 'connected'], ['validating', 'validating']):
+            with self.assertRaises(ValueError):
+                next_pipeline_batch([{'batchIndex': i, 'status': status}
+                                     for i, status in enumerate(statuses)], 3)
+        with self.assertRaises(ValueError):
+            next_pipeline_batch([{'batchIndex': 0, 'status': 'validating'},
+                                 {'batchIndex': 0, 'status': 'running'}], 3)
 
     def test_schedule_ranking_identity_and_manifest_changes(self):
         with tempfile.TemporaryDirectory() as temp:
