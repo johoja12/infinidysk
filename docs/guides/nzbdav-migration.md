@@ -286,7 +286,7 @@ dotnet run --project tools/NzbDavMigration -c Release -- \
   --max-payload-bytes 4294967296
 ```
 
-Bind only one completed batch at a time beneath
+For serial operation, bind one completed batch at a time beneath
 `/config/migration-input/...:ro`. Register each full batch with
 `POST /api/migration/nzbdav/full/connect` using its package path, master digest,
 root-specific mapped and recoverable counts, one submit worker, and queue depth
@@ -302,6 +302,38 @@ file has an exact validated link, a recorded terminal import failure, or a
 recorded `unmatched-target` correlation. Neither a failed nor an unmatched
 file receives a parallel link. Keep unmatched source files in the legacy
 library; run the failed-import cleanup below for confirmed failures.
+
+### Two-batch pipeline [since unreleased](https://github.com/johoja12/infinidysk/pulls){ .nzbdav-since }
+
+The advanced `scripts/operations/plex-import-runner.py` runner can import batch B
+while batch A validates. It retains two submission workers, queue depth ten,
+and four bounded validation workers. Its paths and master identity are specific
+to the recorded Plex migration; review them before using it elsewhere.
+
+Back up `/config` before upgrading. Install the backend with the additive
+validation-checkpoint migration before installing this runner. Let the existing
+serial runner finish its current batch before upgrading, then stop it before
+installing the new runner. Preserve all packages, per-batch reports, immutable
+plans, and journals.
+
+After terminal reconciliation and exact link application, the runner calls
+`POST /api/migration/nzbdav/full/batches/{index}/checkpoint-validation` with
+`{"planDigest":"<lowercase SHA-256>"}`. The backend verifies its immutable plan
+and freezes the package, run, selected IDs, paths, and terminal exact correlation
+in the migration ledger. Full status then reports the batch as `validating`.
+Only then may a distinct next package connect and scan. Overlapping selected
+source IDs or library paths are rejected. A third batch cannot connect while
+both slots are occupied.
+
+Validation, retries, unreadable-file recovery, promotion, and acknowledgement
+use batch A's saved artifacts while B imports. If B finishes first, its terminal
+scan evidence stays in place until A acknowledges. Validation failure stops
+further admission; completed imports and both batches' evidence remain resumable.
+Restarting the runner recovers the slots from full status and can wait for an
+already-running validation unit with the identical command. Acknowledgement
+still requires the frozen plan digest and complete accounting of validated,
+unreadable, missing, or replaced exact sources. Reports are final only after
+all batches acknowledge. This operational workflow adds no setup-wizard setting.
 
 After each terminal run, download `GET /api/migration/nzbdav/import-failures`
 and save its JSON response with a SHA-256 checksum under the matching root and
