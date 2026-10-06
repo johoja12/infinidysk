@@ -77,6 +77,23 @@ class DurableReplacementResumeTests(unittest.TestCase):
             self.check_resume()
 
 
+class FrozenValidationCoverageTests(unittest.TestCase):
+    def test_same_count_different_paths_and_duplicate_results_are_rejected(self):
+        source = Path(__file__).with_name('plex-import-runner.py').read_text()
+        function = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef)
+                        and n.name == 'require_validation_coverage')
+        context = {}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), 'coverage', 'exec'), context)
+        check = context['require_validation_coverage']
+        journal = {'links': [{'libraryRelativePath': 'A', 'status': 'applied'},
+                             {'libraryRelativePath': 'B', 'status': 'applied'},
+                             {'libraryRelativePath': 'missing', 'status': 'source-missing'}]}
+        check(journal, [{'libraryRelativePath': 'B'}, {'libraryRelativePath': 'A'}])
+        for paths in (['A', 'C'], ['A', 'A'], ['A'], ['A', 'B', 'missing']):
+            with self.assertRaisesRegex(RuntimeError, 'cover'):
+                check(journal, [{'libraryRelativePath': path} for path in paths])
+
+
 class ValidationUnitRecoveryTests(unittest.TestCase):
     def test_existing_validation_is_adopted_only_for_identical_command(self):
         from types import SimpleNamespace

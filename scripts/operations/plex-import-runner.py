@@ -523,6 +523,16 @@ def process_batch(batch_index, stage_name, destination, manifest):
     log(f"batch {batch_index + 1}/{BATCH_COUNT} frozen for background validation")
 
 
+def require_validation_coverage(journal_data, validations):
+    applied_paths = [row["libraryRelativePath"] for row in journal_data["links"]
+                     if row.get("status") == "applied"]
+    validated_paths = [row["libraryRelativePath"] for row in validations]
+    if len(applied_paths) != len(set(applied_paths)) \
+            or len(validated_paths) != len(set(validated_paths)) \
+            or set(validated_paths) != set(applied_paths):
+        raise RuntimeError("validation results do not cover the frozen batch's applied paths exactly")
+
+
 def finish_batch(batch_index, destination, manifest):
     # Resume entirely from immutable, per-batch artifacts. The singleton import
     # session may already belong to the next batch.
@@ -560,6 +570,7 @@ def finish_batch(batch_index, destination, manifest):
     if not validated_path.exists():
         raise RuntimeError(f"batch {batch_index + 1} validation produced no durable result")
     validations, resolved_path = retry_failed_validations(batch_index, journal, validated_path)
+    require_validation_coverage(journal_data, validations)
     validated = sum(1 for item in validations if item.get("success") is True)
     failures_validation = [item for item in validations if item.get("success") is not True]
     if validated + len(failures_validation) != applied:
