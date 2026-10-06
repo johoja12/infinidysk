@@ -15,50 +15,74 @@ public sealed record CanaryValidationResult(
 
 public sealed class CanaryValidator
 {
+    private readonly Func<CanaryApplyJournalLink, int, TimeSpan, string?, CancellationToken,
+        Task<CanaryValidationResult>> _validateLink;
+
+    public CanaryValidator() : this(ValidateLinkAsync) { }
+
+    internal CanaryValidator(Func<CanaryApplyJournalLink, int, TimeSpan, string?, CancellationToken,
+        Task<CanaryValidationResult>> validateLink) => _validateLink = validateLink;
+
     public async Task<IReadOnlyList<CanaryValidationResult>> ValidateAsync(
         string journalPath,
         int maximumBytesPerRead = 64 * 1024,
         TimeSpan? timeout = null,
         string? ffprobePath = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        int workers = 1)
     {
         if (maximumBytesPerRead <= 0 || maximumBytesPerRead > 1024 * 1024)
             throw new ArgumentOutOfRangeException(nameof(maximumBytesPerRead));
+        if (workers is < 1 or > 16)
+            throw new ArgumentOutOfRangeException(nameof(workers));
         var operationTimeout = timeout ?? TimeSpan.FromSeconds(10);
         var journal = await CanaryJournalStore.ReadAsync(journalPath, cancellationToken).ConfigureAwait(false)
                       ?? throw new FileNotFoundException("Canary apply journal is missing.", journalPath);
         if (journal.Links.Any(link => link.Status is not ("applied" or "source-missing" or "source-replaced")))
             throw new InvalidDataException("Canary apply journal contains an unfinished link.");
-        var results = new List<CanaryValidationResult>();
-        foreach (var link in journal.Links.Where(item => item.Status == "applied"))
+        var links = journal.Links.Where(item => item.Status == "applied").ToArray();
+        var results = new CanaryValidationResult[links.Length];
+        await Parallel.ForEachAsync(Enumerable.Range(0, links.Length), new ParallelOptions
         {
-            var reads = new List<CanaryValidationRead>();
-            try
-            {
-                var linkInfo = new FileInfo(link.LinkPath);
-                if (!CanaryPathSafety.PathExistsNoFollow(link.LinkPath)
-                    || linkInfo.LinkTarget != link.TargetPath)
-                    throw new InvalidDataException("Journaled link target no longer matches.");
-                var target = new FileInfo(link.TargetPath);
-                if (!target.Exists || target.Length != link.ExpectedFileSize)
-                    throw new InvalidDataException("Journaled target size no longer matches.");
-                reads.AddRange(await ReadWindowsAsync(
-                    link.TargetPath, target.Length, maximumBytesPerRead,
-                    operationTimeout, cancellationToken).ConfigureAwait(false));
-                var ffprobe = ffprobePath is null
-                    ? null
-                    : await RunFfprobeAsync(ffprobePath, link.TargetPath, operationTimeout, cancellationToken)
-                        .ConfigureAwait(false);
-                results.Add(new CanaryValidationResult(
-                    link.LibraryRelativePath, true, link.ExpectedFileSize, target.Length, reads, ffprobe, null));
-            }
-            catch (Exception exception) when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
-            {
-                results.Add(new CanaryValidationResult(
-                    link.LibraryRelativePath, false, link.ExpectedFileSize, null, reads, null, exception.Message));
-            }
-        }
+            MaxDegreeOfParallelism = workers,
+            CancellationToken = cancellationToken,
+        }, async (index, token) =>
+        {
+            results[index] = await _validateLink(links[index], maximumBytesPerRead,
+                operationTimeout, ffprobePath, token).ConfigureAwait(false);
+        }).ConfigureAwait(false);
         return results;
+    }
+
+    private static async Task<CanaryValidationResult> ValidateLinkAsync(
+        CanaryApplyJournalLink link, int maximumBytesPerRead, TimeSpan operationTimeout,
+        string? ffprobePath, CancellationToken cancellationToken)
+    {
+        var reads = new List<CanaryValidationRead>();
+        try
+        {
+            var linkInfo = new FileInfo(link.LinkPath);
+            if (!CanaryPathSafety.PathExistsNoFollow(link.LinkPath)
+                || linkInfo.LinkTarget != link.TargetPath)
+                throw new InvalidDataException("Journaled link target no longer matches.");
+            var target = new FileInfo(link.TargetPath);
+            if (!target.Exists || target.Length != link.ExpectedFileSize)
+                throw new InvalidDataException("Journaled target size no longer matches.");
+            reads.AddRange(await ReadWindowsAsync(
+                link.TargetPath, target.Length, maximumBytesPerRead,
+                operationTimeout, cancellationToken).ConfigureAwait(false));
+            var ffprobe = ffprobePath is null
+                ? null
+                : await RunFfprobeAsync(ffprobePath, link.TargetPath, operationTimeout, cancellationToken)
+                    .ConfigureAwait(false);
+            return new CanaryValidationResult(
+                link.LibraryRelativePath, true, link.ExpectedFileSize, target.Length, reads, ffprobe, null);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            return new CanaryValidationResult(
+                link.LibraryRelativePath, false, link.ExpectedFileSize, null, reads, null, exception.Message);
+        }
     }
 
     private static async Task<IReadOnlyList<CanaryValidationRead>> ReadWindowsAsync(

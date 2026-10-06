@@ -56,3 +56,17 @@ snapshot, then atomically replace the active file at a batch boundary to refresh
 priorities. Sealed package checksums and the master digest stay unchanged.
 After any batch has run out of order, retain a complete schedule until all
 batches are acknowledged; removing it is not a rollback to numerical order.
+
+### Worker limits
+
+The runner caps the import queue at ten items and uses two submission workers.
+Link validation and validation retries use four workers (`validate-links
+--workers 4`), with the existing 64 KiB read limit and 20-second read timeout.
+The standalone validator defaults to one worker and accepts 1–16; its report
+retains journal order and is published only after every applied link finishes.
+Source-missing and source-replaced entries remain excluded from validation.
+
+Install the matching migration tool before the updated runner. Resume from the
+existing batch ledger and journals; do not reconnect or resubmit a completed
+batch to change its worker count. Submission workers take effect when the next
+batch is connected. Preserve recorded replacement exclusions when restarting.
