@@ -11,6 +11,7 @@ using NzbWebDAV.Config;
 using NzbWebDAV.Database.Models.UsenetMigration;
 using NzbWebDAV.Tests.Database;
 using NzbWebDAV.UsenetMigration;
+using NzbWebDAV.UsenetMigration.Canary;
 using NzbWebDAV.UsenetMigration.NzbDav;
 using NzbWebDAV.UsenetMigration.Source;
 
@@ -370,6 +371,94 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         var status = Assert.IsType<OkObjectResult>(await controller.GetFullStatus());
         using var json = JsonDocument.Parse(JsonSerializer.Serialize(status.Value));
         Assert.Equal(100, json.RootElement.GetProperty("sourceLinkCount").GetInt32());
+    }
+
+    [Theory]
+    [InlineData("validated")]
+    [InlineData("unreadable")]
+    [InlineData("missing")]
+    [InlineData("replaced")]
+    public async Task Pipeline_CheckpointSurvivesNextScanAndAcknowledgesOldBatchDuringImport(string outcome)
+    {
+        await using var harness = await MigrationTestHarness.CreateAsync();
+        var master = new string('e', 64);
+        var first = await CreateFullPackageAsync("pipeline-0", master, 0, 3);
+        var second = await CreateFullPackageAsync("pipeline-1", master, 1, 3, libraryPath: "Migration-TV/b.mkv");
+        var third = await CreateFullPackageAsync("pipeline-2", master, 2, 3, libraryPath: "Migration-TV/c.mkv");
+        var overlapping = await CreateFullPackageAsync("pipeline-overlap", master, 1, 3);
+        var controller = CreateController(harness);
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(new(first, master, 3, 3, 10, 2)));
+        var package = await new NzbDavPackageReader().ReadAsync(first);
+        var selected = Assert.Single(package.Manifest.SelectedLinks);
+        var duplicateSource = await CreateFullPackageAsync("pipeline-duplicate-id", master, 1, 3,
+            libraryPath: "Migration-TV/other.mkv", sourceId: selected.LegacyDavItemId);
+        var run = await harness.Store.BeginRunAsync();
+        await harness.Store.AttachNzbDavBatchRunAsync(package.PackageDigest, run);
+        await using (var db = harness.Mig())
+        {
+            db.Releases.Add(new MigrationRelease
+            {
+                StoreRef = "proof",
+                StoreBasename = "proof",
+                SubmitFileName = "proof.nzb",
+                QueueFileName = "proof.nzb",
+                JobName = "proof",
+                VerdictReasons = "[]",
+                ScannedAt = DateTime.UtcNow
+            });
+            db.ReleaseFiles.Add(new MigrationReleaseFile
+            {
+                StoreRef = "proof",
+                MetaPath = "payload",
+                VirtualPath = "/content/a.mkv",
+                FileName = "a.mkv",
+                NormalisedName = "a.mkv",
+                SourceFileId = selected.LegacyDavItemId.ToString(),
+                FileStatus = "exact",
+                NewDavItemId = Guid.NewGuid().ToString()
+            });
+            db.Submissions.Add(new MigrationSubmission { StoreRef = "proof", State = "processing", UpdatedAt = DateTime.UtcNow });
+            await db.SaveChangesAsync();
+        }
+        var plan = new NzbDavCanaryPlan(1, run, package.PackageDigest, DateTimeOffset.UtcNow, 1, 1, true,
+            [new(selected.LibraryRelativePath, selected.OriginalTarget, selected.LegacyDavItemId,
+                10, "exact", "proof", ".ids/target", "planned")]);
+        var directory = await new NzbDavCanaryPlanWriter().WriteAsync(Path.Join(_config, "migration-output", "nzbdav"), plan);
+        var digest = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(Path.Join(directory, "plan.json")))).ToLowerInvariant();
+        Assert.IsType<BadRequestObjectResult>(await controller.CheckpointValidation(0, new(digest)));
+        await harness.Store.UpdateSessionAsync(item => item.Status = "complete");
+        Assert.IsType<BadRequestObjectResult>(await controller.CheckpointValidation(0, new(digest)));
+        await using (var db = harness.Mig())
+        {
+            (await db.Submissions.SingleAsync()).State = "completed";
+            await db.SaveChangesAsync();
+        }
+        Assert.IsType<BadRequestObjectResult>(await controller.CheckpointValidation(0, new(new string('0', 64))));
+        Assert.IsType<OkObjectResult>(await controller.CheckpointValidation(0, new(digest)));
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(new(overlapping, master, 3, 3, 10, 2)));
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(new(duplicateSource, master, 3, 3, 10, 2)));
+        Assert.IsType<OkObjectResult>(await controller.ConnectFull(new(second, master, 3, 3, 10, 2)));
+        Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(new(third, master, 3, 3, 10, 2)));
+        // A real next scan removes the singleton release/submission proof. The frozen
+        // package and exact IDs must remain sufficient across controller restart.
+        await using (var db = harness.Mig())
+            await UsenetMigrationStore.ClearScanArtifactsAsync(db, CancellationToken.None);
+        await harness.Store.UpdateSessionAsync(item => item.Status = "running");
+        controller = CreateController(harness);
+        Assert.IsType<OkObjectResult>(await controller.CheckpointValidation(0, new(digest)));
+        Assert.IsType<BadRequestObjectResult>(await controller.AcknowledgePlan(0, new(new string('0', 64), 1, 1)));
+        Assert.IsType<BadRequestObjectResult>(await controller.AcknowledgePlan(0, new(digest, 1, 0)));
+        var sourceIds = new[] { selected.LegacyDavItemId.ToString() };
+        var acknowledgement = new NzbDavBatchPlanAcknowledgementRequest(digest,
+            outcome is "missing" or "replaced" ? 0 : 1, outcome == "validated" ? 1 : 0,
+            outcome == "unreadable" ? sourceIds : null, outcome == "missing" ? sourceIds : null,
+            outcome == "replaced" ? sourceIds : null);
+        Assert.IsType<OkObjectResult>(await controller.AcknowledgePlan(0, acknowledgement));
+        Assert.IsType<OkObjectResult>(await controller.AcknowledgePlan(0, acknowledgement));
+        Assert.Equal("running", (await harness.Store.GetSessionAsync()).Status);
+        await using var verify = harness.Mig();
+        Assert.Equal("acknowledged", (await verify.NzbDavBatches.SingleAsync(item => item.BatchIndex == 0)).Status);
+        Assert.Equal("connected", (await verify.NzbDavBatches.SingleAsync(item => item.BatchIndex == 1)).Status);
     }
 
     [Fact]
@@ -760,19 +849,19 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
         string masterDigest,
         int batchIndex,
         int batchCount,
-        bool includeSecondRelease = false)
+        bool includeSecondRelease = false, string libraryPath = "Migration-TV/a.mkv", Guid? sourceId = null)
     {
         var parent = Path.Join(_config, "migration-input");
         Directory.CreateDirectory(parent);
         var payload = Path.Join(parent, $"{name}.nzb");
         await File.WriteAllTextAsync(payload, "<nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\" />");
-        var leafId = Guid.NewGuid();
+        var leafId = sourceId ?? Guid.NewGuid();
         var leaf = new NzbDavExportLeaf(leafId, "/content/a.mkv", 10, "release-1", null, null,
             NzbDavArticleIdentity.DirectKind, new string('a', 64), "ready", null);
         var output = Path.Join(parent, $"package-{name}-{Guid.NewGuid():N}");
         var releases = new List<CanaryExportRelease> { new("release-1", null, payload, [leaf]) };
         var links = new List<NzbDavSelectedLibraryLink>
-            { new("Migration-TV/a.mkv", "/legacy/a", leafId) };
+            { new(libraryPath, "/legacy/a", leafId) };
         if (includeSecondRelease)
         {
             var secondPayload = Path.Join(parent, $"{name}-second.nzb");

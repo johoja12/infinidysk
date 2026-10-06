@@ -34,7 +34,9 @@ internal sealed record NzbDavFullConnectionValues(
     int MaxQueueDepth,
     int SubmitWorkers,
     IReadOnlyList<string> SourceCategories,
-    bool AllowOutOfOrder = false);
+    bool AllowOutOfOrder = false,
+    IReadOnlyList<string>? SelectedLibraryPaths = null,
+    IReadOnlyList<string>? SelectedSourceIds = null);
 
 internal sealed record NzbDavFullConnectionResult(
     MigrationNzbDavMaster Master,
@@ -55,7 +57,7 @@ internal sealed record MigrationCategoryMappingChange(
 /// than resolving a scoped context, because the migration DB is separate from the
 /// request-scoped <see cref="DavDatabaseContext"/>.
 /// </summary>
-public sealed class UsenetMigrationStore : IDisposable
+public sealed partial class UsenetMigrationStore : IDisposable
 {
     /// <summary>The pinned singleton session id enforced by CK_SessionState_Singleton.</summary>
     public const int SessionId = 1;
@@ -393,9 +395,22 @@ public sealed class UsenetMigrationStore : IDisposable
         if (!values.AllowOutOfOrder && (values.BatchIndex != batches.Count
             || batches.Select(item => item.BatchIndex).Where((index, position) => index != position).Any()))
             throw new InvalidOperationException("Full-library batches must be connected in contiguous index order.");
-        if (batches.Any(item => item.Status != "acknowledged"))
-            throw new InvalidOperationException(
-                "The previous full-library batch must be terminal, exact, applied, validated, and acknowledged first.");
+        var unfinished = batches.Where(item => item.Status != "acknowledged").ToArray();
+        if (unfinished.Length > 0)
+        {
+            if (unfinished.Length != 1 || unfinished[0].Status != "validating"
+                || unfinished[0].ValidationCheckpointJson is null)
+                throw new InvalidOperationException("The two-batch pipeline is full or the previous batch lacks frozen validation evidence.");
+            var checkpoint = ReadValidationCheckpoint(unfinished[0]);
+            if (values.SelectedLibraryPaths is null || values.SelectedSourceIds is null
+                || values.SelectedLibraryPaths.Count != values.SelectionCount
+                || values.SelectedSourceIds.Count != values.SelectionCount
+                || values.SelectedLibraryPaths.Distinct(StringComparer.Ordinal).Count() != values.SelectionCount
+                || values.SelectedSourceIds.Distinct(StringComparer.OrdinalIgnoreCase).Count() != values.SelectionCount
+                || checkpoint.LibraryPaths.Intersect(values.SelectedLibraryPaths, StringComparer.Ordinal).Any()
+                || checkpoint.SelectedIds.Intersect(values.SelectedSourceIds, StringComparer.OrdinalIgnoreCase).Any())
+                throw new InvalidOperationException("Pipeline batches require distinct selected source IDs and library paths.");
+        }
 
         var transition = await TryTransitionSessionAsync(ctx, MigrationSessionTransition.Connect, ct)
             .ConfigureAwait(false);
@@ -518,16 +533,6 @@ public sealed class UsenetMigrationStore : IDisposable
     {
         await using var ctx = ContextFactory();
         await using var transaction = await ctx.Database.BeginTransactionAsync(ct).ConfigureAwait(false);
-        var session = await ctx.SessionState.AsNoTracking()
-            .SingleAsync(item => item.Id == SessionId, ct).ConfigureAwait(false);
-        if (session.Status != MigrationSessionStatus.Complete)
-            throw new InvalidOperationException("The active batch must reach terminal completion first.");
-        var activeSubmissions = await ctx.Submissions.AsNoTracking().AnyAsync(
-            item => item.State == "pending" || item.State == "submitting" || item.State == "submitted"
-                    || item.State == "processing", ct).ConfigureAwait(false);
-        if (activeSubmissions)
-            throw new InvalidOperationException("The active batch still has submissions in progress.");
-
         var master = await ctx.NzbDavMasters
             .SingleOrDefaultAsync(item => item.ManifestDigest == masterManifestDigest, ct)
             .ConfigureAwait(false)
@@ -549,44 +554,19 @@ public sealed class UsenetMigrationStore : IDisposable
         if (selectedSourceIds.Count != batch.SelectionCount)
             throw new InvalidOperationException("The package selection count disagrees with the registered batch.");
 
-        var correlated = await ctx.ReleaseFiles.AsNoTracking()
-            .Where(item => item.SourceFileId != null && selectedSourceIds.Contains(item.SourceFileId))
-            .Select(item => new { item.SourceFileId, item.StoreRef, item.FileStatus, item.NewDavItemId })
-            .ToListAsync(ct).ConfigureAwait(false);
-        if (correlated.Count != selectedSourceIds.Count
-            || correlated.Select(item => item.SourceFileId!).Distinct(StringComparer.OrdinalIgnoreCase).Count()
-            != selectedSourceIds.Count)
-            throw new InvalidOperationException("Every selected source file must have one correlation row.");
-        var storeRefs = correlated.Select(item => item.StoreRef).Distinct().ToArray();
-        var submissions = await ctx.Submissions.AsNoTracking()
-            .Where(item => storeRefs.Contains(item.StoreRef))
-            .ToDictionaryAsync(item => item.StoreRef, ct).ConfigureAwait(false);
-        var exactIds = correlated
-            .Where(item => item.FileStatus == "exact" && item.NewDavItemId != null
-                           && submissions.TryGetValue(item.StoreRef, out var submission)
-                           && submission.State is "completed" or "history_cleared")
-            .Select(item => item.SourceFileId!)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var terminalFailedIds = correlated
-            .Where(item => item.FileStatus == "import-failed" && item.NewDavItemId is null
-                           && submissions.TryGetValue(item.StoreRef, out var submission)
-                           && submission.State is "failed" or "evicted")
-            .Select(item => item.SourceFileId!)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var unmatchedIds = correlated
-            .Where(item => item.FileStatus == "unmatched-target" && item.NewDavItemId is null
-                           && submissions.TryGetValue(item.StoreRef, out var submission)
-                           && submission.State is "completed" or "history_cleared")
-            .Select(item => item.SourceFileId!)
-            .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        var scanExcludedIds = await NzbDavScanExclusion.VerifiedSourceIdsAsync(ctx, packageDigest, ct)
-            .ConfigureAwait(false);
-        if (exactIds.Count + terminalFailedIds.Count + unmatchedIds.Count + scanExcludedIds.Count != selectedSourceIds.Count
-            || selectedSourceIds.Any(id => !exactIds.Contains(id)
-                                           && !terminalFailedIds.Contains(id)
-                                           && !unmatchedIds.Contains(id)
-                                           && !scanExcludedIds.Contains(id)))
-            throw new InvalidOperationException("Every selected link must be exact or recorded as an unlinked terminal outcome.");
+        HashSet<string> exactIds;
+        if (batch.ValidationCheckpointJson is not null)
+        {
+            var checkpoint = ReadValidationCheckpoint(batch);
+            if (checkpoint.PlanDigest != planDigest
+                || !checkpoint.SelectedIds.ToHashSet(StringComparer.OrdinalIgnoreCase).SetEquals(selectedSourceIds))
+                throw new InvalidOperationException("Acknowledgement disagrees with the frozen validation checkpoint.");
+            exactIds = checkpoint.ExactIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        }
+        else
+        {
+            exactIds = await ReadTerminalExactIdsAsync(ctx, selectedSourceIds, packageDigest, ct).ConfigureAwait(false);
+        }
         var unvalidated = unvalidatedExactSourceIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
         var missing = missingSourceIds.ToHashSet(StringComparer.OrdinalIgnoreCase);
         var replaced = replacedSourceIds.ToHashSet(StringComparer.OrdinalIgnoreCase);

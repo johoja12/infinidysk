@@ -121,6 +121,43 @@ public sealed class NzbDavMigrationSchemaTests
     }
 
     [Fact]
+    public async Task ValidationCheckpointUpgrade_PreservesAcknowledgedProgressAndAddsNullableEvidence()
+    {
+        var path = Path.Join(Path.GetTempPath(), $"nzbdav-checkpoint-upgrade-{Guid.NewGuid():N}.db");
+        var options = MigrationTestHarness.CreateMigrationOptions(path);
+        try
+        {
+            await using (var previous = new UsenetMigrationDbContext(options))
+            {
+                await previous.Database.GetService<IMigrator>().MigrateAsync("20260921115900_AddNzbDavFullRecovery");
+                await previous.Database.ExecuteSqlRawAsync("""
+                    INSERT INTO NzbDavMasters
+                        (Id, ManifestDigest, SourceLinkCount, RecoverableCount, Status, CreatedAt, UpdatedAt)
+                    VALUES (1, 'master', 100, 95, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+                    INSERT INTO NzbDavBatches
+                        (Id, MasterId, BatchIndex, PackageDigest, SelectionCount, Status, RunId,
+                         PlanDigest, AppliedCount, ValidatedCount)
+                    VALUES (1, 1, 0, 'package', 95, 'acknowledged', 7, 'sealed-plan', 90, 89);
+                    """);
+            }
+            await using var upgraded = new UsenetMigrationDbContext(options);
+            await upgraded.Database.MigrateAsync();
+            var batch = await upgraded.NzbDavBatches.SingleAsync();
+            Assert.Equal("acknowledged", batch.Status);
+            Assert.Equal("sealed-plan", batch.PlanDigest);
+            Assert.Equal(7, batch.RunId);
+            Assert.Equal(90, batch.AppliedCount);
+            Assert.Equal(89, batch.ValidatedCount);
+            Assert.Null(batch.ValidationCheckpointJson);
+            Assert.Empty(await upgraded.Database.GetPendingMigrationsAsync());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task FreshSchema_PersistsOrderedNzbDavMasterBatchesWithUniqueProvenance()
     {
         await using var harness = await MigrationTestHarness.CreateAsync();
