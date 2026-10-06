@@ -28,8 +28,8 @@ public sealed class CanaryValidator
         int maximumBytesPerRead = 64 * 1024,
         TimeSpan? timeout = null,
         string? ffprobePath = null,
-        CancellationToken cancellationToken = default,
-        int workers = 1)
+        int workers = 1,
+        CancellationToken cancellationToken = default)
     {
         if (maximumBytesPerRead <= 0 || maximumBytesPerRead > 1024 * 1024)
             throw new ArgumentOutOfRangeException(nameof(maximumBytesPerRead));
