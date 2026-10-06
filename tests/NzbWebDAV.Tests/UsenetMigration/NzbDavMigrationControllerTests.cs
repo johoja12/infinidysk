@@ -433,6 +433,17 @@ public sealed class NzbDavMigrationControllerTests : IAsyncLifetime
             (await db.Submissions.SingleAsync()).State = "completed";
             await db.SaveChangesAsync();
         }
+        await using (var db = harness.Mig())
+        {
+            (await db.NzbDavBatches.SingleAsync()).Status = "acknowledged";
+            await db.SaveChangesAsync();
+        }
+        Assert.IsType<BadRequestObjectResult>(await controller.CheckpointValidation(0, new(digest)));
+        await using (var db = harness.Mig())
+        {
+            (await db.NzbDavBatches.SingleAsync()).Status = "running";
+            await db.SaveChangesAsync();
+        }
         Assert.IsType<BadRequestObjectResult>(await controller.CheckpointValidation(0, new(new string('0', 64))));
         Assert.IsType<OkObjectResult>(await controller.CheckpointValidation(0, new(digest)));
         Assert.IsType<BadRequestObjectResult>(await controller.ConnectFull(new(overlapping, master, 3, 3, 10, 2)));

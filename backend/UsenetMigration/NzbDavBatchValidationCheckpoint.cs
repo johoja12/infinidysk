@@ -63,6 +63,8 @@ public sealed partial class UsenetMigrationStore
             await transaction.CommitAsync(ct).ConfigureAwait(false);
             return batch.Status;
         }
+        if (batch.Status != "running")
+            throw new InvalidOperationException("Only an unacknowledged imported batch may enter the validation slot.");
         if (await ctx.NzbDavBatches.AnyAsync(item => item.MasterId == master.Id && item.Id != batch.Id
                 && item.Status == "validating", ct).ConfigureAwait(false))
             throw new InvalidOperationException("Only one batch may occupy the validation slot.");
