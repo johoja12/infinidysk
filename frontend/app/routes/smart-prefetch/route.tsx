@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { usePageCoverage } from "~/utils/use-page-coverage";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import { useIsReadOnly } from "~/auth/authorization";
 import { Icon } from "~/components/ui";
@@ -50,6 +51,7 @@ type Job = {
   isRangeJob?: boolean;
   rangeBytes?: number | null;
   rangeCachedBytes?: number | null;
+  coveragePending?: boolean;
   failureCode?: string | null;
   remedy?: string | null;
   recentBytesPerSecond?: number | null;
@@ -102,7 +104,8 @@ function matchesHistoryFilter(job: Job, kind: HistoryKind, filter: string) {
       ? !job.missReason || !(job.missReason in missReasons)
       : job.missReason === filter;
   if (filter === "fully-cached") return coverage(job) === 100;
-  if (filter === "partial") return job.state === "completed" && coverage(job) !== 100;
+  if (filter === "partial")
+    return job.state === "completed" && coverage(job) !== null && coverage(job) !== 100;
   return job.state === filter;
 }
 const bytes = decimalBytes;
@@ -332,28 +335,48 @@ export default function SmartPrefetchActivityPage() {
   const [page, setPage] = useState(0);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const fileModal = useLibraryFileModal({ prewarmAction: "/library-file" });
-  const refresh = useCallback(async (signal?: AbortSignal) => {
-    const response = await fetch(withUrlBase("/api/prefetch"), signal ? { signal } : {});
-    if (!response.ok)
-      throw new Error(`Could not load Smart Prefetch activity (${response.status}).`);
-    const body = (await response.json()) as Status;
-    if (!signal?.aborted) {
-      setStatus(body);
-      setError(null);
-    }
+  const refreshInFlight = useRef<Promise<void> | null>(null);
+  const refreshSignal = useRef<AbortSignal | undefined>(undefined);
+  const refresh = useCallback((signal?: AbortSignal) => {
+    if (refreshInFlight.current && !refreshSignal.current?.aborted) return refreshInFlight.current;
+    refreshSignal.current = signal;
+    const request = (async () => {
+      const response = await fetch(
+        withUrlBase("/api/prefetch?includeCoverage=false"),
+        signal ? { signal } : {},
+      );
+      if (!response.ok)
+        throw new Error(`Could not load Smart Prefetch activity (${response.status}).`);
+      const body = (await response.json()) as Status;
+      if (!signal?.aborted) {
+        setStatus(body);
+        setError(null);
+      }
+    })();
+    refreshInFlight.current = request;
+    void request
+      .finally(() => {
+        if (refreshInFlight.current === request) refreshInFlight.current = null;
+      })
+      .catch(() => {});
+    return request;
   }, []);
   useEffect(() => {
     const controller = new AbortController();
-    const tick = () =>
-      void refresh(controller.signal).catch((cause) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const tick = async () => {
+      try {
+        await refresh(controller.signal);
+      } catch (cause) {
         if (!controller.signal.aborted)
           setError(cause instanceof Error ? cause.message : "Could not load activity.");
-      });
-    tick();
-    const timer = setInterval(tick, 10_000);
+      }
+      if (!controller.signal.aborted) timer = setTimeout(() => void tick(), 10_000);
+    };
+    void tick();
     return () => {
       controller.abort();
-      clearInterval(timer);
+      clearTimeout(timer);
     };
   }, [refresh]);
   const operate = async (operation: string) => {
@@ -380,9 +403,47 @@ export default function SmartPrefetchActivityPage() {
   const warmingHistory = history.filter((job) => !isGapFill(job));
   const current =
     view === "activity" ? active : historyKind === "gaps" ? gapHistory : warmingHistory;
+  const coverageFilter = view === "history" && (filter === "fully-cached" || filter === "partial");
+  const metadataMatches = (job: Job) =>
+    (coverageFilter ||
+      (view === "activity"
+        ? filter === "all" || job.state === filter
+        : matchesHistoryFilter(job, historyKind, filter))) &&
+    `${job.displayName ?? ""} ${job.itemId} ${job.source ?? job.trigger} ${(job.sources ?? []).map((source) => source.label).join(" ")}`
+      .toLowerCase()
+      .includes(search.toLowerCase());
+  const coverageCandidates = current.filter(metadataMatches);
+  const coveragePage = Math.min(page, Math.max(0, Math.ceil(coverageCandidates.length / 25) - 1));
+  const coverageJobs = coverageFilter
+    ? coverageCandidates
+    : coverageCandidates.slice(coveragePage * 25, (coveragePage + 1) * 25);
+  const deferredCoverage = usePageCoverage<{
+    updated: number;
+    start: number;
+    length: number;
+    rangeBytes: number;
+    rangeCachedBytes: number;
+  }>(
+    "/api/prefetch/coverage",
+    "jobIds",
+    view === "predictions"
+      ? []
+      : coverageJobs
+          .filter((job) => job.isRangeJob ?? (job.start !== 0 || job.length !== 0))
+          .map((job) => job.id),
+    status,
+    25,
+    true,
+  );
+  const enrichedCurrent = current.map((job) => {
+    const result = deferredCoverage.values[job.id];
+    return result && result.start === job.start && result.length === job.length
+      ? { ...job, rangeBytes: result.rangeBytes, rangeCachedBytes: result.rangeCachedBytes }
+      : { ...job, coveragePending: deferredCoverage.pending };
+  });
   const visible = useMemo(
     () =>
-      current.filter(
+      enrichedCurrent.filter(
         (job) =>
           (view === "activity"
             ? filter === "all" || job.state === filter
@@ -391,7 +452,7 @@ export default function SmartPrefetchActivityPage() {
             .toLowerCase()
             .includes(search.toLowerCase()),
       ),
-    [current, filter, search, view, historyKind],
+    [enrichedCurrent, filter, search, view, historyKind],
   );
   const lastPage = Math.max(0, Math.ceil(visible.length / 25) - 1);
   const shownPage = Math.min(page, lastPage);
@@ -587,6 +648,11 @@ export default function SmartPrefetchActivityPage() {
               </select>
             </div>
           </div>
+          {coverageFilter && deferredCoverage.pending && (
+            <p role="status" className="text-sm text-base-content/60">
+              Checking current range coverage for this filter…
+            </p>
+          )}
           {view === "activity" ? (
             <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_19rem]">
               <JobList

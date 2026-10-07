@@ -95,6 +95,8 @@ export const adminFrontendOperations = [
     path: "/api/watchtower-discover-catalogs",
     operationId: "post-api-watchtower-discover-catalogs",
   },
+  { method: "get", path: "/api/get-library-coverage", operationId: "get-api-get-library-coverage" },
+  { method: "get", path: "/api/prefetch/coverage", operationId: "get-api-prefetch-coverage" },
   {
     method: "get",
     path: "/api/get-library-catalog",

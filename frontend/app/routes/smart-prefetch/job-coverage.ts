@@ -9,6 +9,7 @@ export type CoverageJob = {
   isRangeJob?: boolean;
   rangeBytes?: number | null;
   rangeCachedBytes?: number | null;
+  coveragePending?: boolean;
 };
 
 export type CoverageSummary = {
@@ -82,10 +83,10 @@ export function describeCoverage(job: CoverageJob): CoverageSummary {
   if (bytes === null || cached === null || bytes <= 0) {
     const length = requestedLength(job);
     return {
-      primary: `${length === null ? "Range" : `${mebibytes(length)} range`} · current coverage unavailable`,
+      primary: `${length === null ? "Range" : `${mebibytes(length)} range`} · ${job.coveragePending ? "checking current coverage…" : "current coverage unavailable"}`,
       secondary,
       percent: null,
-      label: "Range coverage unavailable",
+      label: job.coveragePending ? "Checking range coverage" : "Range coverage unavailable",
       complete: false,
     };
   }

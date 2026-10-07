@@ -548,6 +548,8 @@ class BackendClient {
     const qs = new URLSearchParams();
     if (query.q) qs.set("q", query.q);
     if (query.group) qs.set("group", query.group);
+    if (query.includeCoverage !== undefined)
+      qs.set("includeCoverage", String(query.includeCoverage));
     qs.set("category", query.category ?? "shows");
     qs.set("view", query.view ?? "groups");
     qs.set("match", query.match ?? "all");
@@ -576,7 +578,7 @@ class BackendClient {
 
   public async getNativeCacheStatus(): Promise<{ activeMode: string }> {
     const data = await call<{ activeMode?: string }>(
-      adminApi.nativeCache,
+      `${adminApi.nativeCache}?modeOnly=true`,
       "Failed to get native cache status",
       { method: "GET" },
     );
@@ -978,6 +980,7 @@ export type LibraryCatalogItem = z.infer<typeof libraryCatalogItemSchema>;
 export type LibraryCatalogResponse = z.infer<typeof libraryCatalogResponseSchema>;
 
 const libraryBrowseGroupSchema = z.object({
+  davItemId: z.string().nullable().optional(),
   key: z.string(),
   title: z.string(),
   category: z.enum(["shows", "movies", "unmatched"]),
@@ -1043,6 +1046,7 @@ const libraryBrowseResponseSchema = z.object({
 export type LibraryBrowseResponse = z.infer<typeof libraryBrowseResponseSchema>;
 
 export type LibraryBrowseQuery = {
+  includeCoverage?: boolean;
   q?: string;
   category?: "all" | "shows" | "movies" | "unmatched";
   view?: "groups" | "files";
