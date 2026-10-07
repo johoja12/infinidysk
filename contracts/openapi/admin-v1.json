@@ -2237,6 +2237,14 @@
       },
       "PrefetchRangeCoverage": {
         "properties": {
+          "length": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
           "rangeBytes": {
             "format": "int64",
             "pattern": "^-?(?:0|[1-9]\\d*)$",
@@ -2246,6 +2254,14 @@
             ]
           },
           "rangeCachedBytes": {
+            "format": "int64",
+            "pattern": "^-?(?:0|[1-9]\\d*)$",
+            "type": [
+              "integer",
+              "string"
+            ]
+          },
+          "start": {
             "format": "int64",
             "pattern": "^-?(?:0|[1-9]\\d*)$",
             "type": [
@@ -2263,8 +2279,10 @@
           }
         },
         "required": [
+          "length",
           "rangeBytes",
           "rangeCachedBytes",
+          "start",
           "updated"
         ],
         "type": "object"
