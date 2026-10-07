@@ -485,3 +485,9 @@ rechecks read at most 64 GiB of cached data per UTC day; a job that reaches the 
 waits until the next day instead of completing unverified. Playback still hashes every
 block it serves. Only concurrent in-flight verification is shared. See the [validation report](../testing/native-cache-followups.md)
 for exact boundaries and upgrade/downgrade notes. Back up `/config` before upgrading.
+
+## Loading Smart Prefetch pages [since unreleased](https://github.com/johoja12/infinidysk/issues/187){ .nzbdav-since }
+
+The activity page loads queue status independently of current range coverage. Range coverage is checked for the visible page afterward; pending and unavailable checks are labeled explicitly. History filters for fully or partially cached jobs check all relevant retained range jobs before their coverage can determine a match. A slow refresh does not start overlapping status polls, and existing status remains visible during refresh. Coverage checks finish independently of queue updates, so a slow historical check can complete while activity keeps refreshing.
+
+The Plex source picker shows libraries and available sources as each request finishes. A slow library or user lookup no longer delays every other library's sources. Failed source refreshes preserve the previous catalog and your saved selections.
