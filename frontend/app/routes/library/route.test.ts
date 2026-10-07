@@ -88,6 +88,7 @@ describe("library browse loader", () => {
     } as never);
 
     expect(browseMock()).toHaveBeenCalledWith({
+      includeCoverage: false,
       q: "dune",
       category: "movies",
       view: "groups",
@@ -108,6 +109,7 @@ describe("library browse loader", () => {
     } as never);
 
     expect(browseMock()).toHaveBeenCalledWith({
+      includeCoverage: false,
       category: "all",
       view: "files",
       match: "all",

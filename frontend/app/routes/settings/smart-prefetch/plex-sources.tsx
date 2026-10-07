@@ -95,57 +95,59 @@ export function PlexSources({
       setError(null);
       try {
         const body = { serverId, forceRefresh };
-        const [nextLibraries, nextUsers] = await Promise.all([
-          plexRequest<PlexSnapshot<PlexLibrary>>("libraries", body),
-          plexRequest<PlexSnapshot<PlexUser>>("users", body),
-        ]);
+        // Users and individual source libraries must not hold up the library picker.
+        const usersRequest = plexRequest<PlexSnapshot<PlexUser>>("users", body)
+          .then((value) => {
+            if (version === generation.current) setUsers(value);
+          })
+          .catch((cause: unknown) => {
+            if (version === generation.current)
+              setError(cause instanceof Error ? cause.message : "Plex users unavailable.");
+          });
+        const nextLibraries = await plexRequest<PlexSnapshot<PlexLibrary>>("libraries", body);
+        if (version !== generation.current) return;
+        setLibraries(nextLibraries);
         const requests: SourceRequest[] = [
           { libraryId: null },
           ...nextLibraries.data
             .filter((library) => library.type === "movie" || library.type === "show")
             .map((library) => ({ libraryId: library.id })),
         ];
-        const results = await Promise.allSettled(
-          requests.map((request) =>
-            plexRequest<PlexSnapshot<PlexSource>>("sources", {
-              serverId,
-              libraryId: request.libraryId,
-              forceRefresh,
-            }),
-          ),
-        );
-        if (version !== generation.current) return;
-        const merged: PlexSource[] = [];
+        let merged = sources?.data.filter((source) => source.serverId === serverId) ?? [];
         const failures: string[] = [];
         let isStale = false;
-        let lastSuccess: string | null = null;
-        results.forEach((result, index) => {
-          const request = requests[index]!;
-          if (result.status === "fulfilled") {
-            merged.push(...result.value.data);
-            isStale ||= result.value.isStale;
-            if (result.value.error) failures.push(result.value.error);
-            if (!lastSuccess || (result.value.lastSuccess ?? "") > lastSuccess)
-              lastSuccess = result.value.lastSuccess;
-          } else {
-            isStale = true;
-            failures.push(
-              result.reason instanceof Error ? result.reason.message : "Source unavailable.",
-            );
-            if (sources)
-              merged.push(
-                ...sources.data.filter((source) => sourceRequestMatches(source, request)),
-              );
-          }
-        });
-        setLibraries(nextLibraries);
-        setUsers(nextUsers);
-        setSources({
-          data: merged,
-          lastSuccess: lastSuccess ?? sources?.lastSuccess ?? null,
-          isStale,
-          error: failures.length > 0 ? [...new Set(failures)].join(" · ") : null,
-        });
+        let lastSuccess = sources?.lastSuccess ?? null;
+        setSources({ data: merged, lastSuccess, isStale: true, error: null });
+        await Promise.allSettled(
+          requests.map(async (request) => {
+            try {
+              const value = await plexRequest<PlexSnapshot<PlexSource>>("sources", {
+                serverId,
+                libraryId: request.libraryId,
+                forceRefresh,
+              });
+              if (version !== generation.current) return;
+              merged = [
+                ...merged.filter((source) => !sourceRequestMatches(source, request)),
+                ...value.data,
+              ];
+              isStale ||= value.isStale;
+              if (value.error) failures.push(value.error);
+              if ((value.lastSuccess ?? "") > (lastSuccess ?? "")) lastSuccess = value.lastSuccess;
+            } catch (cause) {
+              if (version !== generation.current) return;
+              isStale = true;
+              failures.push(cause instanceof Error ? cause.message : "Source unavailable.");
+            }
+            setSources({
+              data: merged,
+              lastSuccess,
+              isStale,
+              error: failures.length > 0 ? [...new Set(failures)].join(" · ") : null,
+            });
+          }),
+        );
+        await usersRequest;
       } catch (cause) {
         if (version === generation.current) {
           setError(cause instanceof Error ? cause.message : "Plex catalogue unavailable.");

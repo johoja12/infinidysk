@@ -8,6 +8,7 @@ using NzbWebDAV.Database.Models;
 using NzbWebDAV.Exceptions;
 using NzbWebDAV.Services;
 using NzbWebDAV.Services.NativeCache;
+using NzbWebDAV.Services.Library;
 using NzbWebDAV.Services.Plex;
 using NzbWebDAV.Services.Prefetch;
 using NzbWebDAV.Services.Repair;
@@ -24,6 +25,45 @@ namespace NzbWebDAV.Tests.Services;
 public sealed class PrefetchWarmingOutcomeTests
 {
     private const long MiB = 1024L * 1024;
+
+    [Fact]
+    public async Task BrowseWithoutCoverage_PreservesCountsAndDoesNotReadSourceMetadata()
+    {
+        var reads = 0;
+        await using var harness = await Harness.CreateAsync(fileSize: NativeCacheStore.BlockSize, onBlobRead: () => reads++);
+        harness.Item.Path = "/content/movie.mkv";
+        await using var context = new DavDatabaseContext(harness.Options);
+        context.Items.Update(harness.Item);
+        await context.SaveChangesAsync();
+        var identity = (await harness.Native.GetCurrentCacheIdentityAsync(harness.Item))!;
+        Assert.True(await harness.Native.Store!.WriteBlockAsync(identity, 0, new byte[NativeCacheStore.BlockSize]));
+        var service = new LibraryBrowseService(new LibraryCatalogService(context), new EmptyMetadataIndex(), harness.Native);
+        reads = 0;
+        var fast = await service.QueryAsync(new LibraryBrowseQuery { View = "files", Category = "all", IncludeCoverage = false });
+        Assert.Equal(1, fast.TotalItems);
+        Assert.Null(Assert.Single(fast.Files!).CachePercentage);
+        Assert.Equal(0, reads);
+        var enriched = await service.QueryAsync(new LibraryBrowseQuery { View = "files", Category = "all" });
+        Assert.Equal(fast.TotalItems, enriched.TotalItems);
+        Assert.Equal(100, Assert.Single(enriched.Files!).CachePercentage);
+        Assert.True(reads > 0);
+    }
+
+    [Fact]
+    public async Task RangeCoverage_SourceReplacementImmediatelyDropsOldCoverage()
+    {
+        await using var harness = await Harness.CreateAsync(fileSize: NativeCacheStore.BlockSize);
+        var jobs = harness.Runtime.Jobs!;
+        var range = jobs.Enqueue(harness.Item.Id, "manual", 50, 0, NativeCacheStore.BlockSize);
+        var items = new Dictionary<Guid, DavItem> { [harness.Item.Id] = harness.Item };
+        var identity = (await harness.Native.GetCurrentCacheIdentityAsync(harness.Item))!;
+        Assert.True(await harness.Native.Store!.WriteBlockAsync(identity, 0, new byte[NativeCacheStore.BlockSize]));
+        var before = await harness.Runtime.GetRangeCoverageAsync(jobs.List(), items, CancellationToken.None);
+        Assert.Equal((long)NativeCacheStore.BlockSize, before[range.Id].Cached);
+        await harness.ReplaceSourceAsync();
+        var after = await harness.Runtime.GetRangeCoverageAsync(jobs.List(), items, CancellationToken.None);
+        Assert.Equal(0, after[range.Id].Cached);
+    }
 
     [Fact]
     public async Task RangeCoverage_ReportsTheJobsOwnRangeForTheCurrentRevision()
@@ -197,6 +237,22 @@ public sealed class PrefetchWarmingOutcomeTests
 
     private static long FinishWatchedMinimumBytes() => PlexPrefetchService.FinishWatchedMinimumBytes;
 
+    private sealed class EmptyMetadataIndex : IPlexLibraryMetadataIndex
+    {
+        public PlexLibraryMetadataStatus Status { get; } = new(false, null, 0, null, false);
+        public PlexLibraryMedia? Match(string? fileName) => null;
+    }
+
+    private sealed class ObservedBlobStore(IBlobStore inner, Action onRead) : IBlobStore
+    {
+        public Stream? ReadBlob(Guid id) { onRead(); return inner.ReadBlob(id); }
+        public Task<T?> ReadBlob<T>(Guid id) { onRead(); return inner.ReadBlob<T>(id); }
+        public Task WriteBlob(Guid id, Stream stream, CancellationToken ct = default) => inner.WriteBlob(id, stream, ct);
+        public Task WriteBlob<T>(Guid id, T blob, CancellationToken ct = default) => inner.WriteBlob(id, blob, ct);
+        public bool Exists(Guid id) => inner.Exists(id);
+        public bool Delete(Guid id) => inner.Delete(id);
+    }
+
     private sealed class Harness : IAsyncDisposable
     {
         private readonly string _root;
@@ -226,7 +282,7 @@ public sealed class PrefetchWarmingOutcomeTests
             _provider = provider;
         }
 
-        public static async Task<Harness> CreateAsync(long fileSize, Func<Stream>? source = null, PrefetchSettings? settings = null)
+        public static async Task<Harness> CreateAsync(long fileSize, Func<Stream>? source = null, PrefetchSettings? settings = null, Action? onBlobRead = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "warm-outcome-" + Guid.NewGuid().ToString("N"));
             var previous = Environment.GetEnvironmentVariable("CONFIG_PATH");
@@ -251,15 +307,24 @@ public sealed class PrefetchWarmingOutcomeTests
             var blobId = Guid.NewGuid();
             await blobs.WriteBlob(blobId, new DavNzbFile { Id = blobId, SegmentIds = ["source-" + blobId.ToString("N")] });
             var id = Guid.NewGuid();
-            var item = new DavItem { Id = id, IdPrefix = id.ToString("N")[..5], Path = "/movie.mkv", Name = "movie.mkv",
-                FileBlobId = blobId, FileSize = fileSize, Type = DavItem.ItemType.UsenetFile, SubType = DavItem.ItemSubType.NzbFile };
+            var item = new DavItem
+            {
+                Id = id,
+                IdPrefix = id.ToString("N")[..5],
+                Path = "/movie.mkv",
+                Name = "movie.mkv",
+                FileBlobId = blobId,
+                FileSize = fileSize,
+                Type = DavItem.ItemType.UsenetFile,
+                SubType = DavItem.ItemSubType.NzbFile
+            };
             await using (var context = new DavDatabaseContext(options))
             {
                 context.Items.Add(item);
                 await context.SaveChangesAsync();
             }
             var repairPatches = new RepairPatchStore(Path.Combine(root, "repairs"), 100);
-            var native = new NativeCacheService(config, blobs, repairPatches);
+            var native = new NativeCacheService(config, onBlobRead is null ? blobs : new ObservedBlobStore(blobs, onBlobRead), repairPatches);
             Assert.True(await native.WaitForInitializationAsync());
             var tracker = new StreamingFailureTracker();
             var repairs = new StreamingRepairScheduler(config, tracker, new ContextFactory(options));
@@ -275,7 +340,12 @@ public sealed class PrefetchWarmingOutcomeTests
 #pragma warning restore CA2000
             return new Harness(root, previous, connection, blobs, repairPatches, provider, reads)
             {
-                Config = config, Options = options, Item = item, Native = native, Runtime = runtime, Repairs = repairs,
+                Config = config,
+                Options = options,
+                Item = item,
+                Native = native,
+                Runtime = runtime,
+                Repairs = repairs,
             };
         }
 
@@ -292,6 +362,9 @@ public sealed class PrefetchWarmingOutcomeTests
 
         public void ConfigureSettings(PrefetchSettings settings) => Config.UpdateValues([
             new ConfigItem { ConfigName = ConfigKeys.SmartPrefetchSettings, ConfigValue = JsonSerializer.Serialize(settings) }]);
+
+        public Task ReplaceSourceAsync() => _blobs.WriteBlob(Item.FileBlobId!.Value,
+            new DavNzbFile { Id = Item.FileBlobId.Value, SegmentIds = ["replacement"] });
 
         public void ConfigurePlexSource() => Config.UpdateValues([
             new ConfigItem { ConfigName = ConfigKeys.PlexServers, ConfigValue = JsonSerializer.Serialize(new[] { new PlexServer
@@ -347,7 +420,10 @@ public sealed class PrefetchWarmingOutcomeTests
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
             Task.FromResult(request.RequestUri!.AbsolutePath == "/status/sessions"
                 ? new HttpResponseMessage(System.Net.HttpStatusCode.ServiceUnavailable)
-                : new HttpResponseMessage(System.Net.HttpStatusCode.OK) { Content = new StringContent(
-                    """<MediaContainer size="1" totalSize="1"><Video ratingKey="movie" type="movie" title="Movie"><Media selected="1"><Part selected="1" file="/plex/movie.mkv"/></Media></Video></MediaContainer>""") });
+                : new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                    """<MediaContainer size="1" totalSize="1"><Video ratingKey="movie" type="movie" title="Movie"><Media selected="1"><Part selected="1" file="/plex/movie.mkv"/></Media></Video></MediaContainer>""")
+                });
     }
 }

@@ -12,18 +12,20 @@ public sealed class NativeCacheController(NativeCacheService native, NativeCache
 {
     protected override async Task<IActionResult> HandleRequest()
     {
+        if (string.Equals(HttpContext.Request.Query["modeOnly"], "true", StringComparison.OrdinalIgnoreCase))
+            return Ok(new { ActiveMode = native.ActiveMode.ToString().ToLowerInvariant() });
         await native.WaitForInitializationAsync(HttpContext.RequestAborted).ConfigureAwait(false);
         return Ok(new
         {
-        ActiveMode = native.ActiveMode.ToString().ToLowerInvariant(),
-        ConfiguredMode = config.GetCacheMode().ToString().ToLowerInvariant(),
-        RestartRequired = native.RequiresRestart(config),
-        native.InitializationError,
-        native.InitializationPending,
-        native.ReservedBufferBytes,
-        Counters = native.Statistics.Snapshot(),
-        Folders = native.Store is null ? [] : await native.Store.GetStatusAsync(HttpContext.RequestAborted).ConfigureAwait(false),
-        Jobs = operations.GetJobs()
+            ActiveMode = native.ActiveMode.ToString().ToLowerInvariant(),
+            ConfiguredMode = config.GetCacheMode().ToString().ToLowerInvariant(),
+            RestartRequired = native.RequiresRestart(config),
+            native.InitializationError,
+            native.InitializationPending,
+            native.ReservedBufferBytes,
+            Counters = native.Statistics.Snapshot(),
+            Folders = native.Store is null ? [] : await native.Store.GetStatusAsync(HttpContext.RequestAborted).ConfigureAwait(false),
+            Jobs = operations.GetJobs()
         });
     }
 }
@@ -65,8 +67,22 @@ public sealed class NativeCacheEntriesController(NativeCacheService native, DavD
         var ids = page.Select(entry => Guid.TryParse(entry.ItemId, out var id) ? id : Guid.Empty).Where(id => id != Guid.Empty).ToArray();
         var items = await database.GetItemsByIdsBatchedAsync(ids, ct: HttpContext.RequestAborted).ConfigureAwait(false);
         var names = items.ToDictionary(item => item.Id.ToString("N"), item => item.Name);
-        return Ok(new { entries = page.Select(entry => new { entry.Key, entry.FolderId, entry.ItemId, name = names.GetValueOrDefault(entry.ItemId) ?? entry.ItemId,
-            entry.Length, entry.AllocatedBytes, entry.VerifiedBytes, entry.Pinned, entry.Generation }), nextAfter = page.Count == limit ? page[^1].Key : null });
+        return Ok(new
+        {
+            entries = page.Select(entry => new
+            {
+                entry.Key,
+                entry.FolderId,
+                entry.ItemId,
+                name = names.GetValueOrDefault(entry.ItemId) ?? entry.ItemId,
+                entry.Length,
+                entry.AllocatedBytes,
+                entry.VerifiedBytes,
+                entry.Pinned,
+                entry.Generation
+            }),
+            nextAfter = page.Count == limit ? page[^1].Key : null
+        });
     }
 }
 

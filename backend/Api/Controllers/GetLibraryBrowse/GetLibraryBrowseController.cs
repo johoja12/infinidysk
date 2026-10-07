@@ -92,6 +92,7 @@ public sealed class GetLibraryBrowseRequest
 
         Query = new LibraryBrowseQuery
         {
+            IncludeCoverage = !string.Equals(context.GetQueryParam("includeCoverage"), "false", StringComparison.OrdinalIgnoreCase),
             Search = string.IsNullOrWhiteSpace(search) ? null : search.Trim(),
             Category = category.ToLowerInvariant(),
             View = view.ToLowerInvariant(),

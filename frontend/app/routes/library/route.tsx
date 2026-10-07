@@ -1,5 +1,6 @@
+import { usePageCoverage } from "~/utils/use-page-coverage";
 import type { Route } from "./+types/route";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   Form,
   Link,
@@ -126,7 +127,9 @@ export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPage
     group: url.searchParams.get("group"),
     groupPage: parsePage(url.searchParams.get("groupPage")),
   };
+  const cacheStatus = backendClient.getNativeCacheStatus().catch(() => ({ activeMode: "" }));
   const browse = await backendClient.getLibraryBrowse({
+    includeCoverage: false,
     ...(query.q ? { q: query.q } : {}),
     category: query.category,
     view: query.view,
@@ -146,13 +149,7 @@ export async function loader({ request }: Route.LoaderArgs): Promise<LibraryPage
       previewUrls[item.davItemId] = getPreviewUrl(item.contentPath, frontendBackendApiKey);
     }
   }
-  let nativeCacheActive = false;
-  try {
-    const status = await backendClient.getNativeCacheStatus();
-    nativeCacheActive = status.activeMode === "native";
-  } catch {
-    // The catalog remains usable if the optional cache status cannot be loaded.
-  }
+  const nativeCacheActive = (await cacheStatus).activeMode === "native";
   return { query, browse, previewUrls, nativeCacheActive, libraryRoot };
 }
 
@@ -226,6 +223,24 @@ export default function Library({ loaderData }: Route.ComponentProps) {
       : browse.expandedGroup?.key === expandedKey
         ? browse.expandedGroup
         : null;
+  const coverageIds =
+    query.cache === "all"
+      ? [
+          ...browse.groups.map((group) => group.davItemId),
+          ...(browse.files ?? []).map((row) => row.item.davItemId),
+          ...(expandedGroup?.items ?? []).map((row) => row.item.davItemId),
+        ].filter((id): id is string => Boolean(id))
+      : [];
+  const coverageSnapshot = useMemo(() => [browse, expandedGroup], [browse, expandedGroup]);
+  const deferredCoverage = usePageCoverage<number | null>(
+    "/api/get-library-coverage",
+    "itemIds",
+    coverageIds,
+    coverageSnapshot,
+    50,
+  );
+  const cachePercentage = (id: string | null | undefined, fallback: number | null) =>
+    query.cache === "all" && id ? (deferredCoverage.values[id] ?? null) : fallback;
   const expandedPreviewUrls =
     groupFetcher.data?.browse.expandedGroup?.key === expandedKey
       ? groupFetcher.data.previewUrls
@@ -676,9 +691,11 @@ export default function Library({ loaderData }: Route.ComponentProps) {
                         {group.itemCount === 1 ? (
                           <span className="text-base-content/65">
                             Cache{" "}
-                            {group.cachePercentage == null
-                              ? "unavailable"
-                              : `${group.cachePercentage}%`}
+                            {cachePercentage(group.davItemId, group.cachePercentage) == null
+                              ? deferredCoverage.pending
+                                ? "checking…"
+                                : "unavailable"
+                              : `${cachePercentage(group.davItemId, group.cachePercentage)}%`}
                           </span>
                         ) : null}
                         {group.healthyCount > 0 && <Badge>{group.healthyCount} valid</Badge>}
@@ -701,7 +718,13 @@ export default function Library({ loaderData }: Route.ComponentProps) {
                           </p>
                         ) : null}
                         {expandedGroup?.items.map(
-                          ({ item, season, episode, quality, cachePercentage }) => (
+                          ({
+                            item,
+                            season,
+                            episode,
+                            quality,
+                            cachePercentage: initialCoverage,
+                          }) => (
                             <div
                               key={item.davItemId ?? item.mappings[0]?.linkPath ?? item.displayName}
                               className="border-b border-base-content/10 py-3 last:border-b-0"
@@ -739,7 +762,11 @@ export default function Library({ loaderData }: Route.ComponentProps) {
                                 </Badge>
                                 <span className="text-xs text-base-content/65">
                                   Cache{" "}
-                                  {cachePercentage == null ? "unavailable" : `${cachePercentage}%`}
+                                  {cachePercentage(item.davItemId, initialCoverage) == null
+                                    ? deferredCoverage.pending
+                                      ? "checking…"
+                                      : "unavailable"
+                                    : `${cachePercentage(item.davItemId, initialCoverage)}%`}
                                 </span>
                                 <Badge>{item.health}</Badge>
                                 <RegrabBadge status={item.regrabStatus} />
@@ -842,17 +869,19 @@ export default function Library({ loaderData }: Route.ComponentProps) {
             )?.quality ??
             "unknown"
           }
-          cachePercentage={
+          cachePercentage={cachePercentage(
+            selected.davItemId,
             (browse.files ?? []).find(
               ({ item }) =>
                 item.davItemId === selected.davItemId && item.displayName === selected.displayName,
             )?.cachePercentage ??
-            expandedGroup?.items.find(
-              ({ item }) =>
-                item.davItemId === selected.davItemId && item.displayName === selected.displayName,
-            )?.cachePercentage ??
-            null
-          }
+              expandedGroup?.items.find(
+                ({ item }) =>
+                  item.davItemId === selected.davItemId &&
+                  item.displayName === selected.displayName,
+              )?.cachePercentage ??
+              null,
+          )}
           previewUrl={selectedPreviewUrl}
           canPrewarm={nativeCacheActive}
         />

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import type { ReactNode } from "react";
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createMemoryRouter, RouterProvider } from "react-router";
@@ -391,5 +391,79 @@ describe("Smart Prefetch activity page", () => {
     expect(within(dialog).getByText("Unavailable")).toBeTruthy();
     expect(within(dialog).queryByRole("button", { name: /Requeue repair/ })).toBeNull();
     expect(within(dialog).queryByRole("button", { name: /Run health check/ })).toBeNull();
+  });
+  it("shows active jobs while range coverage is stalled", async () => {
+    const range = {
+      ...response.jobs[0],
+      start: 0,
+      length: 4096,
+      rangeBytes: null,
+      rangeCachedBytes: null,
+    };
+    const fetch = vi.fn((url: string) =>
+      url.includes("/coverage?")
+        ? new Promise<Response>(() => {})
+        : Promise.resolve(new Response(JSON.stringify({ ...response, jobs: [range] }))),
+    );
+    vi.stubGlobal("fetch", fetch);
+    const router = createMemoryRouter(
+      [{ path: "/smart-prefetch", element: <SmartPrefetchActivityPage /> }],
+      { initialEntries: ["/smart-prefetch"] },
+    );
+    render(<RouterProvider router={router} />);
+    expect(await screen.findByText("Movie warming")).toBeTruthy();
+    expect(fetch.mock.calls[0]![0]).toContain("includeCoverage=false");
+    expect(screen.getByText(/checking current coverage/)).toBeTruthy();
+  });
+
+  it("does not overlap status polls when a status request is slow", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetch = vi.fn(() => new Promise<Response>(() => {}));
+      vi.stubGlobal("fetch", fetch);
+      const router = createMemoryRouter(
+        [{ path: "/smart-prefetch", element: <SmartPrefetchActivityPage /> }],
+        { initialEntries: ["/smart-prefetch"] },
+      );
+      render(<RouterProvider router={router} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+  it("accepts matching range coverage after running-job progress updates", async () => {
+    const range = {
+      ...response.jobs[0],
+      start: 0,
+      length: 4096,
+      rangeBytes: null,
+      rangeCachedBytes: null,
+    };
+    const fetch = vi.fn((url: string) => {
+      const body = url.includes("/coverage?")
+        ? {
+            coverage: {
+              a: {
+                updated: now + 100,
+                start: 0,
+                length: 4096,
+                rangeBytes: 4096,
+                rangeCachedBytes: 4096,
+              },
+            },
+          }
+        : { ...response, jobs: [range] };
+      return Promise.resolve(new Response(JSON.stringify(body)));
+    });
+    vi.stubGlobal("fetch", fetch);
+    const router = createMemoryRouter(
+      [{ path: "/smart-prefetch", element: <SmartPrefetchActivityPage /> }],
+      { initialEntries: ["/smart-prefetch"] },
+    );
+    render(<RouterProvider router={router} />);
+    expect(await screen.findByText(/Cached the 4 KiB requested range/)).toBeTruthy();
   });
 });

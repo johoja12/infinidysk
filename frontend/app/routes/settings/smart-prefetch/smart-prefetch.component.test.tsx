@@ -574,4 +574,20 @@ describe("Smart Prefetch settings", () => {
     expect(await screen.findByText(/deduplicated.*existing/)).toBeTruthy();
     expect(screen.getByText(/Not an available imported streamable file/)).toBeTruthy();
   });
+  it("shows library sources while a different source request and users are pending", async () => {
+    const base = fakeApi();
+    const fetch = vi.fn((url: string, init?: RequestInit) => {
+      const request = JSON.parse(typeof init?.body === "string" ? init.body : "{}") as {
+        libraryId?: string | null;
+      };
+      if (url.endsWith("/users") || (url.endsWith("/sources") && !request.libraryId))
+        return new Promise<Response>(() => {});
+      return base(url, init);
+    });
+    vi.stubGlobal("fetch", fetch);
+    render(<Harness />);
+    await userEvent.selectOptions(await screen.findByLabelText("Plex source server"), "server");
+    await userEvent.click(await screen.findByRole("button", { name: "Show TV sources" }));
+    expect(await screen.findByLabelText("Enable TV source On Deck")).toBeTruthy();
+  });
 });
