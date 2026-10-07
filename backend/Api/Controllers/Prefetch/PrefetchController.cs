@@ -15,6 +15,7 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
 {
     protected override async Task<IActionResult> HandleRequest()
     {
+        using var timing = new NzbWebDAV.Services.Observability.PageLoadTiming("prefetch.status");
         await runtime.WaitForInitializationAsync(HttpContext.RequestAborted).ConfigureAwait(false);
         IReadOnlyList<PrefetchJob> jobs = [];
         IReadOnlyDictionary<string, IReadOnlyList<string>> owners = new Dictionary<string, IReadOnlyList<string>>();
@@ -34,7 +35,10 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
         { runtime.ReportMetadataFailure(); }
         var items = (await database.GetItemsByIdsBatchedAsync(jobs.Select(job => job.ItemId).Distinct().ToArray(),
             ct: HttpContext.RequestAborted).ConfigureAwait(false)).ToDictionary(item => item.Id);
-        var coverage = await runtime.GetRangeCoverageAsync(jobs, items, HttpContext.RequestAborted).ConfigureAwait(false);
+        var includeCoverage = !string.Equals(HttpContext.Request.Query["includeCoverage"], "false", StringComparison.OrdinalIgnoreCase);
+        var coverage = includeCoverage
+            ? await runtime.GetRangeCoverageAsync(jobs, items, HttpContext.RequestAborted).ConfigureAwait(false)
+            : new Dictionary<string, (long Bytes, long Cached)>();
         var settings = runtime.Settings();
         IReadOnlyList<PlexServer> servers;
         try { servers = PlexSettings.ParseServers(config.GetEffectiveConfigValue(ConfigKeys.PlexServers)); }
@@ -52,8 +56,10 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
             {
                 try
                 {
-                    var snapshot = await catalogue.GetUsersAsync(server, ct: lookupTimeout.Token).ConfigureAwait(false);
-                    return snapshot.Data.Select(user => new KeyValuePair<string, string>(
+                    var snapshot = includeCoverage
+                        ? await catalogue.GetUsersAsync(server, ct: lookupTimeout.Token).ConfigureAwait(false)
+                        : catalogue.CachedUsers(server);
+                    return (snapshot?.Data ?? []).Select(user => new KeyValuePair<string, string>(
                         PlexPrefetchService.Hash(server.Id) + ":" + PlexPrefetchService.Hash(user.Id), user.Name)).ToArray();
                 }
                 catch (OperationCanceledException) when (!HttpContext.RequestAborted.IsCancellationRequested)

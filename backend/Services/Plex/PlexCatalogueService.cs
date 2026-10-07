@@ -43,11 +43,22 @@ public sealed class PlexCatalogueService(PlexApiClient api, TimeProvider clock)
             errors.Length == 0 ? null : string.Join(" · ", errors));
     }
 
+    /// <summary>Last authorized snapshot only; status reads never wait for Plex.</summary>
+    public PlexSnapshot<PlexUser>? CachedUsers(PlexServer server)
+    {
+        var key = SnapshotKey(server, "users");
+        lock (_gate)
+            return _entries.TryGetValue(key, out var value) ? Volatile.Read(ref ((Entry<PlexUser>)value).Snapshot) : null;
+    }
+
+    private static string SnapshotKey(PlexServer server, string resource) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{server.Id}\n{server.Url}\n{server.Token}\n{resource}")));
+
     private async Task<PlexSnapshot<T>> GetAsync<T>(PlexServer server, string resource, bool force,
         Func<CancellationToken, Task<IReadOnlyList<T>>> fetch, CancellationToken ct)
     {
         // Credentials and endpoint changes cannot reuse an earlier authorization snapshot.
-        var key = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{server.Id}\n{server.Url}\n{server.Token}\n{resource}")));
+        var key = SnapshotKey(server, resource);
         Entry<T> entry;
         long version;
         lock (_gate)
@@ -109,7 +120,7 @@ public sealed class PlexCatalogueService(PlexApiClient api, TimeProvider clock)
     private sealed class Entry<T>
     {
         public SemaphoreSlim Refresh { get; } = new(1, 1);
-        public PlexSnapshot<T>? Snapshot { get; set; }
+        public PlexSnapshot<T>? Snapshot;
         public DateTimeOffset NextRefresh { get; set; }
         public DateTimeOffset RetryAfter { get; set; }
         public long Version;

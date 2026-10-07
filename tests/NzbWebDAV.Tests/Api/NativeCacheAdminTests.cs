@@ -25,6 +25,10 @@ public sealed class NativeCacheAdminTests
     [InlineData("/api/native-cache/activity")]
     [InlineData("/api/native-cache/transfers")]
     [InlineData("/api/native-cache/evictions")]
+    [InlineData("/api/get-library-coverage?itemIds=11111111111111111111111111111111")]
+    [InlineData("/api/prefetch/coverage?jobIds=11111111111111111111111111111111")]
+    [InlineData("/api/prefetch?includeCoverage=false")]
+    [InlineData("/api/native-cache?modeOnly=true")]
     [InlineData("/api/prefetch")]
     [InlineData("/api/prefetch/preview")]
     [InlineData("/api/prefetch/predictions")]
@@ -71,9 +75,17 @@ public sealed class NativeCacheAdminTests
         paused.EnsureSuccessStatusCode();
         Assert.True(runtime.Jobs!.Paused);
         var id = Guid.NewGuid();
-        await factory.AddDavItemsAsync(new DavItem { Id = id, IdPrefix = id.ToString("N")[..5], Name = "Episode.mkv",
-            Path = "/Episode.mkv", Type = DavItem.ItemType.UsenetFile, SubType = DavItem.ItemSubType.NzbFile,
-            FileBlobId = Guid.NewGuid(), FileSize = 100 });
+        await factory.AddDavItemsAsync(new DavItem
+        {
+            Id = id,
+            IdPrefix = id.ToString("N")[..5],
+            Name = "Episode.mkv",
+            Path = "/Episode.mkv",
+            Type = DavItem.ItemType.UsenetFile,
+            SubType = DavItem.ItemSubType.NzbFile,
+            FileBlobId = Guid.NewGuid(),
+            FileSize = 100
+        });
         using var warmed = await client.PostAsJsonAsync("/api/prefetch/operations", new { operation = "warm", itemIds = new[] { id } });
         Assert.Equal(HttpStatusCode.Accepted, warmed.StatusCode);
         using (var result = JsonDocument.Parse(await warmed.Content.ReadAsStringAsync()))
@@ -193,9 +205,17 @@ public sealed class NativeCacheAdminTests
         var itemId = Guid.NewGuid();
         var blobs = factory.Services.GetRequiredService<IBlobStore>();
         await blobs.WriteBlob(blobId, new DavNzbFile { Id = blobId, SegmentIds = ["range-map-segment"] });
-        var item = new DavItem { Id = itemId, IdPrefix = itemId.ToString("N")[..5], Name = "range-map.mkv",
-            Path = "/range-map.mkv", Type = DavItem.ItemType.UsenetFile, SubType = DavItem.ItemSubType.NzbFile,
-            FileBlobId = blobId, FileSize = 3 };
+        var item = new DavItem
+        {
+            Id = itemId,
+            IdPrefix = itemId.ToString("N")[..5],
+            Name = "range-map.mkv",
+            Path = "/range-map.mkv",
+            Type = DavItem.ItemType.UsenetFile,
+            SubType = DavItem.ItemSubType.NzbFile,
+            FileBlobId = blobId,
+            FileSize = 3
+        };
         await factory.AddDavItemsAsync(item);
         var currentIdentity = await native.GetCurrentCacheIdentityAsync(item);
         Assert.NotNull(currentIdentity);

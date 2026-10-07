@@ -19,6 +19,7 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
         LibraryCatalogScanner? scanner = null,
         CancellationToken ct = default)
     {
+        using var timing = new NzbWebDAV.Services.Observability.PageLoadTiming("library.browse");
         var all = await catalog.LoadAllAsync(ct).ConfigureAwait(false);
         // Cache filters need coverage for the whole catalogue. Ordinary browsing
         // only displays it for the current page, so defer the expensive source
@@ -78,7 +79,7 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
             var filePage = Math.Clamp(query.Page, 1,
                 Math.Max(1, (selectedFiles.Count + TablePageSize - 1) / TablePageSize));
             var visibleFiles = selectedFiles.Skip((filePage - 1) * TablePageSize).Take(TablePageSize).ToList();
-            var fileCoverage = query.Cache == "all"
+            var fileCoverage = query.Cache == "all" && query.IncludeCoverage
                 ? await LoadCurrentCoverageAsync(visibleFiles.Select(i => i.Item), ct).ConfigureAwait(false)
                 : currentCoverage;
             var files = visibleFiles
@@ -119,7 +120,7 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
             .ThenBy(i => i.Item.DisplayName, StringComparer.OrdinalIgnoreCase)
             .Skip((groupPage - 1) * GroupFilePageSize)
             .Take(GroupFilePageSize).ToList() ?? [];
-        var visibleCoverage = query.Cache == "all"
+        var visibleCoverage = query.Cache == "all" && query.IncludeCoverage
             ? await LoadCurrentCoverageAsync(visibleGroups.Where(g => g.Items.Count == 1)
                 .Select(g => g.Items[0].Item).Concat(expandedFiles.Select(i => i.Item)), ct).ConfigureAwait(false)
             : currentCoverage;
@@ -127,7 +128,8 @@ public sealed class LibraryBrowseService(LibraryCatalogService catalog, IPlexLib
             .Select(g => new LibraryBrowseGroupDto(g.Key, g.Title, g.Category,
                 g.Items.Count, g.Items.Count(i => IsHealthy(i.Item)), g.Items.Count(i => NeedsAttention(i.Item)),
                 g.Items.Count == 1 ? QualityFromName(g.Items[0].Item.DisplayName) : null,
-                g.Items.Count == 1 ? CachePercentage(g.Items[0].Item, visibleCoverage) : null))
+                g.Items.Count == 1 ? CachePercentage(g.Items[0].Item, visibleCoverage) : null,
+                g.Items.Count == 1 ? g.Items[0].Item.DavItemId : null))
             .ToList();
 
         LibraryBrowseExpandedGroupDto? expanded = null;

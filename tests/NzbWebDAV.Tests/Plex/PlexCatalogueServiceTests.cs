@@ -6,6 +6,22 @@ namespace NzbWebDAV.Tests.Plex;
 public sealed class PlexCatalogueServiceTests
 {
     [Fact]
+    public async Task CachedUsers_DoesNotFetch_AndCannotReuseChangedCredentials()
+    {
+        using var handler = new FakePlexHandler(_ => PlexApiClientTests.Xml("""<MediaContainer><User id="7" title="Owner"/></MediaContainer>"""));
+        var catalogue = new PlexCatalogueService(new PlexApiClient(new HttpClient(handler), "installation"), new PlexTestClock());
+        var server = PlexApiClientTests.Server();
+        Assert.Null(catalogue.CachedUsers(server));
+        Assert.Empty(handler.Requests);
+        var loaded = await catalogue.GetUsersAsync(server);
+        Assert.Same(loaded, catalogue.CachedUsers(server));
+        Assert.Single(handler.Requests);
+        Assert.Null(catalogue.CachedUsers(server with { Token = "changed" }));
+        Assert.Null(catalogue.CachedUsers(server with { Url = "http://different.test" }));
+        Assert.Single(handler.Requests);
+    }
+
+    [Fact]
     public async Task ScopedSources_RetainCollectionsWhenHubsFail()
     {
         using var handler = new FakePlexHandler(request => request.RequestUri!.AbsolutePath switch

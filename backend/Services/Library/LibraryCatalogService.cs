@@ -36,7 +36,15 @@ public sealed class LibraryCatalogService(DavDatabaseContext context, bool video
     internal async Task<List<LibraryCatalogItemDto>> LoadAllAsync(
         CancellationToken ct, string? search = null)
     {
-        var maps = await context.LinkMaps.AsNoTracking().ToListAsync(ct).ConfigureAwait(false);
+        using var timing = new NzbWebDAV.Services.Observability.PageLoadTiming("library.catalog");
+        var maps = await context.LinkMaps.AsNoTracking().Select(m => new LibraryLinkMap
+        {
+            DavItemId = m.DavItemId,
+            LinkPath = m.LinkPath,
+            TargetText = m.TargetText,
+            MappingType = m.MappingType,
+            Status = m.Status,
+        }).ToListAsync(ct).ConfigureAwait(false);
         if (videoOnly)
             maps = maps.Where(map => MediaLibraryVideoFilter.IsVideoLink(map.LinkPath, map.TargetText)).ToList();
 
@@ -53,7 +61,7 @@ public sealed class LibraryCatalogService(DavDatabaseContext context, bool video
                 i.Name.Contains(search) || i.Path.Contains(search) || matchedIds.Contains(i.Id));
         }
         var internalRows = await items
-            .Select(i => new { Item = i })
+            .Select(i => new { Item = new DavItem { Id = i.Id, Name = i.Name, Path = i.Path, FileSize = i.FileSize } })
             .ToListAsync(ct)
             .ConfigureAwait(false);
         if (videoOnly)

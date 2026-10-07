@@ -39,6 +39,7 @@ public sealed record LibraryCatalogResult(
 
 public sealed record LibraryBrowseQuery
 {
+    public bool IncludeCoverage { get; init; } = true;
     public string? Search { get; init; }
     public string Category { get; init; } = "shows"; // all|shows|movies|unmatched
     public string View { get; init; } = "groups"; // groups|files
@@ -61,7 +62,8 @@ public sealed record LibraryBrowseGroupDto(
     int HealthyCount,
     int AttentionCount,
     string? Quality,
-    int? CachePercentage);
+    int? CachePercentage,
+    Guid? DavItemId = null);
 
 public sealed record LibraryBrowseFileDto(
     LibraryCatalogItemDto Item,

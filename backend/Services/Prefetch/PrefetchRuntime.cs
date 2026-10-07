@@ -107,16 +107,21 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
     public async Task<IReadOnlyDictionary<string, (long Bytes, long Cached)>> GetRangeCoverageAsync(
         IEnumerable<PrefetchJob> jobs, IReadOnlyDictionary<Guid, DavItem> items, CancellationToken ct)
     {
+        using var timing = new NzbWebDAV.Services.Observability.PageLoadTiming("prefetch.coverage");
         var result = new Dictionary<string, (long Bytes, long Cached)>(StringComparer.Ordinal);
         if (native.Store is not { } store) return result;
+        var selected = jobs.ToArray();
         var resolved = new Dictionary<Guid, NativeCacheIdentity?>();
-        foreach (var job in jobs)
+        foreach (var job in selected)
         {
             if (!job.IsRangeJob || items.GetValueOrDefault(job.ItemId) is not { FileSize: > 0 } item) continue;
             if (!resolved.TryGetValue(job.ItemId, out var identity))
             {
                 if (resolved.Count >= MaxCoverageItems) continue;
-                identity = await CachedIdentityAsync(item, ct).ConfigureAwait(false);
+                try { identity = await native.GetCurrentCacheIdentityAsync(item, ct).ConfigureAwait(false); }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+                    or Microsoft.Data.Sqlite.SqliteException or NzbWebDAV.Exceptions.CorruptedBlobPayloadException or ObjectDisposedException)
+                { identity = null; }
                 resolved[job.ItemId] = identity;
             }
             if (identity is null || job.Start >= identity.Length
@@ -129,7 +134,19 @@ public sealed class PrefetchRuntime(ConfigManager config, NativeCacheService nat
             }
             catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
                 or Microsoft.Data.Sqlite.SqliteException or ObjectDisposedException)
-            { return result; }
+            { break; }
+        }
+        // Revalidate once per item after all range sums, including on a partial metadata failure.
+        foreach (var (id, identity) in resolved)
+        {
+            if (identity is null) continue;
+            NativeCacheIdentity? current;
+            try { current = await native.GetCurrentCacheIdentityAsync(items[id], ct).ConfigureAwait(false); }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+                or Microsoft.Data.Sqlite.SqliteException or NzbWebDAV.Exceptions.CorruptedBlobPayloadException or ObjectDisposedException)
+            { current = null; }
+            if (current != identity)
+                foreach (var job in selected.Where(job => job.ItemId == id)) result.Remove(job.Id);
         }
         return result;
     }
