@@ -239,6 +239,29 @@ public sealed class PrefetchCoordinatorTests : IDisposable
         Assert.Equal("queued", store.List().Single().State);
     }
 
+    [Fact]
+    public async Task SmallRangeJob_RunsBesideLongWholeFileWarm_LargeRangeWaits()
+    {
+        using var store = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var whole = store.Enqueue(Guid.NewGuid(), "source", 100);
+        var large = store.Enqueue(Guid.NewGuid(), "backfill", 60, 4 * 1024 * 1024, PrefetchCoordinator.ExpressRangeBytes + 4 * 1024 * 1024);
+        var small = store.Enqueue(Guid.NewGuid(), "backfill", 60, 4 * 1024 * 1024, 4 * 1024 * 1024);
+        var smallDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var executor = new CallbackExecutor(async (job, ct) =>
+        {
+            if (job.Id == whole.Id) await smallDone.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+            else if (job.Id == small.Id) smallDone.SetResult();
+            else throw new InvalidOperationException("A large range job must wait for a regular slot.");
+        });
+        using var coordinator = new PrefetchCoordinator(store, executor, () => new() { MaxConcurrentJobs = 1 }, () => true)
+            { ExpressPollInterval = TimeSpan.FromMilliseconds(10) };
+        await coordinator.RunOnceAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(10));
+        var states = store.List().ToDictionary(job => job.Id, job => job.State);
+        Assert.Equal("completed", states[whole.Id]);
+        Assert.Equal("completed", states[small.Id]);
+        Assert.Equal("queued", states[large.Id]);
+    }
+
     private sealed class BlockingExecutor : IPrefetchExecutor
     {
         public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);

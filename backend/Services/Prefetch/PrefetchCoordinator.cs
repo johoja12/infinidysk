@@ -14,6 +14,11 @@ public sealed class PrefetchCoordinator(PrefetchJobStore store, IPrefetchExecuto
 {
     private readonly Lock _gate = new();
     private readonly Dictionary<string, CancellationTokenSource> _running = [];
+    /// <summary>
+    /// Range jobs up to this size (playback backfill, usually one block) may run in an extra slot
+    /// beside the regular ones, so a gap fill never waits behind a long whole-file warm.
+    /// </summary>
+    internal const long ExpressRangeBytes = 64L * 1024 * 1024;
     internal const string MetadataFailureMessage = "Prefetch is unhealthy and warming is disabled until restart. Check local metadata storage and settings; ordinary playback remains available.";
     private string? _runtimeError;
     public string? RuntimeError => Volatile.Read(ref _runtimeError);
@@ -40,6 +45,7 @@ public sealed class PrefetchCoordinator(PrefetchJobStore store, IPrefetchExecuto
                 if (job is null) break;
                 tasks.Add(RunJobAsync(job, ct));
             }
+            if (tasks.Count > 0) tasks.Add(RunExpressAsync(Task.WhenAll(tasks.ToArray()), ct));
             await Task.WhenAll(tasks).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested || applicationStopping.IsCancellationRequested)
@@ -47,6 +53,21 @@ public sealed class PrefetchCoordinator(PrefetchJobStore store, IPrefetchExecuto
         catch (Exception exception) when (exception is not OutOfMemoryException)
         { ReportMetadataFailure(); await DrainAsync(tasks).ConfigureAwait(false); }
     }
+
+    /// <summary>Runs small range jobs one at a time until the regular slots of this round finish.</summary>
+    private async Task RunExpressAsync(Task regular, CancellationToken ct)
+    {
+        while (!regular.IsCompleted)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (RuntimeError is not null) return;
+            var job = admission() && !store.Paused ? store.ClaimNext(ExpressRangeBytes) : null;
+            if (job is not null) await RunJobAsync(job, ct).ConfigureAwait(false);
+            else await Task.WhenAny(regular, Task.Delay(ExpressPollInterval, ct)).ConfigureAwait(false);
+        }
+    }
+
+    internal TimeSpan ExpressPollInterval { get; init; } = TimeSpan.FromSeconds(1);
 
     private static async Task DrainAsync(List<Task> tasks)
     {

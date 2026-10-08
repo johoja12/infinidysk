@@ -508,7 +508,8 @@ public sealed class PrefetchJobStore : IDisposable
         }
     }
 
-    public PrefetchJob? ClaimNext()
+    /// <param name="maxRangeLength">When set, claims only range jobs of at most this many bytes.</param>
+    public PrefetchJob? ClaimNext(long? maxRangeLength = null)
     {
         lock (_gate)
         {
@@ -516,8 +517,8 @@ public sealed class PrefetchJobStore : IDisposable
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             Execute("UPDATE Jobs SET State='failed',Error='Intent expired; retry explicitly.',FinishedAt=$now WHERE State='queued' AND Created<$cutoff",
                 ("$cutoff", DateTimeOffset.UtcNow.AddHours(-(_settings?.Invoke().IntentTtlHours ?? 24)).ToUnixTimeMilliseconds()), ("$now", now));
-            var job = ReadOne("SELECT * FROM Jobs WHERE State='queued' AND ItemId NOT IN (SELECT ItemId FROM Jobs WHERE State='running') AND Id NOT IN (SELECT Id FROM Deferred WHERE Until>$now) ORDER BY Priority DESC,Created,Id LIMIT 1",
-                ("$now", now));
+            var job = ReadOne("SELECT * FROM Jobs WHERE State='queued' AND ($max IS NULL OR Length BETWEEN 1 AND $max) AND ItemId NOT IN (SELECT ItemId FROM Jobs WHERE State='running') AND Id NOT IN (SELECT Id FROM Deferred WHERE Until>$now) ORDER BY Priority DESC,Created,Id LIMIT 1",
+                ("$now", now), ("$max", (object?)maxRangeLength ?? DBNull.Value));
             if (job is null) return null;
             Execute("UPDATE Jobs SET State='running',Error=NULL,FailureCode=NULL,Remedy=NULL,StartedAt=COALESCE(StartedAt,$now),RunStarted=$now,ActiveMs=COALESCE(ActiveMs,0),WarmedBytes=COALESCE(WarmedBytes,0) WHERE Id=$id",
                 ("$id", job.Id), ("$now", now));

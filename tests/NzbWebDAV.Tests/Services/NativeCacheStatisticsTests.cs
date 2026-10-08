@@ -41,4 +41,25 @@ public sealed class NativeCacheStatisticsTests
         }
         Assert.Empty(statistics.ActiveTransfers());
     }
+
+    [Fact]
+    public void IdleTransfer_LeavesActiveListUntilItCommitsAgain()
+    {
+        var clock = new ManualClock();
+        var statistics = new NativeCacheStatistics(clock);
+        using var transfer = statistics.BeginTransfer("item", "Film.mkv", 100, background: true)!;
+        transfer.Committed(40);
+        clock.Now += NativeCacheStatistics.TransferIdleAfter;
+        Assert.Single(statistics.ActiveTransfers());
+        clock.Now += TimeSpan.FromSeconds(1);
+        Assert.Empty(statistics.ActiveTransfers());
+        transfer.Committed(20);
+        Assert.Equal(60, Assert.Single(statistics.ActiveTransfers()).CommittedBytes);
+    }
+
+    private sealed class ManualClock : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = DateTimeOffset.UtcNow;
+        public override DateTimeOffset GetUtcNow() => Now;
+    }
 }

@@ -1,8 +1,11 @@
 namespace NzbWebDAV.Services.NativeCache;
 
 /// <summary>Process counters plus bounded five-minute deltas. No per-block database writes.</summary>
-public sealed class NativeCacheStatistics
+public sealed class NativeCacheStatistics(TimeProvider? clock = null)
 {
+    /// <summary>A transfer with no commit for this long is waiting (a paused warm lane), not transferring.</summary>
+    internal static readonly TimeSpan TransferIdleAfter = TimeSpan.FromSeconds(30);
+    private readonly TimeProvider _clock = clock ?? TimeProvider.System;
     private long _hitBlocks, _hitBytes, _missBlocks, _committedBytes, _fallbacks, _ioTimeouts;
     private readonly Lock _windowGate = new();
     private readonly Dictionary<long, NativeCacheTrafficBucket> _pending = [];
@@ -82,15 +85,19 @@ public sealed class NativeCacheStatistics
             if (_transfers.Count >= 64) return null;
             var id = ++_nextTransferId;
             var transfer = new NativeCacheTransfer(this, id, itemId, name is { Length: > 256 } ? name[..256] : name,
-                length, background, DateTimeOffset.UtcNow);
+                length, background, _clock.GetUtcNow());
             _transfers[id] = transfer;
             return transfer;
         }
     }
     public IReadOnlyList<NativeCacheTransferSnapshot> ActiveTransfers()
     {
-        lock (_windowGate) return _transfers.Values.Where(x => x.CommittedBytes > 0)
-            .Select(x => x.Snapshot()).OrderByDescending(x => x.StartedAt).ToArray();
+        lock (_windowGate)
+        {
+            var now = _clock.GetUtcNow();
+            return _transfers.Values.Where(x => x.CommittedBytes > 0 && now - x.LastCommitAt <= TransferIdleAfter)
+                .Select(x => x.Snapshot(now)).OrderByDescending(x => x.StartedAt).ToArray();
+        }
     }
 
     public sealed class NativeCacheTransfer(NativeCacheStatistics owner, long id, string itemId, string? name,
@@ -98,9 +105,11 @@ public sealed class NativeCacheStatistics
     {
         private long _bytes;
         private long _recentBytes;
-        private DateTimeOffset _recentAt = DateTimeOffset.UtcNow;
+        private DateTimeOffset _recentAt = startedAt;
         private bool _disposed;
         public long CommittedBytes => Interlocked.Read(ref _bytes);
+        internal DateTimeOffset LastCommitAt { get; private set; } = startedAt;
+        private DateTimeOffset StartedAt { get; } = startedAt;
         public void Committed(long bytes)
         {
             if (bytes <= 0) return;
@@ -108,15 +117,16 @@ public sealed class NativeCacheStatistics
             {
                 if (_disposed) return;
                 Interlocked.Add(ref _bytes, bytes);
-                var now = DateTimeOffset.UtcNow;
+                var now = owner._clock.GetUtcNow();
+                LastCommitAt = now;
                 if (now - _recentAt > TimeSpan.FromSeconds(5)) { _recentAt = now; _recentBytes = 0; }
                 _recentBytes += bytes;
             }
         }
-        internal NativeCacheTransferSnapshot Snapshot()
+        internal NativeCacheTransferSnapshot Snapshot(DateTimeOffset now)
         {
-            var seconds = Math.Max(1, (DateTimeOffset.UtcNow - _recentAt).TotalSeconds);
-            return new(itemId, name, length, CommittedBytes, (long)(_recentBytes / seconds), startedAt, background);
+            var seconds = Math.Max(1, (now - _recentAt).TotalSeconds);
+            return new(itemId, name, length, CommittedBytes, (long)(_recentBytes / seconds), StartedAt, background);
         }
         public void Dispose()
         {
