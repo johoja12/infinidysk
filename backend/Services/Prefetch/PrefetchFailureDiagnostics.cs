@@ -10,6 +10,7 @@ internal static class PrefetchFailureDiagnostics
     /// <summary>A stable category (stored as the job's failure code) and safe operator guidance.</summary>
     internal static (string Category, string Guidance) Classify(Exception exception) => exception switch
         {
+            CircuitAdmissionRejectedException => ("provider-unavailable", "Provider access is temporarily unavailable while circuits recover."),
             UsenetArticleNotFoundException => ("source-unavailable", "A required article is unavailable. Check source health before retrying."),
             SeekPositionNotFoundException => ("source-layout", "A source byte position could not be resolved. Check the imported source before retrying."),
             UnauthorizedAccessException => ("storage-access", "A file or cache access was denied. Check storage permissions before retrying."),

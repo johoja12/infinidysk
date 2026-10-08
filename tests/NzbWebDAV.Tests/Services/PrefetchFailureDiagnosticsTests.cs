@@ -11,6 +11,7 @@ public sealed class PrefetchFailureDiagnosticsTests : IDisposable
     private readonly string _root = Path.Combine(Path.GetTempPath(), "prefetch-diagnostics-" + Guid.NewGuid().ToString("N"));
 
     [Theory]
+    [InlineData("circuit", "provider-unavailable", "queued")]
     [InlineData("io", "source-or-cache-io", "queued")]
     [InlineData("article", "source-unavailable", "failed")]
     [InlineData("seek", "source-layout", "failed")]
@@ -24,6 +25,7 @@ public sealed class PrefetchFailureDiagnosticsTests : IDisposable
         var inner = new Exception(secret);
         Exception exception = failure switch
         {
+            "circuit" => new CircuitAdmissionRejectedException(),
             "io" => new IOException(secret, inner),
             "article" => new UsenetArticleNotFoundException(secret, secret),
             "seek" => new SeekPositionNotFoundException(secret, inner),

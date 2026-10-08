@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Hosting;
+using NzbWebDAV.Exceptions;
 using Serilog;
 
 namespace NzbWebDAV.Services.Prefetch;
@@ -111,6 +112,13 @@ public sealed class PrefetchCoordinator(PrefetchJobStore store, IPrefetchExecuto
             catch (PrefetchDeferredException exception)
             {
                 store.Defer(job.Id, exception.Message, exception.RetryAfter ?? TimeSpan.FromMinutes(1), exception.CountsAsFailure, exception.FailureCode);
+                return;
+            }
+            catch (CircuitAdmissionRejectedException exception)
+            {
+                var delay = TimeSpan.FromMinutes(Math.Min(5, Math.Pow(2, Math.Min(3, store.Attempts(job.Id)))));
+                store.Defer(job.Id, PrefetchFailureDiagnostics.Report(logger ?? Log.Logger, job, exception, retryable: true),
+                    delay, consumeAttempt: true, PrefetchFailureDiagnostics.Classify(exception).Category);
                 return;
             }
             catch (IOException exception)
