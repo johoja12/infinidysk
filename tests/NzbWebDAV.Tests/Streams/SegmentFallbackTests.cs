@@ -156,7 +156,7 @@ public class SegmentFallbackTests
     }
 
     [Fact]
-    public async Task MultiSegmentStream_PrefetchCeilingGrowsWithConsumedBytes()
+    public async Task MultiSegmentStream_PrefetchCeilingOpensFullWindowAfterFirstRead()
     {
         var segmentIds = Enumerable.Range(0, 100).Select(index => $"seg-{index}").ToArray();
         var client = new RawBodyNntpClient(
@@ -181,9 +181,61 @@ public class SegmentFallbackTests
         await Task.Delay(200);
         Assert.Equal(8, client.BodyRequestCount);
 
-        var buffer = new byte[25];
+        // Low-bitrate playback must not wait for consumption to grow the window.
+        var buffer = new byte[1];
         await stream.ReadExactlyAsync(buffer);
-        Assert.Equal(65, multiSegmentStream.CurrentPrefetchByteCeiling);
+        Assert.Equal(400, multiSegmentStream.CurrentPrefetchByteCeiling);
+        deadline = DateTime.UtcNow.AddSeconds(5);
+        while (client.BodyRequestCount < 80 && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+        Assert.True(client.BodyRequestCount >= 80, $"Only {client.BodyRequestCount} bodies requested.");
+    }
+
+    [Fact]
+    public async Task MultiSegmentStream_SpeculativeAllowanceTracksReaderInEarlierPart()
+    {
+        var segmentIds = Enumerable.Range(0, 100).Select(index => $"seg-{index}").ToArray();
+        var client = new RawBodyNntpClient(
+            segmentIds.ToDictionary(id => id, _ => Encoding.ASCII.GetBytes("abcde")));
+        var cursor = new ReadAheadCursor();
+        var speculative = new SpeculativeReadAhead();
+        // A 100-byte window with 70 unread bytes in front leaves this part 30 bytes.
+        speculative.Bind(cursor, start: 70, window: 100);
+
+        await using var stream = MultiSegmentStream.CreateWithInitialBatchPlan(
+            segmentIds.AsMemory(),
+            client,
+            articleBufferSize: 20,
+            estimatedSegmentSize: 5,
+            failFastOnFirstSegment: false,
+            usePipelinedBodyRequests: false,
+            cancellationToken: CancellationToken.None,
+            fileName: "speculative.bin",
+            speculativeReadAhead: speculative);
+        var multiSegmentStream = Assert.IsType<MultiSegmentStream>(stream);
+
+        async Task AssertSettlesAtAsync(int requests)
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (client.BodyRequestCount < requests && DateTime.UtcNow < deadline)
+                await Task.Delay(10);
+            await Task.Delay(200);
+            Assert.Equal(requests, client.BodyRequestCount);
+        }
+
+        Assert.Equal(30, multiSegmentStream.CurrentPrefetchByteCeiling);
+        await AssertSettlesAtAsync(6);
+
+        // The reader advancing in the earlier part grows the allowance past the 8-segment ramp
+        // without this part being read.
+        cursor.Advance(50);
+        Assert.Equal(80, multiSegmentStream.CurrentPrefetchByteCeiling);
+        await AssertSettlesAtAsync(16);
+
+        // Once the reader reaches this part only its own window applies.
+        cursor.Advance(70);
+        Assert.Equal(100, multiSegmentStream.CurrentPrefetchByteCeiling);
+        await AssertSettlesAtAsync(20);
     }
 
     [Fact]

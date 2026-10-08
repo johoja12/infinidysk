@@ -35,7 +35,8 @@ internal sealed class YencFileValidationContext : IDisposable
         string[][]? segmentFallbacks = null,
         bool deferToPar2Proof = false,
         string? fileName = null,
-        bool ownerLogsOutcome = false)
+        bool ownerLogsOutcome = false,
+        Lazy<Dictionary<string, int>>? positionIndex = null)
     {
         _fileName = string.IsNullOrWhiteSpace(fileName) ? null : fileName;
         _ownerLogsOutcome = ownerLogsOutcome;
@@ -44,7 +45,7 @@ internal sealed class YencFileValidationContext : IDisposable
         _file = file;
         _segmentIds = segmentIds;
         _segmentFallbacks = segmentFallbacks;
-        _positionIndex = new Lazy<Dictionary<string, int>>(CreatePositionIndex);
+        _positionIndex = positionIndex ?? new Lazy<Dictionary<string, int>>(CreatePositionIndex);
         _deferToPar2Proof = deferToPar2Proof;
         Active.Value = this;
     }
@@ -105,12 +106,13 @@ internal sealed class YencFileValidationContext : IDisposable
         new YencFileValidationContext(file.Segments.Count, "SizeProbe", file: file);
 
     public static IDisposable BeginStreaming(
-        string[] segmentIds, string[][]? segmentFallbacks, string? fileName = null) =>
+        string[] segmentIds, string[][]? segmentFallbacks, string? fileName = null,
+        Lazy<Dictionary<string, int>>? positionIndex = null) =>
         new YencFileValidationContext(
             segmentIds.Length, "Streaming", segmentIds: segmentIds, segmentFallbacks: segmentFallbacks,
             deferToPar2Proof: Current?._deferToPar2Proof == true
                 && ReferenceEquals(Current._segmentIds, segmentIds),
-            fileName: fileName);
+            fileName: fileName, positionIndex: positionIndex);
 
     /// <summary>
     /// Scope for sampled article-content verification of an imported file. Foreign answers
@@ -134,10 +136,11 @@ internal sealed class YencFileValidationContext : IDisposable
             ownerLogsOutcome: true);
 
     internal static IDisposable BeginBufferedPar2ProofRead(
-        string[] segmentIds, string[][]? segmentFallbacks, string? fileName = null) =>
+        string[] segmentIds, string[][]? segmentFallbacks, string? fileName = null,
+        Lazy<Dictionary<string, int>>? positionIndex = null) =>
         new YencFileValidationContext(
             segmentIds.Length, "BufferedPar2ProofRead", segmentIds: segmentIds,
-            segmentFallbacks: segmentFallbacks, deferToPar2Proof: true, fileName: fileName);
+            segmentFallbacks: segmentFallbacks, deferToPar2Proof: true, fileName: fileName, positionIndex: positionIndex);
 
     /// <summary>
     /// Identity of the active file for <see cref="MismatchedArticleTracker"/>: its first
@@ -193,6 +196,10 @@ internal sealed class YencFileValidationContext : IDisposable
             : current._segmentIds![0];
         return new UsenetForeignPostException(anchor, foreignArticles, current.ExpectedTotalParts);
     }
+
+    internal static Lazy<Dictionary<string, int>> CreatePositionIndex(
+        string[] segmentIds, string[][]? segmentFallbacks) =>
+        new(() => BuildPositionIndex(segmentIds, segmentFallbacks));
 
     public (string? FileAnchor, int? Position, int? NzbNumber) GetRequestDetails(string requestedId)
     {
@@ -305,29 +312,22 @@ internal sealed class YencFileValidationContext : IDisposable
 
     private Dictionary<string, int> CreatePositionIndex()
     {
-        var index = new Dictionary<string, int>(StringComparer.Ordinal);
-        var segmentCount = _file?.Segments.Count ?? _segmentIds?.Length ?? 0;
-        for (var segmentIndex = 0; segmentIndex < segmentCount; segmentIndex++)
-        {
-            var messageId = _file is { } file
-                ? file.Segments[segmentIndex].MessageId
-                : _segmentIds![segmentIndex];
-            index.TryAdd(NormalizeMessageId(messageId), segmentIndex + 1);
-        }
+        if (_file is { } file)
+            return BuildPositionIndex(file.GetSegmentIds(), file.GetSegmentFallbackIds());
+        return BuildPositionIndex(_segmentIds ?? [], _segmentFallbacks);
+    }
 
-        if (_file is { } nzbFile)
+    private static Dictionary<string, int> BuildPositionIndex(string[] segmentIds, string[][]? segmentFallbacks)
+    {
+        var index = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (var segmentIndex = 0; segmentIndex < segmentIds.Length; segmentIndex++)
+            index.TryAdd(NormalizeMessageId(segmentIds[segmentIndex]), segmentIndex + 1);
+
+        if (segmentFallbacks is not null)
         {
-            for (var segmentIndex = 0; segmentIndex < nzbFile.Segments.Count; segmentIndex++)
+            for (var segmentIndex = 0; segmentIndex < Math.Min(segmentIds.Length, segmentFallbacks.Length); segmentIndex++)
             {
-                foreach (var fallbackId in nzbFile.Segments[segmentIndex].FallbackMessageIds)
-                    index.TryAdd(NormalizeMessageId(fallbackId), segmentIndex + 1);
-            }
-        }
-        else if (_segmentFallbacks is not null)
-        {
-            for (var segmentIndex = 0; segmentIndex < Math.Min(segmentCount, _segmentFallbacks.Length); segmentIndex++)
-            {
-                if (_segmentFallbacks[segmentIndex] is not { } fallbackIds) continue;
+                if (segmentFallbacks[segmentIndex] is not { } fallbackIds) continue;
                 foreach (var fallbackId in fallbackIds)
                     index.TryAdd(NormalizeMessageId(fallbackId), segmentIndex + 1);
             }

@@ -12,13 +12,22 @@ public sealed class CacheReadEvidenceTests
     [InlineData("missing", false)]
     public async Task BufferedSegment_OnlyCompleteAcceptedBytesAreCacheable(string kind, bool expected)
     {
+        using var native = new NativeCacheReadContext();
         var data = new Dictionary<string, byte[]> { ["two"] = "fghij"u8.ToArray() };
-        if (kind != "missing") data["one"] = kind == "short" ? "ab"u8.ToArray() : "abcde"u8.ToArray();
-        using var client = new FakeNntpClient(data, useCachedYencStreams: true);
+        if (kind != "missing") data["one"] = "abcde"u8.ToArray();
+        using var client = new FakeNntpClient(data, useCachedYencStreams: true,
+            segmentRanges: new Dictionary<string, NzbWebDAV.Models.LongRange>
+            {
+                ["one"] = new(0, 5), ["two"] = new(5, 10),
+            },
+            decodedStreamFactory: (id, bytes) => kind == "short" && id == "one"
+                ? new MemoryStream(bytes, 0, 2, writable: false)
+                : new MemoryStream(bytes, writable: false));
         await using var stream = MultiSegmentStream.Create(new[] { "one", "two" }.AsMemory(), client,
             articleBufferSize: 4, estimatedSegmentSize: 5, failFastOnFirstSegment: false,
             usePipelinedBodyRequests: true, cancellationToken: CancellationToken.None,
-            fileName: "evidence-" + Guid.NewGuid().ToString("N"), exactSegmentSizes: new long[] { 5, 5 });
+            fileName: "evidence-" + Guid.NewGuid().ToString("N"), exactSegmentSizes: new long[] { 5, 5 },
+            firstSegmentFileOffset: 0);
         var buffer = new byte[5];
         Assert.Equal(5, await stream.ReadAsync(buffer));
         var evidence = Assert.IsAssignableFrom<ICacheReadEvidence>(stream);

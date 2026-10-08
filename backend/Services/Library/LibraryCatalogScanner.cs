@@ -99,7 +99,7 @@ public sealed class LibraryCatalogScanner(
         {
             foreach (var (isPrimary, rootPath) in roots)
             {
-                discovered.AddRange(SymlinkAndStrmUtil.GetAllSymlinksAndStrms(rootPath)
+                discovered.AddRange(SymlinkAndStrmUtil.GetAllSymlinksAndStrms(rootPath, ct)
                     .Where(info => !videoOnly || MediaLibraryVideoFilter.IsVideoLink(info))
                     .Select(info => info switch
                     {
