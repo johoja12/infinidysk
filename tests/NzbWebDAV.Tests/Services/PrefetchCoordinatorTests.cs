@@ -1,4 +1,5 @@
 using NzbWebDAV.Services.Prefetch;
+using NzbWebDAV.Exceptions;
 using Microsoft.Data.Sqlite;
 
 namespace NzbWebDAV.Tests.Services;
@@ -188,6 +189,80 @@ public sealed class PrefetchCoordinatorTests : IDisposable
         var until = DateTimeOffset.FromUnixTimeMilliseconds((long)command.ExecuteScalar()!);
         Assert.InRange(until - before, TimeSpan.FromMinutes(minMinutes), TimeSpan.FromMinutes(maxMinutes));
         Assert.Equal("queued", Assert.Single(store.List()).State);
+    }
+
+    [Fact]
+    public async Task CircuitRejection_RetainsCoverageAndResumesAfterBackoff()
+    {
+        var path = Path.Combine(_root, "circuit-recovery.db");
+        using var store = new PrefetchJobStore(path);
+        var job = store.Enqueue(Guid.NewGuid(), "manual", 0);
+        var calls = 0;
+        using var coordinator = new PrefetchCoordinator(store, new CallbackExecutor((current, _) =>
+        {
+            calls++;
+            if (calls == 1)
+            {
+                store.Progress(current.Id, "generation", 4096);
+                throw new CircuitAdmissionRejectedException();
+            }
+            Assert.Equal(4096, current.CommittedBytes);
+            return Task.CompletedTask;
+        }), () => new(), () => true);
+        await coordinator.RunOnceAsync(CancellationToken.None);
+        var saved = Assert.Single(store.List());
+        Assert.Equal("queued", saved.State);
+        Assert.Equal("provider-unavailable", saved.FailureCode);
+        Assert.Equal(4096, saved.CommittedBytes);
+        Assert.Equal(1, store.Attempts(job.Id));
+        await coordinator.RunOnceAsync(CancellationToken.None);
+        Assert.Equal(1, calls); // No immediate retry during the cooldown.
+        ExecuteSql(path, "UPDATE Deferred SET Until=0");
+        await coordinator.RunOnceAsync(CancellationToken.None);
+        Assert.Equal(2, calls);
+        Assert.Equal("completed", Assert.Single(store.List()).State);
+        Assert.Null(coordinator.RuntimeError);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(3)]
+    [InlineData(5)]
+    public async Task CircuitRejection_BackoffIsCappedAndRetryLimitIsHonored(int maxRetries)
+    {
+        var path = Path.Combine(_root, "circuit-limit.db");
+        using var store = new PrefetchJobStore(path, settings: () => new() { MaxRetries = maxRetries });
+        var job = store.Enqueue(Guid.NewGuid(), "manual", 0);
+        var calls = 0;
+        using var coordinator = new PrefetchCoordinator(store, new CallbackExecutor((_, _) =>
+        {
+            calls++;
+            throw new CircuitAdmissionRejectedException();
+        }), () => new(), () => true);
+        for (var attempt = 0; attempt <= maxRetries; attempt++)
+        {
+            // Deferred timestamps are persisted at millisecond precision.
+            var before = DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+            await coordinator.RunOnceAsync(CancellationToken.None);
+            Assert.Equal(attempt + 1, calls);
+            using var connection = new SqliteConnection($"Data Source={path};Mode=ReadOnly");
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "SELECT Until FROM Deferred WHERE Id=$id";
+            command.Parameters.AddWithValue("$id", job.Id);
+            var until = DateTimeOffset.FromUnixTimeMilliseconds((long)command.ExecuteScalar()!);
+            var delay = TimeSpan.FromMinutes(Math.Min(5, Math.Pow(2, Math.Min(3, attempt))));
+            Assert.InRange(until - before, delay, delay + TimeSpan.FromSeconds(5));
+            await coordinator.RunOnceAsync(CancellationToken.None);
+            Assert.Equal(attempt + 1, calls);
+            ExecuteSql(path, "UPDATE Deferred SET Until=0");
+        }
+        await coordinator.RunOnceAsync(CancellationToken.None);
+        Assert.Equal(maxRetries + 1, calls);
+        var saved = Assert.Single(store.List());
+        Assert.Equal("failed", saved.State);
+        Assert.Equal("provider-unavailable", saved.FailureCode);
+        Assert.Equal(maxRetries + 1, store.Attempts(job.Id));
     }
 
     private sealed class FailingExecutor : IPrefetchExecutor
