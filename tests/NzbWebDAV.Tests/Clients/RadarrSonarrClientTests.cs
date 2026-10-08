@@ -16,6 +16,7 @@ public class RadarrSonarrClientTests
     {
         const string path = "/synthetic/movie.mkv";
         var handler = CreateHandler(
+            ("GET /api/v3/parse?title=movie.mkv", Status(HttpStatusCode.NotFound)),
             ("GET /api/v3/movie", JsonResponse("""[{"id":101,"movieFile":{"id":201,"path":"/synthetic/movie.mkv"}}]""")),
             ("POST /api/v3/command", JsonResponse("""{"id":301}""")));
         using var http = new HttpClient(handler);
@@ -24,7 +25,7 @@ public class RadarrSonarrClientTests
         Assert.NotNull(match);
         var command = await SearchFileInArrController.RequestSearchAsync(new(client, "radarr", "synthetic", "Synthetic", path, match), CancellationToken.None);
         Assert.Equal(301, command.Id);
-        Assert.Equal(["GET /api/v3/movie", "POST /api/v3/command"], handler.Requests);
+        Assert.Equal(["GET /api/v3/parse?title=movie.mkv", "GET /api/v3/movie", "POST /api/v3/command"], handler.Requests);
         using var body = JsonDocument.Parse(Assert.Single(handler.Bodies));
         Assert.Equal("MoviesSearch", body.RootElement.GetProperty("name").GetString());
         Assert.Equal([101], body.RootElement.GetProperty("movieIds").EnumerateArray().Select(value => value.GetInt32()));
