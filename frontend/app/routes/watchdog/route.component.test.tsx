@@ -52,6 +52,37 @@ describe("Watchdog attempt timeline", () => {
     expect(screen.getAllByText("5.8s").length).toBeGreaterThan(0);
   });
 
+  it("shows a confirmed replacement on the failed request without hiding its failure", () => {
+    render(
+      <Watchdog
+        {...({
+          loaderData: {
+            entries: [
+              entry({
+                replacementTitle: "Example.S01E01.WEB-EDITH",
+                replacementImportedAtUnix: 1_800_000_120,
+              }),
+            ],
+          },
+        } as ComponentProps<typeof Watchdog>)}
+      />,
+    );
+    expect(screen.getByText("Replacement imported")).toBeTruthy();
+    expect(screen.getByText(/Example.S01E01.WEB-EDITH · Imported/)).toBeTruthy();
+    expect(screen.getByText("Missing volumes. Try another release.")).toBeTruthy();
+    expect(screen.queryByText("Recovery unconfirmed")).toBeNull();
+    expect(screen.getByRole("radiogroup", { name: "Watchdog status filter" }).textContent).toBe(
+      "All 1Resolved 1",
+    );
+  });
+
+  it("does not imply recovery when no replacement is confirmed", () => {
+    render(
+      <Watchdog {...({ loaderData: { entries: [entry()] } } as ComponentProps<typeof Watchdog>)} />,
+    );
+    expect(screen.getByText("Recovery unconfirmed")).toBeTruthy();
+  });
+
   it("hides empty filters and offers recovery when the log is empty", () => {
     render(
       <Watchdog {...({ loaderData: { entries: [entry()] } } as ComponentProps<typeof Watchdog>)} />,

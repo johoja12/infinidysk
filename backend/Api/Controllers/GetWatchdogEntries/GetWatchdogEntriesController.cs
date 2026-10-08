@@ -9,7 +9,8 @@ namespace NzbWebDAV.Api.Controllers.GetWatchdogEntries;
 [Route("api/get-watchdog-entries")]
 public partial class GetWatchdogEntriesController(
     WatchdogLog watchdogLog,
-    ConfigManager configManager
+    ConfigManager configManager,
+    WatchdogRecoveryService recoveryService
 ) : BaseApiController
 {
     [GeneratedRegex(@"\s*\(\d+%\)\s*$")] private static partial Regex PercentSuffixRegex();
@@ -28,6 +29,7 @@ public partial class GetWatchdogEntriesController(
             .ToDictionary(g => g.Key, g => g.First().Nickname, StringComparer.OrdinalIgnoreCase);
 
         var recent = await watchdogLog.GetRecentAsync(limit, HttpContext.RequestAborted).ConfigureAwait(false);
+        var recoveries = await recoveryService.GetRecoveriesAsync(recent, HttpContext.RequestAborted);
         var dtos = recent.Select(a => new GetWatchdogEntriesResponse.EntryDto
         {
             ClickId = a.ClickId.ToString(),
@@ -42,6 +44,8 @@ public partial class GetWatchdogEntriesController(
             FailReason = a.FailReason,
             DurationMs = a.DurationMs,
             IsWinner = a.IsWinner,
+            ReplacementTitle = recoveries.GetValueOrDefault(a.ClickId)?.SourceTitle,
+            ReplacementImportedAtUnix = recoveries.GetValueOrDefault(a.ClickId)?.Date.ToUnixTimeSeconds(),
             ProviderHost = a.ProviderHost,
             ProviderNickname = ResolveNickname(a.ProviderHost, nicknamesByHost),
         }).ToList();

@@ -469,6 +469,7 @@ public sealed partial class Program
                 .AddHostedService(sp => sp.GetRequiredService<ProwlarrSyncService>())
                 .AddSingleton<PlaybackFastVerifier>()
                 .AddSingleton<WatchdogLog>()
+                .AddSingleton<WatchdogRecoveryService>()
                 .AddSingleton<PreflightCache>()
                 .AddSingleton<PreflightSessionRegistry>()
                 .AddSingleton<PreflightOrchestrator>()

@@ -989,6 +989,8 @@ export type WatchdogEntry = {
   isWinner: boolean;
   providerHost?: string | null | undefined;
   providerNickname?: string | null | undefined;
+  replacementTitle?: string | null;
+  replacementImportedAtUnix?: number | null;
 };
 
 export type DirectoryItem = {

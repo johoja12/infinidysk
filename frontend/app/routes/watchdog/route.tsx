@@ -296,6 +296,7 @@ function ClickCard({ group }: { group: ClickGroup }) {
       ? "loss"
       : "inflight";
   const winner = group.attempts.find((a) => a.isWinner);
+  const recovery = group.attempts.find((a) => a.replacementTitle && a.replacementImportedAtUnix);
   const [expanded, setExpanded] = useState(status === "inflight");
 
   return (
@@ -311,7 +312,13 @@ function ClickCard({ group }: { group: ClickGroup }) {
               name="chevron_right"
               className={`shrink-0 !text-[20px] text-base-content/60 transition-transform ${expanded ? "rotate-90" : ""}`}
             />
-            <StatusPill status={status} />
+            {recovery ? (
+              <Badge className="badge-success badge-soft badge-sm shrink-0">
+                Replacement imported
+              </Badge>
+            ) : (
+              <StatusPill status={status} />
+            )}
             <span className="min-w-0 break-words font-semibold text-base-content [overflow-wrap:anywhere]">
               {group.requestedTitle}
             </span>
@@ -332,6 +339,15 @@ function ClickCard({ group }: { group: ClickGroup }) {
           </div>
         </div>
 
+        {recovery && (
+          <p className="mt-1.5 break-words pl-[30px] text-xs text-success">
+            {recovery.replacementTitle} · Imported{" "}
+            {new Date(recovery.replacementImportedAtUnix! * 1000).toLocaleString()}
+          </p>
+        )}
+        {!group.hasWinner && group.attempts.some((a) => a.outcome === "QueueFailed") && (
+          <p className="mt-1.5 pl-[30px] text-xs text-base-content/60">Recovery unconfirmed</p>
+        )}
         {winner && (
           <div className="mt-1.5 flex flex-wrap items-center gap-2 pl-[30px] text-xs text-base-content/60">
             <span>
@@ -546,6 +562,8 @@ function attemptsEqual(a: WatchdogEntry[], b: WatchdogEntry[]): boolean {
     if (x.durationMs !== y.durationMs) return false;
     if (x.size !== y.size) return false;
     if (x.failReason !== y.failReason) return false;
+    if (x.replacementTitle !== y.replacementTitle) return false;
+    if (x.replacementImportedAtUnix !== y.replacementImportedAtUnix) return false;
   }
   return true;
 }
@@ -557,14 +575,14 @@ function groupByClick(list: WatchdogEntry[]): ClickGroup[] {
     if (g) {
       g.attempts.push(a);
       if (a.attemptedAtUnix > g.firstAt) g.firstAt = a.attemptedAtUnix;
-      if (a.isWinner) g.hasWinner = true;
+      if (a.isWinner || a.replacementImportedAtUnix) g.hasWinner = true;
     } else {
       map.set(a.clickId, {
         clickId: a.clickId,
         firstAt: a.attemptedAtUnix,
         requestedTitle: a.requestedTitle,
         contentType: a.contentType,
-        hasWinner: a.isWinner,
+        hasWinner: a.isWinner || !!a.replacementImportedAtUnix,
         allResolved: false,
         attempts: [a],
       });

@@ -94,6 +94,9 @@ public class ArrClient(string host, string apiKey)
     public virtual Task<ArrQueue<ArrQueueRecord>> GetQueueAsync(CancellationToken ct = default) =>
         Get<ArrQueue<ArrQueueRecord>>($"/queue?protocol=usenet&pageSize=5000", ct);
 
+    public virtual Task<ArrHistory> GetRecentHistoryAsync(CancellationToken ct = default) =>
+        Get<ArrHistory>("/history?page=1&pageSize=500&sortKey=date&sortDirection=descending", ct);
+
     public virtual Task<ArrHistory> GetImportHistoryAsync(int page, int pageSize, CancellationToken ct = default) =>
         Get<ArrHistory>($"/history?eventType=3&page={page}&pageSize={pageSize}&sortKey=date&sortDirection=descending", ct);
 
