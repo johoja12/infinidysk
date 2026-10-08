@@ -30,6 +30,12 @@ public class ArrHistoryRecord
     [JsonPropertyName("sourceTitle")]
     public string? SourceTitle { get; set; }
 
+    [JsonPropertyName("episodeId")]
+    public int? EpisodeId { get; set; }
+
+    [JsonPropertyName("movieId")]
+    public int? MovieId { get; set; }
+
     [JsonPropertyName("data")]
     public ArrHistoryData? Data { get; set; } = new();
 }
