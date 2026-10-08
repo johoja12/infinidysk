@@ -166,7 +166,9 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
     /// <summary>
     /// Extra lanes for one job: half the native buffer slots, at most <see cref="MaxLanes"/> in all.
     /// They run only while nothing is playing and at least half the slots are free, so playback
-    /// always finds buffers; the primary lane alone continues otherwise.
+    /// always finds buffers; the primary lane alone continues otherwise. Short probe reads (library
+    /// scans, media analysis) do not count as playback: the connection governor already yields to
+    /// any transfer they queue.
     /// </summary>
     private WarmLanes? WarmLanesFor(NzbWebDAV.Database.Models.DavItem item, IDavContentStreamFactory factory)
     {
@@ -176,9 +178,13 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         return new WarmLanes(extra,
             async token => await native.WrapAsync(item, open => factory.OpenAsync(item, open), token, requireNative: true)
                 .ConfigureAwait(false) as NativeCachedStream,
-            () => activeReads.Snapshot().Count == 0 && playback?.HasActivePlayback != true
-                && slots.Free >= (slots.Capacity + 1) / 2);
+            () => ExtraLanesMayRun(activeReads.Snapshot(), playback?.HasActivePlayback == true,
+                slots.Free, slots.Capacity, DateTimeOffset.UtcNow));
     }
+
+    internal static bool ExtraLanesMayRun(IReadOnlyList<ActiveReadRegistry.Entry> reads, bool plexPlayback,
+        int freeSlots, int capacity, DateTimeOffset now)
+        => !plexPlayback && freeSlots >= (capacity + 1) / 2 && !reads.Any(read => read.QualifiesForWarming(now));
 
     /// <summary>
     /// A damaged release cannot be fixed by warming again: hand the item to the existing repair path
