@@ -39,6 +39,43 @@ public sealed class CacheReadEvidenceTests
     }
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task GapFill_ReachesTheRecorderOfTheContextTheStreamWasOpenedUnder(bool missing)
+    {
+        var gaps = new NativeCacheGapRecorder();
+        var data = new Dictionary<string, byte[]> { ["two"] = "fghij"u8.ToArray() };
+        if (!missing) data["one"] = "abcde"u8.ToArray();
+        using var client = new FakeNntpClient(data, useCachedYencStreams: true,
+            segmentRanges: new Dictionary<string, NzbWebDAV.Models.LongRange>
+            {
+                ["one"] = new(0, 5), ["two"] = new(5, 10),
+            });
+        Stream stream;
+        using (new NativeCacheReadContext(gaps: gaps))
+        {
+            stream = MultiSegmentStream.Create(new[] { "one", "two" }.AsMemory(), client,
+                articleBufferSize: 4, estimatedSegmentSize: 5, failFastOnFirstSegment: false,
+                usePipelinedBodyRequests: true, cancellationToken: CancellationToken.None,
+                fileName: "evidence-" + Guid.NewGuid().ToString("N"), exactSegmentSizes: new long[] { 5, 5 },
+                firstSegmentFileOffset: 0);
+        }
+        await using (stream)
+        {
+            // Later fills open fresh contexts; downloads keep the one they started under.
+            using var read = new NativeCacheReadContext(gaps: gaps);
+            var buffer = new byte[10];
+            Assert.Equal(5, await stream.ReadAsync(buffer.AsMemory(0, 5)));
+            Assert.Equal(5, await stream.ReadAsync(buffer.AsMemory(5, 5)));
+        }
+
+        if (missing)
+            Assert.Equal("one", Assert.IsType<NzbWebDAV.Exceptions.UsenetArticleNotFoundException>(gaps.Conclusive).SegmentId);
+        else
+            Assert.Null(gaps.Conclusive);
+    }
+
+    [Theory]
     [InlineData(0, 0)]
     [InlineData(4, 0)]
     [InlineData(0, 2)]

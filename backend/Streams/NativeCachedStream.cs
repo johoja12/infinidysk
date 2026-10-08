@@ -103,6 +103,12 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     /// mismatch, or a different post), or -1. Warming treats repeated failures here as source damage.
     /// </summary>
     internal long LastUnverifiedSourceBlock { get; private set; } = -1;
+    private readonly NativeCacheGapRecorder _gaps = new();
+    /// <summary>
+    /// The first article this stream's source gap-filled because it is missing on every provider or
+    /// persistently corrupt, or null. Retrying cannot verify those bytes.
+    /// </summary>
+    internal Exception? ConclusiveGapFill => _gaps.Conclusive;
     /// <summary>
     /// End of the contiguous uncached run a warming job is filling, or null. Warm probes size the
     /// source window to it so consecutive blocks share one NNTP pipeline instead of each block
@@ -768,13 +774,13 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             remaining = Math.Min(remaining, rounded);
         }
         _sourceWindowEnd = position + remaining;
-        using var context = new NativeCacheReadContext(remaining);
+        using var context = new NativeCacheReadContext(remaining, _gaps);
         source.Position = position;
     }
 
     private async ValueTask<int> ReadSourceForFillAsync(Stream source, Memory<byte> destination, CancellationToken cancellationToken)
     {
-        using var context = new NativeCacheReadContext(_sourceWindowEnd - source.Position);
+        using var context = new NativeCacheReadContext(_sourceWindowEnd - source.Position, _gaps);
         return await source.ReadAsync(destination, cancellationToken).ConfigureAwait(false);
     }
 

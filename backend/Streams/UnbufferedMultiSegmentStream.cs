@@ -885,6 +885,7 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream, ISegm
         _consecutiveZeroFills++;
         _openSegmentHole = true;
         PlaybackHoleTracker.RecordHole(_fileName, segmentId, cause);
+        NativeCacheReadContext.RecordGapFill(cause);
         var inconclusive = !isCorruption && cause.IsInconclusiveArticleMiss();
         var template = isCorruption
             ? "Article {SegmentId} persistently corrupt while reading {FileName}. Filling the {Bytes}-byte gap to preserve later file offsets."

@@ -444,6 +444,9 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         }
         if (stream.LastFillFailure is { } failure && ConclusiveDamage(failure, out var segmentId))
             return new PrefetchSourceDamagedException(DamagedDetail(position), segmentId);
+        // A gap fill is conclusive on the first run: every provider already answered.
+        if (stream.ConclusiveGapFill is { } gap && ConclusiveDamage(gap, out var gapSegmentId))
+            return new PrefetchSourceDamagedException(DamagedDetail(position), gapSegmentId);
         if (stream.LastUnverifiedSourceBlock == position / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize)
             return new PrefetchDeferredException(
                 $"Source bytes near {position / (1024 * 1024)} MiB did not verify: articles may be missing, corrupt, or from a different post. Retrying; repeated failures are treated as a damaged release.",

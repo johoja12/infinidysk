@@ -178,6 +178,24 @@ public sealed class PrefetchWarmingOutcomeTests
     }
 
     [Theory]
+    [InlineData(false, true)] // Every provider answered: damaged on the first run, retries left or not.
+    [InlineData(true, false)] // Inconclusive miss: retried like any unverified block.
+    public async Task GapFilledSource_IsDamagedOnTheFirstRunOnlyWhenTheMissIsConclusive(bool inconclusive, bool damaged)
+    {
+        await using var harness = await Harness.CreateAsync(fileSize: 3, source: () => new GapFilledSource(inconclusive),
+            settings: new PrefetchSettings { MaxRetries = 3 });
+        var jobs = harness.Runtime.Jobs!;
+        jobs.Enqueue(harness.Item.Id, "manual", 50);
+
+        await harness.Runtime.Coordinator!.RunOnceAsync(CancellationToken.None);
+
+        var job = Assert.Single(jobs.List());
+        Assert.Equal(damaged ? "failed" : "queued", job.State);
+        Assert.Equal(damaged ? PrefetchFailureCodes.SourceDamaged : PrefetchFailureCodes.SourceUnverified, job.FailureCode);
+        Assert.Equal(damaged, jobs.IsDamaged(harness.Item.Id, null, DateTimeOffset.UtcNow));
+    }
+
+    [Theory]
     [InlineData(true)]
     [InlineData(false)]
     public async Task FinishWatched_IsOptIn(bool enabled)
@@ -406,6 +424,18 @@ public sealed class PrefetchWarmingOutcomeTests
     private sealed class UnverifiedSource() : MemoryStream(new byte[3]), ICacheReadEvidence
     {
         public bool LastReadCacheable => false;
+    }
+
+    /// <summary>Pads a missing article with zeros, as segment streams do, and reports the gap.</summary>
+    private sealed class GapFilledSource(bool inconclusive) : MemoryStream(new byte[3]), ICacheReadEvidence
+    {
+        public bool LastReadCacheable => false;
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            NativeCacheReadContext.RecordGapFill(new UsenetArticleNotFoundException("gap-segment")
+                { InconclusiveReason = inconclusive ? "provider timed out" : null });
+            return base.ReadAsync(buffer, cancellationToken);
+        }
     }
 
     private sealed class MissingArticleSource() : MemoryStream(new byte[3]), ICacheReadEvidence
