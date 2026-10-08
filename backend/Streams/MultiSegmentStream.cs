@@ -2308,6 +2308,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
             Par2RepairTriggerSink.Current?.ReportZeroFill(_fileName, segmentId, segmentIndex, fill);
 
         PlaybackHoleTracker.RecordHole(_fileName, segmentId, exception);
+        NativeCacheReadContext.RecordGapFill(exception);
 
 #pragma warning disable CA2000 // gap-fill stream ownership transfers to the returned SegmentDownloadResult
         return SegmentDownloadResult.ZeroFill(
