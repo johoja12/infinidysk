@@ -241,7 +241,8 @@ public sealed class PrefetchCoordinatorTests : IDisposable
         }), () => new(), () => true);
         for (var attempt = 0; attempt <= maxRetries; attempt++)
         {
-            var before = DateTimeOffset.UtcNow;
+            // Deferred timestamps are persisted at millisecond precision.
+            var before = DateTimeOffset.FromUnixTimeMilliseconds(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             await coordinator.RunOnceAsync(CancellationToken.None);
             Assert.Equal(attempt + 1, calls);
             using var connection = new SqliteConnection($"Data Source={path};Mode=ReadOnly");
