@@ -6,7 +6,7 @@ Playback failover when a release cannot be served: try parallel candidates withi
 
 Enable and tune under [Watchdog settings](../configuration/watchdog.md).
 
-### Replacement outcomes
+### Replacement outcomes [since unreleased](https://github.com/johoja12/infinidysk/pull/197){ .nzbdav-since }
 
 The Watchdog also records Sonarr/Radarr queue imports. When recent Arr history confirms that the same episode or movie was subsequently imported from a different download, its failed request shows **Replacement imported**, the replacement release, and import time. The original failure stays in the attempt details, and the request counts as resolved. This records an import outcome, not a playback or current-file health check.
 
