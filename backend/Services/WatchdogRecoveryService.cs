@@ -1,3 +1,4 @@
+using NzbWebDAV.Clients.RadarrSonarr;
 using NzbWebDAV.Clients.RadarrSonarr.BaseModels;
 using NzbWebDAV.Config;
 using NzbWebDAV.Database.Models;
@@ -5,40 +6,71 @@ using NzbWebDAV.Database.Models;
 namespace NzbWebDAV.Services;
 
 /// <summary>Read-only, bounded Arr history evidence; never infer recovery from release names.</summary>
-public sealed class WatchdogRecoveryService(ConfigManager configManager) : IDisposable
+public sealed class WatchdogRecoveryService : IDisposable
 {
-    private readonly SemaphoreSlim gate = new(1, 1);
+    private readonly Func<IEnumerable<ArrClient>> clientsFactory;
+
+    public WatchdogRecoveryService(ConfigManager configManager)
+        : this(() => configManager.GetArrConfig().GetArrClients()) { }
+
+    internal WatchdogRecoveryService(Func<IEnumerable<ArrClient>> clientsFactory)
+        => this.clientsFactory = clientsFactory;
+
+    private readonly object gate = new();
+    private readonly CancellationTokenSource lifetime = new();
     private DateTimeOffset refreshAfter;
+    private Task? refreshTask;
     private List<IReadOnlyList<ArrHistoryRecord>> histories = [];
 
-    public void Dispose() => gate.Dispose();
-
-    public async Task<Dictionary<Guid, ArrHistoryRecord>> GetRecoveriesAsync(
+    public Task<Dictionary<Guid, ArrHistoryRecord>> GetRecoveriesAsync(
         IReadOnlyList<WatchdogEntry> entries, CancellationToken ct)
     {
-        if (!entries.Any(x => x.Result == WatchdogEntry.Outcome.QueueFailed)) return [];
-        await gate.WaitAsync(ct);
+        ct.ThrowIfCancellationRequested();
+        lock (gate)
+        {
+            if (entries.Any(x => x.Result == WatchdogEntry.Outcome.QueueFailed)
+                && DateTimeOffset.UtcNow >= refreshAfter
+                && (refreshTask == null || refreshTask.IsCompleted))
+            {
+                // Arr bulk history can take seconds on a NAS. Never block UI polling on it.
+                refreshTask = Task.Run(RefreshAsync, lifetime.Token);
+            }
+            return Task.FromResult(FindRecoveries(entries, histories));
+        }
+    }
+
+    private async Task RefreshAsync()
+    {
         try
         {
-            if (DateTimeOffset.UtcNow >= refreshAfter)
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(30));
+            var clients = clientsFactory().Take(16);
+            var fetched = await Task.WhenAll(clients.Select(async client =>
             {
-                // Bound both upstream work and latency; polling the UI must not poll every Arr.
-                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                timeout.CancelAfter(TimeSpan.FromSeconds(5));
-                var clients = configManager.GetArrConfig().GetArrClients().Take(16);
-                var fetched = await Task.WhenAll(clients.Select(async client =>
-                {
-                    try { return (IReadOnlyList<ArrHistoryRecord>)(await client.GetRecentHistoryAsync(timeout.Token)).Records; }
-                    catch (Exception e) when (e is HttpRequestException or OperationCanceledException or System.Text.Json.JsonException or InvalidDataException)
-                    { return (IReadOnlyList<ArrHistoryRecord>)Array.Empty<ArrHistoryRecord>(); }
-                }));
-                ct.ThrowIfCancellationRequested();
-                histories = fetched.ToList();
-                refreshAfter = DateTimeOffset.UtcNow.AddMinutes(1);
-            }
-            return FindRecoveries(entries, histories);
+                try { return (IReadOnlyList<ArrHistoryRecord>)(await client.GetRecentHistoryAsync(timeout.Token).ConfigureAwait(false)).Records; }
+                catch (Exception e) when (e is HttpRequestException or OperationCanceledException or System.Text.Json.JsonException or InvalidDataException)
+                { return (IReadOnlyList<ArrHistoryRecord>)Array.Empty<ArrHistoryRecord>(); }
+            })).ConfigureAwait(false);
+            lock (gate) histories = fetched.ToList();
         }
-        finally { gate.Release(); }
+        catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
+        catch (Exception e) when (e is InvalidOperationException or System.Text.Json.JsonException)
+        {
+            Serilog.Log.Warning("Watchdog replacement history refresh failed ({ErrorType})", e.GetType().Name);
+        }
+        finally
+        {
+            lock (gate) refreshAfter = DateTimeOffset.UtcNow.AddMinutes(1);
+        }
+    }
+
+    public void Dispose()
+    {
+        lifetime.Cancel();
+        try { refreshTask?.GetAwaiter().GetResult(); }
+        catch (OperationCanceledException) { }
+        lifetime.Dispose();
     }
 
     internal static Dictionary<Guid, ArrHistoryRecord> FindRecoveries(

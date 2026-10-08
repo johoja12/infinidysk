@@ -1,3 +1,4 @@
+using NzbWebDAV.Clients.RadarrSonarr;
 using NzbWebDAV.Clients.RadarrSonarr.BaseModels;
 using NzbWebDAV.Database.Models;
 using NzbWebDAV.Services;
@@ -48,4 +49,38 @@ public class WatchdogRecoveryTests
         imported.EventType = 1;
         Assert.Empty(WatchdogRecoveryService.FindRecoveries([Failed()], [[Original(), imported]]));
     }
+
+    [Fact]
+    public async Task SlowArrHistoryDoesNotBlockPollingAndPublishesRecoveryWhenReady()
+    {
+        var client = new SlowHistoryClient();
+        using var service = new WatchdogRecoveryService(() => [client]);
+        var first = service.GetRecoveriesAsync([Failed()], CancellationToken.None);
+        Assert.True(first.IsCompletedSuccessfully);
+        Assert.Empty(await first);
+        await client.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Empty(await service.GetRecoveriesAsync([Failed()], CancellationToken.None));
+        client.History.SetResult(new ArrHistory { Records = [Original(), Imported()] });
+        var deadline = DateTimeOffset.UtcNow.AddSeconds(5);
+        while ((await service.GetRecoveriesAsync([Failed()], CancellationToken.None)).Count == 0)
+        {
+            Assert.True(DateTimeOffset.UtcNow < deadline, "Completed history did not reach the polling cache");
+            await Task.Delay(10);
+        }
+        Assert.Equal(1, client.Calls);
+    }
+
+    private sealed class SlowHistoryClient() : ArrClient("http://unused", "unused")
+    {
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<ArrHistory> History { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int Calls;
+        public override Task<ArrHistory> GetRecentHistoryAsync(CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref Calls);
+            Started.TrySetResult();
+            return History.Task.WaitAsync(ct);
+        }
+    }
+
 }

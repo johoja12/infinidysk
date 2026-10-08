@@ -10,7 +10,7 @@ Enable and tune under [Watchdog settings](../configuration/watchdog.md).
 
 The Watchdog also records Sonarr/Radarr queue imports. When recent Arr history confirms that the same episode or movie was subsequently imported from a different download, its failed request shows **Replacement imported**, the replacement release, and import time. The original failure stays in the attempt details, and the request counts as resolved. This records an import outcome, not a playback or current-file health check.
 
-**Recovery unconfirmed** means no replacement import was confirmed from the available history; it does not prove the episode is still missing. Checks use exact download and media IDs within one Arr instance, never title similarity. History checks are limited to the latest 500 events per enabled instance and cached for one minute; unavailable instances, older events, and ambiguous multi-episode downloads can remain unconfirmed.
+**Recovery unconfirmed** means no replacement import was confirmed from the available history; it does not prove the episode is still missing. Checks use exact download and media IDs within one Arr instance, never title similarity. History checks are limited to the latest 500 events per enabled instance and refreshed in the background once a minute with a 30-second timeout; unavailable instances, older events, and ambiguous multi-episode downloads can remain unconfirmed.
 
 ## Preflight
 
