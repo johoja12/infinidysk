@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
@@ -49,10 +50,11 @@ public class MultiProviderNntpClient(
     /// <summary>
     /// Max concurrent batch-failover BODY starts. Admission stays strictly ordered;
     /// this only bounds how many fallback walks may be in flight at once so sequential
-    /// consumers cannot deadlock on an unbounded fan-out (see AGENTS.md).
+    /// consumers cannot deadlock on an unbounded fan-out (see AGENTS.md). The gate is
+    /// per batch: a client-wide gate let read-ahead batches hold every permit until their
+    /// bodies drained, timing out the batch the reader was actually waiting on.
     /// </summary>
     private const int MaxConcurrentFallbackStarts = 4;
-    private readonly SemaphoreSlim _batchFallbackStartGate = new(MaxConcurrentFallbackStarts);
     public int InFlightConnections => providers.Sum(p => p.InFlightConnections);
 
     internal IReadOnlyList<MultiConnectionNntpClient> Providers => providers;
@@ -206,6 +208,18 @@ public class MultiProviderNntpClient(
 
     private static readonly AsyncLocal<StreamTraceRangeContext?> StreamTraceRangeScope = new();
     internal static StreamTraceRangeContext? CurrentStreamTraceRange => StreamTraceRangeScope.Value;
+
+    private static readonly AsyncLocal<bool> HedgeFetchScope = new();
+    // Provider each article's first in-flight BODY waits on, so a hedge can try another first.
+    private readonly ConcurrentDictionary<SegmentId, MultiConnectionNntpClient> _awaitingBody = new();
+
+    /// <summary>Marks fetches in this flow as duplicates racing a stalled original.</summary>
+    public static IDisposable BeginHedgeFetchScope()
+    {
+        var previous = HedgeFetchScope.Value;
+        HedgeFetchScope.Value = true;
+        return new ScopeReleaser(() => HedgeFetchScope.Value = previous);
+    }
 
     /// <summary>
     /// Tag the current async flow with a read-session id so SegmentFetch rows
@@ -542,7 +556,11 @@ public class MultiProviderNntpClient(
                     // Admission (start-order) is separate from transfer completion so segment
                     // N+1 can begin its fallback walk after N has admitted/started, without
                     // waiting for N's body stream to finish. Concurrent starts are bounded by
-                    // _batchFallbackStartGate until each transfer's body callback fires.
+                    // fallbackStartGate until each transfer's body callback fires. Completion
+                    // disposes it after every decision and transfer callback has released.
+#pragma warning disable CA2000 // ownership moves to CompleteOwnedBatchAsync
+                    var fallbackStartGate = new SemaphoreSlim(MaxConcurrentFallbackStarts);
+#pragma warning restore CA2000
                     Task previousFallbackAdmission = Task.CompletedTask;
                     for (var index = 0; index < rawResponses.Length; index++)
                     {
@@ -557,6 +575,7 @@ public class MultiProviderNntpClient(
                             unaskedProviders,
                             previousFallbackAdmission,
                             fallbackAdmission,
+                            fallbackStartGate,
                             coordinator,
                             cancellationToken);
 #pragma warning restore CA2025
@@ -578,7 +597,8 @@ public class MultiProviderNntpClient(
                             primaryBatch.Completion,
                             coordinator.Completion,
                             publisher,
-                            ownedCts),
+                            ownedCts,
+                            fallbackStartGate),
                     };
 #pragma warning restore CA2025
                 }
@@ -640,6 +660,7 @@ public class MultiProviderNntpClient(
         MultiConnectionNntpClient[]? unaskedProviders,
         Task previousFallbackAdmission,
         TaskCompletionSource fallbackAdmission,
+        SemaphoreSlim fallbackStartGate,
         BatchCallbackCoordinator coordinator,
         CancellationToken cancellationToken)
     {
@@ -672,7 +693,16 @@ public class MultiProviderNntpClient(
             string? inconclusiveAdmissionProvider = null;
             try
             {
-                response = await primaryResponse.ConfigureAwait(false);
+                var awaiting = _awaitingBody.TryAdd(segmentId, primaryProvider);
+                try
+                {
+                    response = await primaryResponse.ConfigureAwait(false);
+                }
+                finally
+                {
+                    if (awaiting) _awaitingBody.TryRemove(KeyValuePair.Create(segmentId, primaryProvider));
+                }
+
                 await RejectMismatchedYencFileAsync(
                     segmentId, primaryProvider.MetricsKey, response, cancellationToken).ConfigureAwait(false);
             }
@@ -782,7 +812,7 @@ public class MultiProviderNntpClient(
             await previousFallbackAdmission.WaitAsync(cancellationToken)
                 .ConfigureAwait(false);
             var fallbackAdmissionBudget = GetBatchFallbackAdmissionBudget(cancellationToken);
-            if (!await _batchFallbackStartGate
+            if (!await fallbackStartGate
                     .WaitAsync(fallbackAdmissionBudget, cancellationToken)
                     .ConfigureAwait(false))
             {
@@ -876,14 +906,9 @@ public class MultiProviderNntpClient(
                             gateOwnedByTransfer = true;
                             deferredCallback.Activate((result, failureReason) =>
                             {
-                                try
-                                {
-                                    coordinator.CompleteTransfer(result, failureReason);
-                                }
-                                finally
-                                {
-                                    _batchFallbackStartGate.Release();
-                                }
+                                // Release before completing the transfer: coordinator completion disposes the gate.
+                                fallbackStartGate.Release();
+                                coordinator.CompleteTransfer(result, failureReason);
                             });
                         }
                         else
@@ -966,7 +991,7 @@ public class MultiProviderNntpClient(
             finally
             {
                 if (gateHeld && !gateOwnedByTransfer)
-                    _batchFallbackStartGate.Release();
+                    fallbackStartGate.Release();
             }
 
             walk.UnaskedProviders = CountUnaskedProviders(
@@ -1025,7 +1050,8 @@ public class MultiProviderNntpClient(
         Task transportCompletion,
         Task coordinatorCompletion,
         Task publisher,
-        ContextualCancellationTokenSource owner)
+        ContextualCancellationTokenSource owner,
+        SemaphoreSlim fallbackStartGate)
     {
         try
         {
@@ -1036,6 +1062,7 @@ public class MultiProviderNntpClient(
         finally
         {
             owner.Dispose();
+            fallbackStartGate.Dispose();
         }
     }
 
@@ -1167,6 +1194,14 @@ public class MultiProviderNntpClient(
         var missingGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var orderedProviders = SelectOrderedProviders(
             operation, out var attemptReserved, out var skippedOpenCircuit);
+        var hedging = HedgeFetchScope.Value;
+        if (hedging && orderedProviders.Count > 1 &&
+            _awaitingBody.TryGetValue(segmentId, out var stalled) &&
+            orderedProviders.Remove(stalled))
+        {
+            orderedProviders.Add(stalled);
+        }
+
         using var releasePending = new ScopeReleaser(
             () => ReleasePendingSelection(ref attemptReserved, operation));
         var walk = new ProviderWalkSummary(orderedProviders.Count);
@@ -1216,8 +1251,18 @@ public class MultiProviderNntpClient(
                 cancellationToken.ThrowIfCancellationRequested();
                 MovePendingSelection(ref attemptReserved, provider, operation);
                 walk.Attempts++;
-                var result = await task(provider, deferredCallback.Invoke, admissionFailoverContext, cancellationToken)
-                    .ConfigureAwait(false);
+                var awaiting = !hedging && _awaitingBody.TryAdd(segmentId, provider);
+                T result;
+                try
+                {
+                    result = await task(provider, deferredCallback.Invoke, admissionFailoverContext, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                finally
+                {
+                    if (awaiting) _awaitingBody.TryRemove(KeyValuePair.Create(segmentId, provider));
+                }
+
                 await RejectMismatchedYencFileAsync(
                     segmentId, provider.MetricsKey, result, cancellationToken).ConfigureAwait(false);
                 stopwatch.Stop();
@@ -2382,7 +2427,6 @@ public class MultiProviderNntpClient(
         connectionPoolStats?.Deactivate();
         foreach (var provider in providers)
             provider.Dispose();
-        _batchFallbackStartGate.Dispose();
         GC.SuppressFinalize(this);
     }
 

@@ -33,6 +33,7 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream, ISegm
     private readonly IReadOnlySet<int>? _knownMissingSegmentIndices;
     private readonly LongRange? _expectedFirstSegmentRange;
     private readonly bool _expectedFirstSegmentRangeWasClippedAtFileEnd;
+    private readonly bool _recordedSizesInferred;
     private readonly byte[] _scratch = new byte[16];
     private Stream? _stream;
     private int _currentIndex;
@@ -65,8 +66,10 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream, ISegm
         HashSet<string>? knownCorruptSegmentIds = null,
         IReadOnlySet<int>? knownMissingSegmentIndices = null,
         LongRange? expectedFirstSegmentRange = null,
-        bool expectedFirstSegmentRangeWasClippedAtFileEnd = false)
+        bool expectedFirstSegmentRangeWasClippedAtFileEnd = false,
+        bool recordedSizesInferred = false)
     {
+        _recordedSizesInferred = recordedSizesInferred;
         _segmentIds = segmentIds;
         _segmentFallbacks = segmentFallbacks;
         _usenetClient = usenetClient;
@@ -409,7 +412,8 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream, ISegm
                 return null;
             }
             if (!await SegmentResponseValidator.IsFallbackPartSizeCompatibleAsync(
-                    stream, _segmentSizes, segmentIndex, cancellationToken).ConfigureAwait(false))
+                    stream, _segmentSizes, segmentIndex, cancellationToken, IsClippedAtFileEnd(segmentIndex))
+                    .ConfigureAwait(false))
             {
                 await DisposeBodyStreamAsync(stream).ConfigureAwait(false);
                 return null;
@@ -929,6 +933,7 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream, ISegm
             return null;
 
         var fallbacks = _segmentFallbacks[segmentIndex] ?? [];
+        SegmentGeometryMismatchException? contradiction = null;
         while (state.NextFallbackIndex < fallbacks.Length)
         {
             var fallbackId = fallbacks[state.NextFallbackIndex++];
@@ -949,7 +954,8 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream, ISegm
                     continue;
                 }
                 if (!await SegmentResponseValidator.IsFallbackPartSizeCompatibleAsync(
-                        fallbackStream!, _segmentSizes, segmentIndex, cancellationToken)
+                        fallbackStream!, _segmentSizes, segmentIndex, cancellationToken,
+                        IsClippedAtFileEnd(segmentIndex))
                         .ConfigureAwait(false))
                 {
                     Log.Debug(
@@ -965,9 +971,10 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream, ISegm
                 fallbackStream = null;
                 return accepted;
             }
-            catch (SeekPositionNotFoundException)
+            catch (SeekPositionNotFoundException e)
             {
                 await DisposeBodyStreamAsync(fallbackStream).ConfigureAwait(false);
+                if (_recordedSizesInferred) contradiction ??= e as SegmentGeometryMismatchException;
             }
             catch (UsenetArticleNotFoundException alternateMiss)
             {
@@ -992,6 +999,8 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream, ISegm
             }
         }
 
+        // Zero-filling at the recorded size would emit bytes later recovery cannot retract.
+        if (contradiction is not null) throw contradiction;
         return null;
     }
 
@@ -1026,6 +1035,13 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream, ISegm
                         $"the expected positioning range {_expectedFirstSegmentRange}.");
                 }
 
+                // A clipped final segment's size is its in-file length, so its full yEnc part cannot match.
+                if (!IsClippedAtFileEnd(_openSegmentIndex))
+                {
+                    await SegmentResponseValidator.ThrowOnRecordedSizeMismatchAsync(
+                            response.Stream!, _segmentSizes, _openSegmentIndex, _fileName, cancellationToken)
+                        .ConfigureAwait(false);
+                }
                 return response;
             }
             catch
@@ -1035,6 +1051,9 @@ public class UnbufferedMultiSegmentStream : FastReadOnlyNonSeekableStream, ISegm
             }
         }
     }
+
+    private bool IsClippedAtFileEnd(int segmentIndex) =>
+        segmentIndex == 0 && _expectedFirstSegmentRangeWasClippedAtFileEnd;
 
     private async Task<bool> MatchesPositioningGeometryAsync(
         Stream stream,

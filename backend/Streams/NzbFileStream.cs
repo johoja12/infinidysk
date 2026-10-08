@@ -1,4 +1,4 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using NzbWebDAV.Clients.Usenet;
 using NzbWebDAV.Clients.Usenet.Contexts;
@@ -34,12 +34,20 @@ public class NzbFileStream(
     long? readBudgetOverride = null,
     bool readStartWarmupEnabled = false,
     Par2FileProof? verificationProof = null
-) : FastReadOnlyStream, ICacheReadEvidence, ISegmentIssueProgress
+) : FastReadOnlyStream, ICacheReadEvidence, ISegmentIssueProgress, IDeliveredBytesValidation
 {
     bool ISegmentIssueProgress.AllSegmentsIssued =>
         verificationProof is null
         && _innerStream is ISegmentIssueProgress { AllSegmentsIssued: true };
 
+    // PAR2-verified reads are validated before they are returned.
+    ValueTask IDeliveredBytesValidation.ValidateDeliveredAsync(CancellationToken cancellationToken) =>
+        verificationProof is null
+            ? _innerStream.ValidateDeliveredAsync(cancellationToken)
+            : ValueTask.CompletedTask;
+
+    private readonly Lazy<Dictionary<string, int>> _segmentPositionIndex =
+        YencFileValidationContext.CreatePositionIndex(fileSegmentIds, segmentFallbacks);
     private const long MaximumForwardDrainBytes = 1024 * 1024;
     private const long MinimumPrewarmRangeBytes = 8L * 1024 * 1024;
     private const int MinimumPrewarmConnections = 2;
@@ -61,6 +69,10 @@ public class NzbFileStream(
     private Stopwatch? _pendingSeekStopwatch;
     private string? _pendingSeekKind;
     internal IDisposable? PlaybackLease { get; set; }
+    // Set when recorded ranges may be inferred and the reader re-derives them on contradiction.
+    internal bool RecordedSizesInferred { get; set; }
+    // Set for a multipart successor volume, which prefetches within the combined read-ahead window.
+    internal SpeculativeReadAhead? SpeculativeReadAhead { get; set; }
     internal Task? PrewarmObservationForTests { get; private set; }
     private readonly LongRange[]? _segmentByteRanges = ValidateAndCloneSegmentByteRanges(
         segmentByteRanges,
@@ -109,7 +121,8 @@ public class NzbFileStream(
             if (verificationProof is null || !verificationProof.IsValidFor(Length))
                 throw new InvalidDataException("Invalid persisted PAR2 verification metadata.");
             if (_verifiedStream is not null) return _verifiedStream;
-            var reader = new Par2CandidateReader(verificationProof, usenetClient, ReadPar2CandidateAsync);
+            var reader = new Par2CandidateReader(
+                verificationProof, usenetClient, ReadPar2CandidateAsync, () => RecordedSizesInferred);
             _verifiedStream = new Par2VerifiedFileStream(verificationProof,
                 reader.ReadAsync, reader.ReadPrefixAsync);
             return _verifiedStream;
@@ -119,7 +132,7 @@ public class NzbFileStream(
     private async Task ReadPar2CandidateAsync(long start, Memory<byte> target, CancellationToken cancellationToken)
     {
         using var validation = YencFileValidationContext.BeginBufferedPar2ProofRead(
-            fileSegmentIds, segmentFallbacks, fileName);
+            fileSegmentIds, segmentFallbacks, fileName, _segmentPositionIndex);
         // A proof slice may exceed one native block; verification must read the entire
         // slice (bounded by Par2FileProof), not truncate it at the caller's cache window.
         using var nativeRead = NativeCacheReadContext.IsActive
@@ -131,6 +144,7 @@ public class NzbFileStream(
             fileName: fileName, segmentFallbacks: segmentFallbacks,
             inFlightArticleBudget: inFlightArticleBudget, readBudgetOverride: target.Length,
             streamingBodyBatchWidth: streamingBodyBatchWidth);
+        candidate.RecordedSizesInferred = RecordedSizesInferred;
         candidate.Position = start;
         await candidate.ReadExactlyAsync(target, cancellationToken).ConfigureAwait(false);
     }
@@ -161,7 +175,7 @@ public class NzbFileStream(
             return verifiedRead;
         }
         using var yencFileValidation = YencFileValidationContext.BeginStreaming(
-            fileSegmentIds, segmentFallbacks, fileName);
+            fileSegmentIds, segmentFallbacks, fileName, _segmentPositionIndex);
         if (buffer.IsEmpty) return 0;
         if (_position >= fileSize) return 0;
         // A file whose articles keep coming back as another post can only gap-fill from
@@ -207,10 +221,15 @@ public class NzbFileStream(
             _pendingSeekKind = null;
         }
 
+        // A final article may extend past the logical file end; never emit those bytes.
+        if (buffer.Length > fileSize - _position) buffer = buffer[..(int)(fileSize - _position)];
         var read = await _innerStream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
         _position += read;
         LastReadCacheable = read > 0 && _segmentByteRanges is not null &&
             _innerStream is ICacheReadEvidence { LastReadCacheable: true };
+        // Later reads stop at the file size without reaching the inner stream's end.
+        if (read > 0 && _position >= fileSize)
+            await _innerStream.ValidateDeliveredAsync(cancellationToken).ConfigureAwait(false);
         return read;
     }
 
@@ -327,8 +346,7 @@ public class NzbFileStream(
             }
             catch (Exception e) when (!ct.IsCancellationRequested)
             {
-                e.LogWarningKnownOrStack(
-                    "Seek probe transient failure on segment index {Index}. Using estimated range.", guess);
+                LogSeekProbeFailure(e, "Seek probe failed on segment index {Index}. Using estimated range.", guess);
             }
 
             estimated.Add(guess);
@@ -396,6 +414,19 @@ public class NzbFileStream(
         }
     }
 
+    // Invalid yEnc geometry is an article fact, not a code fault: report it without a stack.
+    private static void LogSeekProbeFailure(Exception e, string messageTemplate, int index)
+    {
+        if (e is not InvalidDataException)
+        {
+            e.LogWarningKnownOrStack(messageTemplate, index);
+            return;
+        }
+
+        Log.Warning(messageTemplate + " Reason: {Reason}", index, e.Message);
+        Log.Debug(e, "Seek probe invalid geometry stack");
+    }
+
     private async Task<(LongRange Range, bool WasClippedAtFileEnd)> ProbeAuthoritativeRangeAsync(
         string segmentId,
         int index,
@@ -458,9 +489,8 @@ public class NzbFileStream(
         catch (Exception e) when (IsFallbackEligibleProbeFailure(e, ct))
         {
             transientProbeFailure = e;
-            e.LogWarningKnownOrStack(
-                "Authoritative seek probe transient failure on primary segment index {Index}; trying fallbacks.",
-                index);
+            LogSeekProbeFailure(
+                e, "Authoritative seek probe failed on primary segment index {Index}; trying fallbacks.", index);
         }
 
         if (segmentFallbacks is { } fallbacks && index < fallbacks.Length && fallbacks[index] is { } fallbackIds)
@@ -479,9 +509,8 @@ public class NzbFileStream(
                 catch (Exception e) when (IsFallbackEligibleProbeFailure(e, ct))
                 {
                     transientProbeFailure = e;
-                    e.LogWarningKnownOrStack(
-                        "Authoritative seek probe transient failure on fallback segment index {Index}; trying next fallback.",
-                        index);
+                    LogSeekProbeFailure(
+                        e, "Authoritative seek probe failed on fallback segment index {Index}; trying next fallback.", index);
                 }
             }
         }
@@ -744,6 +773,8 @@ public class NzbFileStream(
                         InitialBatchPlan = initialBatchPlan,
                         ExpectedFirstSegmentRange = expectedFirstSegmentRange,
                         ExpectedFirstSegmentRangeWasClippedAtFileEnd = expectedFirstSegmentRangeWasClippedAtFileEnd,
+                        RecordedSizesInferred = RecordedSizesInferred,
+                        SpeculativeReadAhead = SpeculativeReadAhead,
                     },
                     prefixBytes)
                 .ConfigureAwait(false);
@@ -1140,7 +1171,9 @@ public class NzbFileStream(
             streamingBodyBatchWidth,
             knownCorruptSegmentIds,
             sliced.KnownMissing,
-            initialBatchPlan);
+            initialBatchPlan,
+            RecordedSizesInferred,
+            SpeculativeReadAhead);
     }
 
     private void StartConnectionPrewarm(

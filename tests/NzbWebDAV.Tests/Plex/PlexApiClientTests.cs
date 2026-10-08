@@ -190,8 +190,9 @@ public sealed class PlexApiClientTests
         using var cancellation = new CancellationTokenSource();
         try
         {
+            // Allow scheduler contention in the full suite; the client deadline remains 25 ms.
             await Assert.ThrowsAsync<PlexRequestException>(() => api.GetLibrariesAsync(Server(), cancellation.Token)
-                .WaitAsync(TimeSpan.FromMilliseconds(500)));
+                .WaitAsync(TimeSpan.FromSeconds(5)));
         }
         finally { cancellation.Cancel(); }
     }
