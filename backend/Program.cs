@@ -508,6 +508,8 @@ public sealed partial class Program
                 .AddSingleton(sp => new FilesLibraryIndex(sp.GetRequiredService<ConfigManager>(), TimeProvider.System))
                 .AddSingleton<IHealthCheckQuiescence>(
                     sp => sp.GetRequiredService<HealthCheckService>())
+                .AddSingleton<IFileRecheckQueue>(
+                    sp => sp.GetRequiredService<HealthCheckService>())
                 .AddHostedService(sp => sp.GetRequiredService<HealthCheckService>())
                 .AddSingleton<ImportedContentSweepService>()
                 .AddHostedService(sp => sp.GetRequiredService<ImportedContentSweepService>())

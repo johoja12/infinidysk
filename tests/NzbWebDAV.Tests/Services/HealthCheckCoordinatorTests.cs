@@ -67,6 +67,36 @@ public sealed class HealthCheckCoordinatorTests
     }
 
     [Fact]
+    public async Task ExpediteFileRecheckAsync_MovesAnUnscheduledFileAheadOfTheBacklog()
+    {
+        using var harness = new Harness(workers: 1, fullySplit: false);
+        await using var connection = await harness.ConfigureEmptyDatabaseAsync();
+        await using var context = harness.Service.CreateDbContextOverride!();
+        var file = NewCandidate("unscheduled.mkv", null);
+        file.Path = "/content/unscheduled.mkv";
+        file.LastHealthCheck = DateTimeOffset.UtcNow.AddDays(-7);
+        context.Items.Add(file);
+        await context.SaveChangesAsync();
+
+        // An operator recheck leaves it in place; damage evidence moves it up.
+        Assert.Equal(HealthCheckService.FileRecheckOutcome.AlreadyQueued, await harness.Service.QueueFileRecheckAsync(file.Id, CancellationToken.None));
+        await context.Entry(file).ReloadAsync();
+        Assert.Null(file.NextHealthCheck);
+        Assert.Equal(HealthCheckService.FileRecheckOutcome.Queued, await harness.Service.ExpediteFileRecheckAsync(file.Id, CancellationToken.None));
+        await context.Entry(file).ReloadAsync();
+        Assert.Equal(HealthCheckService.ForcedRecheckSentinel, file.NextHealthCheck);
+        Assert.Equal(HealthCheckService.FileRecheckOutcome.AlreadyQueued, await harness.Service.ExpediteFileRecheckAsync(file.Id, CancellationToken.None));
+    }
+
+    [Fact]
+    public void WithKnownFailedSegments_AddsKnownHolesTheSampleSkipped()
+    {
+        string[] segments = ["a", "b", "c", "d", "e"];
+        Assert.Equal([0, 2, 3, 4], HealthCheckService.WithKnownFailedSegments([0, 4], segments, ["d", "c", "unknown"]));
+        Assert.Equal([0, 4], HealthCheckService.WithKnownFailedSegments([4, 0], segments, ["a"]));
+    }
+
+    [Fact]
     public async Task QueueFileRecheckAsync_AlreadyRunningDoesNotQueueAgain()
     {
         using var harness = new Harness(workers: 1, fullySplit: false);

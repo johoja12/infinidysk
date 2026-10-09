@@ -35,7 +35,7 @@ internal enum HealthCheckRefillOutcome
 /// <summary>
 /// This service monitors for health checks
 /// </summary>
-public partial class HealthCheckService : BackgroundService, IHealthCheckQuiescence
+public partial class HealthCheckService : BackgroundService, IHealthCheckQuiescence, IFileRecheckQueue
 {
     private const int MaximumMissingSegmentIds = 100_000;
     internal const string MissingPayloadMessagePrefix = "Streaming payload missing.";
@@ -220,7 +220,17 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
 
     public enum FileRecheckOutcome { Queued, AlreadyQueued, AlreadyRunning, NotFound, Unsupported, Disabled }
 
-    public async Task<FileRecheckOutcome> QueueFileRecheckAsync(Guid davItemId, CancellationToken cancellationToken)
+    public Task<FileRecheckOutcome> QueueFileRecheckAsync(Guid davItemId, CancellationToken cancellationToken) =>
+        QueueFileRecheckAsync(davItemId, includeUnscheduled: false, cancellationToken);
+
+    /// <summary>
+    /// Also moves files that are still waiting unscheduled (never checked, or awaiting
+    /// rescheduling) ahead of that backlog, for callers with evidence the file is damaged.
+    /// </summary>
+    public Task<FileRecheckOutcome> ExpediteFileRecheckAsync(Guid davItemId, CancellationToken cancellationToken) =>
+        QueueFileRecheckAsync(davItemId, includeUnscheduled: true, cancellationToken);
+
+    private async Task<FileRecheckOutcome> QueueFileRecheckAsync(Guid davItemId, bool includeUnscheduled, CancellationToken cancellationToken)
     {
         await _workerAdmissionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
@@ -231,11 +241,13 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             if (item is null || !item.Path.StartsWith("/content/", StringComparison.Ordinal)) return FileRecheckOutcome.NotFound;
             if (item.Type != DavItem.ItemType.UsenetFile || !FilenameUtil.IsHealthCheckCandidate(item.Name)) return FileRecheckOutcome.Unsupported;
             if (_inProgress.ContainsKey(davItemId)) return FileRecheckOutcome.AlreadyRunning;
-            if (item.HealthRepairPending || item.NextHealthCheck == null || item.NextHealthCheck == DateTimeOffset.UnixEpoch || item.NextHealthCheck == ForcedRecheckSentinel)
+            // Unscheduled files are already queued, but behind the whole never-checked backlog.
+            if (item.HealthRepairPending || (item.NextHealthCheck == null && !includeUnscheduled)
+                || item.NextHealthCheck == DateTimeOffset.UnixEpoch || item.NextHealthCheck == ForcedRecheckSentinel)
                 return FileRecheckOutcome.AlreadyQueued;
             var updated = await context.Items.Where(file => file.Id == davItemId && file.Type == DavItem.ItemType.UsenetFile)
                 .Where(file => !file.HealthRepairPending)
-                .Where(file => file.NextHealthCheck != null)
+                .Where(file => includeUnscheduled || file.NextHealthCheck != null)
                 .Where(file => file.NextHealthCheck != DateTimeOffset.UnixEpoch)
                 .Where(file => file.NextHealthCheck != ForcedRecheckSentinel)
                 .ExecuteUpdateAsync(setters => setters.SetProperty(file => file.NextHealthCheck, ForcedRecheckSentinel), cancellationToken)
@@ -1370,6 +1382,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             try
             {
                 sampled = SampleSegmentsIndexed(segments, depth, age);
+                if (_failureTracker.GetSnapshot(davItem.Id).SegmentIds is { Length: > 0 } knownFailed && sampled.Count < totalSegments)
+                    sampled = new SegmentIndexView(segments, WithKnownFailedSegments(
+                        Enumerable.Range(0, sampled.Count).Select(sampled.SourceIndexAt), segments, knownFailed));
                 statSegments = nzbFile != null
                     ? FilterSegmentsForStat(sampled, nzbFile, _repairPatchStore)
                     : sampled;
@@ -2641,6 +2656,20 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         }
 
         return new SegmentIndexView(segments, indexes.OrderBy(i => i).ToArray());
+    }
+
+    /// <summary>
+    /// Adds the segments playback or warming proved missing to a sampled check, so a sample that
+    /// happens to skip them cannot pass, and reset the failure count of, a file with a known hole.
+    /// </summary>
+    internal static int[] WithKnownFailedSegments(IEnumerable<int> sampledIndexes, IReadOnlyList<string> segments,
+        IReadOnlyCollection<string> knownFailed)
+    {
+        var indexes = new SortedSet<int>(sampledIndexes);
+        var wanted = new HashSet<string>(knownFailed, StringComparer.Ordinal);
+        for (var index = 0; index < segments.Count && wanted.Count > 0; index++)
+            if (wanted.Remove(segments[index])) indexes.Add(index);
+        return [.. indexes];
     }
 
     internal static List<string> FilterSegmentsForStat(
