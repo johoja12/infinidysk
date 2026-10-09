@@ -134,14 +134,14 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         }
         catch (PrefetchSourceDamagedException damaged) when (!ct.IsCancellationRequested)
         {
-            throw ReportDamaged(scope.ServiceProvider, item, job, generation, damaged.SegmentId, damaged.Message);
+            throw await ReportDamagedAsync(scope.ServiceProvider, item, job, generation, damaged.SegmentId, damaged.Message).ConfigureAwait(false);
         }
         // The same block failing verification on every retry is damage, not bad luck.
         catch (PrefetchDeferredException deferred) when (!ct.IsCancellationRequested
             && deferred.FailureCode == PrefetchFailureCodes.SourceUnverified && jobs.Attempts(job.Id) >= settings.MaxRetries)
         {
-            throw ReportDamaged(scope.ServiceProvider, item, job, generation, null,
-                "The same source bytes failed verification on every retry: articles are missing, corrupt, or belong to a different post.");
+            throw await ReportDamagedAsync(scope.ServiceProvider, item, job, generation, null,
+                "The same source bytes failed verification on every retry: articles are missing, corrupt, or belong to a different post.").ConfigureAwait(false);
         }
         var fingerprint = await native.Store.GetCatalogueFingerprintAsync(cached.Identity, ct).ConfigureAwait(false);
         jobs.RecordVerified(job.ItemId, cached.Identity.Generation, job.Start, job.Length, fingerprint);
@@ -191,14 +191,24 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
     /// (the same urgent health-check scheduling playback failures use), remember the verdict so policy
     /// refreshes stop re-enqueueing it, and fail the job with an actionable reason.
     /// </summary>
-    private PrefetchFailedException ReportDamaged(IServiceProvider services, NzbWebDAV.Database.Models.DavItem item,
+    private async Task<PrefetchFailedException> ReportDamagedAsync(IServiceProvider services, NzbWebDAV.Database.Models.DavItem item,
         PrefetchJob job, string? generation, string? segmentId, string detail)
     {
         var outcome = services.GetService<NzbWebDAV.Services.StreamingRepairScheduler>()?.Schedule(item, segmentId);
+        // Below the threshold nothing else revisits a file warming now skips: have a health check
+        // confirm the damage independently and repair it under the normal repair rules.
+        var recheck = outcome == NzbWebDAV.Services.RepairScheduleOutcome.BelowThreshold
+            ? await QueueRecheckAsync(services, item.Id).ConfigureAwait(false)
+            : null;
         var (remedy, followUp) = outcome switch
         {
             NzbWebDAV.Services.RepairScheduleOutcome.Scheduled or NzbWebDAV.Services.RepairScheduleOutcome.AlreadyScheduled =>
                 (PrefetchRemedies.RepairQueued, "Queued for repair."),
+            NzbWebDAV.Services.RepairScheduleOutcome.BelowThreshold when recheck is
+                NzbWebDAV.Services.HealthCheckService.FileRecheckOutcome.Queued
+                or NzbWebDAV.Services.HealthCheckService.FileRecheckOutcome.AlreadyQueued
+                or NzbWebDAV.Services.HealthCheckService.FileRecheckOutcome.AlreadyRunning =>
+                (PrefetchRemedies.RepairPending, "A health check is queued to confirm the damage; repair follows the rules in Settings > Health & Repairs."),
             NzbWebDAV.Services.RepairScheduleOutcome.BelowThreshold =>
                 (PrefetchRemedies.RepairPending, "Repair starts once the failure threshold in Settings > Health & Repairs is reached."),
             NzbWebDAV.Services.RepairScheduleOutcome.Disabled =>
@@ -213,6 +223,18 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         return new PrefetchFailedException(PrefetchFailureCodes.SourceDamaged,
             $"Release damaged on Usenet. {detail} {followUp} Routine warming skips this file until it is repaired or for 24 hours.", remedy);
     }
+    private static async Task<NzbWebDAV.Services.HealthCheckService.FileRecheckOutcome?> QueueRecheckAsync(IServiceProvider services, Guid itemId)
+    {
+        if (services.GetService<NzbWebDAV.Services.IFileRecheckQueue>() is not { } health) return null;
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        try { return await health.ExpediteFileRecheckAsync(itemId, timeout.Token).ConfigureAwait(false); }
+        catch (Exception exception) when (exception is not OutOfMemoryException)
+        {
+            Log.Warning("Could not queue a health check for damaged item {ItemId}. Reason: {Reason}", itemId, exception.Message);
+            return null;
+        }
+    }
+
     public static Task WarmAsync(NativeCacheStore store, NativeCachedStream stream, long start, long length,
         Func<long, bool> spend, Action<long> progress, CancellationToken ct, int chunkMb = 64)
         => WarmAsync(store, stream, start, length, bytes => new ValueTask<bool>(spend(bytes)),
