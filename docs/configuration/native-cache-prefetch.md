@@ -246,6 +246,15 @@ foreground admission. Whole-file jobs report verified committed whole-file cover
 not bytes merely read from providers. Range jobs report their own range first (see
 below).
 
+**Urgent jobs overtake far-ahead warms** [since unreleased](https://github.com/johoja12/infinidysk/pull/202){ .nzbdav-since }.
+A running whole-file job normally keeps its worker until it finishes. When a
+higher-priority job is waiting for a worker, such as the next episode another viewer is
+about to start, the whole-file job steps aside if every viewer of its file already has
+at least 10 minutes of playback cached ahead (or nobody is watching it). It keeps its
+verified coverage, spends no retry, and resumes about 15 seconds later once a worker is
+free. A job for a file that is playing never steps aside before its viewer's position
+has been seen. Small playback backfill ranges already run in their own slot.
+
 **Warming history** [since unreleased](https://github.com/johoja12/infinidysk/issues/117){ .nzbdav-since }
 shows each finished job's average warming speed and active duration, for example
 `14.2 MB/s · 3m 05s`. Speed counts only the bytes that job fetched and committed,
@@ -374,6 +383,7 @@ is under **Details**.
 | Cache storage error | Verified bytes could not be written to the cache folder named in the message, or no writable folder had room. | Retried. Check that folder's free space, permissions, and mount. |
 | Source changed | The file's source was repaired or replaced while it warmed. | Deferred without using a retry. Coverage is rechecked against the new revision. |
 | Daily budget reached / Waiting for playback to finish | Budget or playback priority. | Deferred until budget or playback allows. |
+| Paused for a more urgent warm | A higher-priority job was waiting and this file's viewers were far enough ahead. | Deferred without using a retry; resumes when a worker is free. |
 
 ### Finish partially watched files [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since } { #finish-partially-watched-files }
 
