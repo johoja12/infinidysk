@@ -180,6 +180,43 @@ public sealed class PrefetchWarmingOutcomeTests
     }
 
     [Theory]
+    [InlineData("plex:s:history-next:u:episode:k", true)] // Nobody watches this file yet: it yields at once.
+    [InlineData("plex:s:realtime:u:movie:k", false)] // Its viewer's position is unknown: it never yields blind.
+    public async Task WholeFileWarm_YieldsToAMoreUrgentJobOnlyWhenNoViewerIsAtRisk(string owner, bool yields)
+    {
+        const long fileSize = 16L * NativeCacheStore.BlockSize;
+        PrefetchJobStore? jobs = null;
+        var urgent = Guid.NewGuid();
+        // The urgent job arrives once the warm is under way, as a next-episode warm would.
+        await using var harness = await Harness.CreateAsync(fileSize, source: () => new ReadObservedSource(fileSize,
+            () => { if (jobs!.List().All(job => job.ItemId != urgent)) jobs.Enqueue(urgent, "plex:s:realtime-next:u:episode:k", 90); }));
+        jobs = harness.Runtime.Jobs!;
+        var executor = new NativePrefetchExecutor(harness.Scopes, harness.Native, harness.Config, jobs, harness.Reads,
+            settingsProvider: () => new PrefetchSettings()) { NewYieldPolicy = () => new(TimeSpan.FromMinutes(10), TimeSpan.Zero) };
+        var coordinator = new PrefetchCoordinator(jobs, executor, () => new PrefetchSettings(), () => true);
+        var warm = jobs.Enqueue(harness.Item.Id, owner, 50);
+
+        await coordinator.RunOnceAsync(CancellationToken.None);
+
+        var job = jobs.List().Single(candidate => candidate.Id == warm.Id);
+        var coverage = await harness.Native.Store!.GetCoverageAsync((await harness.Native.GetCurrentCacheIdentityAsync(harness.Item))!);
+        if (yields)
+        {
+            Assert.Equal("queued", job.State);
+            Assert.Equal(PrefetchFailureCodes.Busy, job.FailureCode);
+            Assert.StartsWith("Paused for a more urgent warm", job.Error);
+            Assert.Equal(0, jobs.Attempts(job.Id));
+            Assert.InRange(coverage, 1, fileSize - 1);
+        }
+        else
+        {
+            Assert.Equal("completed", job.State);
+            Assert.Equal(fileSize, coverage);
+        }
+        Assert.Equal("queued", jobs.List().Single(candidate => candidate.ItemId == urgent).State);
+    }
+
+    [Theory]
     [InlineData(0, true)] // No retries left: the unverified block is a damaged release.
     [InlineData(3, false)] // Retries remain: deferred with a classified reason.
     public async Task RepeatedlyUnverifiedSource_EscalatesToDamageOnTheLastRetry(int maxRetries, bool escalates)
@@ -398,6 +435,9 @@ public sealed class PrefetchWarmingOutcomeTests
             _sessionReads.Touch(session, servedBytes, servedBytes);
         }
 
+        public IServiceScopeFactory Scopes => _provider.GetRequiredService<IServiceScopeFactory>();
+        public ActiveReadRegistry Reads => _sessionReads;
+
         public PlexPrefetchService Policies() => new(Config, new PlexApiClient(_http, "warm-outcome-test"),
             Runtime, _provider.GetRequiredService<IServiceScopeFactory>(), _sessionReads);
 
@@ -442,6 +482,16 @@ public sealed class PrefetchWarmingOutcomeTests
     private sealed class VerifiedSource(long length) : MemoryStream(new byte[length]), ICacheReadEvidence
     {
         public bool LastReadCacheable => true;
+    }
+
+    private sealed class ReadObservedSource(long length, Action onRead) : MemoryStream(new byte[length]), ICacheReadEvidence
+    {
+        public bool LastReadCacheable => true;
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            onRead();
+            return base.ReadAsync(buffer, cancellationToken);
+        }
     }
 
     private sealed class UnverifiedSource() : MemoryStream(new byte[3]), ICacheReadEvidence

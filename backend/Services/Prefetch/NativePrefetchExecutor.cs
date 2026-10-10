@@ -76,6 +76,10 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
     /// <summary>Cached bytes routine warming may re-read for verification per UTC day; manual warms are exempt.</summary>
     public const long VerificationDailyBytes = 64L * 1024 * 1024 * 1024;
     private static readonly TimeSpan GovernorInterval = TimeSpan.FromSeconds(1);
+    internal Func<WarmYieldPolicy> NewYieldPolicy { get; init; } =
+        () => new(WarmYieldPolicy.DefaultMinimumLead, WarmYieldPolicy.DefaultCheckInterval);
+    /// <summary>How long a warm that yielded its slot waits before it may be claimed again.</summary>
+    internal TimeSpan YieldRetryDelay { get; init; } = TimeSpan.FromSeconds(15);
     private PrefetchSettings Settings() => settingsProvider?.Invoke()
         ?? PrefetchSettings.Parse(config.GetEffectiveConfigValue(ConfigKeys.SmartPrefetchSettings));
     public async Task ExecuteAsync(PrefetchJob job, CancellationToken ct)
@@ -121,10 +125,37 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         // Bytes this run filled since the last progress write; flushed with the next coverage update.
         var unreportedWarmed = 0L;
         var lanes = WarmLanesFor(item, factory);
+        var store = native.Store;
+        var yieldPolicy = job.IsRangeJob ? null : NewYieldPolicy();
+        var playbackRate = WarmYieldPolicy.PlaybackBytesPerSecond(item.FileSize.Value, job.MediaDurationMs);
+        // A whole-file warm far ahead of its viewers hands the slot to a more urgent job, such as
+        // the next episode another viewer is about to start, instead of finishing bytes nobody needs yet.
+        async ValueTask YieldIfOutrankedAsync()
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (yieldPolicy is null || !yieldPolicy.CheckDue(now)) return;
+            yieldPolicy.Observe(activeReads.Snapshot().Where(read => read.ItemId == item.Id)
+                .Select(read => Math.Clamp(Interlocked.Read(ref read.CurrentOffset), 0, cached.Length)).ToArray(), now);
+            if (!jobs.HasClaimableAbove(job.Priority, PrefetchCoordinator.ExpressRangeBytes)) return;
+            var servesPlayback = WarmYieldPolicy.ServesPlayback(jobs.OwnersOf([job.Id]).GetValueOrDefault(job.Id) ?? []);
+            var lead = await yieldPolicy.CachedLeadAsync(now, servesPlayback, playbackRate,
+                async (offset, token) => await store.FindNextMissingOffsetAsync(cached.Identity, offset, cached.Length, token).ConfigureAwait(false) - offset,
+                ct).ConfigureAwait(false);
+            if (!yieldPolicy.ShouldYield(lead)) return;
+            Log.Information("Smart Prefetch job {JobId} for item {ItemId} paused for a more urgent warm; {Lead} of playback is cached ahead of every viewer",
+                job.Id, item.Id, lead == TimeSpan.MaxValue ? "all" : $"{lead!.Value.TotalMinutes:F0} min");
+            throw new PrefetchDeferredException("Paused for a more urgent warm; verified coverage retained.",
+                failureCode: PrefetchFailureCodes.Busy, retryAfter: YieldRetryDelay);
+        }
         try
         {
-            await WarmAsync(native.Store, cached, job.Start, job.Length,
-                async _ => CanContinue() && await wireBudget.PrepareReadAsync(ct).ConfigureAwait(false),
+            await WarmAsync(store, cached, job.Start, job.Length,
+                async _ =>
+                {
+                    if (!CanContinue()) return false;
+                    await YieldIfOutrankedAsync().ConfigureAwait(false);
+                    return await wireBudget.PrepareReadAsync(ct).ConfigureAwait(false);
+                },
                 bytes =>
                 {
                     jobs.Progress(job.Id, cached.Identity.Generation, bytes, Interlocked.Exchange(ref unreportedWarmed, 0));

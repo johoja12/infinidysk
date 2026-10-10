@@ -529,6 +529,23 @@ public sealed class PrefetchJobStore : IDisposable
         }
     }
 
+    /// <summary>
+    /// Whether <see cref="ClaimNext"/> could hand out a job outranking <paramref name="priority"/> right now.
+    /// Range jobs of at most <paramref name="expressBytes"/> are left out: they run in their own slot.
+    /// </summary>
+    public bool HasClaimableAbove(int priority, long expressBytes)
+    {
+        lock (_gate)
+        {
+            if (Paused) return false;
+            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            using var command = Command("SELECT 1 FROM Jobs WHERE State='queued' AND Priority>$priority AND Created>=$cutoff AND NOT (Length BETWEEN 1 AND $express) AND ItemId NOT IN (SELECT ItemId FROM Jobs WHERE State='running') AND Id NOT IN (SELECT Id FROM Deferred WHERE Until>$now) LIMIT 1",
+                ("$priority", priority), ("$express", expressBytes), ("$now", now),
+                ("$cutoff", DateTimeOffset.UtcNow.AddHours(-(_settings?.Invoke().IntentTtlHours ?? 24)).ToUnixTimeMilliseconds()));
+            return command.ExecuteScalar() is not null;
+        }
+    }
+
     /// <param name="committedBytes">Whole-file cache coverage after this step, including bytes that were already cached.</param>
     /// <param name="warmedBytes">Bytes this job fetched and committed since its previous progress report.</param>
     public void Progress(string id, string generation, long committedBytes, long warmedBytes = 0)
