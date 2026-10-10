@@ -148,6 +148,28 @@ public sealed class PrefetchJobStoreTests : IDisposable
     }
 
     [Fact]
+    public void HasClaimableAbove_CountsOnlyOutrankingJobsTheNextClaimCouldStart()
+    {
+        using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
+        var running = jobs.Enqueue(Guid.NewGuid(), "manual", 50);
+        jobs.ClaimNext();
+        jobs.Enqueue(Guid.NewGuid(), "lower", 40);
+        // Small ranges run in the express slot, and a second job for the running file must wait for it.
+        jobs.Enqueue(Guid.NewGuid(), "backfill", 60, 0, PrefetchCoordinator.ExpressRangeBytes);
+        jobs.Enqueue(running.ItemId, "same-file", 90, 0, 2 * PrefetchCoordinator.ExpressRangeBytes);
+        Assert.False(jobs.HasClaimableAbove(50, PrefetchCoordinator.ExpressRangeBytes));
+
+        var urgent = jobs.Enqueue(Guid.NewGuid(), "next-episode", 90);
+        Assert.True(jobs.HasClaimableAbove(50, PrefetchCoordinator.ExpressRangeBytes));
+        Assert.False(jobs.HasClaimableAbove(90, PrefetchCoordinator.ExpressRangeBytes));
+
+        // A deferred job cannot be claimed until its delay passes.
+        Assert.Equal(urgent.Id, jobs.ClaimNext()!.Id);
+        jobs.Defer(urgent.Id, "busy", TimeSpan.FromMinutes(1), consumeAttempt: false);
+        Assert.False(jobs.HasClaimableAbove(50, PrefetchCoordinator.ExpressRangeBytes));
+    }
+
+    [Fact]
     public void WholeFileUpgrade_MergesEveryQueuedRange()
     {
         using var jobs = new PrefetchJobStore(Path.Combine(_root, "jobs.db"));
