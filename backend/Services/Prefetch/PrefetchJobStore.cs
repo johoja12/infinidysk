@@ -35,6 +35,8 @@ public sealed record PrefetchJob(string Id, Guid ItemId, string Trigger, int Pri
     public string? FailureCode { get; init; }
     /// <summary>Follow-up taken for a failure, for example <c>repair-queued</c>; null when none.</summary>
     public string? Remedy { get; init; }
+    /// <summary>Live repair outcome; never changes this attempt's failure or cache accounting.</summary>
+    public PrefetchRepairOutcome? RepairOutcome { get; init; }
     /// <summary>Running jobs only: bytes per second fetched over the last few seconds; null until measurable.</summary>
     public double? RecentBytesPerSecond { get; init; }
     /// <summary>Running jobs only: Unix milliseconds of the latest progress report (fetch or verification).</summary>

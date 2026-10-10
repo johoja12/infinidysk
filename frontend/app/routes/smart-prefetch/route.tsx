@@ -19,7 +19,13 @@ import {
   medianWarmingSpeed,
 } from "./warming-speed";
 import { SourceBubbles, type JobSource } from "./source-bubbles";
-import { decimalBytes, describeCoverage, failureReason, mebibytes } from "./job-coverage";
+import {
+  decimalBytes,
+  describeCoverage,
+  failureReason,
+  mebibytes,
+  repairOutcomes,
+} from "./job-coverage";
 import {
   gapBytes,
   gapHeadline,
@@ -54,6 +60,12 @@ type Job = {
   coveragePending?: boolean;
   failureCode?: string | null;
   remedy?: string | null;
+  repairOutcome?: {
+    status: string;
+    replacementItemId?: string | null;
+    requestedAt?: string | null;
+    completedAt?: string | null;
+  } | null;
   recentBytesPerSecond?: number | null;
   lastProgressAt?: number | null;
   stalled?: boolean | null;
@@ -148,6 +160,19 @@ function Card({
   );
 }
 const reasonTone = { warning: "badge-warning", error: "badge-error", info: "badge-info" } as const;
+function repairBadge(job: Job) {
+  const status = job.repairOutcome?.status;
+  if (status === "replacement-warmed" || status === "replaced") return "badge-success";
+  if (status === "failed") return "badge-error";
+  if (
+    status === "unconfirmed" ||
+    status === "replacement-unavailable" ||
+    status === "skipped" ||
+    status === "search-withheld"
+  )
+    return "badge-warning";
+  return "badge-info";
+}
 
 /**
  * A backfill job: bytes playback streamed without caching. Shows where the gap was, why it was
@@ -193,7 +218,9 @@ function GapRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
           >
             {failure.title}
             {failure.remedy && (
-              <span className="badge badge-sm badge-info badge-soft">{failure.remedy}</span>
+              <span className={`badge badge-sm badge-soft ${repairBadge(job)}`}>
+                {failure.remedy}
+              </span>
             )}
           </span>
         )}
@@ -256,7 +283,9 @@ function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
           >
             {failure.title}
             {failure.remedy && (
-              <span className="badge badge-sm badge-info badge-soft">{failure.remedy}</span>
+              <span className={`badge badge-sm badge-soft ${repairBadge(job)}`}>
+                {failure.remedy}
+              </span>
             )}
           </span>
         )}
@@ -315,7 +344,18 @@ function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
             {job.length === 0 ? "end of file" : bytes(job.start + job.length)}
           </p>
           {job.reason && <p>Reason: {job.reason}</p>}
-          {job.error && <p className="text-error">{job.error}</p>}
+          {job.repairOutcome && (
+            <p>
+              Current repair outcome:{" "}
+              {repairOutcomes[job.repairOutcome.status] ?? "Repair outcome unconfirmed"}
+              {job.repairOutcome.completedAt
+                ? ` · ${when(Date.parse(job.repairOutcome.completedAt))}`
+                : job.repairOutcome.requestedAt
+                  ? ` · requested ${when(Date.parse(job.repairOutcome.requestedAt))}`
+                  : ""}
+            </p>
+          )}
+          {job.error && <p className="text-error">Original warming error: {job.error}</p>}
           <p className="break-all">Item ID: {job.itemId}</p>
         </div>
       </details>
@@ -770,10 +810,11 @@ export default function SmartPrefetchActivityPage() {
 }
 
 function openJob(modal: LibraryFileModalController, job: Job) {
-  modal.openByDavItemId(job.itemId, {
+  const replacement = job.repairOutcome?.replacementItemId;
+  modal.openByDavItemId(replacement || job.itemId, {
     displayName: job.displayName || job.itemId,
-    size: job.fileSize ?? null,
-    cachePercentage: coverage(job),
+    size: replacement ? null : (job.fileSize ?? null),
+    cachePercentage: replacement ? null : coverage(job),
   });
 }
 

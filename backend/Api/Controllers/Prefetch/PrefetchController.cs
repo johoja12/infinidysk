@@ -4,6 +4,8 @@ using NzbWebDAV.Config;
 using NzbWebDAV.Database;
 using NzbWebDAV.Services.Plex;
 using NzbWebDAV.Services.Prefetch;
+using NzbWebDAV.Services.NativeCache;
+using NzbWebDAV.Exceptions;
 
 namespace NzbWebDAV.Api.Controllers.Prefetch;
 
@@ -11,7 +13,7 @@ namespace NzbWebDAV.Api.Controllers.Prefetch;
 [Route("api/prefetch")]
 [ProducesResponseType(typeof(PrefetchStatusResponse), StatusCodes.Status200OK)]
 public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchService policies, DavDatabaseClient database,
-    ConfigManager config, PlexCatalogueService catalogue) : GetOnlyApiController
+    ConfigManager config, PlexCatalogueService catalogue, NativeCacheService native) : GetOnlyApiController
 {
     protected override async Task<IActionResult> HandleRequest()
     {
@@ -35,6 +37,13 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
         { runtime.ReportMetadataFailure(); }
         var items = (await database.GetItemsByIdsBatchedAsync(jobs.Select(job => job.ItemId).Distinct().ToArray(),
             ct: HttpContext.RequestAborted).ConfigureAwait(false)).ToDictionary(item => item.Id);
+        var repairs = await PrefetchRepairHistory.LoadAsync(database.Ctx, config, jobs, async (item, ct) =>
+        {
+            try { return (await native.GetCurrentCacheIdentityAsync(item, ct).ConfigureAwait(false))?.Generation; }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException
+                or Microsoft.Data.Sqlite.SqliteException or CorruptedBlobPayloadException or ObjectDisposedException)
+            { return null; }
+        }, HttpContext.RequestAborted).ConfigureAwait(false);
         var includeCoverage = !string.Equals(HttpContext.Request.Query["includeCoverage"], "false", StringComparison.OrdinalIgnoreCase);
         var coverage = includeCoverage
             ? await runtime.GetRangeCoverageAsync(jobs, items, HttpContext.RequestAborted).ConfigureAwait(false)
@@ -75,7 +84,11 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
                     owners.GetValueOrDefault(job.Id) ?? [job.Trigger], settings, servers, userNames: userNames);
                 return job with
                 {
-                    DisplayName = items.GetValueOrDefault(job.ItemId)?.Name ?? "Removed media",
+                    DisplayName = items.GetValueOrDefault(job.ItemId)?.Name
+                        ?? repairs.GetValueOrDefault(job.ItemId)?.DisplayName ?? "Removed media",
+                    RepairOutcome = repairs.GetValueOrDefault(job.ItemId)?.Outcome
+                        ?? (!items.ContainsKey(job.ItemId)
+                            ? new PrefetchRepairOutcome("unconfirmed", null, null, null) : null),
                     FileSize = items.GetValueOrDefault(job.ItemId)?.FileSize,
                     Source = PlexPrefetchService.SourceLabel(job.Trigger),
                     Reason = PlexPrefetchService.RangeReason(job.Trigger, job.Length),
