@@ -133,10 +133,13 @@ public class NzbFileStream(
                 reader.RecoverAsync,
                 () => readBudgetOverride ?? NzbWebDAV.WebDav.Requests.RangeContext.GetReadBudget(),
                 GetVerifiedBufferSlices(verificationProof.SliceSize));
+            // Native cache blocks can be smaller than a proof slice. The direct reader
+            // expands the native budget for the complete slice before returning verified bytes.
             // A volume opened ahead of the reader goes straight to the sequential candidate so its
             // prefetch starts before the reader arrives.
             _verifiedStream = new Par2VerifiedFileStream(verificationProof,
-                reader.ReadAsync, SpeculativeReadAhead is null ? reader.ReadPrefixAsync : null, sequential);
+                reader.ReadAsync, SpeculativeReadAhead is null ? reader.ReadPrefixAsync : null,
+                NativeCacheReadContext.IsActive ? null : sequential);
             return _verifiedStream;
         }
     }
