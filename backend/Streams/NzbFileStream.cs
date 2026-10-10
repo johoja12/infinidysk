@@ -38,7 +38,8 @@ public class NzbFileStream(
 {
     bool ISegmentIssueProgress.AllSegmentsIssued =>
         verificationProof is null
-        && _innerStream is ISegmentIssueProgress { AllSegmentsIssued: true };
+            ? _innerStream is ISegmentIssueProgress { AllSegmentsIssued: true }
+            : _verifiedStream is ISegmentIssueProgress { AllSegmentsIssued: true };
 
     // PAR2-verified reads are validated before they are returned.
     ValueTask IDeliveredBytesValidation.ValidateDeliveredAsync(CancellationToken cancellationToken) =>
@@ -73,6 +74,8 @@ public class NzbFileStream(
     internal bool RecordedSizesInferred { get; set; }
     // Set for a multipart successor volume, which prefetches within the combined read-ahead window.
     internal SpeculativeReadAhead? SpeculativeReadAhead { get; set; }
+    // Archive volume this stream reads, carried on its pipelines' trace events.
+    internal int? TracePartIndex { get; set; }
     internal Task? PrewarmObservationForTests { get; private set; }
     private readonly LongRange[]? _segmentByteRanges = ValidateAndCloneSegmentByteRanges(
         segmentByteRanges,
@@ -123,10 +126,46 @@ public class NzbFileStream(
             if (_verifiedStream is not null) return _verifiedStream;
             var reader = new Par2CandidateReader(
                 verificationProof, usenetClient, ReadPar2CandidateAsync, () => RecordedSizesInferred);
+            var sequential = new Par2SequentialCandidateSource(
+                OpenSequentialPar2Candidate,
+                () => YencFileValidationContext.BeginBufferedPar2ProofRead(
+                    fileSegmentIds, segmentFallbacks, _segmentPositionIndex),
+                reader.RecoverAsync,
+                () => readBudgetOverride ?? NzbWebDAV.WebDav.Requests.RangeContext.GetReadBudget(),
+                GetVerifiedBufferSlices(verificationProof.SliceSize));
+            // A volume opened ahead of the reader goes straight to the sequential candidate so its
+            // prefetch starts before the reader arrives.
             _verifiedStream = new Par2VerifiedFileStream(verificationProof,
-                reader.ReadAsync, reader.ReadPrefixAsync);
+                reader.ReadAsync, SpeculativeReadAhead is null ? reader.ReadPrefixAsync : null, sequential);
             return _verifiedStream;
         }
+    }
+
+    // Slice buffers held at once: a quarter of the normal read-ahead window.
+    private int GetVerifiedBufferSlices(int sliceSize) =>
+        Par2VerifiedFileStream.GetBufferSlices(
+            MultiSegmentStream.SaturatingMultiply(
+                MultiSegmentStream.CalculateTaskWindowSize(
+                    articleBufferSize, usePipelinedBodyRequests, streamingBodyBatchWidth),
+                EstimatedSegmentSize) / 4,
+            sliceSize);
+
+    // One candidate stream with normal read-ahead serves consecutive slices.
+    private NzbFileStream OpenSequentialPar2Candidate(long start, long endExclusive)
+    {
+        var candidate = new NzbFileStream(
+            fileSegmentIds, Length, usenetClient, articleBufferSize: articleBufferSize,
+            segmentByteRanges: _segmentByteRanges, usePipelinedBodyRequests: usePipelinedBodyRequests,
+            fileName: fileName, segmentFallbacks: segmentFallbacks,
+            inFlightArticleBudget: inFlightArticleBudget, readBudgetOverride: endExclusive - start,
+            streamingBodyBatchWidth: streamingBodyBatchWidth, readStartWarmupEnabled: readStartWarmupEnabled)
+        {
+            RecordedSizesInferred = RecordedSizesInferred,
+            SpeculativeReadAhead = SpeculativeReadAhead,
+            TracePartIndex = TracePartIndex,
+        };
+        candidate.Position = start;
+        return candidate;
     }
 
     private async Task ReadPar2CandidateAsync(long start, Memory<byte> target, CancellationToken cancellationToken)
@@ -775,6 +814,7 @@ public class NzbFileStream(
                         ExpectedFirstSegmentRangeWasClippedAtFileEnd = expectedFirstSegmentRangeWasClippedAtFileEnd,
                         RecordedSizesInferred = RecordedSizesInferred,
                         SpeculativeReadAhead = SpeculativeReadAhead,
+                        TraceFlow = StreamTraceFlow.Capture(TracePartIndex),
                     },
                     prefixBytes)
                 .ConfigureAwait(false);
@@ -1173,7 +1213,8 @@ public class NzbFileStream(
             sliced.KnownMissing,
             initialBatchPlan,
             RecordedSizesInferred,
-            SpeculativeReadAhead);
+            SpeculativeReadAhead,
+            StreamTraceFlow.Capture(TracePartIndex));
     }
 
     private void StartConnectionPrewarm(

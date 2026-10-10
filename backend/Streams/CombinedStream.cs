@@ -1,5 +1,7 @@
 using System.Buffers;
+using System.Diagnostics;
 using NzbWebDAV.Clients.Usenet.Contexts;
+using NzbWebDAV.Services.StreamTrace;
 using UsenetSharp.Streams;
 
 namespace NzbWebDAV.Streams;
@@ -132,6 +134,9 @@ public class CombinedStream(IEnumerable<Task<Stream>> streams, long readAheadByt
 
     private void ScheduleLocked(long start, long window, CancellationToken cancellationToken)
     {
+        // No reader waits on this part yet, so its opening and priming are background preparation.
+        // The scope only restores an AsyncLocal; started tasks keep the flag through their captured context.
+        using var background = StreamTrace.BeginBackground();
         Task<Stream> opening;
         try
         {
@@ -146,7 +151,9 @@ public class CombinedStream(IEnumerable<Task<Stream>> streams, long readAheadByt
 
         // Owned by the stream, not the triggering read: only disposal cancels prefetch.
         _prefetchCts ??= ContextualCancellationTokenSource.CreateWithContextsOf(cancellationToken);
+#pragma warning disable CA2025 // the background scope only restores an AsyncLocal, which the task already captured
         var pending = new PendingPart(start, PrepareNextAsync(opening, start, window, _prefetchCts.Token));
+#pragma warning restore CA2025
         _nextParts.Enqueue(pending);
         _lastScheduled = pending;
         _ = pending.Prepared.ContinueWith(
@@ -168,6 +175,8 @@ public class CombinedStream(IEnumerable<Task<Stream>> streams, long readAheadByt
         }
 
         // A failed prefetch surfaces here, at the boundary, after every current-part byte.
+        var phase = pending is null ? "cold" : pending.Prepared.IsCompleted ? "prepared" : "preparing";
+        var waitStarted = Stopwatch.GetTimestamp();
         var next = pending is not null
             ? await pending.Prepared.ConfigureAwait(false)
             : opening is not null
@@ -175,6 +184,12 @@ public class CombinedStream(IEnumerable<Task<Stream>> streams, long readAheadByt
                 : null;
 
         if (next is null) return false;
+        StreamTrace.TryWait(
+            StreamTraceKind.VolumeBoundary,
+            phase,
+            Stopwatch.GetElapsedTime(waitStarted),
+            partIndex: (next.Stream as PaddedLengthStream)?.PartIndex,
+            offset: _position);
         _currentStream = next.Stream;
         _primedCacheable = next.Cacheable;
         _primed = next.Primed;
