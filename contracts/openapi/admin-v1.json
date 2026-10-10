@@ -2390,6 +2390,16 @@
               "string"
             ]
           },
+          "repairOutcome": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PrefetchRepairOutcome"
+              }
+            ]
+          },
           "source": {
             "type": [
               "null",
@@ -2693,6 +2703,41 @@
           "rangeCachedBytes",
           "start",
           "updated"
+        ],
+        "type": "object"
+      },
+      "PrefetchRepairOutcome": {
+        "properties": {
+          "completedAt": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "replacementItemId": {
+            "format": "uuid",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "requestedAt": {
+            "format": "date-time",
+            "type": [
+              "null",
+              "string"
+            ]
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "completedAt",
+          "replacementItemId",
+          "requestedAt",
+          "status"
         ],
         "type": "object"
       },

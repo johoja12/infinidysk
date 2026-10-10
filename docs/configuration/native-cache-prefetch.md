@@ -375,6 +375,21 @@ is under **Details**.
 | Source changed | The file's source was repaired or replaced while it warmed. | Deferred without using a retry. Coverage is rechecked against the new revision. |
 | Daily budget reached / Waiting for playback to finish | Budget or playback priority. | Deferred until budget or playback allows. |
 
+### Repair outcomes in history [since unreleased](https://github.com/johoja12/infinidysk/issues/200){ .nzbdav-since }
+
+After a damaged file is removed, its warming history uses the recorded repair's
+original release title and current outcome. **Replacement requested** means a
+search was requested, **Replaced** means the replacement is available through its
+verified InfiniDysk library link, and **Replacement fully warmed** means that
+replacement's current revision completed whole-file warming. Select the row to
+open the replacement's file details when its identity is available.
+
+The original warming attempt still shows **failed**, its original bytes and timing,
+and its original error under **Details**. A withheld search, failed or skipped
+repair, unavailable replacement, or unconfirmed outcome is shown separately;
+deleting a file does not by itself confirm a successful repair. Older records
+without repair provenance may still show **Removed media**.
+
 ### Finish partially watched files [since 1.6.0](https://github.com/infinidysk/infinidysk/releases/tag/v1.6.0){ .nzbdav-since } { #finish-partially-watched-files }
 
 **Finish caching partially watched files** (Smart Prefetch → Advanced settings →

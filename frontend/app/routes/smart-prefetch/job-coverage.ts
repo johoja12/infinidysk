@@ -148,14 +148,33 @@ const remedies: Record<string, string> = {
   "repair-unavailable": "Repair unavailable",
 };
 
+export const repairOutcomes: Record<string, string> = {
+  pending: "Repair queued",
+  requested: "Replacement requested",
+  "search-withheld": "Replacement search withheld",
+  replaced: "Replaced",
+  "replacement-warmed": "Replacement fully warmed",
+  "replacement-unavailable": "Replacement file unavailable",
+  skipped: "Repair skipped",
+  failed: "Repair failed",
+  unconfirmed: "Repair outcome unconfirmed",
+};
+
 /** Headline for a failed or deferred job, from its stable failure code. */
 export function failureReason(job: {
   state: string;
   failureCode?: string | null;
   remedy?: string | null;
   error?: string | null;
+  repairOutcome?: { status: string } | null;
 }): FailureReason | null {
   if (!job.failureCode) {
+    if (job.repairOutcome)
+      return {
+        title: job.state === "failed" ? "Warming failed" : "Repair follow-up",
+        remedy: repairOutcomes[job.repairOutcome.status] ?? "Repair outcome unconfirmed",
+        tone: "warning",
+      };
     return job.state === "failed" && job.error
       ? { title: "Warming failed", remedy: null, tone: "error" }
       : null;
@@ -163,7 +182,11 @@ export function failureReason(job: {
   const known = reasons[job.failureCode] ?? { title: "Warming failed", tone: "error" as const };
   return {
     title: known.title,
-    remedy: job.remedy ? (remedies[job.remedy] ?? null) : null,
+    remedy: job.repairOutcome
+      ? (repairOutcomes[job.repairOutcome.status] ?? "Repair outcome unconfirmed")
+      : job.remedy
+        ? (remedies[job.remedy] ?? null)
+        : null,
     tone: job.state === "failed" ? "error" : known.tone,
   };
 }

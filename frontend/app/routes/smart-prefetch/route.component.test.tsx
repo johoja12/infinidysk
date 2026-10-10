@@ -64,6 +64,42 @@ const response = {
 };
 
 describe("Smart Prefetch activity page", () => {
+  it("shows repaired history and opens the verified replacement instead of the removed item", async () => {
+    const jobs = [
+      {
+        ...response.jobs[1],
+        state: "failed",
+        failureCode: "source-damaged",
+        remedy: "repair-pending",
+        repairOutcome: { status: "replacement-warmed", replacementItemId: "replacement-id" },
+      },
+    ];
+    const fetchMock = vi.fn((input: string) =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve(
+            input.includes("/library-file")
+              ? { details: null, unavailableReason: "Library lookup" }
+              : { ...response, jobs },
+          ),
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const router = createMemoryRouter(
+      [{ path: "/smart-prefetch", element: <SmartPrefetchActivityPage /> }],
+      { initialEntries: ["/smart-prefetch"] },
+    );
+    render(<RouterProvider router={router} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("tab", { name: /Warming history/ }));
+    expect(await screen.findByText("Replacement fully warmed")).toBeTruthy();
+    expect(screen.queryByText("Repair pending")).toBeNull();
+    const row = screen.getByRole("button", { name: /Series finished/ });
+    expect(row.textContent).toContain("failed");
+    await user.click(row);
+    expect(fetchMock).toHaveBeenCalledWith("/library-file?davItemId=replacement-id");
+  });
   it("separates active jobs from recent history and shows real budget accounting", async () => {
     vi.stubGlobal(
       "fetch",

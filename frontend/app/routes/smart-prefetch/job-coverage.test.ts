@@ -96,6 +96,30 @@ describe("Smart Prefetch job coverage", () => {
 });
 
 describe("Smart Prefetch failure reasons", () => {
+  it("shows a later repair for an earlier successful warming attempt", () => {
+    expect(failureReason({ state: "completed", repairOutcome: { status: "replaced" } })).toEqual({
+      title: "Repair follow-up",
+      remedy: "Replaced",
+      tone: "warning",
+    });
+  });
+  it.each([
+    ["requested", "Replacement requested"],
+    ["replacement-warmed", "Replacement fully warmed"],
+    ["replacement-unavailable", "Replacement file unavailable"],
+    ["search-withheld", "Replacement search withheld"],
+    ["failed", "Repair failed"],
+    ["unconfirmed", "Repair outcome unconfirmed"],
+  ])("uses live repair outcome %s instead of the saved pending remedy", (status, label) => {
+    expect(
+      failureReason({
+        state: "failed",
+        failureCode: "source-damaged",
+        remedy: "repair-pending",
+        repairOutcome: { status },
+      })?.remedy,
+    ).toBe(label);
+  });
   it("explains a damaged release and its repair hand-off", () => {
     expect(
       failureReason({ state: "failed", failureCode: "source-damaged", remedy: "repair-queued" }),
