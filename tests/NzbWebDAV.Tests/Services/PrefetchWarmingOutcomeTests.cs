@@ -158,6 +158,27 @@ public sealed class PrefetchWarmingOutcomeTests
         Assert.Single(jobs.List());
     }
 
+    [Fact]
+    public async Task DamagedRelease_BelowTheRepairThreshold_QueuesAHealthCheckToConfirmIt()
+    {
+        var rechecks = new RecordingRecheckQueue();
+        await using var harness = await Harness.CreateAsync(fileSize: 3, source: () => new MissingArticleSource(), recheck: rechecks);
+        harness.Config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.RepairAutoRemoveAfterFailures, ConfigValue = "3" }]);
+        var jobs = harness.Runtime.Jobs!;
+        jobs.Enqueue(harness.Item.Id, "manual", 50);
+
+        await harness.Runtime.Coordinator!.RunOnceAsync(CancellationToken.None);
+
+        var failed = Assert.Single(jobs.List());
+        Assert.Equal(PrefetchFailureCodes.SourceDamaged, failed.FailureCode);
+        Assert.Equal(PrefetchRemedies.RepairPending, failed.Remedy);
+        Assert.Contains("A health check is queued to confirm the damage", failed.Error);
+        Assert.Equal([harness.Item.Id], rechecks.Items);
+        // The urgent (remove-and-replace) path stays behind the threshold.
+        await using var context = new DavDatabaseContext(harness.Options);
+        Assert.NotEqual(DateTimeOffset.UnixEpoch, (await context.Items.FindAsync(harness.Item.Id))!.NextHealthCheck);
+    }
+
     [Theory]
     [InlineData(0, true)] // No retries left: the unverified block is a damaged release.
     [InlineData(3, false)] // Retries remain: deferred with a classified reason.
@@ -300,7 +321,8 @@ public sealed class PrefetchWarmingOutcomeTests
             _provider = provider;
         }
 
-        public static async Task<Harness> CreateAsync(long fileSize, Func<Stream>? source = null, PrefetchSettings? settings = null, Action? onBlobRead = null)
+        public static async Task<Harness> CreateAsync(long fileSize, Func<Stream>? source = null, PrefetchSettings? settings = null, Action? onBlobRead = null,
+            IFileRecheckQueue? recheck = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "warm-outcome-" + Guid.NewGuid().ToString("N"));
             var previous = Environment.GetEnvironmentVariable("CONFIG_PATH");
@@ -351,6 +373,7 @@ public sealed class PrefetchWarmingOutcomeTests
             services.AddScoped(sp => new DavDatabaseClient(sp.GetRequiredService<DavDatabaseContext>(), blobs));
             services.AddSingleton<IDavContentStreamFactory>(new Factory(source ?? (() => new VerifiedSource(fileSize))));
             services.AddSingleton(repairs);
+            if (recheck is not null) services.AddSingleton(recheck);
             var provider = services.BuildServiceProvider();
             var reads = new ActiveReadRegistry();
 #pragma warning disable CA2000 // Owned by the harness and disposed with it.
@@ -424,6 +447,16 @@ public sealed class PrefetchWarmingOutcomeTests
     private sealed class UnverifiedSource() : MemoryStream(new byte[3]), ICacheReadEvidence
     {
         public bool LastReadCacheable => false;
+    }
+
+    private sealed class RecordingRecheckQueue : IFileRecheckQueue
+    {
+        public List<Guid> Items { get; } = [];
+        public Task<HealthCheckService.FileRecheckOutcome> ExpediteFileRecheckAsync(Guid davItemId, CancellationToken cancellationToken)
+        {
+            Items.Add(davItemId);
+            return Task.FromResult(HealthCheckService.FileRecheckOutcome.Queued);
+        }
     }
 
     /// <summary>Pads a missing article with zeros, as segment streams do, and reports the gap.</summary>
