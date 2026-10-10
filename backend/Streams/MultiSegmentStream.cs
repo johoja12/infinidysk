@@ -61,6 +61,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
     // Producer-only: stripes the next group may use, between 1 and _stripeCount.
     private int _stripeTarget;
     private readonly List<Task> _activeRemoteBatches = [];
+    private Task[] _traceRemoteBatches = [];
     private readonly InFlightArticleBudget? _budget;
     private long _inFlightPrefetchBytes;
     // Producer-only enqueue progress, read by ShouldStopPrefetch.
@@ -1310,6 +1311,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
             return;
         ActiveRemoteBatchCount();
         _activeRemoteBatches.Add(lastResponse);
+        Volatile.Write(ref _traceRemoteBatches, _activeRemoteBatches.ToArray());
         if (_activeRemoteBatches.Count > _stripeTarget)
             _stripeTarget = Math.Min(_stripeCount, _activeRemoteBatches.Count);
     }
@@ -3031,7 +3033,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
                 scope.SessionId, scope.Generation, _tracePipelineId, _traceFlow.PartIndex, headIndex,
                 _streamTasks.Reader.Count, awaiting,
                 Math.Max(0, Volatile.Read(ref _highestRespondedIndex) - headIndex),
-                Volatile.Read(ref _activeBatches), _batchSizer?.Current ?? _bodyPipelineBatchSize,
+                Volatile.Read(ref _traceRemoteBatches).Count(batch => !batch.IsCompleted), _batchSizer?.Current ?? _bodyPipelineBatchSize,
                 Interlocked.Read(ref _inFlightPrefetchBytes), waitPhase, waitMs));
         }
     }

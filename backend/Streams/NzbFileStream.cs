@@ -129,7 +129,7 @@ public class NzbFileStream(
             var sequential = new Par2SequentialCandidateSource(
                 OpenSequentialPar2Candidate,
                 () => YencFileValidationContext.BeginBufferedPar2ProofRead(
-                    fileSegmentIds, segmentFallbacks, _segmentPositionIndex),
+                    fileSegmentIds, segmentFallbacks, positionIndex: _segmentPositionIndex),
                 reader.RecoverAsync,
                 () => readBudgetOverride ?? NzbWebDAV.WebDav.Requests.RangeContext.GetReadBudget(),
                 GetVerifiedBufferSlices(verificationProof.SliceSize));
