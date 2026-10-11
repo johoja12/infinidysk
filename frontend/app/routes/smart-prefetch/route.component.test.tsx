@@ -64,6 +64,72 @@ const response = {
 };
 
 describe("Smart Prefetch activity page", () => {
+  it("counts and paginates grouped entries instead of individual runs", async () => {
+    const jobs = Array.from({ length: 26 }, (_, i) => ({
+      ...response.jobs[1],
+      id: `run-${i}`,
+      updated: now + i,
+    }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ ...response, jobs }) }),
+    );
+    const router = createMemoryRouter(
+      [{ path: "/smart-prefetch", element: <SmartPrefetchActivityPage /> }],
+      { initialEntries: ["/smart-prefetch"] },
+    );
+    render(<RouterProvider router={router} />);
+    await userEvent.setup().click(await screen.findByRole("tab", { name: /Warming history/ }));
+    expect(screen.getAllByRole("button", { name: /Series finished/ })).toHaveLength(1);
+    expect(screen.getByRole("tab", { name: /Warming history · 1/ })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: /Prefetch warming\s*1/ })).toBeTruthy();
+    expect(screen.getByText("26 warming runs")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Next" })).toBeNull();
+  });
+
+  it("groups repeated warming runs while keeping earlier errors and filter access", async () => {
+    const latest = {
+      ...response.jobs[1],
+      id: "latest",
+      updated: now + 1000,
+      sources: [{ label: "Next episode · history", category: "plex-history-next" }],
+    };
+    const earlier = {
+      ...response.jobs[1],
+      id: "earlier",
+      state: "failed",
+      error: "Damaged source",
+      repairOutcome: { status: "replacement-warmed" },
+      sources: [{ label: "Next episode · realtime", category: "plex-realtime-next" }],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ ...response, jobs: [earlier, latest] }),
+      }),
+    );
+    const router = createMemoryRouter(
+      [{ path: "/smart-prefetch", element: <SmartPrefetchActivityPage /> }],
+      { initialEntries: ["/smart-prefetch"] },
+    );
+    render(<RouterProvider router={router} />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("tab", { name: /Warming history/ }));
+    expect(screen.getAllByRole("button", { name: /Series finished/ })).toHaveLength(1);
+    expect(screen.getByText("2 warming runs")).toBeTruthy();
+    expect(screen.getByText("1 entry")).toBeTruthy();
+    const row = screen.getByRole("button", { name: /Series finished/ });
+    expect(row.textContent).toContain("completed");
+    expect(within(row).getByText("Next episode · history")).toBeTruthy();
+    expect(within(row).getByText("Next episode · realtime")).toBeTruthy();
+    await user.click(screen.getByText("Details"));
+    expect(screen.getByText("Original warming error: Damaged source")).toBeTruthy();
+    expect(screen.getByText(/Current repair outcome: Replacement fully warmed/)).toBeTruthy();
+    await user.selectOptions(screen.getByRole("combobox", { name: /Filter history/ }), "failed");
+    expect(screen.getByRole("button", { name: /Series finished/ }).textContent).toContain("failed");
+  });
+
   it("shows repaired history and opens the verified replacement instead of the removed item", async () => {
     const jobs = [
       {
@@ -158,7 +224,7 @@ describe("Smart Prefetch activity page", () => {
     expect(timed.textContent).toContain("14.2 MB/s · 3m 05s");
     // A job recorded before timing existed shows a dash instead of a speed.
     expect(screen.getByRole("button", { name: /Series finished/ }).textContent).toContain("—");
-    expect(screen.getByText(/median 14\.2 MB\/s · 2 jobs/)).toBeTruthy();
+    expect(screen.getByText(/median 14\.2 MB\/s · 2 entries/)).toBeTruthy();
   });
 
   it("splits history into prefetch warming and playback gap fills with a definite reason", async () => {

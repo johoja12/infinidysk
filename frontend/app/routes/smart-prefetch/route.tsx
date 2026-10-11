@@ -19,6 +19,7 @@ import {
   medianWarmingSpeed,
 } from "./warming-speed";
 import { SourceBubbles, type JobSource } from "./source-bubbles";
+import { groupWarmingHistory, warmingHistoryKey } from "./history-groups";
 import {
   decimalBytes,
   describeCoverage,
@@ -39,6 +40,7 @@ import {
 type Job = {
   id: string;
   itemId: string;
+  generation?: string | null;
   displayName?: string;
   source?: string;
   reason?: string;
@@ -97,7 +99,7 @@ const terminal = new Set(["completed", "failed", "cancelled", "expired"]);
 const filterStates = ["all", "running", "queued", "deferred", "paused", "failed"];
 type HistoryKind = "warming" | "gaps";
 const warmingFilters: Record<string, string> = {
-  all: "All jobs",
+  all: "All entries",
   "fully-cached": "Fully cached",
   partial: "Partially cached",
   failed: "Failed",
@@ -195,7 +197,9 @@ function GapRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
         onClick={() => onOpen(job)}
       >
         <span className="flex flex-wrap items-center justify-between gap-2">
-          <span className="min-w-0 font-semibold">{job.displayName || job.itemId}</span>
+          <span className="min-w-0 font-semibold [overflow-wrap:anywhere]">
+            {job.displayName || job.itemId}
+          </span>
           {badge(job.state)}
         </span>
         <span className="mt-1 flex flex-wrap items-center gap-2 text-xs text-base-content/70">
@@ -252,7 +256,15 @@ function GapRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
   );
 }
 
-function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
+function JobRow({
+  job,
+  onOpen,
+  runs = [],
+}: {
+  job: Job;
+  onOpen: (job: Job) => void;
+  runs?: Job[];
+}) {
   const summary = describeCoverage(job);
   const pct = summary.percent;
   const finished = terminal.has(job.state);
@@ -266,7 +278,9 @@ function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
         onClick={() => onOpen(job)}
       >
         <span className="flex flex-wrap items-center justify-between gap-2">
-          <span className="min-w-0 font-semibold">{job.displayName || job.itemId}</span>
+          <span className="min-w-0 font-semibold [overflow-wrap:anywhere]">
+            {job.displayName || job.itemId}
+          </span>
           {badge(job.state)}
         </span>
         <span className="mt-1 flex flex-wrap items-center gap-2 text-xs text-base-content/55">
@@ -276,6 +290,9 @@ function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
             fallback={job.source || job.trigger}
           />
           <span>{when(job.updated)}</span>
+          {runs.length > 1 && (
+            <span className="badge badge-sm badge-ghost">{runs.length} warming runs</span>
+          )}
         </span>
         {failure && (
           <span
@@ -306,6 +323,7 @@ function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
           </span>
           {finished && (
             <span title="Average speed of the bytes this job fetched, over its active warming time">
+              {runs.length > 1 ? "Latest run · " : ""}
               {formatWarmingSpeed(job)}
             </span>
           )}
@@ -357,6 +375,34 @@ function JobRow({ job, onOpen }: { job: Job; onOpen: (job: Job) => void }) {
           )}
           {job.error && <p className="text-error">Original warming error: {job.error}</p>}
           <p className="break-all">Item ID: {job.itemId}</p>
+          {runs.length > 1 && (
+            <div className="mt-3 border-t border-base-content/10 pt-3">
+              <p className="font-semibold">Warming runs · newest first</p>
+              <ul className="mt-2 space-y-3">
+                {runs.map((run) => (
+                  <li key={run.id} className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      {badge(run.state)} <span>{when(run.updated)}</span>
+                      <SourceBubbles
+                        sources={run.sources ?? null}
+                        sourceCount={run.sourceCount ?? null}
+                        fallback={run.source || run.trigger}
+                      />
+                    </div>
+                    <p>{formatWarmingSpeed(run)}</p>
+                    {run.reason && <p>Reason: {run.reason}</p>}
+                    {run.error && <p className="text-error">Original warming error: {run.error}</p>}
+                    {run.repairOutcome && (
+                      <p>
+                        Current repair outcome:{" "}
+                        {repairOutcomes[run.repairOutcome.status] ?? "Repair outcome unconfirmed"}
+                      </p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       </details>
     </article>
@@ -441,6 +487,7 @@ export default function SmartPrefetchActivityPage() {
   const history = jobs.filter((job) => terminal.has(job.state));
   const gapHistory = history.filter(isGapFill);
   const warmingHistory = history.filter((job) => !isGapFill(job));
+  const warmingHistoryCount = groupWarmingHistory(warmingHistory).length;
   const current =
     view === "activity" ? active : historyKind === "gaps" ? gapHistory : warmingHistory;
   const coverageFilter = view === "history" && (filter === "fully-cached" || filter === "partial");
@@ -452,7 +499,11 @@ export default function SmartPrefetchActivityPage() {
     `${job.displayName ?? ""} ${job.itemId} ${job.source ?? job.trigger} ${(job.sources ?? []).map((source) => source.label).join(" ")}`
       .toLowerCase()
       .includes(search.toLowerCase());
-  const coverageCandidates = current.filter(metadataMatches);
+  const matchingCoverage = current.filter(metadataMatches);
+  const coverageCandidates =
+    view === "history" && historyKind === "warming"
+      ? groupWarmingHistory(matchingCoverage).map((group) => group.job)
+      : matchingCoverage;
   const coveragePage = Math.min(page, Math.max(0, Math.ceil(coverageCandidates.length / 25) - 1));
   const coverageJobs = coverageFilter
     ? coverageCandidates
@@ -494,9 +545,15 @@ export default function SmartPrefetchActivityPage() {
       ),
     [enrichedCurrent, filter, search, view, historyKind],
   );
-  const lastPage = Math.max(0, Math.ceil(visible.length / 25) - 1);
+  const groupedHistory =
+    view === "history" && historyKind === "warming" ? groupWarmingHistory(visible) : null;
+  const listed = groupedHistory?.map((group) => group.job) ?? visible;
+  const historyRuns = groupedHistory
+    ? new Map(groupedHistory.map((group) => [warmingHistoryKey(group.job), group.runs]))
+    : undefined;
+  const lastPage = Math.max(0, Math.ceil(listed.length / 25) - 1);
   const shownPage = Math.min(page, lastPage);
-  const pageJobs = visible.slice(shownPage * 25, (shownPage + 1) * 25);
+  const pageJobs = listed.slice(shownPage * 25, (shownPage + 1) * 25);
   const running = active.filter((job) => job.state === "running").length;
   const today = new Date().toDateString();
   const completedToday = history.filter(
@@ -506,7 +563,7 @@ export default function SmartPrefetchActivityPage() {
   const used = status?.dailyBudgetUsed;
   const pct = budget && used != null ? Math.min(100, (used / budget) * 100) : 0;
   const unavailable = !status?.available || status?.healthy === false;
-  const median = view === "history" ? medianWarmingSpeed(visible) : null;
+  const median = view === "history" ? medianWarmingSpeed(listed) : null;
   return (
     <div className="mx-auto max-w-7xl space-y-5 px-4 py-6 sm:px-6 lg:px-8">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -613,7 +670,7 @@ export default function SmartPrefetchActivityPage() {
             setPage(0);
           }}
         >
-          Warming history · {history.length}
+          Warming history · {warmingHistoryCount + gapHistory.length}
         </button>
         <button
           type="button"
@@ -639,7 +696,7 @@ export default function SmartPrefetchActivityPage() {
                   ? "Current queue jobs refresh every 10 seconds."
                   : historyKind === "gaps"
                     ? "Small ranges playback had to stream straight from Usenet because they weren't cached. Each fill caches only that range — it does not mean the whole file is cached."
-                    : "Policy, manual and finish-watched warming. Coverage is for the whole file."}
+                    : "Repeated warming for the same file and range is grouped. The latest run supplies coverage and speed; earlier runs are in Details."}
               </p>
               {view === "history" && historyKind === "warming" && (
                 <p className="mt-1 max-w-3xl text-xs text-base-content/55">
@@ -754,7 +811,7 @@ export default function SmartPrefetchActivityPage() {
               <div className="tabs tabs-box w-fit" role="tablist" aria-label="Warming history kind">
                 {(
                   [
-                    ["warming", "Prefetch warming", warmingHistory.length],
+                    ["warming", "Prefetch warming", warmingHistoryCount],
                     ["gaps", "Playback gap fills", gapHistory.length],
                   ] as const
                 ).map(([kind, label, count]) => (
@@ -779,7 +836,8 @@ export default function SmartPrefetchActivityPage() {
                 title={historyKind === "gaps" ? "Playback gap fills" : "Recent outcomes"}
                 summary={median === null ? null : `median ${formatSpeed(median)}`}
                 jobs={pageJobs}
-                total={visible.length}
+                total={listed.length}
+                historyRuns={historyRuns}
                 loaded={status !== null}
                 page={shownPage}
                 lastPage={lastPage}
@@ -828,10 +886,12 @@ function JobList({
   lastPage,
   onPage,
   onOpen,
+  historyRuns,
 }: {
   title: string;
   summary?: string | null;
   jobs: Job[];
+  historyRuns?: Map<string, Job[]> | undefined;
   total: number;
   loaded: boolean;
   page: number;
@@ -845,7 +905,7 @@ function JobList({
         <span>{title}</span>
         <span className="text-xs font-normal text-base-content/50">
           {summary ? `${summary} · ` : ""}
-          {total} jobs
+          {total} {historyRuns ? (total === 1 ? "entry" : "entries") : "jobs"}
         </span>
       </div>
       {total ? (
@@ -853,7 +913,12 @@ function JobList({
           isGapFill(job) ? (
             <GapRow key={job.id} job={job} onOpen={onOpen} />
           ) : (
-            <JobRow key={job.id} job={job} onOpen={onOpen} />
+            <JobRow
+              key={historyRuns ? warmingHistoryKey(job) : job.id}
+              job={job}
+              runs={historyRuns?.get(warmingHistoryKey(job)) ?? []}
+              onOpen={onOpen}
+            />
           ),
         )
       ) : (
