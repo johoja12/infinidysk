@@ -6,6 +6,9 @@
 circuits, and degraded or offline Arr integrations. Expand an Arr warning to identify the
 affected instance and its reason. Queue warnings or errors come from the Arr app's queue;
 inspect **Activity → Queue** in that app. They do not mean the instance is offline.
+An instance whose queue answers but whose import history cannot be read is shown as degraded,
+with the failed request as its reason, rather than offline
+[since unreleased](https://github.com/johoja12/infinidysk/pull/203){ .nzbdav-since }.
 Connection settings remain available separately for unreachable instances.
 Unavailable status is shown separately
 from a successful check with no problems. The health count refreshes every minute while

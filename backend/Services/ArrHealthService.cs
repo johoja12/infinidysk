@@ -19,8 +19,11 @@ namespace NzbWebDAV.Services;
 /// </summary>
 public sealed class ArrHealthService : BackgroundService
 {
-    internal const int MaxHistoryPages = 5;
-    internal const int HistoryPageSize = 100;
+    /// <summary>
+    /// How far back an import-history poll reaches. Polls run every minute, so this only drops imports
+    /// missed during a long outage — handoff telemetry, not import state — and keeps each request cheap.
+    /// </summary>
+    internal static readonly TimeSpan MaxHistoryWindow = TimeSpan.FromHours(1);
     internal const int MaxAwaitingPerInstance = 100;
     internal const int OfflineFailureThreshold = 2;
     internal const int ImportEventType = 3;
@@ -227,8 +230,22 @@ public sealed class ArrHealthService : BackgroundService
             await using var metrics = MetricsContextFactory();
 
             var awaiting = await BuildAwaitingAsync(queue.Records, dav, ct).ConfigureAwait(false);
-            await IngestHistoryAsync(key, appLabel, details.Host, client, dav, metrics,
-                () => arrRequestFailed = true, ct).ConfigureAwait(false);
+            // The queue answered, so the instance is up: a failed history read leaves it degraded
+            // with stale handoff numbers rather than offline.
+            string? historyError = null;
+            var historyRequestFailed = false;
+            try
+            {
+                await IngestHistoryAsync(key, appLabel, details.Host, client, dav, metrics,
+                    () => historyRequestFailed = true, ct).ConfigureAwait(false);
+            }
+            catch (Exception e) when (historyRequestFailed && e is not OutOfMemoryException && !ct.IsCancellationRequested)
+            {
+                historyError = DescribeFailure(e);
+                Log.Warning("Arr health could not read import history from {Host}; queue health is current. Reason: {Reason}",
+                    details.Host, historyError);
+                Log.Debug(e, "Arr health import history failure details for {Host}", details.Host);
+            }
             _backoff.RecordSuccess(details.Host);
 
             var nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -252,7 +269,7 @@ public sealed class ArrHealthService : BackgroundService
 
             var hasWarnings = queueStatus.Warnings || queueStatus.UnknownWarnings;
             var hasErrors = queueStatus.Errors || queueStatus.UnknownErrors;
-            var status = hasWarnings || hasErrors || unusual
+            var status = hasWarnings || hasErrors || unusual || historyError is not null
                 ? ArrInstanceHealthStatus.Degraded
                 : ArrInstanceHealthStatus.Healthy;
 
@@ -269,7 +286,7 @@ public sealed class ArrHealthService : BackgroundService
                 HasErrors = hasErrors,
                 LastImportAtMs = lastImport,
                 LastPolledAt = now,
-                LastError = null,
+                LastError = historyError,
                 MedianHandoffMs30d = median,
                 MedianSampleCount30d = handoffs.Count,
                 Awaiting = awaiting.Items,
@@ -299,6 +316,11 @@ public sealed class ArrHealthService : BackgroundService
                 Log.Warning("Arr health poll failed for {Host}. Reason: {Reason}", details.Host, timeout!.Message);
                 Log.Debug(e, "Arr health poll timeout details for {Host}", details.Host);
             }
+            else if (e.TryGetCausingException<ArrRequestFailedException>(out var failed))
+            {
+                Log.Warning("Arr health poll failed for {Host}. Reason: {Reason}", details.Host, failed!.Message);
+                Log.Debug(e, "Arr health poll failure details for {Host}", details.Host);
+            }
             else
                 e.LogWarningKnownOrStack("Arr health poll failed for {Host}", details.Host);
             if (queueSucceeded && !arrRequestFailed)
@@ -327,6 +349,12 @@ public sealed class ArrHealthService : BackgroundService
             onFailure();
             throw new ArrRequestTimeoutException(operation, host, PerCallTimeout, e);
         }
+        catch (HttpRequestException e) when (e.StatusCode is { } status && e is not ArrRequestFailedException
+                                             && !ct.IsCancellationRequested)
+        {
+            onFailure();
+            throw new ArrRequestFailedException(operation, host, status, e);
+        }
         catch (Exception) when (!ct.IsCancellationRequested)
         {
             onFailure();
@@ -344,27 +372,21 @@ public sealed class ArrHealthService : BackgroundService
         Action onRequestFailure,
         CancellationToken ct)
     {
-        var cursor = await metrics.ArrImportEvents
-            .Where(e => e.InstanceKey == instanceKey)
-            .Select(e => (int?)e.ArrRecordId)
-            .MaxAsync(ct).ConfigureAwait(false) ?? 0;
+        var recorded = metrics.ArrImportEvents.Where(e => e.InstanceKey == instanceKey);
+        var cursor = await recorded.Select(e => (int?)e.ArrRecordId).MaxAsync(ct).ConfigureAwait(false) ?? 0;
+        var lastImportedAtMs = await recorded.Select(e => (long?)e.ImportedAtMs).MaxAsync(ct).ConfigureAwait(false);
 
-        for (var page = 1; page <= MaxHistoryPages; page++)
-        {
-            var history = await CallAsync(
-                $"{appLabel} import history page {page}", host,
-                callCt => client.GetImportHistoryAsync(page, HistoryPageSize, callCt),
-                onRequestFailure, ct).ConfigureAwait(false);
-            var records = history.Records ?? [];
-            if (records.Count == 0) break;
+        var since = DateTimeOffset.UtcNow - MaxHistoryWindow;
+        if (lastImportedAtMs is { } lastMs && DateTimeOffset.FromUnixTimeMilliseconds(lastMs) > since)
+            since = DateTimeOffset.FromUnixTimeMilliseconds(lastMs);
 
-            var newRecords = records.Where(r => r.Id > cursor && r.EventType == ImportEventType).ToList();
-            if (newRecords.Count == 0) break;
-
+        var records = await CallAsync(
+            $"{appLabel} import history", host,
+            callCt => client.GetImportHistorySinceAsync(since, callCt),
+            onRequestFailure, ct).ConfigureAwait(false);
+        var newRecords = records.Where(r => r.Id > cursor && r.EventType == ImportEventType).ToList();
+        if (newRecords.Count > 0)
             await InsertNewEventsAsync(instanceKey, newRecords, dav, metrics, ct).ConfigureAwait(false);
-
-            if (records.Any(r => r.Id <= cursor)) break;
-        }
     }
 
     private static async Task InsertNewEventsAsync(
@@ -579,6 +601,8 @@ public sealed class ArrHealthService : BackgroundService
     {
         if (exception.TryGetCausingException<ArrRequestTimeoutException>(out var timeout))
             return timeout!.Message;
+        if (exception.TryGetCausingException<ArrRequestFailedException>(out var failed))
+            return failed!.Message;
         return exception.TryGetKnownErrorMessage(out var reason) ? reason : exception.Message;
     }
 
