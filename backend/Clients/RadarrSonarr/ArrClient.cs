@@ -97,8 +97,15 @@ public class ArrClient(string host, string apiKey)
     public virtual Task<ArrHistory> GetRecentHistoryAsync(CancellationToken ct = default) =>
         Get<ArrHistory>("/history?page=1&pageSize=500&sortKey=date&sortDirection=descending&includeSeries=false&includeEpisode=false&includeMovie=false", ct);
 
-    public virtual Task<ArrHistory> GetImportHistoryAsync(int page, int pageSize, CancellationToken ct = default) =>
-        Get<ArrHistory>($"/history?eventType=3&page={page}&pageSize={pageSize}&sortKey=date&sortDirection=descending", ct);
+    /// <summary>
+    /// Imports recorded at or after <paramref name="since"/>, oldest first. Unlike the paged
+    /// <c>/history?eventType=3</c>, whose filtered count scans the whole history table, this costs
+    /// only what the window holds.
+    /// </summary>
+    public virtual Task<List<ArrHistoryRecord>> GetImportHistorySinceAsync(DateTimeOffset since, CancellationToken ct = default) =>
+        Get<List<ArrHistoryRecord>>(
+            $"/history/since?date={Uri.EscapeDataString(since.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", System.Globalization.CultureInfo.InvariantCulture))}&eventType=3",
+            ct);
 
     public virtual Task<ArrHistory> GetMediaImportHistoryAsync(
         ArrMediaFileMatch mediaFile,

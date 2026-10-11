@@ -64,14 +64,11 @@ public sealed class ArrHealthServiceTests
         var imported = DateTimeOffset.UtcNow;
         var client = new ScriptedArrClient("http://sonarr:8989")
         {
-            ImportHistory = (_, _, _) => Task.FromResult(new ArrHistory
+            ImportHistorySince = (_, _) => Task.FromResult(new List<ArrHistoryRecord>
             {
-                Records =
-                [
-                    History(1, matchedId, imported, "matched"),
-                    History(2, missingId, imported, "missing"),
-                    History(3, skewId, imported, "skew"),
-                ],
+                History(1, matchedId, imported, "matched"),
+                History(2, missingId, imported, "missing"),
+                History(3, skewId, imported, "skew"),
             }),
         };
 
@@ -87,41 +84,69 @@ public sealed class ArrHealthServiceTests
     }
 
     [Fact]
-    public async Task Ingest_IsIncremental_Dedupes_SkipsNonGuid_AndCapsAtFivePages()
+    public async Task Ingest_AsksOnlyForImportsSinceTheLastRecorded_Dedupes_AndSkipsNonGuid()
     {
         await using var harness = await DualDbHarness.CreateAsync();
         var guid = Guid.NewGuid();
-        var pagesRequested = 0;
+        var lastImport = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.AddMinutes(-10).ToUnixTimeSeconds());
+        List<ArrHistoryRecord> available =
+        [
+            History(1, guid, lastImport.AddMinutes(-2), "t-1"),
+            History(2, "SABnzbd_nzo_abc", lastImport.AddMinutes(-1), "t-2"),
+            History(3, guid, lastImport, "t-3"),
+        ];
+        var requested = new List<DateTimeOffset>();
         var client = new ScriptedArrClient("http://sonarr:8989")
         {
-            ImportHistory = (page, pageSize, _) =>
+            ImportHistorySince = (since, _) =>
             {
-                Interlocked.Increment(ref pagesRequested);
-                Assert.Equal(100, pageSize);
-                if (page > 6) return Task.FromResult(new ArrHistory());
-                var startId = 600 - (page - 1) * 100;
-                var records = Enumerable.Range(0, 100).Select(i =>
-                {
-                    var id = startId - i;
-                    var downloadId = id == 599
-                        ? "SABnzbd_nzo_abc"
-                        : guid.ToString();
-                    return History(id, downloadId, DateTimeOffset.UtcNow, $"t-{id}");
-                }).ToList();
-                return Task.FromResult(new ArrHistory { Records = records });
+                requested.Add(since);
+                return Task.FromResult(available.Where(r => r.Date >= since).ToList());
             },
         };
 
         using var service = harness.CreateService(client, "http://sonarr:8989");
         Assert.True(await service.TryRunCycleAsync(CancellationToken.None));
-        Assert.Equal(5, pagesRequested);
-        var firstCount = await harness.Metrics.ArrImportEvents.AsNoTracking().CountAsync();
-        Assert.Equal(499, firstCount);
+        var firstSince = Assert.Single(requested);
+        Assert.InRange(DateTimeOffset.UtcNow - ArrHealthService.MaxHistoryWindow - firstSince,
+            TimeSpan.Zero, TimeSpan.FromMinutes(1));
+        Assert.Equal([1, 3], await harness.Metrics.ArrImportEvents.AsNoTracking()
+            .OrderBy(e => e.ArrRecordId).Select(e => e.ArrRecordId).ToListAsync());
 
-        pagesRequested = 0;
+        available.Add(History(4, guid, lastImport.AddMinutes(1), "t-4"));
         Assert.True(await service.TryRunCycleAsync(CancellationToken.None));
-        Assert.Equal(1, pagesRequested);
-        Assert.Equal(firstCount, await harness.Metrics.ArrImportEvents.AsNoTracking().CountAsync());
+        Assert.Equal(lastImport, requested[1]);
+        Assert.Equal([1, 3, 4], await harness.Metrics.ArrImportEvents.AsNoTracking()
+            .OrderBy(e => e.ArrRecordId).Select(e => e.ArrRecordId).ToListAsync());
+    }
+
+    [Fact]
+    public async Task Ingest_NeverReachesFurtherBackThanTheHistoryWindow()
+    {
+        await using var harness = await DualDbHarness.CreateAsync();
+        harness.Metrics.ArrImportEvents.Add(new ArrImportEvent
+        {
+            InstanceKey = ArrConfig.MakeInstanceKey("sonarr", "http://sonarr:8989"),
+            ArrRecordId = 7,
+            DownloadId = Guid.NewGuid(),
+            ImportedAtMs = DateTimeOffset.UtcNow.AddDays(-3).ToUnixTimeMilliseconds(),
+            Title = "old",
+        });
+        await harness.Metrics.SaveChangesAsync();
+        DateTimeOffset? requested = null;
+        var client = new ScriptedArrClient("http://sonarr:8989")
+        {
+            ImportHistorySince = (since, _) =>
+            {
+                requested = since;
+                return Task.FromResult(new List<ArrHistoryRecord>());
+            },
+        };
+
+        using var service = harness.CreateService(client, "http://sonarr:8989");
+        Assert.True(await service.TryRunCycleAsync(CancellationToken.None));
+        Assert.InRange(DateTimeOffset.UtcNow - ArrHealthService.MaxHistoryWindow - requested!.Value,
+            TimeSpan.Zero, TimeSpan.FromMinutes(1));
     }
 
     [Fact]
@@ -439,30 +464,68 @@ public sealed class ArrHealthServiceTests
     }
 
     [Fact]
-    public async Task Poll_RepeatedImportHistoryTimeouts_EnterBackoff()
+    public async Task Poll_ImportHistoryTimeouts_LeaveAnAnsweringInstanceDegradedNotOffline()
     {
         var host = "http://sonarr:8989";
         var backoff = new ArrInstanceBackoff();
         await using var harness = await DualDbHarness.CreateAsync();
         var historyCalls = 0;
+        var timeout = new ArrRequestTimeoutException("Sonarr import history", host,
+            TimeSpan.FromSeconds(10), new TimeoutException());
         var client = new ScriptedArrClient(host)
         {
-            ImportHistory = (_, _, _) =>
+            ImportHistorySince = (_, _) =>
             {
                 historyCalls++;
-                throw new ArrRequestTimeoutException("Sonarr import history", host,
-                    TimeSpan.FromSeconds(10), new TimeoutException());
+                throw timeout;
             },
         };
         using var service = harness.CreateService(client, host, backoff);
 
-        Assert.True(await service.TryRunCycleAsync(CancellationToken.None));
+        var events = await CaptureAsync(async () =>
+        {
+            for (var i = 0; i < 3; i++)
+                Assert.True(await service.TryRunCycleAsync(CancellationToken.None));
+        });
+
         Assert.False(backoff.IsInBackoff(host));
-        Assert.True(await service.TryRunCycleAsync(CancellationToken.None));
-        Assert.True(backoff.IsInBackoff(host));
-        Assert.Equal(ArrInstanceHealthStatus.Offline, Assert.Single(service.GetSnapshots()).Status);
-        Assert.True(await service.TryRunCycleAsync(CancellationToken.None));
-        Assert.Equal(2, historyCalls);
+        Assert.Equal(3, historyCalls);
+        var snapshot = Assert.Single(service.GetSnapshots());
+        Assert.Equal(ArrInstanceHealthStatus.Degraded, snapshot.Status);
+        Assert.Equal(timeout.Message, snapshot.LastError);
+        var warnings = events.Where(e => e.Level == LogEventLevel.Warning).ToList();
+        Assert.Equal(3, warnings.Count);
+        Assert.All(warnings, warning =>
+        {
+            Assert.Null(warning.Exception);
+            Assert.Contains(timeout.Message, warning.RenderMessage());
+        });
+    }
+
+    [Fact]
+    public async Task Poll_ErrorStatusFromTheArr_LogsOneLineNamingTheRequest()
+    {
+        const string host = "http://radarr:7878";
+        await using var harness = await DualDbHarness.CreateAsync();
+        var client = new ScriptedArrClient(host)
+        {
+            QueueStatus = _ => throw new HttpRequestException(
+                "Response status code does not indicate success: 500 (Internal Server Error).",
+                null, System.Net.HttpStatusCode.InternalServerError),
+        };
+        var config = new ConfigManager();
+        SetInstances(config, ("radarr", host, true));
+        using var service = harness.CreateService(config, new Dictionary<string, ArrClient> { [host] = client });
+
+        var events = await CaptureAsync(async () =>
+            Assert.True(await service.TryRunCycleAsync(CancellationToken.None)));
+
+        const string expected = "Radarr queue status request to http://radarr:7878 returned HTTP 500 (InternalServerError); "
+                                + "see that instance's logs for the cause.";
+        Assert.Equal(expected, Assert.Single(service.GetSnapshots()).LastError);
+        var warning = Assert.Single(events, e => e.Level == LogEventLevel.Warning);
+        Assert.Null(warning.Exception);
+        Assert.Contains(expected, warning.RenderMessage());
     }
 
     [Fact]
@@ -487,11 +550,10 @@ public sealed class ArrHealthServiceTests
         var downloadId = Guid.NewGuid();
         var client = new ScriptedArrClient("http://sonarr:8989")
         {
-            ImportHistory = (page, _, _) => Task.FromResult(new ArrHistory
+            ImportHistorySince = (_, _) => Task.FromResult(new List<ArrHistoryRecord>
             {
-                Records = page <= 2
-                    ? [History(10, downloadId, DateTimeOffset.UtcNow, "dup")]
-                    : [],
+                History(10, downloadId, DateTimeOffset.UtcNow, "dup"),
+                History(10, downloadId, DateTimeOffset.UtcNow, "dup"),
             }),
         };
         using var service = harness.CreateService(client, "http://sonarr:8989");
@@ -757,8 +819,8 @@ public sealed class ArrHealthServiceTests
         public Func<CancellationToken, Task<ArrQueue<ArrQueueRecord>>> Queue { get; init; } =
             _ => Task.FromResult(new ArrQueue<ArrQueueRecord>());
 
-        public Func<int, int, CancellationToken, Task<ArrHistory>> ImportHistory { get; init; } =
-            (_, _, _) => Task.FromResult(new ArrHistory());
+        public Func<DateTimeOffset, CancellationToken, Task<List<ArrHistoryRecord>>> ImportHistorySince { get; init; } =
+            (_, _) => Task.FromResult(new List<ArrHistoryRecord>());
 
         public ScriptedArrClient(string host) : base(host, "test-key")
         {
@@ -768,7 +830,7 @@ public sealed class ArrHealthServiceTests
 
         public override Task<ArrQueue<ArrQueueRecord>> GetQueueAsync(CancellationToken ct = default) => Queue(ct);
 
-        public override Task<ArrHistory> GetImportHistoryAsync(int page, int pageSize, CancellationToken ct = default) =>
-            ImportHistory(page, pageSize, ct);
+        public override Task<List<ArrHistoryRecord>> GetImportHistorySinceAsync(DateTimeOffset since, CancellationToken ct = default) =>
+            ImportHistorySince(since, ct);
     }
 }
