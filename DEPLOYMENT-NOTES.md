@@ -271,6 +271,21 @@ through a symlinked folder. Every removal is journaled to
 de-duplicated per legacy item. Link targets, the legacy NzbDav data, and every
 other `/mnt/plex` entry remain outside the deletion boundary.
 
+## Building a deploy image
+
+Build prod images with `scripts/build-prod-image.sh <commit>`, never a plain
+`docker build` from the main checkout. It builds `local/infinidysk:<sha8>` from
+a clean, detached worktree and passes `NZBDAV_VERSION`, so the UI's bottom-left
+label, support packs and user agents report the running build. Without it the
+label is blank and the backend reports `0.0.0`.
+
+The label comes from `scripts/fork-version.sh`: the newest upstream stable
+release the commit contains, plus the fork commit, for example
+`1.6.0+fork.3dc8cccb`. It needs the `upstream` remote
+(`https://github.com/infinidysk/infinidysk.git`). Leave `NZBDAV_COMMIT_SHA`
+unset: the update check compares that commit with upstream, where fork
+commits do not exist.
+
 ## Operator checks
 
 ```bash
