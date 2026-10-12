@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using Serilog;
 
 namespace NzbWebDAV.Services.Plex;
 
@@ -15,6 +16,8 @@ public sealed class PlexCatalogueService(PlexApiClient api, TimeProvider clock)
     private const int MaximumSnapshotBytes = 256 * 1024;
     private const int MaximumRetainedBytes = 8 * 1024 * 1024;
     private int _retainedBytes;
+    private readonly HashSet<string> _backgroundRefreshes = new(StringComparer.Ordinal);
+    internal static readonly TimeSpan BackgroundRefreshTimeout = TimeSpan.FromSeconds(15);
 
     public Task<PlexSnapshot<PlexLibrary>> GetLibrariesAsync(PlexServer server, bool forceRefresh = false, CancellationToken ct = default) =>
         GetAsync(server, "libraries", forceRefresh, token => api.GetLibrariesAsync(server, token), ct);
@@ -49,6 +52,30 @@ public sealed class PlexCatalogueService(PlexApiClient api, TimeProvider clock)
         var key = SnapshotKey(server, "users");
         lock (_gate)
             return _entries.TryGetValue(key, out var value) ? Volatile.Read(ref ((Entry<PlexUser>)value).Snapshot) : null;
+    }
+
+    /// <summary>
+    /// Last authorized snapshot without waiting, plus at most one background refresh per server so
+    /// status polls that never call Plex themselves still learn viewer names after a restart.
+    /// </summary>
+    public PlexSnapshot<PlexUser>? CachedUsersRefreshing(PlexServer server)
+    {
+        var cached = CachedUsers(server);
+        var key = SnapshotKey(server, "users");
+        lock (_gate)
+            if (!_backgroundRefreshes.Add(key)) return cached;
+        _ = Task.Run(async () =>
+        {
+            using var timeout = new CancellationTokenSource(BackgroundRefreshTimeout);
+            try { await GetUsersAsync(server, ct: timeout.Token).ConfigureAwait(false); }
+            catch (Exception exception) when (exception is not OutOfMemoryException)
+            {
+                Log.Debug("Background Plex user refresh for {Server} did not complete. Reason: {Reason}",
+                    server.Name, exception.GetType().Name);
+            }
+            finally { lock (_gate) _backgroundRefreshes.Remove(key); }
+        });
+        return cached;
     }
 
     private static string SnapshotKey(PlexServer server, string resource) =>
