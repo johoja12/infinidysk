@@ -113,6 +113,74 @@ public sealed class CachedCopyCheckTests : IDisposable
         Assert.Equal(liveKey, Assert.Single(await native.Store!.ListProtectedAsync(10)).Key);
     }
 
+    [Fact]
+    public async Task Maintenance_EvictsSupersededCopiesOnlyBesideTheCurrentCopy()
+    {
+        using var blobs = new FileBlobStore();
+        using var repairs = new RepairPatchStore(Path.Combine(_root, "patches"), 100);
+        await using var native = new NativeCacheService(Config(), blobs, repairs);
+        Assert.True(await native.WaitForInitializationAsync());
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<DavDatabaseContext>().UseSqlite(connection).Options;
+        await using (var context = new DavDatabaseContext(options)) await context.Database.EnsureCreatedAsync();
+        var store = native.Store!;
+
+        // Three generations of one file: a pinned one, a superseded one, and the current one.
+        var live = await NewItemAsync(blobs, 3);
+        var pinned = await CacheGenerationAsync(native, live);
+        await store.SetPinnedAsync(pinned, true);
+        await ReplaceSourceAsync(blobs, live);
+        var superseded = await CacheGenerationAsync(native, live);
+        await ReplaceSourceAsync(blobs, live);
+        var current = await CacheGenerationAsync(native, live);
+        // Only stale copies: nothing confirms the current identity, so normal eviction keeps them.
+        var uncached = await NewItemAsync(blobs, 3);
+        var uncachedOld = await CacheGenerationAsync(native, uncached);
+        await ReplaceSourceAsync(blobs, uncached);
+        var uncachedNewer = await CacheGenerationAsync(native, uncached);
+        await ReplaceSourceAsync(blobs, uncached);
+        // Copies of a deleted item are left to normal eviction.
+        var removed = await NewItemAsync(blobs, 3);
+        var removedOld = await CacheGenerationAsync(native, removed);
+        await ReplaceSourceAsync(blobs, removed);
+        var removedCurrent = await CacheGenerationAsync(native, removed);
+        await using (var context = new DavDatabaseContext(options))
+        {
+            context.Items.AddRange(live, uncached);
+            await context.SaveChangesAsync();
+        }
+
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new DavDatabaseContext(options));
+        services.AddScoped(sp => new DavDatabaseClient(sp.GetRequiredService<DavDatabaseContext>(), blobs));
+        await using var provider = services.BuildServiceProvider();
+        var maintenance = new NativeCacheBrowserMaintenance(native, provider.GetRequiredService<IServiceScopeFactory>());
+
+        var (copies, bytes) = await maintenance.EvictSupersededCopiesAsync(store, CancellationToken.None);
+
+        Assert.Equal(1, copies);
+        Assert.True(bytes > 0); // On-disk bytes, including allocation and integrity metadata.
+        var remaining = (await store.ListItemsWithSeveralCopiesAsync(null, 10)).Select(copy => copy.Key).ToHashSet();
+        Assert.Equal(new[] { pinned.Key, current.Key, uncachedOld.Key, uncachedNewer.Key, removedOld.Key, removedCurrent.Key }.ToHashSet(),
+            remaining);
+        Assert.DoesNotContain(superseded.Key, remaining);
+        Assert.Equal(CachedCopyState.Verified, (await native.CheckCachedCopyAsync(live)).State);
+        // The pass resumes after the last item it listed and restarts once the list is exhausted.
+        Assert.Equal((0, 0L), await maintenance.EvictSupersededCopiesAsync(store, CancellationToken.None));
+        Assert.Equal((0, 0L), await maintenance.EvictSupersededCopiesAsync(store, CancellationToken.None));
+    }
+
+    private static async Task<NativeCacheIdentity> CacheGenerationAsync(NativeCacheService native, DavItem item)
+    {
+        await SeedAsync(native, item, (int)item.FileSize!.Value);
+        return (await native.GetCurrentCacheIdentityAsync(item))!;
+    }
+
+    private static async Task ReplaceSourceAsync(FileBlobStore blobs, DavItem item) =>
+        await blobs.WriteBlob(item.FileBlobId!.Value,
+            new DavNzbFile { Id = item.FileBlobId!.Value, SegmentIds = [Guid.NewGuid().ToString("N")] });
+
     private static async Task<DavItem> NewItemAsync(FileBlobStore blobs, long size)
     {
         var blobId = Guid.NewGuid();
