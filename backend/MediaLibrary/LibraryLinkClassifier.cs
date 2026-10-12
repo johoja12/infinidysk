@@ -14,7 +14,8 @@ public static class LibraryLinkClassifier
         string targetText,
         bool isStrm,
         string mountDir,
-        string libraryRoot)
+        string libraryRoot,
+        string strmPathPrefix = "")
     {
         var fullRoot = Path.GetFullPath(libraryRoot);
         var fullPath = Path.GetFullPath(linkPath);
@@ -30,7 +31,7 @@ public static class LibraryLinkClassifier
         if (isStrm)
         {
             davItemId = OrganizedLinksUtil.GetDavItemLink(
-                new SymlinkAndStrmUtil.StrmInfo { StrmPath = fullPath, TargetUrl = targetText })?.DavItemId;
+                new SymlinkAndStrmUtil.StrmInfo { StrmPath = fullPath, TargetUrl = targetText }, strmPathPrefix)?.DavItemId;
         }
         else
         {

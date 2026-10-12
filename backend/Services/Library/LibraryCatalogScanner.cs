@@ -78,6 +78,7 @@ public sealed class LibraryCatalogScanner(
         var videoOnly = configManager.IsMediaLibraryVideoOnly();
 
         var mountDir = configManager.GetRcloneMountDir();
+        var strmPathPrefix = OrganizedLinksUtil.GetStrmPathPrefix(configManager);
         var primaryRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(libraryRoot));
         var roots = new List<(bool IsPrimary, string Path)> { (true, primaryRoot) };
         roots.AddRange(configManager.GetMediaLibraryScanDirs()
@@ -126,7 +127,7 @@ public sealed class LibraryCatalogScanner(
             ClassifiedLink classified;
             try
             {
-                classified = LibraryLinkClassifier.Classify(linkPath, targetText, isStrm, mountDir, rootPath);
+                classified = LibraryLinkClassifier.Classify(linkPath, targetText, isStrm, mountDir, rootPath, strmPathPrefix);
             }
             catch (ArgumentException)
             {
