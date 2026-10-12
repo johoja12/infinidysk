@@ -272,7 +272,13 @@ pipeline and takes the next unfinished cache chunk, so one slow or retried artic
 holds back only its own chunk instead of the whole job. A job uses at most half the
 native-cache buffer slots (`cache.native.writer-mb` ÷ 4) for lanes. Extra lanes pause
 while anything is playing or fewer than half the slots are free, and rejoin about a
-second after that clears; the first lane always keeps going. Near the end of the range,
+second after that clears; the first lane always keeps going.
+
+Playback of a file that is already fully cached reads only the cache, so it no longer
+pauses lanes, and when the only playback that still streams from Usenet is the file
+being warmed, one extra lane keeps running to stay further ahead of that viewer [since unreleased](https://github.com/johoja12/infinidysk/pull/211){ .nzbdav-since }.
+Any other playback, or a Plex session that does not resolve to an imported file,
+still pauses every extra lane. Near the end of the range,
 the remaining work is split into smaller pieces (down to 8 MiB) so every lane stays busy
 until the job finishes. All lanes share the job's single cache-space reservation, which
 grows chunk by chunk under the same quota and free-space checks.
