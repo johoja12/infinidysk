@@ -5,6 +5,7 @@ using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models;
 using NzbWebDAV.Models;
 using NzbWebDAV.Services;
+using NzbWebDAV.Services.NativeCache;
 using NzbWebDAV.Tests.Database;
 using NzbWebDAV.Utils;
 using UsenetSharp.Models;
@@ -120,6 +121,7 @@ public class LazyRarResolverTests
         };
         var mpf = MultipartFile(pathInArchive, Pending("unused", length, 1000));
         mpf.Metadata.PendingParts[0].SegmentIds = ["s0", "s1", "s2"];
+        var identity = MultipartContentIdentity.Get(mpf.Metadata);
 
         await resolver.EnsureResolvedThroughAsync(mpf, long.MaxValue, CancellationToken.None);
 
@@ -141,6 +143,8 @@ public class LazyRarResolverTests
             Assert.Null(resolved.SegmentByteRanges);
             Assert.NotEqual(true, resolved.SegmentByteRangesTrusted);
         }
+        // Recorded geometry must not start a new Native Cache generation.
+        Assert.Equal(identity, MultipartContentIdentity.Get(mpf.Metadata));
     }
 
     [Fact]
@@ -443,6 +447,7 @@ public class LazyRarResolverTests
                     FileParts = [Part("v1", true), Part("v2", true), Part("v3", false)],
                 },
             };
+            var identity = MultipartContentIdentity.Get(newer.Metadata);
             await BlobStore.WriteBlob(id, newer);
 
             using var client = new MeasuringNntpClient("unused", 0, new Dictionary<string, (long, long)>
@@ -467,6 +472,8 @@ public class LazyRarResolverTests
             Assert.False(stored.Metadata.IsLazy);
             Assert.Equal(3, stored.Metadata.FileParts.Length);
             Assert.True(stored.Metadata.FileParts[1].SegmentByteRangesTrusted);
+            Assert.Equal(identity, stored.Metadata.ContentIdentity);
+            Assert.Equal(identity, MultipartContentIdentity.Get(stored.Metadata));
         }
         finally
         {
@@ -511,7 +518,7 @@ public class LazyRarResolverTests
                 },
             };
             // Storage already holds a more complete snapshot carrying the same inferred volume-2 ranges.
-            await BlobStore.WriteBlob(id, new DavMultipartFile
+            var complete = new DavMultipartFile
             {
                 Id = id,
                 Metadata = new DavMultipartFile.Meta
@@ -519,7 +526,9 @@ public class LazyRarResolverTests
                     PathInArchive = "movie.mkv",
                     FileParts = [Part("v1", true), Part("v2", true), Part("v3", false)],
                 },
-            });
+            };
+            var identity = MultipartContentIdentity.Get(complete.Metadata);
+            await BlobStore.WriteBlob(id, complete);
 
             using var client = new MeasuringNntpClient("unused", 0, new Dictionary<string, (long, long)>());
             var resolver = new LazyRarResolver(client, new ConfigManager());
@@ -540,6 +549,7 @@ public class LazyRarResolverTests
             Assert.True(stored.Metadata.FileParts[0].SegmentByteRangesTrusted);
             Assert.Equal(3, stale.Metadata.FileParts.Length);
             Assert.NotEqual(true, stale.Metadata.FileParts[1].SegmentByteRangesTrusted);
+            Assert.Equal(identity, stored.Metadata.ContentIdentity);
         }
         finally
         {

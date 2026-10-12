@@ -479,9 +479,12 @@ public class LazyRarResolver(INntpClient usenetClient, ConfigManager configManag
         _ = SchedulePersistAsync(mpf, reconcileFileSize: !meta.IsLazy);
     }
 
+    // Geometry changes hashed byte ranges but not the decoded bytes, so the content identity
+    // (and with it the Native Cache generation) is carried from the meta being replaced.
     private static DavMultipartFile.Meta WithFileParts(
-        DavMultipartFile.Meta meta, DavMultipartFile.FilePart[] parts) => new()
+        DavMultipartFile.Meta meta, DavMultipartFile.FilePart[] parts, string? contentIdentity = null) => new()
     {
+        ContentIdentity = contentIdentity ?? MultipartContentIdentity.Get(meta),
         AesParams = meta.AesParams,
         FileParts = parts,
         IsLazy = meta.IsLazy,
@@ -956,7 +959,10 @@ public class LazyRarResolver(INntpClient usenetClient, ConfigManager configManag
                 changed = true;
             }
 
-            if (changed) mpf.Metadata = WithFileParts(baseMeta, parts);
+            // Cached generations are keyed by the identity readers derive from the stored blob, so
+            // that one wins over a stale instance's and is pinned even if it was never stored.
+            var identity = MultipartContentIdentity.Get(theirs);
+            if (changed || mine.ContentIdentity != identity) mpf.Metadata = WithFileParts(baseMeta, parts, identity);
         }
     }
 
