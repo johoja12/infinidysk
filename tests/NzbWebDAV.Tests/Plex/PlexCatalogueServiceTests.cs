@@ -22,6 +22,28 @@ public sealed class PlexCatalogueServiceTests
     }
 
     [Fact]
+    public async Task CachedUsersRefreshing_ReturnsWithoutWaiting_AndLoadsNamesInBackground()
+    {
+        using var release = new ManualResetEventSlim();
+        using var handler = new FakePlexHandler(_ =>
+        {
+            release.Wait(TimeSpan.FromSeconds(10));
+            return PlexApiClientTests.Xml("""<MediaContainer><Account id="282306795" name="Viewer"/></MediaContainer>""");
+        });
+        var catalogue = new PlexCatalogueService(new PlexApiClient(new HttpClient(handler), "installation"), new PlexTestClock());
+        var server = PlexApiClientTests.Server();
+
+        Assert.Null(catalogue.CachedUsersRefreshing(server));
+        Assert.Null(catalogue.CachedUsersRefreshing(server));
+        release.Set();
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (catalogue.CachedUsers(server) is null && DateTime.UtcNow < deadline) await Task.Delay(20);
+
+        Assert.Equal("Viewer", Assert.Single(catalogue.CachedUsers(server)!.Data).Name);
+        Assert.Single(handler.Requests);
+    }
+
+    [Fact]
     public async Task ScopedSources_RetainCollectionsWhenHubsFail()
     {
         using var handler = new FakePlexHandler(request => request.RequestUri!.AbsolutePath switch

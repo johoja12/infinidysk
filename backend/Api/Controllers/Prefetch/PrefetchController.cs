@@ -67,7 +67,7 @@ public sealed class PrefetchController(PrefetchRuntime runtime, PlexPrefetchServ
                 {
                     var snapshot = includeCoverage
                         ? await catalogue.GetUsersAsync(server, ct: lookupTimeout.Token).ConfigureAwait(false)
-                        : catalogue.CachedUsers(server);
+                        : catalogue.CachedUsersRefreshing(server);
                     return (snapshot?.Data ?? []).Select(user => new KeyValuePair<string, string>(
                         PlexPrefetchService.Hash(server.Id) + ":" + PlexPrefetchService.Hash(user.Id), user.Name)).ToArray();
                 }
