@@ -161,7 +161,7 @@ internal sealed record NntpWholePathScenario(
             "native-cold" => NativeCold,
             "smoothness" => Smoothness,
             _ => throw new ArgumentException(
-                "--set must be 'quick', 'sustained', 'profile', 'cold', 'native-cold', or 'smoothness'.",
+                "--set must be 'quick', 'sustained', 'profile', 'cold', 'native-cold', 'smoothness', or 'seek'.",
                 nameof(set)),
         };
 }
