@@ -217,6 +217,32 @@ public sealed class PrefetchWarmingOutcomeTests
     }
 
     [Theory]
+    [InlineData(1_234_567L)] // Mid-block, where a player's last read usually ends.
+    [InlineData(16L * NativeCacheStore.BlockSize)] // At the end of the file.
+    public async Task WholeFileWarm_MeasuresAViewerAtAnyOffsetBeforeDecidingToYield(long viewerOffset)
+    {
+        const long fileSize = 16L * NativeCacheStore.BlockSize;
+        PrefetchJobStore? jobs = null;
+        var urgent = Guid.NewGuid();
+        await using var harness = await Harness.CreateAsync(fileSize, source: () => new ReadObservedSource(fileSize,
+            () => { if (jobs!.List().All(job => job.ItemId != urgent)) jobs.Enqueue(urgent, "plex:s:realtime-next:u:episode:k", 90); }));
+        jobs = harness.Runtime.Jobs!;
+        var read = harness.Reads.GetOrCreate("/movie.mkv", "player", "movie.mkv", fileSize);
+        harness.Reads.UpdateInfo(read, "movie.mkv", fileSize, itemId: harness.Item.Id);
+        harness.Reads.Touch(read, 0, viewerOffset);
+        var settings = new PrefetchSettings { PauseDuringPlayback = false };
+        var executor = new NativePrefetchExecutor(harness.Scopes, harness.Native, harness.Config, jobs, harness.Reads,
+            settingsProvider: () => settings) { NewYieldPolicy = () => new(TimeSpan.FromMinutes(10), TimeSpan.Zero) };
+        var coordinator = new PrefetchCoordinator(jobs, executor, () => settings, () => true);
+        var warm = jobs.Enqueue(harness.Item.Id, "plex:s:realtime:u:episode:k", 80);
+
+        await coordinator.RunOnceAsync(CancellationToken.None);
+
+        var job = jobs.List().Single(candidate => candidate.Id == warm.Id);
+        Assert.True(job.State != "failed", job.Error);
+    }
+
+    [Theory]
     [InlineData(0, true)] // No retries left: the unverified block is a damaged release.
     [InlineData(3, false)] // Retries remain: deferred with a classified reason.
     public async Task RepeatedlyUnverifiedSource_EscalatesToDamageOnTheLastRetry(int maxRetries, bool escalates)

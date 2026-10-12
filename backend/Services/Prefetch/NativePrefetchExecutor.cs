@@ -139,7 +139,10 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
             if (!jobs.HasClaimableAbove(job.Priority, PrefetchCoordinator.ExpressRangeBytes)) return;
             var servesPlayback = WarmYieldPolicy.ServesPlayback(jobs.OwnersOf([job.Id]).GetValueOrDefault(job.Id) ?? []);
             var lead = await yieldPolicy.CachedLeadAsync(now, servesPlayback, playbackRate,
-                async (offset, token) => await store.FindNextMissingOffsetAsync(cached.Identity, offset, cached.Length, token).ConfigureAwait(false) - offset,
+                // Reader offsets are wherever the last read ended; the catalogue is searched from the
+                // containing block's start.
+                async (offset, token) => Math.Max(0, await store.FindNextMissingOffsetAsync(cached.Identity,
+                    offset / NativeCacheStore.BlockSize * NativeCacheStore.BlockSize, cached.Length, token).ConfigureAwait(false) - offset),
                 ct).ConfigureAwait(false);
             if (!yieldPolicy.ShouldYield(lead)) return;
             Log.Information("Smart Prefetch job {JobId} for item {ItemId} paused for a more urgent warm; {Lead} of playback is cached ahead of every viewer",
