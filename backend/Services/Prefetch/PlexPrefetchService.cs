@@ -284,7 +284,7 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
                 var target = link switch
                 {
                     SymlinkAndStrmUtil.SymlinkInfo symlink => OrganizedLinksUtil.GetDavItemLink(symlink, config.GetRcloneMountDir()),
-                    SymlinkAndStrmUtil.StrmInfo strm => OrganizedLinksUtil.GetDavItemLink(strm),
+                    SymlinkAndStrmUtil.StrmInfo strm => OrganizedLinksUtil.GetDavItemLink(strm, OrganizedLinksUtil.GetStrmPathPrefix(config)),
                     _ => null
                 };
                 if (target is { } match) imported = await database.GetFileById(match.DavItemId.ToString()).ConfigureAwait(false);
