@@ -38,6 +38,38 @@ public sealed class PlexPlaybackRegistryTests
         Assert.False(registry.HasActivePlayback);
     }
 
+    [Fact]
+    public void LoadFor_IgnoresCachedPlaybackAndTreatsUnresolvedSessionsAsOtherFiles()
+    {
+        var registry = new PlexPlaybackRegistry(TimeProvider.System);
+        var media = new PlexMediaItem("m", "movie", "Movie", null, null, null, "/movie.mkv", 1, 100, null);
+        var playing = new[] { new PlexSession("session", "user", "playing", media.File, media) };
+        var item = Guid.NewGuid();
+        var cached = Guid.NewGuid();
+        Assert.Equal(PlexPlaybackRegistry.Load.None, registry.LoadFor(item));
+
+        registry.Record("server", playing, TimeSpan.FromSeconds(30));
+        Assert.Equal(PlexPlaybackRegistry.Load.Other, registry.LoadFor(item)); // Not resolved yet.
+        registry.RecordItems("server", [item], [cached]);
+        Assert.Equal(PlexPlaybackRegistry.Load.OnlyItem, registry.LoadFor(item));
+        Assert.Equal(PlexPlaybackRegistry.Load.Other, registry.LoadFor(cached));
+        Assert.True(registry.IsCachedPlayback(cached));
+        Assert.False(registry.IsCachedPlayback(item));
+
+        registry.RecordItems("server", [], [cached]);
+        Assert.Equal(PlexPlaybackRegistry.Load.None, registry.LoadFor(item));
+
+        registry.Record("other", playing, TimeSpan.FromSeconds(30));
+        registry.RecordItems("other", null);
+        Assert.Equal(PlexPlaybackRegistry.Load.Other, registry.LoadFor(item));
+        registry.Record("other", [], TimeSpan.FromSeconds(30));
+        Assert.Equal(PlexPlaybackRegistry.Load.None, registry.LoadFor(item));
+
+        registry.Record("server", playing, TimeSpan.FromSeconds(30));
+        Assert.Equal(PlexPlaybackRegistry.Load.Other, registry.LoadFor(item)); // A fresh poll clears the previous resolution.
+        Assert.False(registry.IsCachedPlayback(cached));
+    }
+
     private sealed class Clock : TimeProvider
     {
         public DateTimeOffset Now { get; set; } = DateTimeOffset.UtcNow;
