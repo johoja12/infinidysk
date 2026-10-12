@@ -18,6 +18,7 @@ public sealed class PrefetchFailureDiagnosticsTests : IDisposable
     [InlineData("access", "storage-access", "failed")]
     [InlineData("cancel", "unexpected-cancellation", "failed")]
     [InlineData("argument", "invalid-request", "failed")]
+    [InlineData("out-of-range", "unexpected-failure", "failed")]
     [InlineData("unexpected", "unexpected-failure", "failed")]
     public async Task Failure_PersistsSafeCategoryAndLogsJobIdentity_WithoutSecretMessages(string failure, string category, string state)
     {
@@ -32,6 +33,7 @@ public sealed class PrefetchFailureDiagnosticsTests : IDisposable
             "access" => new UnauthorizedAccessException(secret, inner),
             "cancel" => new OperationCanceledException(secret, inner),
             "argument" => new ArgumentException(secret, inner),
+            "out-of-range" => new ArgumentOutOfRangeException(nameof(failure), secret),
             _ => new InvalidOperationException(secret, inner)
         };
         var sink = new RecordingSink();
@@ -53,6 +55,8 @@ public sealed class PrefetchFailureDiagnosticsTests : IDisposable
             Assert.Null(e.Exception);
             Assert.DoesNotContain(secret, e.RenderMessage());
         });
+        Assert.Equal(category == "unexpected-failure",
+            sink.Events.Any(e => e.Level == LogEventLevel.Error && e.RenderMessage().Contains("code frames")));
         Assert.Null(coordinator.RuntimeError);
     }
 
