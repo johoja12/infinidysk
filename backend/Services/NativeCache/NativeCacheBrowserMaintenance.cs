@@ -10,7 +10,10 @@ public sealed class NativeCacheBrowserMaintenance(NativeCacheService native, ISe
 {
     /// <summary>Ticks (30 s each) between checks for protected copies whose item is gone; about 10 minutes.</summary>
     private const int ProtectionReviewTicks = 20;
+    /// <summary>Items with several cached copies reviewed per tick.</summary>
+    internal const int SupersededItemsPerTick = 50;
     private int _ticks;
+    private string? _supersededCursor;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -53,6 +56,7 @@ public sealed class NativeCacheBrowserMaintenance(NativeCacheService native, ISe
             foreach (var id in ids) names.TryAdd(id, id);
             await store.UpdateDisplayNamesAsync(names, ct).ConfigureAwait(false);
             if (++_ticks % ProtectionReviewTicks == 1) await ReleaseStaleProtectionAsync(store, ct).ConfigureAwait(false);
+            await EvictSupersededCopiesAsync(store, ct).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException and not OutOfMemoryException)
         { Log.Warning("Native cache browser maintenance failed ({Reason})", exception.GetType().Name); }
@@ -86,6 +90,44 @@ public sealed class NativeCacheBrowserMaintenance(NativeCacheService native, ISe
             Log.Information("Released eviction protection for {Count} cached copies whose files were removed or replaced.", stale.Count);
         }
         return stale.Count;
+    }
+
+    /// <summary>
+    /// A file whose source or cache identity changed keeps its earlier cached copies until age eviction
+    /// reaches them, though nothing reads them again. Reviews the next batch of items with several copies
+    /// and evicts every copy but the current one. Pinned copies, copies being read, items that no longer
+    /// exist and items whose current identity cannot be resolved are left alone.
+    /// </summary>
+    internal async Task<(int Copies, long Bytes)> EvictSupersededCopiesAsync(NativeCacheStore store, CancellationToken ct)
+    {
+        var copies = await store.ListItemsWithSeveralCopiesAsync(_supersededCursor, SupersededItemsPerTick, ct).ConfigureAwait(false);
+        _supersededCursor = copies.Count == 0 ? null : copies[^1].ItemId;
+        if (copies.Count == 0) return (0, 0);
+        var ids = copies.Select(copy => Guid.TryParse(copy.ItemId, out var id) ? id : Guid.Empty)
+            .Where(id => id != Guid.Empty).Distinct().ToArray();
+        using var scope = scopes.CreateScope();
+        var database = scope.ServiceProvider.GetRequiredService<DavDatabaseClient>();
+        var items = (await database.GetItemsByIdsBatchedAsync(ids, ct: ct).ConfigureAwait(false))
+            .ToDictionary(item => item.Id.ToString("N"), StringComparer.OrdinalIgnoreCase);
+        var evicted = 0;
+        var bytes = 0L;
+        foreach (var group in copies.GroupBy(copy => copy.ItemId, StringComparer.Ordinal))
+        {
+            var key = Guid.TryParse(group.Key, out var parsed) ? parsed.ToString("N") : group.Key;
+            if (!items.TryGetValue(key, out var item)) continue;
+            var current = await native.GetCurrentCacheIdentityAsync(item, ct).ConfigureAwait(false);
+            if (current is null || group.All(copy => copy.Key != current.Key)) continue;
+            foreach (var copy in group.Where(copy => copy.Key != current.Key && !copy.Pinned))
+            {
+                if (await store.EvictKeyAsync(copy.Folder, copy.Key, ct).ConfigureAwait(false) != NativeCacheEntryEviction.Evicted) continue;
+                evicted++;
+                bytes += copy.Bytes;
+            }
+        }
+        if (evicted > 0)
+            Log.Information("Removed {Count} superseded cached copies ({Bytes:F1} GiB) of files whose cache identity changed.",
+                evicted, bytes / (1024.0 * 1024 * 1024));
+        return (evicted, bytes);
     }
 
     private async Task FlushAsync(CancellationToken ct)
