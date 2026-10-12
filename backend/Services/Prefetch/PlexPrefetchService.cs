@@ -146,16 +146,25 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             {
                 var sessions = await api.GetSessionsAsync(server, ct).ConfigureAwait(false);
                 if (_preview is null) _playback.Record(server.Id, sessions, TimeSpan.FromSeconds(settings.VerifiedSessionExpirySeconds));
+                var playing = new Dictionary<Guid, DavItem>();
+                var unresolvedPlaying = sessions.Count(session => session.State == "playing");
                 foreach (var session in sessions.Where(session => session.State is "playing" or "paused"
                     && UserSelected(settings, server.Id, session.UserId)).Take(32))
                 {
                     var owner = Owner(server.Id, "realtime", session.UserId);
                     var viewer = new PlaybackViewer(session.UserName, session.PlayerName, session.Item.Duration);
                     if (session.Item.ViewOffset > 0) await QueueMediaAsync(server, session.Item, owner, 80, settings, null, ct,
-                        resolved: imported => runtime.Viewers.Note(imported.Id, viewer)).ConfigureAwait(false);
+                        resolved: imported =>
+                        {
+                            runtime.Viewers.Note(imported.Id, viewer);
+                            if (session.State != "playing") return;
+                            playing[imported.Id] = imported;
+                            unresolvedPlaying--;
+                        }).ConfigureAwait(false);
                     if (settings.PredictionsEnabled && session.Item.Type == "episode")
                         await QueueNextAsync(server, session.Item, Owner(server.Id, "realtime-next", session.UserId), 90, settings, null, ct).ConfigureAwait(false);
                 }
+                if (_preview is null) await RecordPlayingItemsAsync(server.Id, unresolvedPlaying == 0 ? playing.Values : null, ct).ConfigureAwait(false);
             }
             catch (PlexRequestException) { _plexUnavailable = true; LastError = "Plex playback could not be refreshed; other source policies remain available."; }
         }
@@ -203,6 +212,25 @@ public sealed class PlexPrefetchService(ConfigManager config, PlexApiClient api,
             }
             catch (PlexRequestException) { _plexUnavailable = true; LastError = "A selected Plex source could not be refreshed; its previous cache is retained."; }
         }
+    }
+
+    /// <summary>
+    /// Tells warming which playing files still stream from Usenet. Playback of a fully cached file
+    /// reads only the cache, so it does not hold back warming lanes.
+    /// </summary>
+    private async Task RecordPlayingItemsAsync(string serverId, IEnumerable<DavItem>? playing, CancellationToken ct)
+    {
+        if (playing is null) { _playback.RecordItems(serverId, null); return; }
+        using var scope = scopes.CreateScope();
+        var native = scope.ServiceProvider.GetService<NativeCacheService>();
+        var streaming = new List<Guid>();
+        var cached = new List<Guid>();
+        foreach (var item in playing)
+        {
+            var coverage = native is null ? null : await native.GetCurrentCoverageAsync(item, ct).ConfigureAwait(false);
+            (coverage >= 100 ? cached : streaming).Add(item.Id);
+        }
+        _playback.RecordItems(serverId, streaming, cached);
     }
 
     private async Task QueueNextAsync(PlexServer server, PlexMediaItem current, string owner, int priority,

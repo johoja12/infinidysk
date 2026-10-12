@@ -65,6 +65,8 @@ public sealed record WarmLanes(int Count, Func<CancellationToken, Task<NativeCac
 {
     /// <summary>How often a paused extra lane checks whether it may rejoin.</summary>
     public TimeSpan ResumeDelay { get; init; } = TimeSpan.FromSeconds(1);
+    /// <summary>Gate for the first extra lane only; <see cref="MayStart"/> when null.</summary>
+    public Func<bool>? FirstMayStart { get; init; }
 }
 
 public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCacheService native, ConfigManager config,
@@ -199,8 +201,9 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
 
     /// <summary>
     /// Extra lanes for one job: half the native buffer slots, at most <see cref="MaxLanes"/> in all.
-    /// They run only while nothing is playing and at least half the slots are free, so playback
-    /// always finds buffers; the primary lane alone continues otherwise. Short probe reads (library
+    /// They run only while at least half the slots are free, so playback always finds buffers, and
+    /// while no playback needs Usenet (see <see cref="ExtraLanesMayRun"/>); the primary lane alone
+    /// continues otherwise. Short probe reads (library
     /// scans, media analysis) do not count as playback: the connection governor already yields to
     /// any transfer they queue.
     /// </summary>
@@ -212,13 +215,36 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         return new WarmLanes(extra,
             async token => await native.WrapAsync(item, open => factory.OpenAsync(item, open), token, requireNative: true)
                 .ConfigureAwait(false) as NativeCachedStream,
-            () => ExtraLanesMayRun(activeReads.Snapshot(), playback?.HasActivePlayback == true,
-                slots.Free, slots.Capacity, DateTimeOffset.UtcNow));
+            () => ExtraLanesMayRun(item.Id, firstLane: false, activeReads.Snapshot(), Load(item.Id), CachedPlayback,
+                slots.Free, slots.Capacity, DateTimeOffset.UtcNow))
+        {
+            FirstMayStart = () => ExtraLanesMayRun(item.Id, firstLane: true, activeReads.Snapshot(), Load(item.Id),
+                CachedPlayback, slots.Free, slots.Capacity, DateTimeOffset.UtcNow)
+        };
     }
 
-    internal static bool ExtraLanesMayRun(IReadOnlyList<ActiveReadRegistry.Entry> reads, bool plexPlayback,
-        int freeSlots, int capacity, DateTimeOffset now)
-        => !plexPlayback && freeSlots >= (capacity + 1) / 2 && !reads.Any(read => read.QualifiesForWarming(now));
+    // Without a registry there is no verified Plex playback; reads still gate the lanes.
+    private PlexPlaybackRegistry.Load Load(Guid itemId) => playback?.LoadFor(itemId) ?? PlexPlaybackRegistry.Load.None;
+    private bool CachedPlayback(Guid itemId) => playback?.IsCachedPlayback(itemId) == true;
+
+    /// <summary>
+    /// Extra lanes run while no playback needs Usenet. Playback of a fully cached file reads only the
+    /// cache and is ignored. When the only such playback is this file itself, the first extra lane
+    /// still runs: warming further ahead serves that viewer instead of competing with anyone else.
+    /// </summary>
+    internal static bool ExtraLanesMayRun(Guid itemId, bool firstLane, IReadOnlyList<ActiveReadRegistry.Entry> reads,
+        PlexPlaybackRegistry.Load plexLoad, Func<Guid, bool> cachedPlayback, int freeSlots, int capacity, DateTimeOffset now)
+    {
+        if (freeSlots < (capacity + 1) / 2 || plexLoad == PlexPlaybackRegistry.Load.Other) return false;
+        var self = plexLoad == PlexPlaybackRegistry.Load.OnlyItem;
+        foreach (var read in reads)
+        {
+            if (!read.QualifiesForWarming(now) || read.ItemId is { } cached && cachedPlayback(cached)) continue;
+            if (read.ItemId != itemId) return false;
+            self = true;
+        }
+        return !self || firstLane;
+    }
 
     /// <summary>
     /// A damaged release cannot be fixed by warming again: hand the item to the existing repair path
@@ -375,7 +401,7 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
     /// Fills chunks out of order: the primary stream and up to <see cref="WarmLanes.Count"/> extra
     /// streams each take the next unfinished chunk, so a slow article stalls only its own lane.
     /// Extra lanes start, and take each further chunk, only while <see cref="WarmLanes.MayStart"/>
-    /// allows; the primary lane always runs. The first failure stops every lane at its next block
+    /// (or <see cref="WarmLanes.FirstMayStart"/> for the first one) allows; the primary lane always runs. The first failure stops every lane at its next block
     /// and is rethrown with its original classification.
     /// </summary>
     private static async Task WarmInLanesAsync(NativeCacheStore store, NativeCachedStream primary, long position, long end,
@@ -403,28 +429,28 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
         }
         // An extra lane yields to playback or short buffers by waiting, not retiring, and
         // rejoins while unassigned chunks remain. False once there is nothing left to take.
-        async Task<bool> WaitToRunAsync()
+        async Task<bool> WaitToRunAsync(Func<bool> mayStart)
         {
-            while (!lanes.MayStart())
+            while (!mayStart())
             {
                 if (!HasWork()) return false;
                 await Task.Delay(lanes.ResumeDelay, ct).ConfigureAwait(false);
             }
             return HasWork();
         }
-        async Task RunAsync(WarmLane lane, bool extra)
+        async Task RunAsync(WarmLane lane, Func<bool>? mayStart)
         {
-            while ((!extra || await WaitToRunAsync().ConfigureAwait(false)) && TryTake(out var chunkStart, out var chunkEnd))
+            while ((mayStart is null || await WaitToRunAsync(mayStart).ConfigureAwait(false)) && TryTake(out var chunkStart, out var chunkEnd))
                 await WarmChunkAsync(store, lane, chunkStart, chunkEnd, chunkEnd, spend, progress, warmed, Stopped, shared, ct).ConfigureAwait(false);
         }
-        async Task LaneAsync(bool extra)
+        async Task LaneAsync(Func<bool>? mayStart)
         {
             NativeCachedStream? opened = null;
             try
             {
-                if (extra)
+                if (mayStart is not null)
                 {
-                    if (!await WaitToRunAsync().ConfigureAwait(false)) return;
+                    if (!await WaitToRunAsync(mayStart).ConfigureAwait(false)) return;
                     try { opened = await lanes.Open(ct).ConfigureAwait(false); }
                     catch (Exception exception) when (exception is not OperationCanceledException and not OutOfMemoryException)
                     {
@@ -434,13 +460,17 @@ public sealed class NativePrefetchExecutor(IServiceScopeFactory scopes, NativeCa
                     if (opened is null) return;
                     if (opened.Identity != primary.Identity) return;
                 }
-                await RunAsync(new WarmLane(opened ?? primary), extra).ConfigureAwait(false);
+                await RunAsync(new WarmLane(opened ?? primary), mayStart).ConfigureAwait(false);
             }
             catch (Exception exception) { Interlocked.CompareExchange(ref failure, exception, null); }
             finally { if (opened is not null) await opened.DisposeAsync().ConfigureAwait(false); }
         }
-        var running = new List<Task> { LaneAsync(extra: false) };
-        for (var index = 0; index < lanes.Count; index++) running.Add(Task.Run(() => LaneAsync(extra: true), CancellationToken.None));
+        var running = new List<Task> { LaneAsync(mayStart: null) };
+        for (var index = 0; index < lanes.Count; index++)
+        {
+            var mayStart = index == 0 ? lanes.FirstMayStart ?? lanes.MayStart : lanes.MayStart;
+            running.Add(Task.Run(() => LaneAsync(mayStart), CancellationToken.None));
+        }
         await Task.WhenAll(running).ConfigureAwait(false);
         if (failure is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }

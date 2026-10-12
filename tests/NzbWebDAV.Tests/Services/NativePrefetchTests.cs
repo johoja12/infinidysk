@@ -210,6 +210,38 @@ public sealed class NativePrefetchTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task LaneWarm_OnlyTheFirstExtraLaneRunsUnderItsOwnGate()
+    {
+        const int block = NativeCacheStore.BlockSize;
+        var bytes = new byte[4L * block];
+        new Random(6).NextBytes(bytes);
+        var identity = new NativeCacheIdentity("lanes-first", "revision", bytes.Length);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using var primary = new NativeCachedStream(_store, identity,
+            _ => Task.FromResult<Stream>(new GatedSource(bytes, release.Task)), () => true);
+        var opens = 0;
+        var lanes = new WarmLanes(2, _ =>
+        {
+            Interlocked.Increment(ref opens);
+            return Task.FromResult<NativeCachedStream?>(new NativeCachedStream(_store, identity,
+                _ => Task.FromResult<Stream>(new VerifiedSource(bytes, true)), () => true));
+        }, () => false) { FirstMayStart = () => true, ResumeDelay = TimeSpan.FromMilliseconds(20) };
+
+        var warm = NativePrefetchExecutor.WarmAsync(_store, primary, 0, 0, _ => new ValueTask<bool>(true), _ => { },
+            CancellationToken.None, chunkMb: 4, lanes: lanes);
+
+        // The primary holds chunk 0; the first extra lane alone fills chunks 1–3.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (await _store.GetCoverageAsync(identity) < 3L * block && DateTime.UtcNow < deadline) await Task.Delay(20);
+        Assert.Equal(3L * block, await _store.GetCoverageAsync(identity));
+        Assert.Equal(1, Volatile.Read(ref opens));
+
+        release.SetResult();
+        await warm;
+        Assert.Equal(bytes.Length, await _store.GetCoverageAsync(identity));
+    }
+
+    [Fact]
     public async Task LaneWarm_PrimaryFinishesAloneWhenExtraLanesCannotRun()
     {
         const int block = NativeCacheStore.BlockSize;
