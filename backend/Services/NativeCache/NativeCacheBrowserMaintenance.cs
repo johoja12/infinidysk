@@ -95,8 +95,9 @@ public sealed class NativeCacheBrowserMaintenance(NativeCacheService native, ISe
     /// <summary>
     /// A file whose source or cache identity changed keeps its earlier cached copies until age eviction
     /// reaches them, though nothing reads them again. Reviews the next batch of items with several copies
-    /// and evicts every copy but the current one. Pinned copies, copies being read, items that no longer
-    /// exist and items whose current identity cannot be resolved are left alone.
+    /// and evicts every copy but the current one, including every copy of an item whose current revision
+    /// is not cached at all, since reads only ever open the current identity. Pinned copies, copies being
+    /// read, items that no longer exist and items whose current identity cannot be resolved are left alone.
     /// </summary>
     internal async Task<(int Copies, long Bytes)> EvictSupersededCopiesAsync(NativeCacheStore store, CancellationToken ct)
     {
@@ -116,7 +117,7 @@ public sealed class NativeCacheBrowserMaintenance(NativeCacheService native, ISe
             var key = Guid.TryParse(group.Key, out var parsed) ? parsed.ToString("N") : group.Key;
             if (!items.TryGetValue(key, out var item)) continue;
             var current = await native.GetCurrentCacheIdentityAsync(item, ct).ConfigureAwait(false);
-            if (current is null || group.All(copy => copy.Key != current.Key)) continue;
+            if (current is null) continue;
             foreach (var copy in group.Where(copy => copy.Key != current.Key && !copy.Pinned))
             {
                 if (await store.EvictKeyAsync(copy.Folder, copy.Key, ct).ConfigureAwait(false) != NativeCacheEntryEviction.Evicted) continue;

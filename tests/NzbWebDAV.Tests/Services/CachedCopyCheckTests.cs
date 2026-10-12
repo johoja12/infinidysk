@@ -114,7 +114,7 @@ public sealed class CachedCopyCheckTests : IDisposable
     }
 
     [Fact]
-    public async Task Maintenance_EvictsSupersededCopiesOnlyBesideTheCurrentCopy()
+    public async Task Maintenance_EvictsEveryCopyButTheCurrentOne()
     {
         using var blobs = new FileBlobStore();
         using var repairs = new RepairPatchStore(Path.Combine(_root, "patches"), 100);
@@ -134,7 +134,7 @@ public sealed class CachedCopyCheckTests : IDisposable
         var superseded = await CacheGenerationAsync(native, live);
         await ReplaceSourceAsync(blobs, live);
         var current = await CacheGenerationAsync(native, live);
-        // Only stale copies: nothing confirms the current identity, so normal eviction keeps them.
+        // Only stale copies: reads open the current identity, so none of them is reachable.
         var uncached = await NewItemAsync(blobs, 3);
         var uncachedOld = await CacheGenerationAsync(native, uncached);
         await ReplaceSourceAsync(blobs, uncached);
@@ -159,12 +159,13 @@ public sealed class CachedCopyCheckTests : IDisposable
 
         var (copies, bytes) = await maintenance.EvictSupersededCopiesAsync(store, CancellationToken.None);
 
-        Assert.Equal(1, copies);
+        Assert.Equal(3, copies);
         Assert.True(bytes > 0); // On-disk bytes, including allocation and integrity metadata.
         var remaining = (await store.ListItemsWithSeveralCopiesAsync(null, 10)).Select(copy => copy.Key).ToHashSet();
-        Assert.Equal(new[] { pinned.Key, current.Key, uncachedOld.Key, uncachedNewer.Key, removedOld.Key, removedCurrent.Key }.ToHashSet(),
-            remaining);
+        Assert.Equal(new[] { pinned.Key, current.Key, removedOld.Key, removedCurrent.Key }.ToHashSet(), remaining);
         Assert.DoesNotContain(superseded.Key, remaining);
+        Assert.DoesNotContain(uncachedNewer.Key, remaining);
+        Assert.Equal(CachedCopyState.NotCached, (await native.CheckCachedCopyAsync(uncached)).State);
         Assert.Equal(CachedCopyState.Verified, (await native.CheckCachedCopyAsync(live)).State);
         // The pass resumes after the last item it listed and restarts once the list is exhausted.
         Assert.Equal((0, 0L), await maintenance.EvictSupersededCopiesAsync(store, CancellationToken.None));
