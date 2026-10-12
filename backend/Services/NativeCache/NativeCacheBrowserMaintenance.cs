@@ -12,8 +12,13 @@ public sealed class NativeCacheBrowserMaintenance(NativeCacheService native, ISe
     private const int ProtectionReviewTicks = 20;
     /// <summary>Items with several cached copies reviewed per tick.</summary>
     internal const int SupersededItemsPerTick = 50;
+    /// <summary>Cached items checked per tick for removal from the library: about 30,000 items an hour.</summary>
+    internal const int RemovedItemsPerTick = 250;
+    /// <summary>A copy read this recently is kept even when its item is missing, covering imports that commit after the first read.</summary>
+    internal static readonly TimeSpan RemovedItemGrace = TimeSpan.FromHours(1);
     private int _ticks;
     private string? _supersededCursor;
+    private string? _removedCursor;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -57,6 +62,7 @@ public sealed class NativeCacheBrowserMaintenance(NativeCacheService native, ISe
             await store.UpdateDisplayNamesAsync(names, ct).ConfigureAwait(false);
             if (++_ticks % ProtectionReviewTicks == 1) await ReleaseStaleProtectionAsync(store, ct).ConfigureAwait(false);
             await EvictSupersededCopiesAsync(store, ct).ConfigureAwait(false);
+            await EvictRemovedItemCopiesAsync(store, DateTimeOffset.UtcNow, ct).ConfigureAwait(false);
         }
         catch (Exception exception) when (exception is not OperationCanceledException and not OutOfMemoryException)
         { Log.Warning("Native cache browser maintenance failed ({Reason})", exception.GetType().Name); }
@@ -127,6 +133,42 @@ public sealed class NativeCacheBrowserMaintenance(NativeCacheService native, ISe
         }
         if (evicted > 0)
             Log.Information("Removed {Count} superseded cached copies ({Bytes:F1} GiB) of files whose cache identity changed.",
+                evicted, bytes / (1024.0 * 1024 * 1024));
+        return (evicted, bytes);
+    }
+
+    /// <summary>
+    /// Nothing reads the cached copies of a file once it leaves the library. Reviews the next batch of cached
+    /// items and evicts every copy of an item that no longer exists. Pinned copies, copies being read and copies
+    /// read within <see cref="RemovedItemGrace"/> are left alone.
+    /// </summary>
+    internal async Task<(int Copies, long Bytes)> EvictRemovedItemCopiesAsync(NativeCacheStore store, DateTimeOffset now, CancellationToken ct)
+    {
+        var copies = await store.ListItemCopiesAsync(_removedCursor, RemovedItemsPerTick, ct).ConfigureAwait(false);
+        _removedCursor = copies.Count == 0 ? null : copies[^1].ItemId;
+        if (copies.Count == 0) return (0, 0);
+        var ids = copies.Select(copy => Guid.TryParse(copy.ItemId, out var id) ? id : Guid.Empty)
+            .Where(id => id != Guid.Empty).Distinct().ToArray();
+        if (ids.Length == 0) return (0, 0);
+        HashSet<string> live;
+        using (var scope = scopes.CreateScope())
+        {
+            var database = scope.ServiceProvider.GetRequiredService<DavDatabaseClient>();
+            live = (await database.GetItemsByIdsBatchedAsync(ids, ct: ct).ConfigureAwait(false))
+                .Select(item => item.Id.ToString("N")).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        }
+        var evicted = 0;
+        var bytes = 0L;
+        foreach (var copy in copies)
+        {
+            if (!Guid.TryParse(copy.ItemId, out var parsed) || live.Contains(parsed.ToString("N"))) continue;
+            if (copy.Pinned || now - copy.LastAccess < RemovedItemGrace) continue;
+            if (await store.EvictKeyAsync(copy.Folder, copy.Key, ct).ConfigureAwait(false) != NativeCacheEntryEviction.Evicted) continue;
+            evicted++;
+            bytes += copy.Bytes;
+        }
+        if (evicted > 0)
+            Log.Information("Removed {Count} cached copies ({Bytes:F1} GiB) of files no longer in the library.",
                 evicted, bytes / (1024.0 * 1024 * 1024));
         return (evicted, bytes);
     }
