@@ -368,6 +368,49 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.Null(reloaded.UrgentRepairFailures);
     }
 
+    [Fact]
+    public async Task LongPar2Repair_ContinuesInBackground_AndFileIsRecheckedWhenItFinishes()
+    {
+        _configManager.UpdateValues(
+        [
+            new ConfigItem { ConfigName = ConfigKeys.RepairPar2Enabled, ConfigValue = "true" },
+        ]);
+        var segments = NewSegmentIds(3);
+        var (item, _) = await AddVideoFileAsync(
+            "movie.mkv", segments, [10_000, 10_000, 10_000]);
+        var timeProvider = new ControllableTimeProvider(new DateTimeOffset(2026, 9, 16, 12, 0, 0, TimeSpan.Zero));
+        var (service, par2) = await NewServiceAsync(
+            NewFakeClient(segments, missing: [1]), Par2RepairOutcome.Repaired, timeProvider);
+        service.CreateDbContextOverride = () => new DavDatabaseContext(_options);
+        par2.Started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        par2.Release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var check = service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        await par2.Started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        timeProvider.Advance(service.Par2InlineWait);
+        // The health check finishes while PAR2 is still running.
+        await check.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var row = Assert.Single(GetHealthRows(item.Id));
+        Assert.Contains("running in the background", row.Message, StringComparison.Ordinal);
+        Assert.True(ReloadItem(item.Id).HealthRepairPending);
+        Assert.Empty(await service.SelectNextHealthCheckIdsAsync(
+            [], allowChecks: true, allowRepairs: true, maximumCount: 1, CancellationToken.None));
+
+        par2.Release.SetResult();
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        IReadOnlyCollection<Guid> selected;
+        do
+        {
+            selected = await service.SelectNextHealthCheckIdsAsync(
+                [], allowChecks: true, allowRepairs: true, maximumCount: 1, CancellationToken.None);
+            if (selected.Count > 0) break;
+            await Task.Delay(20);
+        } while (DateTime.UtcNow < deadline);
+        Assert.Contains(item.Id, selected);
+        Assert.Single(par2.Requests);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -434,6 +477,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         var (service, par2) = await NewServiceAsync(
             NewFakeClient(segments, missing: []), Par2RepairOutcome.Repaired, timeProvider);
         service.CreateDbContextOverride = () => new DavDatabaseContext(_options);
+        // The scripted repair advances the clock itself; keep it inline so the attempt's watchdog is what is tested.
+        service.Par2InlineWait = Timeout.InfiniteTimeSpan;
         par2.Work = ct =>
         {
             for (var step = 0; step < 6; step++)
@@ -2502,6 +2547,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         public List<string[]> Requests { get; } = [];
         public Par2RepairOutcome Outcome { get; set; } = repairOutcome;
         public TaskCompletionSource? Hang { get; set; }
+        public TaskCompletionSource? Started { get; set; }
+        public TaskCompletionSource? Release { get; set; }
         public Func<CancellationToken, Task>? Work { get; set; }
 
         public override async Task<Par2RepairOutcome> TryPar2RepairAsync(
@@ -2510,6 +2557,11 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             Requests.Add(missingSegmentIds?.ToArray() ?? []);
             if (Work is not null)
                 await Work(ct);
+            if (Release is not null)
+            {
+                Started?.TrySetResult();
+                await Release.Task.WaitAsync(ct);
+            }
             if (Hang is not null)
             {
                 Hang.TrySetResult();
