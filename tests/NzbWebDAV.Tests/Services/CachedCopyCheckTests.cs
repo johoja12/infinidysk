@@ -172,6 +172,57 @@ public sealed class CachedCopyCheckTests : IDisposable
         Assert.Equal((0, 0L), await maintenance.EvictSupersededCopiesAsync(store, CancellationToken.None));
     }
 
+    [Fact]
+    public async Task Maintenance_EvictsCopiesOfFilesRemovedFromTheLibrary()
+    {
+        using var blobs = new FileBlobStore();
+        using var repairs = new RepairPatchStore(Path.Combine(_root, "patches"), 100);
+        await using var native = new NativeCacheService(Config(), blobs, repairs);
+        Assert.True(await native.WaitForInitializationAsync());
+        await using var connection = new SqliteConnection("Data Source=:memory:");
+        await connection.OpenAsync();
+        var options = new DbContextOptionsBuilder<DavDatabaseContext>().UseSqlite(connection).Options;
+        await using (var context = new DavDatabaseContext(options)) await context.Database.EnsureCreatedAsync();
+        var store = native.Store!;
+
+        var live = await NewItemAsync(blobs, 3);
+        var liveCopy = await CacheGenerationAsync(native, live);
+        var removed = await NewItemAsync(blobs, 3);
+        var removedOld = await CacheGenerationAsync(native, removed);
+        await ReplaceSourceAsync(blobs, removed);
+        var removedCurrent = await CacheGenerationAsync(native, removed);
+        var pinnedRemoved = await NewItemAsync(blobs, 3);
+        var pinned = await CacheGenerationAsync(native, pinnedRemoved);
+        await store.SetPinnedAsync(pinned, true);
+        await using (var context = new DavDatabaseContext(options))
+        {
+            context.Items.Add(live);
+            await context.SaveChangesAsync();
+        }
+
+        var services = new ServiceCollection();
+        services.AddScoped(_ => new DavDatabaseContext(options));
+        services.AddScoped(sp => new DavDatabaseClient(sp.GetRequiredService<DavDatabaseContext>(), blobs));
+        await using var provider = services.BuildServiceProvider();
+        var maintenance = new NativeCacheBrowserMaintenance(native, provider.GetRequiredService<IServiceScopeFactory>());
+        async Task<HashSet<string>> RemainingAsync() => (await store.ListItemCopiesAsync(null, 10)).Select(copy => copy.Key).ToHashSet();
+        var all = new[] { liveCopy.Key, removedOld.Key, removedCurrent.Key, pinned.Key }.ToHashSet();
+
+        // Recently read copies of a missing item are kept: an import may not have committed yet.
+        Assert.Equal((0, 0L), await maintenance.EvictRemovedItemCopiesAsync(store, DateTimeOffset.UtcNow, CancellationToken.None));
+        Assert.Equal(all, await RemainingAsync());
+        // The cursor has passed every item; the next pass is empty and restarts the sweep.
+        var later = DateTimeOffset.UtcNow + NativeCacheBrowserMaintenance.RemovedItemGrace + TimeSpan.FromMinutes(10);
+        Assert.Equal((0, 0L), await maintenance.EvictRemovedItemCopiesAsync(store, later, CancellationToken.None));
+
+        var (copies, bytes) = await maintenance.EvictRemovedItemCopiesAsync(store, later, CancellationToken.None);
+
+        Assert.Equal(2, copies);
+        Assert.True(bytes > 0);
+        Assert.Equal(new[] { liveCopy.Key, pinned.Key }.ToHashSet(), await RemainingAsync());
+        Assert.Equal(CachedCopyState.Verified, (await native.CheckCachedCopyAsync(live)).State);
+    }
+
     private static async Task<NativeCacheIdentity> CacheGenerationAsync(NativeCacheService native, DavItem item)
     {
         await SeedAsync(native, item, (int)item.FileSize!.Value);

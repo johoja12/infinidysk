@@ -1766,17 +1766,45 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             using var command = Command("""
-                SELECT Key,Folder,ItemId,Bytes,Pinned FROM Entries WHERE ItemId IN (
+                SELECT Key,Folder,ItemId,Bytes,Pinned,Access FROM Entries WHERE ItemId IN (
                     SELECT ItemId FROM Entries WHERE ItemId>$after AND ItemId<>'' GROUP BY ItemId HAVING COUNT(*)>1 ORDER BY ItemId LIMIT $limit)
                 ORDER BY ItemId,Key
                 """, ("$after", afterItemId ?? ""), ("$limit", itemLimit));
-            using var reader = command.ExecuteReader();
-            var copies = new List<NativeCacheCopy>();
-            while (reader.Read())
-                copies.Add(new(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetInt64(3), reader.GetInt64(4) != 0));
-            return copies;
+            return ReadCopies(command);
         }
         finally { _gate.Release(); }
+    }
+
+    /// <summary>
+    /// Entries of the next <paramref name="itemLimit"/> items after <paramref name="afterItemId"/>, ordered by item;
+    /// empty once every item has been listed.
+    /// </summary>
+    [SuppressMessage("Performance", "CA1849:Call async methods when in an async method", Justification = LocalSqliteReason)]
+    public async Task<IReadOnlyList<NativeCacheCopy>> ListItemCopiesAsync(string? afterItemId, int itemLimit,
+        CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            using var command = Command("""
+                SELECT Key,Folder,ItemId,Bytes,Pinned,Access FROM Entries WHERE ItemId IN (
+                    SELECT DISTINCT ItemId FROM Entries WHERE ItemId>$after AND ItemId<>'' ORDER BY ItemId LIMIT $limit)
+                ORDER BY ItemId,Key
+                """, ("$after", afterItemId ?? ""), ("$limit", itemLimit));
+            return ReadCopies(command);
+        }
+        finally { _gate.Release(); }
+    }
+
+    private static List<NativeCacheCopy> ReadCopies(SqliteCommand command)
+    {
+        using var reader = command.ExecuteReader();
+        var copies = new List<NativeCacheCopy>();
+        while (reader.Read())
+            copies.Add(new(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetInt64(3), reader.GetInt64(4) != 0,
+                DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(5) * 300)));
+        return copies;
     }
 
     /// <summary>Returns health-protected entries to normal eviction; manual pins are untouched.</summary>
@@ -2176,7 +2204,7 @@ public sealed partial class NativeCacheStore : IAsyncDisposable
 public enum NativeCacheEntryEviction { Evicted, NotFound, Pinned, Active, Unavailable }
 
 /// <summary>One cached copy of an item: its catalogue key, folder, item, bytes on disk and whether it is pinned.</summary>
-public sealed record NativeCacheCopy(string Key, string Folder, string ItemId, long Bytes, bool Pinned);
+public sealed record NativeCacheCopy(string Key, string Folder, string ItemId, long Bytes, bool Pinned, DateTimeOffset LastAccess);
 
 public sealed record NativeCacheProbeResult(string FileSystem, string Capability, bool Readable, bool Writable,
     bool DurableWriteVerified, long AvailableBytes, string? Error);
