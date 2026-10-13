@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import Library, { type LibraryPageData } from "./route";
 
@@ -228,7 +229,7 @@ describe("Library accordion", () => {
     );
 
     render(<RouterProvider router={router} />);
-    fireEvent.click(await screen.findByRole("button", { name: /Film/i }));
+    await userEvent.click(await screen.findByRole("button", { name: /Film/i }));
     expect(await screen.findByText("Film.1080p.mkv")).toBeTruthy();
     expect(router.state.location.search).toBe("?category=movies");
     expect(screen.getAllByText("Cache 75%").length).toBeGreaterThanOrEqual(1);
