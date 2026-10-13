@@ -18,5 +18,8 @@ trap 'rm -rf "$tree"; git worktree prune' EXIT
 git -C "$tree" submodule update -q --init libs/rapidyenc
 
 # Host networking: NuGet restore fails on DNS inside the default build network.
-docker build --network=host --build-arg NZBDAV_VERSION="$version" -t "local/infinidysk:$short" "$tree"
+docker build --network=host --build-arg NZBDAV_VERSION="$version" \
+  --build-arg NZBDAV_COMMIT_SHA="$sha" \
+  --build-arg REPO_URL=https://github.com/johoja12/infinidysk \
+  -t "local/infinidysk:$short" "$tree"
 echo "Built local/infinidysk:$short with NZBDAV_VERSION=$version"
