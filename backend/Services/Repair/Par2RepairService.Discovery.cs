@@ -32,6 +32,7 @@ public partial class Par2RepairService
     {
         public Par2MemoryBudget Budget { get; } = new(memoryLimit);
         public SemaphoreSlim FetchGate { get; } = new(concurrency, concurrency);
+        public int Concurrency { get; } = concurrency;
         public Dictionary<NzbFile, NzbFileObservation> Observations { get; } = new(ReferenceEqualityComparer.Instance);
         public Dictionary<string, UsenetYencHeader?> Headers { get; } = new(StringComparer.Ordinal);
         public HashSet<string> UnavailableIds { get; } = new(StringComparer.Ordinal);
@@ -53,7 +54,8 @@ public partial class Par2RepairService
         public byte[]? IdentityBody { get; set; }
         private long IdentityWorkBytes { get; set; }
         private int IdentityRequests { get; set; }
-        public long BytesRead { get; private set; }
+        private long _bytesRead;
+        public long BytesRead => Interlocked.Read(ref _bytesRead);
         public long MetadataBytesRead { get; private set; }
         public int CandidateCount { get; set; }
         public int MagicCount { get; set; }
@@ -107,7 +109,8 @@ public partial class Par2RepairService
 
         public void ReadBytes(long bytes, bool metadata = false)
         {
-            BytesRead = checked(BytesRead + bytes);
+            // Source read-ahead counts bytes from several reads at once.
+            Interlocked.Add(ref _bytesRead, bytes);
             onRead(bytes);
             if (metadata)
             {

@@ -120,6 +120,25 @@ public sealed class Par2RepairServiceCorruptSourceTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task SourceReads_OverlapUpToFetchConcurrency_AndStillRepair()
+    {
+        var fileData = PatternBytes(SliceSize * 12, 0x13);
+        var inFlight = new InFlightProbe();
+        await using var release = await SeedAsync(fileData, EqualSegments(12), recoveryExponents: [0u],
+            corruptOnRead: [0], fetchConcurrency: "3", inFlight: inFlight);
+
+        var ok = await release.Service.TryPar2RepairAsync(
+            release.Item, [release.ContentSegmentIds[0]], CancellationToken.None);
+
+        Assert.Equal(Par2RepairOutcome.Repaired, ok);
+        Assert.Equal(
+            fileData.AsSpan(0, SliceSize).ToArray(),
+            await ReadPatchAsync(release.Store, release.ContentSegmentIds[0]));
+        // Sequential passes used to wait for each article before requesting the next.
+        Assert.InRange(inFlight.Peak, 2, 3);
+    }
+
+    [Fact]
     public async Task SequentialRepairPasses_RefetchPresentSourceInsteadOfRetainingWholeTarget()
     {
         var fileData = PatternBytes(SliceSize * 3, 0x12);
@@ -675,7 +694,9 @@ public sealed class Par2RepairServiceCorruptSourceTests : IAsyncLifetime
         string? maxMissingSlices = null,
         TaskCompletionSource<bool>? sourceReadStarted = null,
         Task? allowSourceRead = null,
-        NzbWebDAV.Services.StreamingRepairScheduler? repairScheduler = null)
+        NzbWebDAV.Services.StreamingRepairScheduler? repairScheduler = null,
+        string? fetchConcurrency = null,
+        InFlightProbe? inFlight = null)
     {
         _config.UpdateValues(
         [
@@ -686,6 +707,7 @@ public sealed class Par2RepairServiceCorruptSourceTests : IAsyncLifetime
                 ConfigName = ConfigKeys.RepairPar2MaxMissingSlices,
                 ConfigValue = maxMissingSlices ?? "8",
             },
+            new ConfigItem { ConfigName = ConfigKeys.RepairPar2FetchConcurrency, ConfigValue = fetchConcurrency ?? "" },
         ]);
         omitFromProvider ??= [];
         corruptOnRead ??= [];
@@ -708,6 +730,8 @@ public sealed class Par2RepairServiceCorruptSourceTests : IAsyncLifetime
                 if (sourceReadStarted is not null
                     && allowSourceRead is not null)
                     return new GateOnFirstReadStream(bytes, sourceReadStarted, allowSourceRead);
+                if (inFlight is not null)
+                    return new InFlightProbeStream(bytes, inFlight);
                 return new MemoryStream(bytes, writable: false);
             }, repairScheduler: repairScheduler);
     }
@@ -794,6 +818,46 @@ public sealed class Par2RepairServiceCorruptSourceTests : IAsyncLifetime
             }
 
             return await base.ReadAsync(buffer, cancellationToken);
+        }
+    }
+
+    private sealed class InFlightProbe
+    {
+        private int _current;
+        private int _peak;
+        public int Peak => Volatile.Read(ref _peak);
+
+        public void Enter()
+        {
+            var current = Interlocked.Increment(ref _current);
+            int peak;
+            while (current > (peak = Volatile.Read(ref _peak)) && Interlocked.CompareExchange(ref _peak, current, peak) != peak) { }
+        }
+
+        public void Exit() => Interlocked.Decrement(ref _current);
+    }
+
+    // Holds each article open briefly so overlapping source reads are observable.
+    private sealed class InFlightProbeStream(byte[] buffer, InFlightProbe probe) : MemoryStream(buffer, writable: false)
+    {
+        private int _state;
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.CompareExchange(ref _state, 1, 0) == 0)
+            {
+                probe.Enter();
+                await Task.Delay(25, cancellationToken);
+            }
+            var read = await base.ReadAsync(buffer, cancellationToken);
+            if (read == 0 && Interlocked.CompareExchange(ref _state, 2, 1) == 1) probe.Exit();
+            return read;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (Interlocked.Exchange(ref _state, 2) == 1) probe.Exit();
+            base.Dispose(disposing);
         }
     }
 }

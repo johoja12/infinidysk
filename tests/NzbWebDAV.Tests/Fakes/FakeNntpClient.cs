@@ -118,10 +118,14 @@ internal sealed class FakeNntpClient(
         CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        BodyRequestCount++;
         var segmentKey = segmentId.ToString();
-        RequestedSegmentIds.Add(segmentKey);
-        BodyRequestCounts[segmentKey] = BodyRequestCounts.GetValueOrDefault(segmentKey) + 1;
+        // PAR2 source read-ahead issues BODY requests from several reads at once.
+        lock (BodyRequestCounts)
+        {
+            BodyRequestCount++;
+            RequestedSegmentIds.Add(segmentKey);
+            BodyRequestCounts[segmentKey] = BodyRequestCounts.GetValueOrDefault(segmentKey) + 1;
+        }
         try
         {
             var response = CreateBodyResponse(segmentId);
@@ -210,8 +214,11 @@ internal sealed class FakeNntpClient(
 
     private void NoteCompletion(string segmentKey)
     {
-        CompletionCallbackCount++;
-        CompletionCallbackCounts[segmentKey] = CompletionCallbackCounts.GetValueOrDefault(segmentKey) + 1;
+        lock (CompletionCallbackCounts)
+        {
+            CompletionCallbackCount++;
+            CompletionCallbackCounts[segmentKey] = CompletionCallbackCounts.GetValueOrDefault(segmentKey) + 1;
+        }
     }
 
     private UsenetDecodedBodyResponse CreateBodyResponse(SegmentId segmentId) =>
