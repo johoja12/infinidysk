@@ -48,6 +48,11 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
     internal static readonly TimeSpan HealthCheckInactivityLimit = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan HealthCheckStallDeferral = TimeSpan.FromDays(1);
     private readonly ConcurrentDictionary<Guid, DateTimeOffset> _repairRetryNotBefore = new();
+    // PAR2 repairs still running after the inline wait; their files are not re-picked until they finish.
+    private readonly ConcurrentDictionary<Guid, Task<Par2RepairOutcome>> _backgroundPar2Repairs = new();
+    private CancellationToken _stoppingToken;
+    // Small repairs finish within the health check; longer ones continue without holding the worker.
+    internal TimeSpan Par2InlineWait { get; set; } = TimeSpan.FromMinutes(2);
     private readonly NativeCache.NativeCacheService? _nativeCache;
     private long _healthCheckSelections;
     /// <summary>How long a file kept because its cached copy still plays waits before the next check.</summary>
@@ -332,6 +337,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        _stoppingToken = stoppingToken;
         try
         {
             await Task.Delay(StartupGracePeriod, _timeProvider, stoppingToken).ConfigureAwait(false);
@@ -559,6 +565,11 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             .WithCancellation(ct)
             .ConfigureAwait(false))
         {
+            if (_backgroundPar2Repairs.TryGetValue(item.Id, out var backgroundRepair))
+            {
+                if (!backgroundRepair.IsCompleted) continue;
+                _backgroundPar2Repairs.TryRemove(new KeyValuePair<Guid, Task<Par2RepairOutcome>>(item.Id, backgroundRepair));
+            }
             if (_repairRetryNotBefore.TryGetValue(item.Id, out var notBefore))
             {
                 if (notBefore > currentDateTime) continue;
@@ -1656,17 +1667,15 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             }
 
             // When no Arr replacement is available, PAR2 remains the only automatic recovery path.
-            Par2RepairOutcome par2Outcome;
+            Par2RepairOutcome? par2Outcome;
             try
             {
-                par2Outcome = ShouldAttemptPar2Repair()
-                    ? await _par2RepairService.TryPar2RepairAsync(
+                par2Outcome = await RunPar2RepairAsync(
                         davItem,
                         e is UsenetContentMismatchException contentMismatch
                             ? contentMismatch.DamagedSegmentIds
                             : [e.SegmentId],
-                        ct).ConfigureAwait(false)
-                    : Par2RepairOutcome.NotRepaired;
+                        ct).ConfigureAwait(false);
             }
             catch (MissingFilePayloadException exception)
             {
@@ -1678,9 +1687,14 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                 await HandleUnreadablePayloadAsync(davItem, dbClient, exception, ct).ConfigureAwait(false);
                 return;
             }
+            if (par2Outcome is null)
+            {
+                await RecordPar2InBackgroundAsync(davItem, dbClient, ct).ConfigureAwait(false);
+                return;
+            }
             if (par2Outcome == Par2RepairOutcome.DeferredBusy)
             {
-                await DeferPar2RepairAsync(davItem, dbClient, par2Outcome, ct).ConfigureAwait(false);
+                await DeferPar2RepairAsync(davItem, dbClient, Par2RepairOutcome.DeferredBusy, ct).ConfigureAwait(false);
                 return;
             }
             if (par2Outcome is Par2RepairOutcome.Repaired or Par2RepairOutcome.VerifiedClean)
@@ -1847,13 +1861,15 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
 
         // PAR2 first, with the full hole list: reconstruct from parity before any verdict.
         // It is also the only automatic recovery path when no Arr replacement is available.
-        var par2Outcome = ShouldAttemptPar2Repair()
-            ? await _par2RepairService.TryPar2RepairAsync(
-                davItem, holeSegmentIds, ct).ConfigureAwait(false)
-            : Par2RepairOutcome.NotRepaired;
+        var par2Outcome = await RunPar2RepairAsync(davItem, holeSegmentIds, ct).ConfigureAwait(false);
+        if (par2Outcome is null)
+        {
+            await RecordPar2InBackgroundAsync(davItem, dbClient, ct).ConfigureAwait(false);
+            return;
+        }
         if (par2Outcome == Par2RepairOutcome.DeferredBusy)
         {
-            await DeferPar2RepairAsync(davItem, dbClient, par2Outcome, ct).ConfigureAwait(false);
+            await DeferPar2RepairAsync(davItem, dbClient, Par2RepairOutcome.DeferredBusy, ct).ConfigureAwait(false);
             return;
         }
         if (par2Outcome is Par2RepairOutcome.Repaired or Par2RepairOutcome.VerifiedClean)
@@ -3512,15 +3528,18 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             }
         }
 
-        var par2Outcome = ShouldAttemptPar2Repair()
-            ? await _par2RepairService.TryPar2RepairAsync(
-                davItem,
-                failureSnapshot.HasTargetableSegmentIds ? failureSnapshot.SegmentIds : null,
-                ct).ConfigureAwait(false)
-            : Par2RepairOutcome.NotRepaired;
+        var par2Outcome = await RunPar2RepairAsync(
+            davItem,
+            failureSnapshot.HasTargetableSegmentIds ? failureSnapshot.SegmentIds : null,
+            ct).ConfigureAwait(false);
+        if (par2Outcome is null)
+        {
+            await RecordPar2InBackgroundAsync(davItem, dbClient, ct).ConfigureAwait(false);
+            return;
+        }
         if (par2Outcome == Par2RepairOutcome.DeferredBusy)
         {
-            await DeferPar2RepairAsync(davItem, dbClient, par2Outcome, ct).ConfigureAwait(false);
+            await DeferPar2RepairAsync(davItem, dbClient, Par2RepairOutcome.DeferredBusy, ct).ConfigureAwait(false);
             return;
         }
         if (par2Outcome is Par2RepairOutcome.Repaired or Par2RepairOutcome.VerifiedClean)
@@ -3555,6 +3574,102 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             forceDelete: disposition == UrgentRepairDisposition.ForceDelete,
             forceDeleteIfUnlinked: disposition == UrgentRepairDisposition.ForceDeleteIfUnlinked,
             streamingFailureCount: failureCount).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Runs PAR2 repair without letting a long one hold the health worker. Returns null when the
+    /// repair is still running after <see cref="Par2InlineWait"/>: it continues in the background,
+    /// and the file is rechecked once it finishes. Patched articles then pass STAT; a failed repair
+    /// is in its failure cooldown, so the recheck falls through to Arr replacement.
+    /// </summary>
+    private async Task<Par2RepairOutcome?> RunPar2RepairAsync(
+        DavItem davItem, IReadOnlyList<string>? segmentIds, CancellationToken ct)
+    {
+        if (!ShouldAttemptPar2Repair()) return Par2RepairOutcome.NotRepaired;
+        var repair = Task.Run(() => RunBackgroundPar2RepairAsync(davItem, segmentIds), CancellationToken.None);
+        try
+        {
+            await repair.WaitAsync(Par2InlineWait, _timeProvider, ct).ConfigureAwait(false);
+        }
+        catch (TimeoutException) when (!repair.IsCompleted)
+        {
+        }
+        catch (OperationCanceledException) when (!repair.IsCompleted)
+        {
+            KeepUntilBackgroundRepairFinishes(davItem, repair);
+            throw;
+        }
+
+        if (repair.IsCompleted) return await repair.ConfigureAwait(false);
+        KeepUntilBackgroundRepairFinishes(davItem, repair);
+        return null;
+    }
+
+    private async Task<Par2RepairOutcome> RunBackgroundPar2RepairAsync(DavItem davItem, IReadOnlyList<string>? segmentIds)
+    {
+        // The health attempt's watchdog stops once the worker moves on, so the repair keeps its own.
+        // While the attempt still waits inline, progress keeps both alive.
+        var attemptHeartbeat = HealthCheckActivity.Current;
+        using var stalled = new CancellationTokenSource(HealthCheckInactivityLimit, _timeProvider);
+        using var repairCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken, stalled.Token);
+        HealthCheckActivity.Current = () =>
+        {
+            try { stalled.CancelAfter(HealthCheckInactivityLimit); }
+            catch (ObjectDisposedException)
+            {
+                // Late activity after the repair finished.
+            }
+            attemptHeartbeat?.Invoke();
+        };
+        try
+        {
+            return await _par2RepairService.TryPar2RepairAsync(davItem, segmentIds, repairCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (stalled.IsCancellationRequested && !_stoppingToken.IsCancellationRequested)
+        {
+            var next = _timeProvider.GetUtcNow() + HealthCheckStallDeferral;
+            _repairRetryNotBefore[davItem.Id] = next;
+            Log.Warning(
+                "PAR2 repair for {Path} made no progress for {Limit}. Deferred next repair attempt to {NextCheck}.",
+                davItem.Path, HealthCheckInactivityLimit, next);
+            return Par2RepairOutcome.DeferredBusy;
+        }
+    }
+
+    private void KeepUntilBackgroundRepairFinishes(DavItem davItem, Task<Par2RepairOutcome> repair)
+    {
+        _backgroundPar2Repairs[davItem.Id] = repair;
+        var path = davItem.Path;
+        _ = repair.ContinueWith(finished =>
+        {
+            if (finished.Exception?.GetBaseException() is { } failure)
+                failure.LogWarningKnownOrStack("Background PAR2 repair for {Path} failed", path);
+            else if (finished.IsCompletedSuccessfully)
+                Log.Information("Background PAR2 repair for {Path} finished ({Outcome}); rechecking the file.", path, finished.Result);
+            SignalWorkerStateChanged();
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    private async Task RecordPar2InBackgroundAsync(DavItem davItem, DavDatabaseClient dbClient, CancellationToken ct)
+    {
+        CompleteHealthProgress(davItem.Id);
+        var now = _timeProvider.GetUtcNow();
+        davItem.LastHealthCheck = now;
+        // An urgent sentinel already marks this file for repair; keep it.
+        var urgent = davItem.NextHealthCheck == DateTimeOffset.UnixEpoch;
+        if (!urgent) davItem.NextHealthCheck = now;
+        Log.Information(
+            "PAR2 repair for {Path} is still running after {Wait}; continuing in the background so other health checks can run.",
+            davItem.Path, Par2InlineWait);
+        await RecordHealthResult(
+                dbClient,
+                davItem,
+                HealthCheckResult.HealthResult.Unhealthy,
+                HealthCheckResult.RepairAction.ActionNeeded,
+                "PAR2 repair is running in the background; the file is rechecked when it finishes.",
+                ct,
+                repairPending: !urgent)
+            .ConfigureAwait(false);
     }
 
     private bool ShouldAttemptPar2Repair()

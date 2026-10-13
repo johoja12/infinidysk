@@ -49,6 +49,12 @@ reports enqueue background work; playback never waits for reconstruction. Until 
 available, reads retain their existing safe gap-fill or failure behavior. A gap fill does not
 guarantee that an archive or media player can continue playback.
 
+A health check waits up to two minutes for a PAR2 repair it starts. A longer repair continues in
+the background, the file shows **PAR2 repair is running in the background**, and the health
+worker moves on to other files. When the repair finishes the file is rechecked: repaired articles
+pass, and a failed repair falls through to *Arr replacement during its failure cooldown. A
+background repair that makes no progress for 30 minutes is stopped and retried a day later.
+
 Repair checks PAR2 packet hashes and source-slice checksums, reconstructs unavailable slices,
 and verifies every affected volume's whole-file MD5 before publishing any segment patches.
 Only validated posted bytes are stored. Sources and parity are read through Usenet without
