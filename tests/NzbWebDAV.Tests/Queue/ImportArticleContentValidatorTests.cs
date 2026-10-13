@@ -362,7 +362,7 @@ public sealed class ImportArticleContentQueueTests : IAsyncLifetime
 
             var part = int.Parse(key["mkv-".Length..key.IndexOf('@', StringComparison.Ordinal)]);
             var payload = new byte[PartSize];
-            if (part == 1) new byte[] { 0x1A, 0x45, 0xDF, 0xA3 }.CopyTo(payload, 0);
+            if (part == 1) Convert.FromHexString("1A45DFA38F42F281044282886D6174726F736B61").CopyTo(payload, 0);
             var header = new UsenetYencHeader
             {
                 FileName = "Movie.mkv",
