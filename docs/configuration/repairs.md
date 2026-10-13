@@ -41,7 +41,7 @@ in 1.2.5. Both Background Repairs and PAR2 gap repair must be enabled.
 | Maximum release size (GiB) | `repair.par2-max-release-gb` | `16` | 1-200; total recoverable source-volume bytes, checked before content reads |
 | Maximum repair memory (MiB) | `repair.par2-max-memory-mb` | `256` | 64-2048; conservative repair-owned working-memory budget, not total process RSS |
 | Maximum patch store (GiB) | `repair.par2-max-patch-gb` | `4` | 1-100; cataloged patch-body capacity; restart to apply a changed store capacity |
-| PAR2 fetch concurrency | `repair.par2-fetch-concurrency` | `2` | 1-8; upper bound for repair fetches, not a promise to parallelize every phase |
+| PAR2 fetch concurrency | `repair.par2-fetch-concurrency` | `2` | 1-8; upper bound for repair fetches. Source passes (discovery, reconstruction, whole-file check) keep this many articles in flight, so raising it shortens repairs of large files |
 | Failure cooldown (hours) | `repair.par2-failure-cooldown-hours` | `6` | 1-168; failed/infeasible attempts are deferred, with at most three provider-repair attempts per job |
 
 Health checks and attributed streaming failures can request repair. Playback gap/corruption
