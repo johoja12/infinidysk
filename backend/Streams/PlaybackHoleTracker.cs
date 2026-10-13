@@ -94,7 +94,38 @@ internal static class PlaybackHoleTracker
         return GapFillLimits.MaxConsecutiveZeroFills;
     }
 
-    public static void RecordHole(string? path, string segmentId, Exception exception)
+    /// <summary>Records a hole the reader is padding now; it counts toward consecutive fail-fast.</summary>
+    public static void RecordHole(string? path, string segmentId, Exception exception) =>
+        Record(path, segmentId, exception, countConsecutive: true);
+
+    /// <summary>
+    /// Records a hole found ahead of the reader. Read-ahead finds holes out of read order,
+    /// so the reader counts it with <see cref="RecordFilledHole"/> when it pads the gap.
+    /// </summary>
+    public static void RecordDiscoveredHole(string? path, string segmentId, Exception exception) =>
+        Record(path, segmentId, exception, countConsecutive: false);
+
+    /// <summary>Counts a gap the reader is padding now that was recorded by <see cref="RecordDiscoveredHole"/>.</summary>
+    public static void RecordFilledHole(string? path, Exception exception)
+    {
+        if (!IsTrackablePath(path))
+            return;
+
+        var now = Clock.GetUtcNow();
+        var state = Files.GetOrAdd(path!, static _ => new FileState());
+        lock (state)
+        {
+            ResetIfStale(state, now);
+            Prune(state, now);
+            state.LastEventUtc = now;
+            state.HoleTimes.Add(now);
+            state.LastException = exception;
+        }
+
+        MaybeCleanup(now);
+    }
+
+    private static void Record(string? path, string segmentId, Exception exception, bool countConsecutive)
     {
         // Native block fills read beyond the player's requested range. Keep their
         // repair reports, but never poison the ordinary playback retry history.
@@ -109,7 +140,11 @@ internal static class PlaybackHoleTracker
             ResetIfStale(state, now);
             Prune(state, now);
             state.LastEventUtc = now;
-            state.HoleTimes.Add(now);
+            if (countConsecutive)
+            {
+                state.HoleTimes.Add(now);
+                state.LastException = exception;
+            }
             // An inconclusive miss still counts toward consecutive-hole fail-fast, but later reads
             // must ask the providers again instead of treating the segment as known-missing.
             if (!exception.IsInconclusiveArticleMiss())
@@ -125,7 +160,6 @@ internal static class PlaybackHoleTracker
                         state.BudgetException ??= exception;
                 }
             }
-            state.LastException = exception;
         }
 
         MaybeCleanup(now);
