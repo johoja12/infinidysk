@@ -53,6 +53,15 @@ Automation must use a finite reviewed manifest, durable intent/accepted/verified
 
 ## Deliver the result
 
+Always finish with a concise user-facing **summary of actions taken**, including runs where no changes were needed or actions were blocked. Derive it from the durable journal and fresh verification, not the plan. Include:
+
+- Scope checked and findings: affected releases, movies/episodes and previews; distinguish ID defects, source damage, stale metadata and mapping issues.
+- Actions actually executed, grouped by queue cleanup, metadata/mapping repair, Preview retry, source repair, and regrab. Give counts and recognizable titles, with exact IDs in the linked detailed artifact. Label requested/accepted operations separately from verified results; use zero or “none” when applicable.
+- Verified outcomes: replacements imported under intended IDs, completed current-part BIFs, and retained library files/mappings. Describe the actual checks and their limits.
+- Pending, failed, skipped and review-required items, with the reason and next action. For active automation, include monitor scope, deadline, status artifact and stopping conditions.
+
+Keep the chat summary short and link a private detailed report/manifest when available. Persist the same summary with the run artifacts; task-owned monitors must update the artifact on completion or stopping. A link alone is not the user-facing summary, and queued work must never be reported as fixed.
+
 Report release and episode counts, exact correlated IDs, evidence supporting each cause, executed and verified actions, pending work, preservation checks, and unresolved items. In automatic mode, do not end at a recommendations-only report when supported remediation remains within scope. Separate search acceptance, import verification, preview queue admission, and finished BIF generation. If a monitor remains active, name its scope, deadline, status artifact, and stopping conditions; do not claim queued work is complete.
 
 Never log credentials, cookies, signed URLs, or raw redirect locations. A provider can put credentials in the **path**, not just the query. Keep secrets inside the authenticated process and redact errors before printing, saving shareable reports, or filing a PR.
