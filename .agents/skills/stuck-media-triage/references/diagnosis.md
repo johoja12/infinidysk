@@ -20,7 +20,7 @@ timeout 40 ffmpeg -nostdin -v error -threads 1 -filter_threads 1 \
   -an -sn -f null - -progress pipe:1
 ```
 
-Choose a time inside the real duration; also sample the reported failure region. Require a decoded frame in progress/output, not exit code alone. Explicitly select the real video stream: an MP4 may contain an attached cover-art video with larger dimensions. Validate that selection from stream metadata rather than universally assuming the first stream.
+Choose a time inside the real duration; also sample the reported failure region. Require a decoded frame in progress/output and inspect error output for corruption or read failures, not exit code alone. FFmpeg can exit zero after reporting an invalid EBML region. A seek beyond that region may succeed even when contiguous decoding through it fails. Explicitly select the real video stream: an MP4 may contain an attached cover-art video with larger dimensions. Validate that selection from stream metadata rather than universally assuming the first stream.
 
 A good header can coexist with missing middle/tail articles. A 60-second sample is not a full decode. Conversely, a timeout alone does not prove bad media: transport pressure, admission waits, GPU failures and mount health require separate checks.
 
