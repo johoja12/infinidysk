@@ -1,11 +1,11 @@
 ---
 name: stuck-media-triage
-description: Investigate stuck Sonarr/Radarr imports, failed Plex Preview generation, and damaged InfiniDysk sources. Correlate queue, library, preview, and Usenet evidence to distinguish an ID defect from missing articles, bad media, stale metadata, or import mapping errors, then recommend or perform authorized repair, retry, or regrab.
+description: Investigate stuck Sonarr/Radarr imports, failed Plex Preview generation, and damaged InfiniDysk sources. Correlate queue, library, preview, and Usenet evidence to distinguish an ID defect from missing articles, bad media, stale metadata, or import mapping errors, then automatically perform evidence-backed repair, retry, or regrab within the requested media scope.
 ---
 
 # Stuck media triage
 
-Trace a failure to an exact file before deciding to repair ID or replace media. A queue warning or failed preview is a symptom, not a diagnosis. Default to investigation when the user asks to check/review; perform recovery when authorized in the current conversation. Existing recovery authority persists, but creating this skill does not authorize future mutations.
+Trace a failure to an exact file before deciding to repair ID or replace media. A queue warning or failed preview is a symptom, not a diagnosis. An explicit invocation of `$stuck-media-triage`, including a bare invocation, requests diagnosis **and automatic scoped remediation**. Carry supported actions through verification without asking the user to select recommendations or approve each routine repair. An explicit read-only, audit-only, report-only, or no-changes instruction overrides this default. When selected implicitly for another task, follow that task’s action authority; do not infer remediation authority from skill discovery alone.
 
 ## Collect current evidence
 
@@ -43,14 +43,27 @@ Multiple causes can coexist: bad source content and an ID validation gap are sep
 
 ## Recovery and automation
 
-When recovery is authorized, read [recovery.md](references/recovery.md). Preserve unrelated and completed mappings; choose the smallest operation supported by the diagnosis. Do not copy historical release IDs, credentials, or ad-hoc mutation scripts into a new run.
+Read [recovery.md](references/recovery.md) and execute its automatic remediation pass unless the user limited the run to inspection. Build and validate the finite action manifest yourself from fresh evidence; “reviewed” means evidence-checked by the agent and does not require another user approval. Preserve unrelated and completed mappings; choose the smallest operation supported by the diagnosis. Do not copy historical release IDs, credentials, or ad-hoc mutation scripts into a new run.
 
-For an ID defect, create a source-backed reproduction and fix on an isolated branch under the repository's commit/PR rules. An upstream PR, merge, or deployment requires the corresponding current-session authorization. For bad media, quarantine only the verified bad library link/record, reject the exact bad release where appropriate, and search for a suitable replacement. For readable media, prefer context repair or preview retry over regrab.
+Automatically clear verified stale duplicate queue entries while retaining healthy library files, refresh stale Preview parts and retry readable media, repair unambiguous import mappings, and repair or replace confirmed bad sources. Prefer an existing active repair/replacement over starting another one. Historical failures, a timeout, a wrong-series match, an empty completed folder, or a successful header/frame sample alone do not justify deleting or regrabbing media. Continue supported independent repairs when another item needs review.
+
+For **every failed Preview item**, record a short evidence-backed RCA, check current ID health/repair history, and follow the [failed-preview RCA and reset procedure](references/recovery.md#failed-preview-rca-refresh-and-reset). After resolving the cause, refresh current parts and automatically reset that item for a bounded retry. Preserve the original error and attempt history before resetting; verify worker execution and the current BIF. Do not leave a resolved failure in failed state merely because the report already recommends a retry.
+
+For a proven ID defect, create a source-backed reproduction and fix on an isolated branch under the repository's commit/PR rules. An upstream PR, merge, or deployment requires the corresponding current-session authorization. For bad media, quarantine only the verified bad library link/record, reject the exact bad release where appropriate, and search for a suitable replacement. For readable media, prefer context repair or preview retry over regrab.
 
 Automation must use a finite reviewed manifest, durable intent/accepted/verified records, bounded retries, and an explicit deadline. Reconcile an uncertain write before any retry. Observe **execution**, not merely accepted API requests: a queued preview can be excluded by priority-only scheduling, and a successful search can choose another ISO, half a movie, or the same damaged post.
 
 ## Deliver the result
 
-Report release and episode counts, exact correlated IDs, evidence supporting each cause, proposed/completed actions, preservation checks, and remaining uncertainty. Separate search acceptance, import verification, preview queue admission, and finished BIF generation. If a monitor remains active, name its scope, deadline, status artifact, and stopping conditions; do not claim queued work is complete.
+Always finish with a concise user-facing **summary of actions taken**, including runs where no changes were needed or actions were blocked. Derive it from the durable journal and fresh verification, not the plan. Include:
+
+- Scope checked and findings: affected releases, movies/episodes and previews; distinguish ID defects, source damage, stale metadata and mapping issues.
+- Actions actually executed, grouped by queue cleanup, metadata/mapping repair, Preview retry, source repair, and regrab. Give counts and recognizable titles, with exact IDs in the linked detailed artifact. Label requested/accepted operations separately from verified results; use zero or “none” when applicable.
+- Verified outcomes: replacements imported under intended IDs, completed current-part BIFs, and retained library files/mappings. Describe the actual checks and their limits.
+- Pending, failed, skipped and review-required items, with the reason and next action. For active automation, include monitor scope, deadline, status artifact and stopping conditions.
+
+Keep the chat summary short and link a private detailed report/manifest when available. Persist the same summary with the run artifacts; task-owned monitors must update the artifact on completion or stopping. A link alone is not the user-facing summary, and queued work must never be reported as fixed.
+
+Report release and episode counts, exact correlated IDs, evidence supporting each cause, executed and verified actions, pending work, preservation checks, and unresolved items. In automatic mode, do not end at a recommendations-only report when supported remediation remains within scope. Separate search acceptance, import verification, preview queue admission, and finished BIF generation. If a monitor remains active, name its scope, deadline, status artifact, and stopping conditions; do not claim queued work is complete.
 
 Never log credentials, cookies, signed URLs, or raw redirect locations. A provider can put credentials in the **path**, not just the query. Keep secrets inside the authenticated process and redact errors before printing, saving shareable reports, or filing a PR.
