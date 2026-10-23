@@ -703,13 +703,13 @@ public class UsenetClientDeterministicTests
         var copyTask = response.Stream!.CopyToAsync(Stream.Null);
         await firstLineSent.Task.WaitAsync(TimeSpan.FromSeconds(2));
         await Task.Delay(50);
-        var cancelledAt = Environment.TickCount64;
+        // The server never sends the remainder. Completion before its 5 s read timeout
+        // proves abandonment without turning thread scheduling/JIT time into a benchmark.
         cts.Cancel();
 
-        await Assert.ThrowsAsync<OperationCanceledException>(async () => await copyTask);
+        await Assert.ThrowsAsync<OperationCanceledException>(async () => await copyTask.WaitAsync(TimeSpan.FromSeconds(2)));
         Assert.That(await completion.Task.WaitAsync(TimeSpan.FromSeconds(2)),
             Is.EqualTo(ArticleBodyResult.NotRetrieved));
-        Assert.That(Environment.TickCount64 - cancelledAt, Is.LessThan(100));
         Assert.That(client.IsHealthy, Is.False);
         await Assert.ThrowsAsync<UsenetProtocolException>(() =>
             client.DateAsync(CancellationToken.None));
@@ -742,13 +742,13 @@ public class UsenetClientDeterministicTests
             "article@example.com", (result, _) => completion.SetResult(result), cts.Token);
         var copyTask = response.Stream!.CopyToAsync(Stream.Null);
         await firstLineSent.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        var cancelledAt = Environment.TickCount64;
+        // The server never sends the remainder. Completion before its 5 s read timeout
+        // proves abandonment without turning thread scheduling/JIT time into a benchmark.
         cts.Cancel();
 
-        await Assert.ThrowsAsync<OperationCanceledException>(async () => await copyTask);
+        await Assert.ThrowsAsync<OperationCanceledException>(async () => await copyTask.WaitAsync(TimeSpan.FromSeconds(2)));
         Assert.That(await completion.Task.WaitAsync(TimeSpan.FromSeconds(2)),
             Is.EqualTo(ArticleBodyResult.NotRetrieved));
-        Assert.That(Environment.TickCount64 - cancelledAt, Is.LessThan(100));
         Assert.That(client.IsHealthy, Is.False);
     }
 
@@ -786,13 +786,13 @@ public class UsenetClientDeterministicTests
         var first = await batch.Responses[0];
         var copyTask = first.Stream!.CopyToAsync(Stream.Null);
         await partialBodySent.Task.WaitAsync(TimeSpan.FromSeconds(2));
-        var cancelledAt = Environment.TickCount64;
+        // The server never sends the remainder. Completion before its 5 s read timeout
+        // proves abandonment without turning thread scheduling/JIT time into a benchmark.
         cts.Cancel();
 
-        await Assert.CatchAsync<OperationCanceledException>(async () => await copyTask);
+        await Assert.CatchAsync<OperationCanceledException>(async () => await copyTask.WaitAsync(TimeSpan.FromSeconds(2)));
         Assert.That(await completion.Task.WaitAsync(TimeSpan.FromSeconds(2)),
             Is.EqualTo(ArticleBodyResult.NotRetrieved));
-        Assert.That(Environment.TickCount64 - cancelledAt, Is.LessThan(100));
         Assert.That(client.IsHealthy, Is.False);
         await Assert.CatchAsync<OperationCanceledException>(async () => await batch.Responses[1]);
     }

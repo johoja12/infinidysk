@@ -1,3 +1,4 @@
+using NzbWebDAV.Config;
 using NzbWebDAV.Database.Models.Metrics;
 using NzbWebDAV.Services;
 
@@ -15,6 +16,27 @@ public class ActiveReadRegistryEnrichmentTests
         registry.UpdateInfo(id, "a.mkv", 100, "/content/Movie/a.mkv", item);
         registry.UpdateInfo(id, null, null);
         Assert.Equal(item, Assert.Single(registry.Snapshot()).ItemId);
+    }
+
+    [Fact]
+    public void RecordFileRead_SurvivesSessionPruningUntilMaximumHold()
+    {
+        var registry = new ActiveReadRegistry();
+        var itemId = Guid.NewGuid();
+        var readAt = DateTimeOffset.UtcNow;
+        registry.GetOrCreate("/.ids/synthetic-id", "client", "sample.mkv", 1024);
+        registry.RecordFileRead(itemId, readAt);
+        registry.RecordFileRead(null, readAt);
+        registry.RecordFileRead(Guid.Empty, readAt);
+
+        Assert.Single(registry.PruneExpired(readAt.AddSeconds(20)));
+        Assert.Equal(readAt, registry.GetLastFileReadAt(itemId));
+        Assert.Null(registry.GetLastFileReadAt(Guid.Empty));
+
+        registry.PruneExpired(readAt.AddMinutes(ConfigManager.MaximumRepairReadHoldMinutes));
+        Assert.Equal(readAt, registry.GetLastFileReadAt(itemId));
+        registry.PruneExpired(readAt.AddMinutes(ConfigManager.MaximumRepairReadHoldMinutes).AddTicks(1));
+        Assert.Null(registry.GetLastFileReadAt(itemId));
     }
 
     [Theory]

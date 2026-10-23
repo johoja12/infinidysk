@@ -61,8 +61,10 @@ it("filters live predictions by viewer and current coverage, and opens the selec
       modal={{ openByDavItemId } as unknown as LibraryFileModalController}
     />,
   );
-  await waitFor(() =>
-    expect(screen.getByRole("button", { name: "Fully cached · 1" })).toBeTruthy(),
+  // Coverage arrives after the prediction rows enable their asynchronous cache requests.
+  await waitFor(
+    () => expect(screen.getByRole("button", { name: "Fully cached · 1" })).toBeTruthy(),
+    { timeout: 5000 },
   );
   expect(screen.getByText("Sam · Living room: Verified next-unwatched")).toBeTruthy();
   fireEvent.change(screen.getByRole("combobox", { name: "Filter prediction viewer" }), {

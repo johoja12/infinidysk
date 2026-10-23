@@ -310,6 +310,8 @@ public class GetAndHeadHandlerPatch : IRequestHandler
                     var davItem = httpContext.Items["DavItem"] as NzbWebDAV.Database.Models.DavItem;
                     _activeReadRegistry.UpdateInfo(sessionId, fileName, stream.CanSeek ? stream.Length : null,
                         davItem?.Path, davItem?.Id);
+                    var davItemId = davItem?.Id;
+                    _activeReadRegistry.RecordFileRead(davItemId);
                     var traceRange = _streamTrace.RangeOpen(
                         sessionId, path, request.Method, copyStart, copyEnd,
                         stream.CanSeek ? stream.Length : null, userAgent, clientIp, fileName);
@@ -332,6 +334,7 @@ public class GetAndHeadHandlerPatch : IRequestHandler
                             {
                                 rangeBytesServed += bytes;
                                 _activeReadRegistry.Touch(sessionId, bytes, position);
+                                _activeReadRegistry.RecordFileRead(davItemId);
                             },
                             traceRange, readCts, path, ct).ConfigureAwait(false);
                         requestTiming?.TransferEnded();

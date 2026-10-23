@@ -10,6 +10,7 @@ using NzbWebDAV.Services.StreamTrace;
 using NzbWebDAV.Streams;
 using NzbWebDAV.Tests.Fakes;
 using NzbWebDAV.Tests.TestUtils;
+using NzbWebDAV.Utils;
 using NzbWebDAV.WebDav.Base;
 
 namespace NzbWebDAV.Tests.WebDav;
@@ -65,7 +66,8 @@ public class SharedStreamHandlerTests
         var item = new DetachedStoreItem(payload: [10, 20, 30, 40], davItem);
         var failureTracker = new StreamingFailureTracker();
         failureTracker.RecordFailure(davItem.Id);
-        var (handler, _, _) = Handler(item, failureTracker);
+        var activeReads = new ActiveReadRegistry();
+        var (handler, _, _) = Handler(item, failureTracker, activeReads);
         var context = Request(HttpMethods.Get, "/movie.mkv");
         using var body = new MemoryStream();
         context.Response.Body = body;
@@ -73,6 +75,8 @@ public class SharedStreamHandlerTests
         await handler.HandleRequestAsync(context);
 
         Assert.Same(davItem, context.Items["DavItem"]);
+        Assert.Equal(davItem.Id, Assert.Single(activeReads.Snapshot()).ItemId);
+        Assert.NotNull(activeReads.GetLastFileReadAt(davItem.Id));
         Assert.Equal(1, item.DetachedOpenCount);
         Assert.Equal(0, item.PrivateOpenCount);
         Assert.Equal(new byte[] { 10, 20, 30, 40 }, body.ToArray());
@@ -197,8 +201,47 @@ public class SharedStreamHandlerTests
         Assert.Equal(new byte[] { 7, 8, 9 }, body.ToArray());
     }
 
+    [Fact]
+    public async Task WebDavCopy_RefreshesFileReadAfterUiSessionPruned()
+    {
+        var davItem = new DavItem { Id = Guid.NewGuid(), Name = "sample.mkv" };
+        var item = new DetachedStoreItem(
+            new byte[StreamingResponseWriteWatchdog.CopyChunkBytes * 2], davItem);
+        var activeReads = new ActiveReadRegistry();
+        var (handler, registry, _) = Handler(item, activeReads: activeReads);
+        await using var sharedStreams = registry;
+        var context = Request(HttpMethods.Get, "/content/synthetic/sample.mkv");
+        await using var body = new PruningResponseStream(activeReads);
+        context.Response.Body = body;
+
+        await handler.HandleRequestAsync(context);
+
+        Assert.NotNull(body.FirstWriteCompletedAt);
+        Assert.True(activeReads.GetLastFileReadAt(davItem.Id) >= body.FirstWriteCompletedAt);
+    }
+
+    private sealed class PruningResponseStream(ActiveReadRegistry registry) : MemoryStream
+    {
+        public DateTimeOffset? FirstWriteCompletedAt { get; private set; }
+
+        public override async ValueTask WriteAsync(
+            ReadOnlyMemory<byte> buffer,
+            CancellationToken cancellationToken = default)
+        {
+            await base.WriteAsync(buffer, cancellationToken);
+            if (FirstWriteCompletedAt is not null)
+                return;
+            registry.PruneExpired(DateTimeOffset.UtcNow.AddSeconds(20));
+            await Task.Delay(20, cancellationToken);
+            FirstWriteCompletedAt = DateTimeOffset.UtcNow;
+        }
+    }
+
     private static (GetAndHeadHandlerPatch Handler, SharedStreamRegistry Registry, ConcurrentReadTracker Tracker)
-        Handler(IStoreItem item, StreamingFailureTracker? failures = null)
+        Handler(
+            IStoreItem item,
+            StreamingFailureTracker? failures = null,
+            ActiveReadRegistry? activeReads = null)
     {
         var config = new ConfigManager();
         var tracker = new ConcurrentReadTracker();
@@ -207,7 +250,7 @@ public class SharedStreamHandlerTests
             new SingleItemStore(item),
             config,
             new ProviderUsageTracker(),
-            new ActiveReadRegistry(),
+            activeReads ?? new ActiveReadRegistry(),
             tracker,
             new StreamTraceBuffer(100, enabled: false),
             failures ?? new StreamingFailureTracker(),
