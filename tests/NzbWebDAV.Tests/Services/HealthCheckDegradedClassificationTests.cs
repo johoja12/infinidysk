@@ -807,13 +807,21 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             var file = new NzbFile { Subject = "movie.mkv" };
             file.Segments.AddRange(segments.Select((id, index) => new NzbSegment
             {
-                MessageId = id, Number = index + 1, Bytes = sizes[index],
+                MessageId = id,
+                Number = index + 1,
+                Bytes = sizes[index],
             }).Where(segment => segment.Number != 3));
             using var probe = NewFakeClient(segments, missing: [2]);
             Assert.True(await file.TryFillOmittedSegmentsAsync(new UsenetYencHeader
             {
-                FileName = "movie.mkv", FileSize = sizes.Sum(), LineLength = 128,
-                PartNumber = 1, TotalParts = 6, HasTotalParts = true, PartOffset = 0, PartSize = sizes[0],
+                FileName = "movie.mkv",
+                FileSize = sizes.Sum(),
+                LineLength = 128,
+                PartNumber = 1,
+                TotalParts = 6,
+                HasTotalParts = true,
+                PartOffset = 0,
+                PartSize = sizes[0],
             }, probe, CancellationToken.None));
             segments = file.GetSegmentIds();
         }
@@ -2317,9 +2325,13 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
                 var index = Array.IndexOf(segments, id);
                 return index < 0 ? null : new UsenetYencHeader
                 {
-                    FileName = "fake.bin", FileSize = 128L * segments.Length, LineLength = 128,
-                    PartNumber = index + 1, TotalParts = segments.Length,
-                    PartOffset = 128L * index, PartSize = 128,
+                    FileName = "fake.bin",
+                    FileSize = 128L * segments.Length,
+                    LineLength = 128,
+                    PartNumber = index + 1,
+                    TotalParts = segments.Length,
+                    PartOffset = 128L * index,
+                    PartSize = 128,
                 };
             },
             decodedStreamFactory: (id, bytes) =>

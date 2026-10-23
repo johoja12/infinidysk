@@ -113,7 +113,8 @@ public sealed class MultiProviderNntpClientYencValidationTests
             var last = first with { PartNumber = 3, PartOffset = 6 };
             using var primary = new FakeNntpClient(new Dictionary<string, byte[]>
             {
-                ["part-1@example"] = [1, 2, 3], ["part-3@example"] = [7, 8, 9],
+                ["part-1@example"] = [1, 2, 3],
+                ["part-3@example"] = [7, 8, 9],
             }, useCachedYencStreams: true,
                 segmentRanges: new Dictionary<string, LongRange> { ["part-1@example"] = new(0, 3), ["part-3@example"] = new(6, 9) },
                 yencHeaders: new Dictionary<string, UsenetYencHeader> { ["part-1@example"] = first, ["part-3@example"] = last });

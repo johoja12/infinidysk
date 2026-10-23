@@ -183,7 +183,8 @@ public sealed class NativeBufferAdmissionTests : IDisposable
             await using var stream = new NativeCachedStream(store, id, _ => Task.FromResult<Stream>(new CacheableSource(data)),
                 () => true, new NativeBufferSlots(2), writeBehind: true, commitQueue: queue,
                 backfill: (start, length, reason) => { backfills.Add((start, length)); reasons.Add(reason); })
-            { CacheIoTimeout = TimeSpan.FromMilliseconds(50) };
+            // The held fill stays blocked; allow ordinary cache reads their production deadline.
+            { CacheIoTimeout = TimeSpan.FromSeconds(1) };
             var actual = new byte[data.Length];
             await stream.ReadExactlyAsync(actual);
             Assert.Equal(data, actual);
@@ -219,7 +220,11 @@ public sealed class NativeBufferAdmissionTests : IDisposable
         NativeCacheCommitQueue queue, TimeSpan? admissionWait = null, Action<long, long, string>? backfill = null) =>
         new(store, id, _ => Task.FromResult<Stream>(new CacheableSource(data)), () => true, slots,
             writeBehind: true, commitQueue: queue, backfill: backfill)
-        { AdmissionWait = admissionWait ?? TimeSpan.FromSeconds(5) };
+        {
+            AdmissionWait = admissionWait ?? TimeSpan.FromSeconds(5),
+            // These scenarios isolate buffer admission, not the host's cache I/O latency.
+            CacheIoTimeout = TimeSpan.FromSeconds(5),
+        };
 
     /// <summary>
     /// Creates each file's catalogue entry up front. The store does not queue a brand-new entry's

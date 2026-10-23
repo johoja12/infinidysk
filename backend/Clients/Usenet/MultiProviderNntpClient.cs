@@ -561,7 +561,7 @@ public class MultiProviderNntpClient(
                             $"Pipelined BODY returned {primaryBatch.Responses.Count} responses for {segmentIds.Count} requests.");
                     }
 
-                            ReleasePendingSelection(ref reserved, NntpOperation.PipelinedBody);
+                    ReleasePendingSelection(ref reserved, NntpOperation.PipelinedBody);
                     var coordinator = new BatchCallbackCoordinator(
                         primaryBatch.Responses.Count, CompleteBatchFetches);
                     deferredCallback.Activate(coordinator.CompleteTransfer);

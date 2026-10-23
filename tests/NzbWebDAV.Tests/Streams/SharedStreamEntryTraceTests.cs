@@ -43,7 +43,14 @@ public sealed class SharedStreamEntryTraceTests
                 ContentIdentity = new SharedContentIdentity("trace-test", null, payload.Length),
             });
             await using (var reader = entry.TryAttach(0, (_, _) => throw new InvalidOperationException(), out _)!)
+            {
                 await reader.CopyToAsync(Stream.Null);
+                // The bounded reader can finish before the pump observes upstream EOF.
+                // Keep demand alive until the pump completes instead of cancelling it on detach.
+                for (var i = 0; i < 500 && !buffer.GetSessionEvents(entry.EntryId)
+                         .Any(e => e.Kind == nameof(StreamTraceKind.RangeEnd)); i++)
+                    await Task.Delay(10);
+            }
             await entry.DisposeAsync();
 
             var events = buffer.GetSessionEvents(entry.EntryId);
