@@ -18,7 +18,8 @@ public class DatabaseStoreSymlinkCollection(
     DavItem davDirectory,
     DavDatabaseClient dbClient,
     ConfigManager configManager,
-    WebsocketManager websocketManager
+    WebsocketManager websocketManager,
+    string? deletionStateRoot = null
 ) : BaseStoreReadonlyCollection
 {
     public override string Name => davDirectory.Name;
@@ -31,6 +32,8 @@ public class DatabaseStoreSymlinkCollection(
 
     private Guid TargetId => davDirectory.Id == DavItem.SymlinkFolder.Id ? DavItem.ContentFolder.Id : davDirectory.Id;
     private DeletedFileManager DeletedFiles => new(davDirectory.Id);
+    private CompletedSymlinkDeletionStore PersistentDeletes => new(deletionStateRoot ??
+        Path.Join(DavDatabaseContext.ConfigPath, "completed-symlink-deletions"));
 
     protected override async Task<IStoreItem?> GetItemAsync(GetItemRequest request)
     {
@@ -43,7 +46,7 @@ public class DatabaseStoreSymlinkCollection(
         var child = await dbClient
             .GetDirectoryChildAsync(TargetId, name, request.CancellationToken)
             .ConfigureAwait(false);
-        if (child is not null) return GetItem(child);
+        if (child is not null) return PersistentDeletes.IsDeleted(child.Id) ? null : GetItem(child);
 
         // return empty category folder
         var isSymlinkFolder = davDirectory.Id == DavItem.SymlinkFolder.Id;
@@ -78,7 +81,7 @@ public class DatabaseStoreSymlinkCollection(
         {
             childNames?.Add(child.Name);
             var item = GetItem(child);
-            if (!DeletedFiles.IsDeleted(item.Name))
+            if (!DeletedFiles.IsDeleted(item.Name) && !PersistentDeletes.IsDeleted(child.Id))
                 yield return item;
         }
 
@@ -124,13 +127,26 @@ public class DatabaseStoreSymlinkCollection(
             }
         }
 
-        // Every other delete under '/completed-symlinks' must succeed, even when read-only
-        // enforcement is on. Radarr/Sonarr import the symlink by moving it to the media library;
-        // since the symlink lives on a separate file-system (rclone-mounted webdav), the OS
-        // performs a copy-and-delete, and a refused delete fails the whole import. Nothing here
-        // actually exists on disk — the symlink is created in memory per request and the
-        // underlying data under '/content' is untouched — so we cache the name for 30 seconds
-        // to mimic a deletion and return 204 No Content.
+        // Per-file removal is durable metadata only: preserve /content, /.ids and history.
+        // Key by item identity so a replacement with the same name stays visible.
+        var name = Regex.Replace(request.Name, @"\.rclonelink$", "");
+        var file = await dbClient.GetDirectoryChildAsync(TargetId, name, request.CancellationToken).ConfigureAwait(false);
+        if (file is { Type: DavItem.ItemType.UsenetFile })
+        {
+            try
+            {
+                PersistentDeletes.MarkDeleted(file.Id);
+                Serilog.Log.Information("Completed symlink entry removed: itemId={ItemId}; content and ID media retained", file.Id);
+                return DavStatusCode.NoContent;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                Serilog.Log.Warning("Completed symlink entry removal deferred: itemId={ItemId}, errorType={ErrorType}", file.Id, ex.GetType().Name);
+                return DavStatusCode.InternalServerError;
+            }
+        }
+
+        // Keep the compatibility no-op for unknown entries and nested directory deletes.
         DeletedFiles.AddDeletedFile(request.Name, TimeSpan.FromSeconds(30));
         return DavStatusCode.NoContent;
     }
@@ -140,7 +156,7 @@ public class DatabaseStoreSymlinkCollection(
         return davItem.SubType switch
         {
             DavItem.ItemSubType.Directory =>
-                new DatabaseStoreSymlinkCollection(davItem, dbClient, configManager, websocketManager),
+                new DatabaseStoreSymlinkCollection(davItem, dbClient, configManager, websocketManager, deletionStateRoot),
             DavItem.ItemSubType.NzbFile =>
                 new DatabaseStoreSymlinkFile(davItem, configManager),
             DavItem.ItemSubType.RarFile =>
