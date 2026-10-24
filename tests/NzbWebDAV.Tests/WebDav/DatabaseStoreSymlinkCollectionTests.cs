@@ -118,6 +118,59 @@ public sealed class DatabaseStoreSymlinkCollectionTests : IAsyncLifetime
         Assert.NotNull(await _context.Items.AsNoTracking().FirstOrDefaultAsync(x => x.Id == release.Id));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FileRemoval_PersistsAndPreservesHistoryMediaAndUnimportedSibling(bool readOnly)
+    {
+        _config.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.WebdavEnforceReadonly, ConfigValue = readOnly.ToString().ToLowerInvariant() }]);
+        var category = NewDir(Guid.NewGuid(), DavItem.ContentFolder, "movies");
+        var release = NewDir(Guid.NewGuid(), category, "pack");
+        var file = NewFile(release, "imported.mp4");
+        var sibling = NewFile(release, "unimported.mp4");
+        var history = CreateHistory(Guid.NewGuid(), "pack.nzb", category.Name, release.Id);
+        _context.Items.AddRange(category, release, file, sibling);
+        _context.HistoryItems.Add(history);
+        await _context.SaveChangesAsync();
+        var state = _databasePath + ".deletions";
+        DatabaseStoreSymlinkCollection Collection() => new(release, _client, _config, _websocket, state);
+        Assert.NotNull(await Collection().GetItemAsync("imported.mp4.rclonelink", CancellationToken.None));
+        Assert.Equal(DavStatusCode.NoContent, await Collection().DeleteItemAsync("imported.mp4.rclonelink", CancellationToken.None));
+        Assert.True(new CompletedSymlinkDeletionStore(state).IsDeleted(file.Id));
+        Assert.Null(await Collection().GetItemAsync("imported.mp4.rclonelink", CancellationToken.None));
+        Assert.NotNull(await Collection().GetItemAsync("unimported.mp4.rclonelink", CancellationToken.None));
+        var names = new List<string>();
+        await foreach (var item in Collection().GetItemsAsync(CancellationToken.None)) names.Add(item.Name);
+        Assert.DoesNotContain("imported.mp4.rclonelink", names);
+        Assert.Contains("unimported.mp4.rclonelink", names);
+        Assert.NotNull(await _context.Items.AsNoTracking().SingleAsync(x => x.Id == file.Id));
+        Assert.NotNull(await _context.HistoryItems.AsNoTracking().SingleAsync(x => x.Id == history.Id));
+        Assert.Equal(DavStatusCode.NoContent, await Collection().DeleteItemAsync("imported.mp4.rclonelink", CancellationToken.None));
+        file.Name = "old-name.mp4";
+        file.Path = Path.Join(release.Path, file.Name);
+        _context.Items.Add(NewFile(release, "imported.mp4"));
+        await _context.SaveChangesAsync();
+        Assert.NotNull(await Collection().GetItemAsync("imported.mp4.rclonelink", CancellationToken.None));
+        Assert.Null(await Collection().GetItemAsync("old-name.mp4.rclonelink", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task FileRemoval_DoesNotClaimSuccessWhenPersistenceFails()
+    {
+        var category = NewDir(Guid.NewGuid(), DavItem.ContentFolder, "movies");
+        var release = NewDir(Guid.NewGuid(), category, "pack");
+        var file = NewFile(release, "scene.mp4");
+        _context.Items.AddRange(category, release, file);
+        await _context.SaveChangesAsync();
+        var collection = new DatabaseStoreSymlinkCollection(release, _client, _config, _websocket, _databasePath);
+        Assert.Equal(DavStatusCode.InternalServerError, await collection.DeleteItemAsync("scene.mp4.rclonelink", CancellationToken.None));
+        Assert.NotNull(await collection.GetItemAsync("scene.mp4.rclonelink", CancellationToken.None));
+        Assert.NotNull(await _context.Items.AsNoTracking().SingleAsync(x => x.Id == file.Id));
+    }
+
+    private static DavItem NewFile(DavItem parent, string name) =>
+        DavItem.New(Guid.NewGuid(), parent, name, 100, DavItem.ItemType.UsenetFile, DavItem.ItemSubType.NzbFile, null, null, null, null);
+
     private static DavItem NewDir(Guid id, DavItem parent, string name) =>
         DavItem.New(id, parent, name, null, DavItem.ItemType.Directory, DavItem.ItemSubType.Directory, null, null, null, null);
 
@@ -134,5 +187,5 @@ public sealed class DatabaseStoreSymlinkCollectionTests : IAsyncLifetime
         DownloadTimeSeconds = 1,
     };
 
-    public async Task DisposeAsync() { await _context.DisposeAsync(); try { File.Delete(_databasePath); } catch (IOException) { } }
+    public async Task DisposeAsync() { await _context.DisposeAsync(); if (Directory.Exists(_databasePath + ".deletions")) Directory.Delete(_databasePath + ".deletions", true); try { File.Delete(_databasePath); } catch (IOException) { } }
 }
