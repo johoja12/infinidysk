@@ -1742,35 +1742,17 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         catch (UsenetUnexpectedResponseException e)
         {
             // Connection-level STAT failures (e.g. buffered 400 goodbye) must not trigger
-            // repair or leave NextHealthCheck unset — defer and surface ActionNeeded.
-            CompleteHealthProgress(davItem.Id);
-            var utcNow = DateTimeOffset.UtcNow;
-            davItem.LastHealthCheck = utcNow;
-            davItem.NextHealthCheck = utcNow + TimeSpan.FromDays(1);
-            await RecordHealthResult(
-                dbClient, davItem,
-                HealthCheckResult.HealthResult.Unhealthy,
-                HealthCheckResult.RepairAction.ActionNeeded,
-                $"Unexpected NNTP response during health check: {e.Message}", ct).ConfigureAwait(false);
+            // repair — defer while retaining any existing priority.
+            await DeferHealthCheck(davItem, dbClient, e, ct,
+                $"Unexpected NNTP response during health check: {e.Message}").ConfigureAwait(false);
         }
         catch (Exception e) when (e.IsTransientTransportException() && e is not OutOfMemoryException)
         {
             // STAT/read timeouts and socket/IO failures must not dump stacks or trigger Arr repair —
             // defer and surface ActionNeeded with a single human-readable Warning.
-            CompleteHealthProgress(davItem.Id);
-            var utcNow = DateTimeOffset.UtcNow;
-            davItem.LastHealthCheck = utcNow;
-            davItem.NextHealthCheck = utcNow + TimeSpan.FromDays(1);
             e.TryGetKnownErrorMessage(out var reason);
-            Log.Warning(
-                "NNTP transport failure during health check for {Path}. Deferred next check. Reason: {Reason}",
-                davItem.Path, reason);
-            Log.Debug(e, "Health check transport failure stack for {Path}", davItem.Path);
-            await RecordHealthResult(
-                dbClient, davItem,
-                HealthCheckResult.HealthResult.Unhealthy,
-                HealthCheckResult.RepairAction.ActionNeeded,
-                FormatTransportFailureHealthMessage(reason), ct).ConfigureAwait(false);
+            await DeferHealthCheck(davItem, dbClient, e, ct,
+                FormatTransportFailureHealthMessage(reason)).ConfigureAwait(false);
         }
         catch (Exception e) when (!e.IsCancellationException(ct) && e is not OutOfMemoryException)
         {
@@ -2489,7 +2471,8 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         DavItem davItem,
         DavDatabaseClient dbClient,
         Exception exception,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? knownFailureMessage = null)
     {
         await using var mutationGate = await _failureTracker
             .AcquireMutationGateAsync(davItem.Id, ct).ConfigureAwait(false);
@@ -2499,6 +2482,11 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         var repairPending = davItem.HealthRepairPending || urgent;
         var prioritized = repairPending || forced;
         var isKnownFailure = exception.TryGetKnownErrorMessage(out var reason);
+        if (knownFailureMessage is not null)
+        {
+            isKnownFailure = true;
+            reason = knownFailureMessage;
+        }
         var utcNow = _timeProvider.GetUtcNow();
         var retryAt = prioritized
             ? utcNow + PriorityFailureRetry
@@ -2531,9 +2519,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                 dbClient, davItem,
                 HealthCheckResult.HealthResult.Unhealthy,
                 HealthCheckResult.RepairAction.ActionNeeded,
-                isKnownFailure
+                knownFailureMessage ?? (isKnownFailure
                     ? $"Health check deferred: {reason}"
-                    : $"Unexpected error during health check: {exception.Message}",
+                    : $"Unexpected error during health check: {exception.Message}"),
                 ct, repairPending: repairPending).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

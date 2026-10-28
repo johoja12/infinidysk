@@ -881,10 +881,14 @@ public sealed class HealthCheckCoordinatorTests
     }
 
     [Theory]
-    [InlineData("pending")]
-    [InlineData("urgent")]
-    [InlineData("forced")]
-    public async Task DeferredPriorityFailure_PreservesPriorityWithoutRetryingBeforeCooldown(string priority)
+    [InlineData("pending", false)]
+    [InlineData("urgent", false)]
+    [InlineData("forced", false)]
+    [InlineData("pending", true)]
+    [InlineData("urgent", true)]
+    [InlineData("forced", true)]
+    public async Task DeferredPriorityFailure_PreservesPriorityWithoutRetryingBeforeCooldown(
+        string priority, bool transportFailure)
     {
         using var harness = new Harness(workers: 1, fullySplit: false);
         await using var connection = await harness.ConfigureEmptyDatabaseAsync();
@@ -902,13 +906,16 @@ public sealed class HealthCheckCoordinatorTests
         context.Items.AddRange(file, routine);
         await context.SaveChangesAsync();
 
+        Exception failure = transportFailure ? new TimeoutException("synthetic timeout") : new CircuitAdmissionRejectedException();
+        var message = transportFailure ? HealthCheckService.FormatTransportFailureHealthMessage(failure.Message) : null;
         await harness.Service.DeferHealthCheck(file, new DavDatabaseClient(context),
-            new CircuitAdmissionRejectedException(), CancellationToken.None);
+            failure, CancellationToken.None, message);
 
         await context.Entry(file).ReloadAsync();
         Assert.Equal(priority != "forced", file.HealthRepairPending);
         Assert.Equal(priority == "pending" ? now + HealthCheckService.PriorityFailureRetry : marker,
             file.NextHealthCheck);
+        if (transportFailure) Assert.Equal(message, (await context.HealthCheckResults.SingleAsync()).Message);
         Assert.Equal([routine.Id], await harness.Service.SelectNextHealthCheckIdsAsync(
             [], allowChecks: true, allowRepairs: true, maximumCount: 2, CancellationToken.None));
         harness.TimeProvider.Advance(HealthCheckService.PriorityFailureRetry - TimeSpan.FromTicks(1));
