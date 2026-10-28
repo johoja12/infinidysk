@@ -1624,19 +1624,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         catch (OperationCanceledException) when (
             !ct.IsCancellationRequested && statCts?.IsCancellationRequested == true)
         {
-            CompleteHealthProgress(davItem.Id);
-            var utcNow = DateTimeOffset.UtcNow;
-            davItem.LastHealthCheck = utcNow;
-            davItem.NextHealthCheck = utcNow + TimeSpan.FromDays(1);
-            Log.Warning(
-                "Health check for {Path} made no STAT progress for {Timeout}. Deferred next check.",
-                davItem.Path, HealthCheckProgressTimeout);
-            await RecordHealthResult(
-                dbClient, davItem,
-                HealthCheckResult.HealthResult.Unhealthy,
-                HealthCheckResult.RepairAction.ActionNeeded,
-                $"Health check deferred: no STAT progress for {HealthCheckProgressTimeout.TotalMinutes:0} minutes.",
-                ct).ConfigureAwait(false);
+            var message = $"Health check deferred: no STAT progress for {HealthCheckProgressTimeout.TotalMinutes:0} minutes.";
+            await DeferHealthCheck(davItem, dbClient, new TimeoutException(message), ct, message)
+                .ConfigureAwait(false);
         }
         catch (MissingFilePayloadException e)
         {
