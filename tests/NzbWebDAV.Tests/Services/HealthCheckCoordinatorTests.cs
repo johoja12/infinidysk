@@ -913,8 +913,8 @@ public sealed class HealthCheckCoordinatorTests
 
         await context.Entry(file).ReloadAsync();
         Assert.Equal(priority != "forced", file.HealthRepairPending);
-        Assert.Equal(priority == "pending" ? now + HealthCheckService.PriorityFailureRetry : marker,
-            file.NextHealthCheck);
+        Assert.Equal((priority == "pending" ? now + HealthCheckService.PriorityFailureRetry : marker).ToUnixTimeSeconds(),
+            file.NextHealthCheck!.Value.ToUnixTimeSeconds());
         if (transportFailure) Assert.Equal(message, (await context.HealthCheckResults.SingleAsync()).Message);
         Assert.Equal([routine.Id], await harness.Service.SelectNextHealthCheckIdsAsync(
             [], allowChecks: true, allowRepairs: true, maximumCount: 2, CancellationToken.None));
@@ -968,7 +968,7 @@ public sealed class HealthCheckCoordinatorTests
         await context.Entry(file).ReloadAsync();
         Assert.False(file.HealthRepairPending);
         Assert.Equal(HealthCheckService.ComputeFailureNextHealthCheck(
-            harness.TimeProvider.GetUtcNow(), knownFailure), file.NextHealthCheck);
+            harness.TimeProvider.GetUtcNow(), knownFailure).ToUnixTimeSeconds(), file.NextHealthCheck!.Value.ToUnixTimeSeconds());
     }
 
     [Fact]
