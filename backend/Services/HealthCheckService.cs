@@ -47,6 +47,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
     // Aborts only stalled attempts: STAT progress and PAR2 repair reads/phase changes reset it.
     internal static readonly TimeSpan HealthCheckInactivityLimit = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan HealthCheckStallDeferral = TimeSpan.FromDays(1);
+    internal static readonly TimeSpan PriorityFailureRetry = TimeSpan.FromMinutes(5);
     private readonly ConcurrentDictionary<Guid, DateTimeOffset> _repairRetryNotBefore = new();
     // PAR2 repairs still running after the inline wait; their files are not re-picked until they finish.
     private readonly ConcurrentDictionary<Guid, Task<Par2RepairOutcome>> _backgroundPar2Repairs = new();
@@ -1623,19 +1624,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         catch (OperationCanceledException) when (
             !ct.IsCancellationRequested && statCts?.IsCancellationRequested == true)
         {
-            CompleteHealthProgress(davItem.Id);
-            var utcNow = DateTimeOffset.UtcNow;
-            davItem.LastHealthCheck = utcNow;
-            davItem.NextHealthCheck = utcNow + TimeSpan.FromDays(1);
-            Log.Warning(
-                "Health check for {Path} made no STAT progress for {Timeout}. Deferred next check.",
-                davItem.Path, HealthCheckProgressTimeout);
-            await RecordHealthResult(
-                dbClient, davItem,
-                HealthCheckResult.HealthResult.Unhealthy,
-                HealthCheckResult.RepairAction.ActionNeeded,
-                $"Health check deferred: no STAT progress for {HealthCheckProgressTimeout.TotalMinutes:0} minutes.",
-                ct).ConfigureAwait(false);
+            var message = $"Health check deferred: no STAT progress for {HealthCheckProgressTimeout.TotalMinutes:0} minutes.";
+            await DeferHealthCheck(davItem, dbClient, new TimeoutException(message), ct, message)
+                .ConfigureAwait(false);
         }
         catch (MissingFilePayloadException e)
         {
@@ -1741,35 +1732,17 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         catch (UsenetUnexpectedResponseException e)
         {
             // Connection-level STAT failures (e.g. buffered 400 goodbye) must not trigger
-            // repair or leave NextHealthCheck unset — defer and surface ActionNeeded.
-            CompleteHealthProgress(davItem.Id);
-            var utcNow = DateTimeOffset.UtcNow;
-            davItem.LastHealthCheck = utcNow;
-            davItem.NextHealthCheck = utcNow + TimeSpan.FromDays(1);
-            await RecordHealthResult(
-                dbClient, davItem,
-                HealthCheckResult.HealthResult.Unhealthy,
-                HealthCheckResult.RepairAction.ActionNeeded,
-                $"Unexpected NNTP response during health check: {e.Message}", ct).ConfigureAwait(false);
+            // repair — defer while retaining any existing priority.
+            await DeferHealthCheck(davItem, dbClient, e, ct,
+                $"Unexpected NNTP response during health check: {e.Message}").ConfigureAwait(false);
         }
         catch (Exception e) when (e.IsTransientTransportException() && e is not OutOfMemoryException)
         {
             // STAT/read timeouts and socket/IO failures must not dump stacks or trigger Arr repair —
             // defer and surface ActionNeeded with a single human-readable Warning.
-            CompleteHealthProgress(davItem.Id);
-            var utcNow = DateTimeOffset.UtcNow;
-            davItem.LastHealthCheck = utcNow;
-            davItem.NextHealthCheck = utcNow + TimeSpan.FromDays(1);
             e.TryGetKnownErrorMessage(out var reason);
-            Log.Warning(
-                "NNTP transport failure during health check for {Path}. Deferred next check. Reason: {Reason}",
-                davItem.Path, reason);
-            Log.Debug(e, "Health check transport failure stack for {Path}", davItem.Path);
-            await RecordHealthResult(
-                dbClient, davItem,
-                HealthCheckResult.HealthResult.Unhealthy,
-                HealthCheckResult.RepairAction.ActionNeeded,
-                FormatTransportFailureHealthMessage(reason), ct).ConfigureAwait(false);
+            await DeferHealthCheck(davItem, dbClient, e, ct,
+                FormatTransportFailureHealthMessage(reason)).ConfigureAwait(false);
         }
         catch (Exception e) when (!e.IsCancellationException(ct) && e is not OutOfMemoryException)
         {
@@ -2488,12 +2461,30 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         DavItem davItem,
         DavDatabaseClient dbClient,
         Exception exception,
-        CancellationToken ct)
+        CancellationToken ct,
+        string? knownFailureMessage = null)
     {
+        await using var mutationGate = await _failureTracker
+            .AcquireMutationGateAsync(davItem.Id, ct).ConfigureAwait(false);
+        await dbClient.Ctx.Entry(davItem).ReloadAsync(ct).ConfigureAwait(false);
+        var urgent = davItem.NextHealthCheck == DateTimeOffset.UnixEpoch;
+        var forced = davItem.NextHealthCheck == ForcedRecheckSentinel;
+        var repairPending = davItem.HealthRepairPending || urgent;
+        var prioritized = repairPending || forced;
         var isKnownFailure = exception.TryGetKnownErrorMessage(out var reason);
+        if (knownFailureMessage is not null)
+        {
+            isKnownFailure = true;
+            reason = knownFailureMessage;
+        }
         var utcNow = _timeProvider.GetUtcNow();
+        var retryAt = prioritized
+            ? utcNow + PriorityFailureRetry
+            : ComputeFailureNextHealthCheck(utcNow, isKnownFailure);
+        // Priority markers must survive the failure, but must not cause a hot retry loop.
+        if (prioritized) _repairRetryNotBefore[davItem.Id] = retryAt;
         davItem.LastHealthCheck = utcNow;
-        davItem.NextHealthCheck = ComputeFailureNextHealthCheck(utcNow, isKnownFailure);
+        if (!urgent && !forced) davItem.NextHealthCheck = retryAt;
 
         CompleteHealthProgress(davItem.Id);
 
@@ -2501,7 +2492,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         {
             Log.Warning(
                 "Health check failed for {Path}. Deferred next check until {NextHealthCheck}. Reason: {Reason}",
-                davItem.Path, davItem.NextHealthCheck, reason);
+                davItem.Path, retryAt, reason);
             Log.Debug(exception, "Health check known failure stack for {Path}", davItem.Path);
         }
         else
@@ -2509,7 +2500,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             Log.Error(
                 exception,
                 "Unexpected error during health check for {Path}. Deferred next check until {NextHealthCheck}",
-                davItem.Path, davItem.NextHealthCheck);
+                davItem.Path, retryAt);
         }
 
         try
@@ -2518,10 +2509,10 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                 dbClient, davItem,
                 HealthCheckResult.HealthResult.Unhealthy,
                 HealthCheckResult.RepairAction.ActionNeeded,
-                isKnownFailure
+                knownFailureMessage ?? (isKnownFailure
                     ? $"Health check deferred: {reason}"
-                    : $"Unexpected error during health check: {exception.Message}",
-                ct).ConfigureAwait(false);
+                    : $"Unexpected error during health check: {exception.Message}"),
+                ct, repairPending: repairPending).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {

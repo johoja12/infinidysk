@@ -12,6 +12,7 @@ using NzbWebDAV.Config;
 using NzbWebDAV.Config.Scheduling;
 using NzbWebDAV.Database;
 using NzbWebDAV.Database.Models;
+using NzbWebDAV.Exceptions;
 using NzbWebDAV.Models;
 using NzbWebDAV.Queue;
 using NzbWebDAV.Services;
@@ -877,6 +878,97 @@ public sealed class HealthCheckCoordinatorTests
 
         Assert.Equal(2, failingContext.SaveAttempts);
         Assert.True(harness.Service.IsWorkerFailureCooldownActive(candidate.Id));
+    }
+
+    [Theory]
+    [InlineData("pending", false)]
+    [InlineData("urgent", false)]
+    [InlineData("forced", false)]
+    [InlineData("pending", true)]
+    [InlineData("urgent", true)]
+    [InlineData("forced", true)]
+    public async Task DeferredPriorityFailure_PreservesPriorityWithoutRetryingBeforeCooldown(
+        string priority, bool transportFailure)
+    {
+        using var harness = new Harness(workers: 1, fullySplit: false);
+        await using var connection = await harness.ConfigureEmptyDatabaseAsync();
+        await using var context = harness.Service.CreateDbContextOverride!();
+        var now = harness.TimeProvider.GetUtcNow();
+        var marker = priority switch
+        {
+            "urgent" => DateTimeOffset.UnixEpoch,
+            "forced" => HealthCheckService.ForcedRecheckSentinel,
+            _ => now.AddSeconds(-1),
+        };
+        var file = NewCandidate("priority-retry.mkv", marker);
+        file.HealthRepairPending = priority == "pending";
+        var routine = NewCandidate("routine-check.mkv", null);
+        context.Items.AddRange(file, routine);
+        await context.SaveChangesAsync();
+
+        Exception failure = transportFailure ? new TimeoutException("synthetic timeout") : new CircuitAdmissionRejectedException();
+        var message = transportFailure ? HealthCheckService.FormatTransportFailureHealthMessage(failure.Message) : null;
+        await harness.Service.DeferHealthCheck(file, new DavDatabaseClient(context),
+            failure, CancellationToken.None, message);
+
+        await context.Entry(file).ReloadAsync();
+        Assert.Equal(priority != "forced", file.HealthRepairPending);
+        Assert.Equal((priority == "pending" ? now + HealthCheckService.PriorityFailureRetry : marker).ToUnixTimeSeconds(),
+            file.NextHealthCheck!.Value.ToUnixTimeSeconds());
+        if (transportFailure) Assert.Equal(message, (await context.HealthCheckResults.SingleAsync()).Message);
+        Assert.Equal([routine.Id], await harness.Service.SelectNextHealthCheckIdsAsync(
+            [], allowChecks: true, allowRepairs: true, maximumCount: 2, CancellationToken.None));
+        harness.TimeProvider.Advance(HealthCheckService.PriorityFailureRetry - TimeSpan.FromTicks(1));
+        Assert.Equal([routine.Id], await harness.Service.SelectNextHealthCheckIdsAsync(
+            [], allowChecks: true, allowRepairs: true, maximumCount: 2, CancellationToken.None));
+        harness.TimeProvider.Advance(TimeSpan.FromTicks(1));
+        var resumed = await harness.Service.SelectNextHealthCheckIdsAsync(
+            [], allowChecks: true, allowRepairs: true, maximumCount: 2, CancellationToken.None);
+        Assert.Contains(file.Id, resumed);
+        if (priority != "forced") Assert.Equal(file.Id, resumed[0]);
+    }
+
+    [Fact]
+    public async Task DeferredFailure_ReloadsPrioritySetDuringTheCheck()
+    {
+        using var harness = new Harness(workers: 1, fullySplit: false);
+        await using var connection = await harness.ConfigureEmptyDatabaseAsync();
+        await using var context = harness.Service.CreateDbContextOverride!();
+        var file = NewCandidate("concurrent-priority.mkv", null);
+        context.Items.Add(file);
+        await context.SaveChangesAsync();
+        await context.Items.Where(item => item.Id == file.Id).ExecuteUpdateAsync(setters => setters
+            .SetProperty(item => item.NextHealthCheck, DateTimeOffset.UnixEpoch)
+            .SetProperty(item => item.UrgentRepairFailures, 3));
+
+        await harness.Service.DeferHealthCheck(file, new DavDatabaseClient(context),
+            new CircuitAdmissionRejectedException(), CancellationToken.None);
+
+        await context.Entry(file).ReloadAsync();
+        Assert.Equal(DateTimeOffset.UnixEpoch, file.NextHealthCheck);
+        Assert.Equal(3, file.UrgentRepairFailures);
+        Assert.True(file.HealthRepairPending);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task DeferredRoutineFailure_KeepsOrdinaryFailureSchedule(bool knownFailure)
+    {
+        using var harness = new Harness(workers: 1, fullySplit: false);
+        await using var connection = await harness.ConfigureEmptyDatabaseAsync();
+        await using var context = harness.Service.CreateDbContextOverride!();
+        var file = NewCandidate("routine-failure.mkv", null);
+        context.Items.Add(file);
+        await context.SaveChangesAsync();
+        Exception failure = knownFailure ? new CircuitAdmissionRejectedException() : new InvalidOperationException();
+
+        await harness.Service.DeferHealthCheck(file, new DavDatabaseClient(context), failure, CancellationToken.None);
+
+        await context.Entry(file).ReloadAsync();
+        Assert.False(file.HealthRepairPending);
+        Assert.Equal(HealthCheckService.ComputeFailureNextHealthCheck(
+            harness.TimeProvider.GetUtcNow(), knownFailure).ToUnixTimeSeconds(), file.NextHealthCheck!.Value.ToUnixTimeSeconds());
     }
 
     [Fact]
