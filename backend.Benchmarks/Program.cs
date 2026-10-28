@@ -9,6 +9,12 @@ using NzbWebDAV.Streams;
 using UsenetSharp.Models;
 using UsenetSharp.Streams;
 
+if (args is ["--multipart-probe-poc", ..])
+{
+    await NzbWebDAV.Benchmarks.MultipartProbePoc.RunAsync(args);
+    return;
+}
+
 if (!await NzbWebDAV.Benchmarks.NativeCacheIoReport.TryHandleAsync(args)
     && !await NzbWebDAV.Benchmarks.NativeCacheScaleReport.TryHandleAsync(args)
     && !await NzbWebDAV.Benchmarks.PerformanceReportCli.TryHandleAsync(args))
