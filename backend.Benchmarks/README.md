@@ -354,3 +354,39 @@ and/or the committed baseline JSON.
 | `dead-article` `transportRequests` / `transportBytes` | extra work around a missing article, or a gap that is no longer zero-filled |
 | SAB `rowsReturned` / `totalCount` | pagination or filter contract change |
 | SAB `dbCommands` | extra round-trips (often N+1) for the same page |
+
+
+### Multipart probe proof of concept
+
+This opt-in experiment measures the production multipart stream through real loopback
+NNTP connection pools and generated CRC-validated yEnc articles. Each sample uses a fresh
+provider pool and header cache. BODY response latency is 450 ms and per-connection
+bandwidth is 6 MB/s. Prewarming and generated-corpus setup are outside the timing window.
+The request reads 4 MiB; first-byte, first-MiB, completion and probe timings are recorded.
+The timed benchmark is deliberately excluded from CI.
+
+```bash
+dotnet run --project backend.Benchmarks -c Release -- --multipart-probe-poc /tmp/multipart-probes.json 5
+```
+
+Compare against the benchmark-only commit `eb224288`, before the bounded parallel
+probe change. Alternate variant order on follow-up runs and compare medians across
+multiple samples; results depend on connection warmth, provider latency and bandwidth.
+These controlled measurements do not establish a live-provider or HTTP-level speedup.
+
+An initial Linux/.NET 10 run on 2026-10-28 used five samples per profile and variant:
+
+| Profile | Serial first byte | Two-probe first byte | Reduction |
+| --- | ---: | ---: | ---: |
+| Two warm connections | 1931.89 ms | 1608.51 ms | 16.74% |
+| Cold connections | 3137.78 ms | 2510.55 ms | 19.99% |
+| One warm connection; slow additional greeting/auth | 10936.29 ms | 7615.87 ms | 30.36% |
+| One-connection limit | 2309.07 ms | 2312.58 ms | -0.15% |
+| Cached headers | 578.28 ms | 577.87 ms | 0.07% |
+
+All 50 reads matched the generated corpus and retained verified cache evidence.
+BODY command counts were unchanged within each profile (9 or 11, including header
+probes and bounded read-ahead). Maximum simultaneous probe calls rose from one to two;
+provider connection limits remained authoritative. The baseline product and candidate
+product were measured separately; serializer/disposal cleanup in the harness is outside
+the timed read. Repeat the comparison against live providers before promotion from PoC.

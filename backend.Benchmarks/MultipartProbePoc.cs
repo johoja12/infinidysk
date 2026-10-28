@@ -17,6 +17,7 @@ namespace NzbWebDAV.Benchmarks;
 internal static class MultipartProbePoc
 {
     private const int ReadBytes = 4 * 1024 * 1024;
+    private static readonly JsonSerializerOptions ReportJsonOptions = new() { WriteIndented = true };
     private sealed record Profile(string Name, int Connections, int Prewarm, int HandshakeMs, bool CachedHeaders = false);
     private sealed record Sample(string Profile, double FirstByteMs, double FirstMiBMs, double CompleteMs,
         double ProbeWallMs, int MaximumProbes, long BodyCommands, bool BytesMatch, bool Verified);
@@ -25,6 +26,7 @@ internal static class MultipartProbePoc
     {
         var outputPath = args.Length > 1 ? args[1] : "multipart-probe-poc.json";
         var repetitions = args.Length > 2 ? int.Parse(args[2], System.Globalization.CultureInfo.InvariantCulture) : 5;
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(repetitions);
         var corpus = NntpLoopbackCorpus.Create(8, 768 * 1024, 823);
         Profile[] profiles =
         [
@@ -64,7 +66,7 @@ internal static class MultipartProbePoc
                     AllBytesMatch = rows.All(s => s.BytesMatch), AllVerified = rows.All(s => s.Verified) };
             }).ToArray(),
         };
-        await File.WriteAllTextAsync(outputPath, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true })).ConfigureAwait(false);
+        await File.WriteAllTextAsync(outputPath, JsonSerializer.Serialize(report, ReportJsonOptions)).ConfigureAwait(false);
     }
 
     private static double Median(IEnumerable<double> values)
@@ -82,7 +84,8 @@ internal static class MultipartProbePoc
         using var provider = NntpWholePathReport.CreateProvider(scenario, server.Port);
         if (profile.Prewarm > 0)
             await provider.PrewarmConnectionsAsync(profile.Prewarm, CancellationToken.None).ConfigureAwait(false);
-        using var client = new ProbeTimingClient(new HeaderCachingNntpClient(provider));
+        using var headers = new HeaderCachingNntpClient(provider);
+        using var client = new ProbeTimingClient(headers);
         if (profile.CachedHeaders)
         {
             foreach (var index in new[] { 0, 1, corpus.Articles.Count - 1 })
