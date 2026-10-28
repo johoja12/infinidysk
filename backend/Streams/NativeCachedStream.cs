@@ -59,6 +59,7 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     private bool _disposed;
     private bool _bypassFill;
     private bool _servedBytes;
+    private long _startupFillBlock = -1;
     private bool _untrackedSource;
     private long _lastDirectMissBlock = -1;
     private long _directBlockStart = -1;
@@ -556,6 +557,8 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 _bufferStart = blockStart;
             }
         }
+        if (!_background && !completeBlock && !_servedBytes && !_bufferFromCache)
+            _startupFillBlock = blockStart;
         var bufferOffset = checked((int)(_position - _bufferStart));
         if (!_bufferFromCache && bufferOffset >= _bufferCount)
         {
@@ -568,11 +571,12 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             try
             {
                 var expected = (int)Math.Min(NativeCacheStore.BlockSize, Length - blockStart);
-                // Return the first response chunk as soon as its source bytes are
-                // verified. Thereafter fill whole blocks: repeated tiny source
-                // reads starve the NNTP batch pipeline on sustained transfers.
-                var target = !completeBlock && !_servedBytes && _bufferCount == 0
-                    ? Math.Min(expected, bufferOffset + Math.Min(destination.Length, 64 * 1024))
+                // Grow the first cold block in bounded stages so early playback does not
+                // wait for a whole block. Later blocks retain full pipeline-sized fills.
+                var target = !completeBlock && !_background && blockStart == _startupFillBlock
+                    ? Math.Min(expected, Math.Max(
+                        bufferOffset + Math.Min(destination.Length, 64 * 1024),
+                        Math.Max(64 * 1024, _bufferCount * 4)))
                     : expected;
                 while (_bufferCount < target)
                 {

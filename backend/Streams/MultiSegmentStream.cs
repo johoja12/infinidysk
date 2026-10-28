@@ -2490,7 +2490,8 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
         ArticleByteLease? existingLease = null,
         long? leasedEstimate = null,
         IIncrementalSegmentHandler? incremental = null,
-        bool reportShortDecode = true)
+        bool reportShortDecode = true,
+        bool validateDuplicateLength = false)
     {
         try
         {
@@ -2524,7 +2525,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
 
         return await DrainSegmentAsync(
                 source, segmentIndex, cancellationToken, existingLease, leasedEstimate, incremental,
-                reportShortDecode)
+                reportShortDecode, validateDuplicateLength)
             .ConfigureAwait(false);
     }
 
@@ -2553,7 +2554,8 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
         ArticleByteLease? existingLease = null,
         long? leasedEstimate = null,
         IIncrementalSegmentHandler? incremental = null,
-        bool reportShortDecode = true)
+        bool reportShortDecode = true,
+        bool validateDuplicateLength = false)
     {
         ArticleByteLease? lease = existingLease;
         var ownsLease = existingLease is null;
@@ -2618,7 +2620,9 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
                     Incremental: true);
             }
 
+#pragma warning disable CA2000 // finally disposes untransferred buffers; success transfers ownership to DrainedSegment
             buffer = new PooledBufferStream(capacity);
+#pragma warning restore CA2000
             var traceRange = MultiProviderNntpClient.CurrentStreamTraceRange;
             var drainStarted = Stopwatch.GetTimestamp();
             await source.CopyToAsync(buffer, cancellationToken).ConfigureAwait(false);
@@ -2627,6 +2631,10 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
                 StreamStallKind.BodyDrain,
                 Stopwatch.GetElapsedTime(drainStarted));
             var drained = buffer.Length;
+            if (validateDuplicateLength && segmentIndex == 0 &&
+                !_expectedFirstSegmentRangeWasClippedAtFileEnd &&
+                _expectedFirstSegmentRange is { } duplicateRange && drained != duplicateRange.Count)
+                throw new InvalidDataException("Duplicate BODY decoded length does not match its trusted positioning range.");
             var shortPadded = false;
             if (segmentIndex == 0
                 && _expectedFirstSegmentRangeWasClippedAtFileEnd
@@ -2663,14 +2671,14 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
         }
         catch
         {
-            if (buffer is not null)
-                await buffer.DisposeAsync().ConfigureAwait(false);
             if (ownsLease)
                 lease?.Dispose();
             throw;
         }
         finally
         {
+            if (buffer is not null)
+                await buffer.DisposeAsync().ConfigureAwait(false);
             if (!sourceDisposeAttempted)
                 await source.DisposeAsync().ConfigureAwait(false);
         }
@@ -3174,12 +3182,14 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
     /// <summary>
     /// Waits for the head segment; once it has had no server response for the hedge delay while a
     /// later segment has already answered, races one duplicate fetch and keeps the first complete result.
+    /// Startup also races uniformly slow responses when a duplicate has spare fetch capacity.
     /// </summary>
     private async Task<SegmentDownloadResult> AwaitHeadSegmentAsync(
         Task<SegmentDownloadResult> head,
         int headIndex)
     {
-        if (_knownMissingSegmentIndices?.Contains(headIndex) == true ||
+        if (!CanVerifyDuplicateLength(headIndex) ||
+            _knownMissingSegmentIndices?.Contains(headIndex) == true ||
             DownloadWorkloadClassifier.Classify(_cts.Token) != DownloadWorkload.Streaming)
         {
             return await head.ConfigureAwait(false);
@@ -3193,7 +3203,9 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
             var issuedAt = Volatile.Read(ref _segmentIssuedAt[headIndex % _segmentIssuedAt.Length]);
             if (issuedAt == 0 || _cts.IsCancellationRequested) return await head.ConfigureAwait(false);
             var remaining = hedgeDelay - Stopwatch.GetElapsedTime(waitStarted);
-            if (remaining <= TimeSpan.Zero && Volatile.Read(ref _highestRespondedIndex) > headIndex)
+            if (remaining <= TimeSpan.Zero &&
+                (Volatile.Read(ref _highestRespondedIndex) > headIndex ||
+                 _deliveredSegments == 0 && _usenetClient.HasSpareFetchCapacity(_segmentIds.Span[headIndex], _cts.Token)))
                 break;
             await Task.WhenAny(head, Task.Delay(remaining > HedgePollInterval ? remaining : HedgePollInterval))
                 .ConfigureAwait(false);
@@ -3283,6 +3295,11 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
         }
     }
 
+    // A replacement must have a length established independently of the duplicate body.
+    private bool CanVerifyDuplicateLength(int segmentIndex) =>
+        (segmentIndex == 0 && _expectedFirstSegmentRange is not null) ||
+        (!IsClippedAtFileEnd(segmentIndex) && _segmentSizes.TryGetExactSize(segmentIndex, out _));
+
     private async Task<SegmentDownloadResult> HedgeSegmentAsync(int segmentIndex, CancellationToken cancellationToken)
     {
         var segmentId = _segmentIds.Span[segmentIndex];
@@ -3300,7 +3317,7 @@ public class MultiSegmentStream : FastReadOnlyNonSeekableStream, ICacheReadEvide
         var drained = await ValidateAndDrainSegmentAsync(
 #pragma warning restore CA2000
                 response.Stream!, segmentIndex, cancellationToken, ArticleByteLease.Empty, estimate,
-                reportShortDecode: false)
+                reportShortDecode: false, validateDuplicateLength: true)
             .ConfigureAwait(false);
         return ToDownloadResult(drained, estimate, segmentId);
     }

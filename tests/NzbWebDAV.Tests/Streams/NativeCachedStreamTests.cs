@@ -195,13 +195,38 @@ public sealed class NativeCachedStreamTests : IDisposable
             var second = new byte[64 * 1024];
             Assert.Equal(second.Length, await stream.ReadAsync(second));
             Assert.Equal(bytes.AsSpan(firstCount, second.Length).ToArray(), second);
-            Assert.Equal([(0, firstCount), (firstCount, bytes.Length - firstCount)], reads);
-            Assert.Equal(bytes.Length, await store.GetCoverageAsync(id));
+            Assert.Equal([(0, firstCount), (firstCount, 192 * 1024)], reads);
+            Assert.Equal(0, await store.GetCoverageAsync(id));
             var rest = new byte[bytes.Length - firstCount - second.Length];
             await stream.ReadExactlyAsync(rest);
             Assert.Equal(bytes.AsSpan(firstCount + second.Length).ToArray(), rest);
         }
         Assert.Equal(bytes.Length, await store.GetCoverageAsync(id));
+    }
+
+    [Fact]
+    public async Task ColdStartup_DeliversQuarterMegabyteWhileRemainingSourceIsBlocked()
+    {
+        await using var store = CreateStore();
+        var bytes = new byte[NativeCacheStore.BlockSize];
+        new Random(85).NextBytes(bytes);
+        var id = new NativeCacheIdentity("gated-startup", "v1", bytes.Length);
+        var source = new PrefixGateSource(bytes);
+        await using var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(source), () => true);
+        try
+        {
+            var prefix = new byte[256 * 1024];
+            await stream.ReadExactlyAsync(prefix).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(bytes.AsSpan(0, prefix.Length).ToArray(), prefix);
+            Assert.Equal(0, await store.GetCoverageAsync(id));
+            source.Release();
+            var rest = new byte[bytes.Length - prefix.Length];
+            await stream.ReadExactlyAsync(rest);
+            Assert.Equal(bytes.AsSpan(prefix.Length).ToArray(), rest);
+            Assert.Equal(bytes.Length, await store.GetCoverageAsync(id));
+        }
+        finally { source.Release(); }
     }
 
     [Fact]
@@ -626,6 +651,20 @@ public sealed class NativeCachedStreamTests : IDisposable
             var count = await base.ReadAsync(buffer, cancellationToken);
             reads.Add((offset, count));
             return count;
+        }
+    }
+
+    private sealed class PrefixGateSource(byte[] bytes) : MemoryStream(bytes), ICacheReadEvidence
+    {
+        private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public bool LastReadCacheable => true;
+        public void Release() => _release.TrySetResult();
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            const int prefixLength = 256 * 1024;
+            if (Position >= prefixLength) await _release.Task.WaitAsync(cancellationToken);
+            else buffer = buffer[..(int)Math.Min(buffer.Length, prefixLength - Position)];
+            return await base.ReadAsync(buffer, cancellationToken);
         }
     }
 
