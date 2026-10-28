@@ -9,6 +9,7 @@ using NzbWebDAV.Services;
 using NzbWebDAV.Services.StreamTrace;
 using Serilog;
 using UsenetSharp.Streams;
+using UsenetSharp.Models;
 
 namespace NzbWebDAV.Streams;
 
@@ -390,16 +391,39 @@ public class DavMultipartFileStream : FastReadOnlyStream, ICacheReadEvidence, ID
         if (count == 0 || length <= 0) return null;
         try
         {
-            var first = await _usenetClient.GetYencHeadersAsync(part.SegmentIds[0], ct).ConfigureAwait(false);
+            using var probes = ContextualCancellationTokenSource.CreateLinkedTokenSource(ct);
+            using var slots = new SemaphoreSlim(2);
+            async Task<UsenetYencHeader> ProbeAsync(string segmentId)
+            {
+                await slots.WaitAsync(probes.Token).ConfigureAwait(false);
+                try
+                {
+                    probes.Token.ThrowIfCancellationRequested();
+                    return await _usenetClient.GetYencHeadersAsync(segmentId, probes.Token).ConfigureAwait(false);
+                }
+                catch (Exception exception) when (exception is not OutOfMemoryException)
+                {
+                    await probes.CancelAsync().ConfigureAwait(false);
+                    throw;
+                }
+                finally { slots.Release(); }
+            }
+
+            var firstTask = ProbeAsync(part.SegmentIds[0]);
+            var secondTask = count > 2 ? ProbeAsync(part.SegmentIds[1]) : null;
+            var tailTask = count > 1 ? ProbeAsync(part.SegmentIds[^1]) : firstTask;
+            // Join every task before disposing cancellation/admission state, including failures.
+            await Task.WhenAll(secondTask is null ? [firstTask, tailTask] : [firstTask, secondTask, tailTask])
+                .ConfigureAwait(false);
+            var first = await firstTask.ConfigureAwait(false);
             if (first.PartOffset != 0 || first.PartSize <= 0) return null;
             var stride = first.PartSize;
-            if (count > 2)
+            if (secondTask is not null)
             {
-                var second = await _usenetClient.GetYencHeadersAsync(part.SegmentIds[1], ct).ConfigureAwait(false);
+                var second = await secondTask.ConfigureAwait(false);
                 if (second.PartOffset != stride || second.PartSize != stride) return null;
             }
-            var tail = count == 1 ? first :
-                await _usenetClient.GetYencHeadersAsync(part.SegmentIds[^1], ct).ConfigureAwait(false);
+            var tail = await tailTask.ConfigureAwait(false);
             var tailStart = checked(stride * (count - 1L));
             if (tail.PartOffset != tailStart || tail.PartSize <= 0 ||
                 checked(tailStart + tail.PartSize) != length) return null;
