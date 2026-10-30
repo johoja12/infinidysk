@@ -60,6 +60,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
     internal static readonly TimeSpan CachedCopyRecheck = TimeSpan.FromDays(7);
     /// <summary>How long repair waits when the cached copy could not be verified right now.</summary>
     internal static readonly TimeSpan CachedCopyRetry = TimeSpan.FromHours(1);
+    private readonly ConcurrentDictionary<Guid, CancellationTokenSource> _stopRequests = new();
 
     // Repeated remove-and-blocklist repairs for the same library path in a short window indicate
     // a replacement loop (Arr keeps re-grabbing a release repair keeps rejecting, issue #732).
@@ -223,6 +224,23 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                 var snapshot = entry.Value.GetDiagnosticSnapshot(now);
                 return new ActiveHealthCheckProgress(entry.Value.Progress, snapshot.Phase, snapshot.PhaseStartedAtUtc);
             });
+    }
+
+    public enum StopHealthCheckOutcome { NotRunning, Stopped, Stopping }
+
+    internal TimeSpan StopWorkerExitWait { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>Stops a running health check or repair and defers it like a stalled attempt.</summary>
+    public async Task<StopHealthCheckOutcome> StopHealthCheckAsync(Guid davItemId, CancellationToken ct = default)
+    {
+        if (!_stopRequests.TryGetValue(davItemId, out var stop)) return StopHealthCheckOutcome.NotRunning;
+        try { await stop.CancelAsync().ConfigureAwait(false); }
+        catch (ObjectDisposedException) { return StopHealthCheckOutcome.NotRunning; }
+        if (!_inProgress.TryGetValue(davItemId, out var worker) || worker.ProcessingTask is not { } exit)
+            return StopHealthCheckOutcome.Stopped;
+        // Report Stopped only once the worker has left the active list, so the next poll cannot show it again.
+        await exit.WaitAsync(StopWorkerExitWait, ct).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        return exit.IsCompleted ? StopHealthCheckOutcome.Stopped : StopHealthCheckOutcome.Stopping;
     }
 
     public enum FileRecheckOutcome { Queued, AlreadyQueued, AlreadyRunning, NotFound, Unsupported, Disabled }
@@ -468,12 +486,10 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                 }
 
                 var availableSlots = _configManager.GetHealthCheckWorkers() - _inProgress.Count;
-                var repairsOpen = admission.RepairsOpen
-                    && (!ShouldAttemptPar2Repair() || _par2RepairService.CanAcceptInlineRepair);
                 var candidateIds = await SelectNextHealthCheckIdsAsync(
                         reservedIds,
                         admission.ChecksOpen,
-                        repairsOpen,
+                        admission.RepairsOpen,
                         availableSlots,
                         ct)
                     .ConfigureAwait(false);
@@ -563,6 +579,20 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         if (activeIds.Count > 0)
             queue = queue.Where(item => !activeIds.Contains(item.Id));
 
+        var par2Busy = allowRepairs
+            && ShouldAttemptPar2Repair()
+            && !_par2RepairService.CanAcceptInlineRepair;
+        if (par2Busy)
+        {
+            queue = queue.Where(item =>
+                (item.NextHealthCheck != DateTimeOffset.UnixEpoch && !item.HealthRepairPending)
+                || dbContext.Par2RepairJobs
+                    .Where(job => job.DavItemId == item.Id)
+                    .OrderByDescending(job => job.CreatedAt)
+                    .Select(job => (Par2RepairJob.RepairJobState?)job.State)
+                    .FirstOrDefault() == Par2RepairJob.RepairJobState.Infeasible);
+        }
+
         var selected = new List<Guid>(maximumCount);
         await foreach (var item in queue
             .AsAsyncEnumerable()
@@ -581,6 +611,8 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             }
             var isRepair = item.NextHealthCheck == DateTimeOffset.UnixEpoch
                 || item.HealthRepairPending;
+            if (par2Busy && isRepair && _par2RepairService.HasActiveRepairFlight(item.Id))
+                continue;
             if ((allowRepairs && isRepair)
                 || (allowChecks && !isRepair && FilenameUtil.IsHealthCheckCandidate(item.Name)))
             {
@@ -1279,7 +1311,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
     )
     {
         using var stalled = new CancellationTokenSource(HealthCheckInactivityLimit, _timeProvider);
-        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(ct, stalled.Token);
+        using var stop = new CancellationTokenSource();
+        _stopRequests[davItem.Id] = stop;
+        using var attempt = CancellationTokenSource.CreateLinkedTokenSource(ct, stalled.Token, stop.Token);
         HealthCheckActivity.Current = () =>
         {
             try { stalled.CancelAfter(HealthCheckInactivityLimit); }
@@ -1292,13 +1326,20 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         {
             await PerformHealthCheckAttempt(davItem, dbClient, concurrency, attempt.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (stalled.IsCancellationRequested && !ct.IsCancellationRequested)
+        catch (OperationCanceledException) when ((stalled.IsCancellationRequested || stop.IsCancellationRequested) && !ct.IsCancellationRequested)
         {
             CompleteHealthProgress(davItem.Id);
             var now = _timeProvider.GetUtcNow();
             var next = now + HealthCheckStallDeferral;
+            // Hold the streaming gate so a stop also defers an urgent flag written during the attempt.
+            await using var mutationGate = await _failureTracker
+                .AcquireMutationGateAsync(davItem.Id, CancellationToken.None)
+                .ConfigureAwait(false);
             // ponytail: repair deferrals are in-memory, so a restart retries timed-out repairs immediately.
-            if (davItem.NextHealthCheck == DateTimeOffset.UnixEpoch || davItem.HealthRepairPending)
+            if (davItem.NextHealthCheck == DateTimeOffset.UnixEpoch
+                || davItem.HealthRepairPending
+                || (stop.IsCancellationRequested
+                    && await IsDurablyUrgentAsync(dbClient, davItem.Id, ct).ConfigureAwait(false)))
                 _repairRetryNotBefore[davItem.Id] = next;
             // Keep the urgent sentinel (including one set by streaming during this attempt) so the retry stays urgent.
             await dbClient.Ctx.Items
@@ -1308,9 +1349,16 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                     .SetProperty(item => item.NextHealthCheck, item =>
                         item.NextHealthCheck == DateTimeOffset.UnixEpoch ? DateTimeOffset.UnixEpoch : (DateTimeOffset?)next), ct)
                 .ConfigureAwait(false);
-            Log.Warning(
-                "Health check for {Path} made no progress for {Limit}. Deferred next check to {NextCheck}.",
-                davItem.Path, HealthCheckInactivityLimit, next);
+            if (stop.IsCancellationRequested)
+                Log.Information("Health check for {Path} was stopped. Deferred next check to {NextCheck}.", davItem.Path, next);
+            else
+                Log.Warning(
+                    "Health check for {Path} made no progress for {Limit}. Deferred next check to {NextCheck}.",
+                    davItem.Path, HealthCheckInactivityLimit, next);
+        }
+        finally
+        {
+            _stopRequests.TryRemove(new KeyValuePair<Guid, CancellationTokenSource>(davItem.Id, stop));
         }
     }
 
@@ -3466,6 +3514,57 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         return new ArrLinkedRepairResult(ArrLinkedRepairDecision.DeferNoMatchingMediaItem);
     }
 
+    /// <summary>
+    /// Asks each Arr instance whether its history proves an unlinked file is no longer wanted.
+    /// The first proof wins; unreachable instances and incomplete answers leave the verdict Unknown.
+    /// </summary>
+    internal static async Task<ArrUnlinkedFileVerdict> ClassifyUnlinkedFileAsync(
+        IEnumerable<ArrClient> arrClients,
+        Guid downloadId,
+        string contentRelativePath,
+        DateTimeOffset utcNow,
+        ArrInstanceBackoff? arrBackoff,
+        CancellationToken ct)
+    {
+        foreach (var arrClient in arrClients)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (arrBackoff?.IsInBackoff(arrClient.Host) == true)
+                continue;
+
+            try
+            {
+                var history = await arrClient.GetDownloadHistoryAsync(downloadId, ct).ConfigureAwait(false);
+                arrBackoff?.RecordSuccess(arrClient.Host);
+                var fileImport = ArrUnlinkedDownloadClassifier.FindFileImport(history.Records, contentRelativePath);
+                if (fileImport is null)
+                {
+                    var verdict = ArrUnlinkedDownloadClassifier.ClassifyWithoutFileImport(
+                        history, contentRelativePath, utcNow);
+                    if (verdict != ArrUnlinkedFileVerdict.Unknown)
+                        return verdict;
+                    continue;
+                }
+
+                var deletions = await arrClient.GetFileDeletionHistoryAsync(fileImport, ct).ConfigureAwait(false);
+                if (ArrUnlinkedDownloadClassifier.IsSupersededByUpgrade(fileImport, deletions.Records))
+                    return ArrUnlinkedFileVerdict.Superseded;
+            }
+            catch (Exception e) when (!ct.IsCancellationRequested &&
+                                      e is HttpRequestException or TaskCanceledException or InvalidOperationException
+                                          or InvalidDataException or System.Text.Json.JsonException)
+            {
+                arrBackoff?.RecordFailure(arrClient.Host, e);
+                LogArrRepairFailure(
+                    e,
+                    "Health-check repair: could not query Arr download history on {Host}",
+                    arrClient.Host);
+            }
+        }
+
+        return ArrUnlinkedFileVerdict.Unknown;
+    }
+
     private static void LogArrRepairFailure(Exception exception, string messageTemplate, string host)
     {
         if (exception.TryGetCausingException<HttpRequestException>(out var httpException) &&
@@ -3594,7 +3693,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         DavItem davItem, IReadOnlyList<string>? segmentIds, CancellationToken ct)
     {
         if (!ShouldAttemptPar2Repair()) return Par2RepairOutcome.NotRepaired;
-        var repair = Task.Run(() => RunBackgroundPar2RepairAsync(davItem, segmentIds), CancellationToken.None);
+        // Manual stops also cancel fork repairs that run outside the health worker.
+        var stopToken = _stopRequests.TryGetValue(davItem.Id, out var stop) ? stop.Token : CancellationToken.None;
+        var repair = Task.Run(() => RunBackgroundPar2RepairAsync(davItem, segmentIds, stopToken), CancellationToken.None);
         try
         {
             await repair.WaitAsync(Par2InlineWait, _timeProvider, ct).ConfigureAwait(false);
@@ -3613,13 +3714,14 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         return null;
     }
 
-    private async Task<Par2RepairOutcome> RunBackgroundPar2RepairAsync(DavItem davItem, IReadOnlyList<string>? segmentIds)
+    private async Task<Par2RepairOutcome> RunBackgroundPar2RepairAsync(
+        DavItem davItem, IReadOnlyList<string>? segmentIds, CancellationToken stopToken)
     {
         // The health attempt's watchdog stops once the worker moves on, so the repair keeps its own.
         // While the attempt still waits inline, progress keeps both alive.
         var attemptHeartbeat = HealthCheckActivity.Current;
         using var stalled = new CancellationTokenSource(HealthCheckInactivityLimit, _timeProvider);
-        using var repairCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken, stalled.Token);
+        using var repairCts = CancellationTokenSource.CreateLinkedTokenSource(_stoppingToken, stalled.Token, stopToken);
         HealthCheckActivity.Current = () =>
         {
             try { stalled.CancelAfter(HealthCheckInactivityLimit); }
@@ -3901,6 +4003,56 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
 
             if (linkDisposition == LibraryLinkRepairDisposition.DeferMissingLink)
             {
+                // A missing link alone is not proof, but Arr history can be: the import was
+                // replaced by an upgrade, the download failed, or Arr imported a sibling file.
+                if (libraryDir != null &&
+                    (davItem.ArrDownloadId ?? davItem.NzbBlobId ?? davItem.HistoryItemId) is { } unlinkedDownloadId)
+                {
+                    var verdict = await ClassifyUnlinkedFileAsync(
+                        CreateRepairArrClientsOverride?.Invoke() ?? _configManager.GetArrConfig().GetArrClients().ToArray(),
+                        unlinkedDownloadId,
+                        CreateStrmFilesPostProcessor.GetPathRelativeToContentRoot(davItem.Path),
+                        _timeProvider.GetUtcNow(),
+                        _arrBackoff,
+                        ct).ConfigureAwait(false);
+                    if (verdict != ArrUnlinkedFileVerdict.Unknown)
+                    {
+                        if (GetReadHoldUntil() is { } unlinkedHoldUntil)
+                        {
+                            await DeferForRecentReadAsync(unlinkedHoldUntil).ConfigureAwait(false);
+                            return;
+                        }
+
+                        var arrReason = verdict switch
+                        {
+                            ArrUnlinkedFileVerdict.Superseded => "Radarr/Sonarr replaced its import with an upgrade",
+                            ArrUnlinkedFileVerdict.DownloadFailed => "Radarr/Sonarr marked its download as failed",
+                            _ => "Radarr/Sonarr imported a different file from the same download",
+                        };
+                        DeletionAuditLog.Record(
+                            "health-repair",
+                            davItem,
+                            $"health validation failed; not library linked and {arrReason}");
+                        Log.Information(
+                            "Removed unlinked {Path} after it failed health validation. Reason: {Reason}.",
+                            davItem.Path,
+                            arrReason);
+                        RemoveDavItemWithGeneratedSidecars(dbClient, davItem);
+                        _failureTracker.ClearFailure(davItem.Id);
+                        await RecordHealthResult(
+                            dbClient, davItem,
+                            HealthCheckResult.HealthResult.Unhealthy,
+                            HealthCheckResult.RepairAction.Deleted,
+                            string.Join(" ", [
+                                "File failed health validation.",
+                                "No imported symlink or .strm file links to it,",
+                                $"and {arrReason}.",
+                                "Deleted the unused webdav-file."
+                            ]), ct).ConfigureAwait(false);
+                        return;
+                    }
+                }
+
                 var utcNow = DateTimeOffset.UtcNow;
                 davItem.LastHealthCheck = utcNow;
                 davItem.NextHealthCheck = utcNow + TimeSpan.FromDays(1);

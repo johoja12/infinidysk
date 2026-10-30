@@ -47,6 +47,12 @@ public sealed class ArrHistoryData
 
     [JsonPropertyName("importedPath")]
     public string? ImportedPath { get; set; }
+
+    [JsonPropertyName("droppedPath")]
+    public string? DroppedPath { get; set; }
+
+    [JsonPropertyName("reason")]
+    public string? Reason { get; set; }
 }
 
 public sealed class ArrEventTypeJsonConverter : JsonConverter<int>
@@ -69,6 +75,7 @@ public sealed class ArrEventTypeJsonConverter : JsonConverter<int>
             _ when int.TryParse(value, out var numericValue) => numericValue,
             _ when value.Equals("grabbed", StringComparison.OrdinalIgnoreCase) => 1,
             _ when value.Equals("downloadFolderImported", StringComparison.OrdinalIgnoreCase) => 3,
+            _ when value.Equals("downloadFailed", StringComparison.OrdinalIgnoreCase) => 4,
             _ => 0,
         };
 }

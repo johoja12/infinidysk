@@ -328,7 +328,6 @@ public partial class Par2RepairService
         {
             reads.Headers[id] = null;
             reads.NoteUnavailable(id, exception);
-            HealthCheckActivity.Report();
             return null;
         }
     }
