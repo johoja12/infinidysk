@@ -229,6 +229,38 @@ public sealed class NativeCachedStreamTests : IDisposable
         finally { source.Release(); }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LaterColdBlock_ReturnsAvailablePrefixBeforeRemainingSource(bool cachedPrefix)
+    {
+        await using var store = CreateStore();
+        var block = NativeCacheStore.BlockSize;
+        var bytes = new byte[2 * block];
+        new Random(87).NextBytes(bytes);
+        var id = new NativeCacheIdentity("later-prefix", "v1", bytes.Length);
+        if (cachedPrefix) Assert.True(await store.WriteBlockAsync(id, 0, bytes.AsMemory(0, block)));
+        var source = new PrefixGateSource(bytes, block + 256 * 1024);
+        await using var stream = new NativeCachedStream(store, id,
+            _ => Task.FromResult<Stream>(source), () => true);
+        try
+        {
+            var first = new byte[block];
+            await stream.ReadExactlyAsync(first);
+            Assert.Equal(bytes.AsSpan(0, block).ToArray(), first);
+            var prefix = new byte[256 * 1024];
+            await stream.ReadExactlyAsync(prefix).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(bytes.AsSpan(block, prefix.Length).ToArray(), prefix);
+            Assert.Equal(block, await store.GetCoverageAsync(id));
+            source.Release();
+            var rest = new byte[block - prefix.Length];
+            await stream.ReadExactlyAsync(rest);
+            Assert.Equal(bytes.AsSpan(block + prefix.Length).ToArray(), rest);
+            Assert.Equal(bytes.Length, await store.GetCoverageAsync(id));
+        }
+        finally { source.Release(); }
+    }
+
     [Fact]
     public async Task WarmProbe_FillsAndCommitsWholeBlockBeforeReturningOneByte()
     {
@@ -319,7 +351,15 @@ public sealed class NativeCachedStreamTests : IDisposable
         {
             await stream.ReadExactlyAsync(new byte[4 * block + 1]);
             Assert.Equal([(1L * block, 4L * block), (5L * block, (long)block)], source.Windows);
+            // A one-byte final prefix does not force a full integrity-block fill.
+            Assert.Equal(4L * block, await store.GetCoverageAsync(id));
+            // Warming is a separate response; the completed finite read released its partial buffer.
+            await using var probe = new NativeCachedStream(store, id,
+                _ => Task.FromResult<Stream>(new WindowedProofSource(new byte[8 * block])), () => true);
+            probe.Position = 5L * block;
+            await probe.ReadWarmProbeAsync(new byte[1], CancellationToken.None);
             Assert.Equal(5L * block, await store.GetCoverageAsync(id));
+            Assert.Equal([(1L * block, 4L * block), (5L * block, (long)block)], source.Windows);
         }
         finally { RangeContext.SetReadBudget(null); }
     }
@@ -625,7 +665,11 @@ public sealed class NativeCachedStreamTests : IDisposable
             var actual = new byte[block + 46];
             await stream.ReadExactlyAsync(actual);
             Assert.Equal(expected.AsSpan(block - 17, actual.Length).ToArray(), actual);
-            Assert.Equal([(block, block)], reads);
+            Assert.Equal(block, reads.Sum(read => read.Count));
+            Assert.Equal(block, reads[0].Offset);
+            Assert.Equal(2L * block, reads[^1].Offset + reads[^1].Count);
+            for (var i = 1; i < reads.Count; i++)
+                Assert.Equal(reads[i - 1].Offset + reads[i - 1].Count, reads[i].Offset);
         }
 
         await using var cached = new NativeCachedStream(store, identity,
@@ -654,14 +698,13 @@ public sealed class NativeCachedStreamTests : IDisposable
         }
     }
 
-    private sealed class PrefixGateSource(byte[] bytes) : MemoryStream(bytes), ICacheReadEvidence
+    private sealed class PrefixGateSource(byte[] bytes, int prefixLength = 256 * 1024) : MemoryStream(bytes), ICacheReadEvidence
     {
         private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public bool LastReadCacheable => true;
         public void Release() => _release.TrySetResult();
         public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
         {
-            const int prefixLength = 256 * 1024;
             if (Position >= prefixLength) await _release.Task.WaitAsync(cancellationToken);
             else buffer = buffer[..(int)Math.Min(buffer.Length, prefixLength - Position)];
             return await base.ReadAsync(buffer, cancellationToken);

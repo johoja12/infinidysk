@@ -111,6 +111,24 @@ public sealed record UsenetClientOptions
     /// </summary>
     public Func<ConnectionReleasePolicy?>? CancellationPolicyResolver { get; init; }
 
+    /// <summary>
+    /// Optional total drain deadline for a cancelled BODY operation, including every response
+    /// in a pipelined batch. Null preserves the ordinary drain-to-reuse behavior. The resolver
+    /// receives the original caller token so pooled clients can select a workload-specific limit.
+    /// </summary>
+    public Func<CancellationToken, TimeSpan?>? CancellationDrainTimeoutResolver { get; init; }
+
+    internal TimeSpan? GetCancellationDrainTimeout(CancellationToken callerToken)
+    {
+        try
+        {
+            var timeout = CancellationDrainTimeoutResolver?.Invoke(callerToken);
+            if (timeout is null || timeout == Timeout.InfiniteTimeSpan) return null;
+            return TimeSpan.FromMilliseconds(Math.Clamp(timeout.Value.TotalMilliseconds, 0, uint.MaxValue - 1d));
+        }
+        catch { return TimeSpan.Zero; }
+    }
+
     internal ConnectionReleasePolicy GetCancellationPolicy()
     {
         try { return CancellationPolicyResolver?.Invoke() ?? CancellationPolicy; }

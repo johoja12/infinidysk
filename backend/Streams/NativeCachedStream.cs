@@ -59,7 +59,6 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
     private bool _disposed;
     private bool _bypassFill;
     private bool _servedBytes;
-    private long _startupFillBlock = -1;
     private bool _untrackedSource;
     private long _lastDirectMissBlock = -1;
     private long _directBlockStart = -1;
@@ -443,8 +442,8 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             _activeFill = await AcquireFillAsync(blockStart, cancellationToken).ConfigureAwait(false);
             if (_activeFill is null) return await ReadDirectBlockAsync(destination, blockStart, cancellationToken).ConfigureAwait(false);
             var blockLength = (int)Math.Min(NativeCacheStore.BlockSize, Length - blockStart);
-            // Only a response's first block: later blocks read whole blocks from an already running
-            // pipeline, where an extra small read would only fragment its batches.
+            // Open a response's first aligned cold block before taking a buffer slot.
+            // Later blocks keep the admitted buffer and the running source pipeline.
             if (!_background && !completeBlock && !_servedBytes && _position == blockStart && _generationIsCurrent()
                 && await IsBlockMissingAsync(blockStart, blockLength, cancellationToken).ConfigureAwait(false))
             {
@@ -557,8 +556,6 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
                 _bufferStart = blockStart;
             }
         }
-        if (!_background && !completeBlock && !_servedBytes && !_bufferFromCache)
-            _startupFillBlock = blockStart;
         var bufferOffset = checked((int)(_position - _bufferStart));
         if (!_bufferFromCache && bufferOffset >= _bufferCount)
         {
@@ -571,9 +568,9 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             try
             {
                 var expected = (int)Math.Min(NativeCacheStore.BlockSize, Length - blockStart);
-                // Grow the first cold block in bounded stages so early playback does not
-                // wait for a whole block. Later blocks retain full pipeline-sized fills.
-                var target = !completeBlock && !_background && blockStart == _startupFillBlock
+                // Return available foreground bytes without waiting for the rest of a cold block.
+                // Keep the source window/pipeline intact; admit only completely filled blocks.
+                var target = !completeBlock && !_background
                     ? Math.Min(expected, Math.Max(
                         bufferOffset + Math.Min(destination.Length, 64 * 1024),
                         Math.Max(64 * 1024, _bufferCount * 4)))
