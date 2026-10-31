@@ -353,7 +353,11 @@ public sealed class NativeCachedStreamTests : IDisposable
             Assert.Equal([(1L * block, 4L * block), (5L * block, (long)block)], source.Windows);
             // A one-byte final prefix does not force a full integrity-block fill.
             Assert.Equal(4L * block, await store.GetCoverageAsync(id));
-            await stream.ReadWarmProbeAsync(new byte[1], CancellationToken.None);
+            // Warming is a separate response; the completed finite read released its partial buffer.
+            await using var probe = new NativeCachedStream(store, id,
+                _ => Task.FromResult<Stream>(new WindowedProofSource(new byte[8 * block])), () => true);
+            probe.Position = 5L * block;
+            await probe.ReadWarmProbeAsync(new byte[1], CancellationToken.None);
             Assert.Equal(5L * block, await store.GetCoverageAsync(id));
             Assert.Equal([(1L * block, 4L * block), (5L * block, (long)block)], source.Windows);
         }

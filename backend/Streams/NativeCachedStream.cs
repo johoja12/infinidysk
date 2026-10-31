@@ -442,8 +442,8 @@ public sealed class NativeCachedStream : FastReadOnlyStream, ICacheReadEvidence,
             _activeFill = await AcquireFillAsync(blockStart, cancellationToken).ConfigureAwait(false);
             if (_activeFill is null) return await ReadDirectBlockAsync(destination, blockStart, cancellationToken).ConfigureAwait(false);
             var blockLength = (int)Math.Min(NativeCacheStore.BlockSize, Length - blockStart);
-            // Only a response's first block: later blocks read whole blocks from an already running
-            // pipeline, where an extra small read would only fragment its batches.
+            // Open a response's first aligned cold block before taking a buffer slot.
+            // Later blocks keep the admitted buffer and the running source pipeline.
             if (!_background && !completeBlock && !_servedBytes && _position == blockStart && _generationIsCurrent()
                 && await IsBlockMissingAsync(blockStart, blockLength, cancellationToken).ConfigureAwait(false))
             {
