@@ -351,7 +351,11 @@ public sealed class NativeCachedStreamTests : IDisposable
         {
             await stream.ReadExactlyAsync(new byte[4 * block + 1]);
             Assert.Equal([(1L * block, 4L * block), (5L * block, (long)block)], source.Windows);
+            // A one-byte final prefix does not force a full integrity-block fill.
+            Assert.Equal(4L * block, await store.GetCoverageAsync(id));
+            await stream.ReadWarmProbeAsync(new byte[1], CancellationToken.None);
             Assert.Equal(5L * block, await store.GetCoverageAsync(id));
+            Assert.Equal([(1L * block, 4L * block), (5L * block, (long)block)], source.Windows);
         }
         finally { RangeContext.SetReadBudget(null); }
     }
@@ -657,7 +661,11 @@ public sealed class NativeCachedStreamTests : IDisposable
             var actual = new byte[block + 46];
             await stream.ReadExactlyAsync(actual);
             Assert.Equal(expected.AsSpan(block - 17, actual.Length).ToArray(), actual);
-            Assert.Equal([(block, block)], reads);
+            Assert.Equal(block, reads.Sum(read => read.Count));
+            Assert.Equal(block, reads[0].Offset);
+            Assert.Equal(2L * block, reads[^1].Offset + reads[^1].Count);
+            for (var i = 1; i < reads.Count; i++)
+                Assert.Equal(reads[i - 1].Offset + reads[i - 1].Count, reads[i].Offset);
         }
 
         await using var cached = new NativeCachedStream(store, identity,
