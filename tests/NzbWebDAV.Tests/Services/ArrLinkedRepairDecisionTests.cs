@@ -195,25 +195,114 @@ public class ArrLinkedRepairDecisionTests
         Assert.Equal(HealthCheckService.ArrLinkedRepairDecision.DeferMissingDownloadIdentity, result.Decision);
     }
 
-    [Fact]
-    public async Task MissingDownloadHistory_DefersWithoutDelete()
+    [Theory]
+    [InlineData(ArrMissingPayloadCleanupOutcome.RemovedSearchRequested, HealthCheckService.ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceeded)]
+    [InlineData(ArrMissingPayloadCleanupOutcome.RemovedSearchWithheld, HealthCheckService.ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchWithheld)]
+    [InlineData(ArrMissingPayloadCleanupOutcome.RemovedSearchFailed, HealthCheckService.ArrLinkedRepairDecision.MediaRemovedWithoutBlocklistSearchUnconfirmed)]
+    public async Task MissingDownloadHistory_ReplacesExactFileWithoutBlocklisting(
+        ArrMissingPayloadCleanupOutcome cleanupOutcome,
+        HealthCheckService.ArrLinkedRepairDecision expected)
     {
-        var clients = new ArrClient[]
-        {
-            new ScriptedArrClient(
-                host: "http://radarr",
-                rootFolders: () => Task.FromResult(new List<ArrRootFolder>
-                {
-                    new() { Path = "/media/movies" },
-                }),
-                removeAndBlocklist: (_, _) =>
-                    Task.FromResult(ArrRepairOutcome.DownloadHistoryNotFound)),
-        };
+        var removals = 0;
+        var client = new ScriptedArrClient(
+            host: "http://radarr",
+            rootFolders: () => Task.FromResult(new List<ArrRootFolder> { new() { Path = "/media/movies" } }),
+            removeAndBlocklist: (_, id) =>
+            {
+                Assert.Equal(DownloadId, id);
+                return Task.FromResult(ArrRepairOutcome.DownloadHistoryNotFound);
+            },
+            removeWithoutBlocklist: (match, budget) =>
+            {
+                Assert.Equal(DummyMediaFile, match);
+                Assert.NotNull(budget);
+                Assert.Equal(cleanupOutcome != ArrMissingPayloadCleanupOutcome.RemovedSearchWithheld, budget(match.MediaKeys));
+                removals++;
+                return Task.FromResult(cleanupOutcome);
+            });
 
         var result = await HealthCheckService.DecideArrLinkedRepairAsync(
-            clients, LibraryPath, DownloadId, CancellationToken.None);
+            [client], LibraryPath, DownloadId, CancellationToken.None,
+            shouldRequestSearch: (owner, keys) =>
+            {
+                Assert.Same(client, owner);
+                Assert.Equal(DummyMediaFile.MediaKeys, keys);
+                return cleanupOutcome != ArrMissingPayloadCleanupOutcome.RemovedSearchWithheld;
+            });
 
-        Assert.Equal(HealthCheckService.ArrLinkedRepairDecision.DeferMissingDownloadHistory, result.Decision);
+        Assert.Equal(expected, result.Decision);
+        Assert.Equal(1, removals);
+        Assert.Equal(client.Host, result.RepairHost);
+        Assert.Equal(DummyMediaFile, result.RepairMatch);
+    }
+
+    [Fact]
+    public async Task MissingDownloadHistory_FileReplacedDuringLookupDoesNotDeleteReplacement()
+    {
+        var lookups = 0;
+        var client = new ScriptedArrClient(
+            host: "http://changed-radarr",
+            rootFolders: () => Task.FromResult(new List<ArrRootFolder> { new() { Path = "/media/movies" } }),
+            removeAndBlocklist: (_, _) => Task.FromResult(ArrRepairOutcome.DownloadHistoryNotFound),
+            findMediaFile: _ => Task.FromResult<ArrMediaFileMatch?>(
+                ++lookups == 1 ? DummyMediaFile : DummyMediaFile with { FileId = 2 }),
+            removeWithoutBlocklist: (_, _) => throw new InvalidOperationException("must preserve the new file"));
+
+        var result = await HealthCheckService.DecideArrLinkedRepairAsync(
+            [client], LibraryPath, DownloadId, CancellationToken.None);
+
+        Assert.Equal(HealthCheckService.ArrLinkedRepairDecision.DeferNoMatchingMediaItem, result.Decision);
+        Assert.Equal(2, lookups);
+    }
+
+    [Fact]
+    public async Task MissingDownloadHistory_ExactImportRecoveryAllowsReplacement()
+    {
+        var client = new ScriptedArrClient(
+            host: "http://recovered-radarr",
+            rootFolders: () => Task.FromResult(new List<ArrRootFolder> { new() { Path = "/media/movies" } }),
+            removeAndBlocklist: (_, id) =>
+            {
+                Assert.Equal(DownloadId, id);
+                return Task.FromResult(ArrRepairOutcome.DownloadHistoryNotFound);
+            },
+            importHistory: (_, _, _) => Task.FromResult(new ArrHistory
+            {
+                TotalRecords = 1,
+                Records = [new ArrHistoryRecord
+                {
+                    DownloadId = DownloadId.ToString(), EventType = 3,
+                    Data = new ArrHistoryData { FileId = "1", ImportedPath = LibraryPath },
+                }],
+            }),
+            removeWithoutBlocklist: (_, _) => Task.FromResult(ArrMissingPayloadCleanupOutcome.RemovedSearchRequested));
+
+        var result = await HealthCheckService.DecideArrLinkedRepairAsync(
+            [client], LibraryPath, null, CancellationToken.None);
+
+        Assert.Equal(HealthCheckService.ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceeded, result.Decision);
+        Assert.Equal(DownloadId, result.RecoveredDownloadId);
+    }
+
+    [Fact]
+    public async Task MissingDownloadHistory_NewReadDuringHistoryLookupDefersFallback()
+    {
+        var held = false;
+        var client = new ScriptedArrClient(
+            host: "http://radarr",
+            rootFolders: () => Task.FromResult(new List<ArrRootFolder> { new() { Path = "/media/movies" } }),
+            removeAndBlocklist: (_, _) =>
+            {
+                held = true;
+                return Task.FromResult(ArrRepairOutcome.DownloadHistoryNotFound);
+            },
+            removeWithoutBlocklist: (_, _) => throw new InvalidOperationException("must preserve the read hold"));
+
+        var result = await HealthCheckService.DecideArrLinkedRepairAsync(
+            [client], LibraryPath, DownloadId, CancellationToken.None,
+            isDestructiveRepairHeld: () => held);
+
+        Assert.Equal(HealthCheckService.ArrLinkedRepairDecision.DeferRecentRead, result.Decision);
     }
 
     [Fact]
@@ -964,7 +1053,8 @@ public class ArrLinkedRepairDecisionTests
         Func<string, Guid, Task<ArrRepairOutcome>> removeAndBlocklist,
         Func<string, Task<ArrMediaFileMatch?>>? findMediaFile = null,
         Func<ArrMediaFileMatch, int, int, Task<ArrHistory>>? importHistory = null,
-        Func<ArrMediaFileMatch, Guid, Task<ArrRepairOutcome>>? removeAndBlocklistMatch = null)
+        Func<ArrMediaFileMatch, Guid, Task<ArrRepairOutcome>>? removeAndBlocklistMatch = null,
+        Func<ArrMediaFileMatch, Func<IReadOnlyList<string>, bool>?, Task<ArrMissingPayloadCleanupOutcome>>? removeWithoutBlocklist = null)
         : ArrClient(host, "test-key")
     {
         public List<Guid> BlocklistDownloadIds { get; } = [];
@@ -984,6 +1074,13 @@ public class ArrLinkedRepairDecisionTests
             CancellationToken ct = default) =>
             importHistory?.Invoke(mediaFile, page, pageSize)
             ?? Task.FromResult(new ArrHistory());
+
+        public override Task<ArrMissingPayloadCleanupOutcome> RemoveMissingPayloadAndSearchAsync(
+            ArrMediaFileMatch match,
+            Func<IReadOnlyList<string>, bool>? shouldRequestSearch = null,
+            CancellationToken ct = default) =>
+            removeWithoutBlocklist?.Invoke(match, shouldRequestSearch)
+            ?? throw new InvalidOperationException("unexpected fallback removal");
 
         public override Task<ArrRepairOutcome> RemoveAndBlocklist(
             string symlinkOrStrmPath,
