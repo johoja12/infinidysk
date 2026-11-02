@@ -103,6 +103,7 @@ public class SonarrClient(string host, string apiKey) : ArrClient(host, apiKey)
 
         try
         {
+            ct.ThrowIfCancellationRequested();
             await ExecuteWithTransientRetryAsync(
                 token => CommandAsync(
                     new { name = "EpisodeSearch", episodeIds = match.MediaIds },
@@ -114,7 +115,10 @@ public class SonarrClient(string host, string apiKey) : ArrClient(host, apiKey)
         {
             return LogMissingPayloadSearchFailure(ex, match.FileId);
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException)
+        {
+            return ArrMissingPayloadCleanupOutcome.RemovedSearchFailed;
+        }
         catch (HttpRequestException ex)
         {
             return LogMissingPayloadSearchFailure(ex, match.FileId);

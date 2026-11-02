@@ -3170,6 +3170,10 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         /// replacement search was withheld by the per-media search budget.
         /// </summary>
         RemoveAndBlocklistSucceededSearchWithheld,
+        /// <summary>The exact file was removed and searched without an original grab to blocklist.</summary>
+        RemoveWithoutBlocklistSucceeded,
+        RemoveWithoutBlocklistSucceededSearchWithheld,
+        MediaRemovedWithoutBlocklistSearchUnconfirmed,
         /// <summary>Arr accepted media removal, but failed-download/blocklist completion is unconfirmed.</summary>
         MediaRemovedBlocklistUnconfirmed,
         /// <summary>Arr confirmed blocklisting, but replacement-search completion is unconfirmed.</summary>
@@ -3189,7 +3193,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         DeferAmbiguousDownloadIdentity,
         /// <summary>
         /// The Arr media item exists and a specific download ID is known, but Arr has no grabbed
-        /// history for that ID. Leave it in place rather than searching again without blocklisting.
+        /// history for that ID, and its legacy identity is not proven enough for replacement.
         /// </summary>
         DeferMissingDownloadHistory,
         /// <summary>
@@ -3269,6 +3273,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         var sawAmbiguousIdentity = false;
         var sawMissingIdentity = false;
         var sawMissingDownloadHistory = false;
+        (ArrClient Client, ArrMediaFileMatch Match)? missingHistoryOwner = null;
         Guid? recoveredDownloadId = null;
         string? recoveryHost = null;
         var recoveredConflict = false;
@@ -3477,6 +3482,10 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             if (repairOutcome == ArrRepairOutcome.DownloadHistoryNotFound)
             {
                 sawMissingDownloadHistory = true;
+                // Only a persisted or exactly recovered download identity permits this fallback.
+                // An unproven legacy candidate must not authorize deleting another release.
+                if (downloadId is not null || effectiveId == recoveredDownloadId)
+                    missingHistoryOwner ??= (arrClient, mediaFile);
                 continue;
             }
         }
@@ -3490,7 +3499,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                 ArrLinkedRepairDecision.DeferUnreachable, recovered, recoveryHost);
         }
 
-        if (sawAmbiguousIdentity)
+        if (sawAmbiguousIdentity || recoveredConflict)
         {
             return new ArrLinkedRepairResult(
                 ArrLinkedRepairDecision.DeferAmbiguousDownloadIdentity, recovered, recoveryHost);
@@ -3500,6 +3509,43 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         {
             return new ArrLinkedRepairResult(
                 ArrLinkedRepairDecision.DeferMissingDownloadIdentity, recovered, recoveryHost);
+        }
+
+        if (missingHistoryOwner is { } owner)
+        {
+            if (isDestructiveRepairHeld?.Invoke() == true)
+                return new ArrLinkedRepairResult(ArrLinkedRepairDecision.DeferRecentRead, recovered, recoveryHost);
+
+            try
+            {
+                var currentMatch = await owner.Client.FindMediaFileAsync(symlinkOrStrmPath, ct).ConfigureAwait(false);
+                if (currentMatch is null || currentMatch.Kind != owner.Match.Kind
+                    || currentMatch.FileId != owner.Match.FileId
+                    || !currentMatch.MediaIds.SequenceEqual(owner.Match.MediaIds))
+                    return new ArrLinkedRepairResult(ArrLinkedRepairDecision.DeferNoMatchingMediaItem, recovered, recoveryHost);
+                if (isDestructiveRepairHeld?.Invoke() == true)
+                    return new ArrLinkedRepairResult(ArrLinkedRepairDecision.DeferRecentRead, recovered, recoveryHost);
+
+                // The same exact-file deletion/search operation used for missing payloads also
+                // recovers damaged imports whose original grabbed event no longer exists.
+                var cleanup = await owner.Client.RemoveMissingPayloadAndSearchAsync(
+                    owner.Match,
+                    shouldRequestSearch is null ? null : identity => shouldRequestSearch(owner.Client, identity),
+                    ct).ConfigureAwait(false);
+                var decision = cleanup switch
+                {
+                    ArrMissingPayloadCleanupOutcome.RemovedSearchRequested => ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceeded,
+                    ArrMissingPayloadCleanupOutcome.RemovedSearchWithheld => ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchWithheld,
+                    ArrMissingPayloadCleanupOutcome.MediaItemNotFound => ArrLinkedRepairDecision.DeferNoMatchingMediaItem,
+                    _ => ArrLinkedRepairDecision.MediaRemovedWithoutBlocklistSearchUnconfirmed,
+                };
+                return new ArrLinkedRepairResult(decision, recovered, recoveryHost, owner.Client.Host, owner.Match);
+            }
+            catch (Exception e) when (e is HttpRequestException or TaskCanceledException or InvalidOperationException)
+            {
+                LogArrRepairFailure(e, "Health-check repair: replacement without blocklisting failed on {Host}", owner.Client.Host);
+                return new ArrLinkedRepairResult(ArrLinkedRepairDecision.DeferUnreachable, recovered, recoveryHost);
+            }
         }
 
         if (sawMissingDownloadHistory)
@@ -4167,7 +4213,8 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             }
 
             if (arrDecision is ArrLinkedRepairDecision.MediaRemovedBlocklistUnconfirmed
-                or ArrLinkedRepairDecision.MediaRemovedBlocklistConfirmedSearchUnconfirmed)
+                or ArrLinkedRepairDecision.MediaRemovedBlocklistConfirmedSearchUnconfirmed
+                or ArrLinkedRepairDecision.MediaRemovedWithoutBlocklistSearchUnconfirmed)
             {
                 await RecordIncompleteArrRepairAsync(
                     davItem,
@@ -4190,8 +4237,14 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             }
 
             if (arrDecision is ArrLinkedRepairDecision.RemoveAndBlocklistSucceeded
-                or ArrLinkedRepairDecision.RemoveAndBlocklistSucceededSearchWithheld)
+                or ArrLinkedRepairDecision.RemoveAndBlocklistSucceededSearchWithheld
+                or ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceeded
+                or ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchWithheld)
             {
+                var blocklistSkipped = arrDecision is ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceeded
+                    or ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchWithheld;
+                var searchWithheld = arrDecision is ArrLinkedRepairDecision.RemoveAndBlocklistSucceededSearchWithheld
+                    or ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceededSearchWithheld;
                 RecordRepairRemoval(linkedPath, DateTimeOffset.UtcNow);
                 if (!ct.IsCancellationRequested)
                 {
@@ -4206,7 +4259,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                 DeletionAuditLog.Record(
                     "health-repair",
                     davItem,
-                    "health validation failed; Arr media removed and original download blocklisted");
+                    blocklistSkipped
+                        ? "health validation failed; Arr media removed; blocklisting skipped because original grab history is missing"
+                        : "health validation failed; Arr media removed and original download blocklisted");
                 if (_regrabService is not null)
                 {
                     // Health repair already performed the Arr replacement; record it through the
@@ -4216,13 +4271,14 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                         linkedPath,
                         arrResult.RepairHost,
                         arrResult.RepairMatch,
-                        arrDecision is ArrLinkedRepairDecision.RemoveAndBlocklistSucceededSearchWithheld,
-                        CancellationToken.None).ConfigureAwait(false);
+                        searchWithheld,
+                        CancellationToken.None,
+                        blocklisted: !blocklistSkipped).ConfigureAwait(false);
                 }
                 RemoveDavItemWithGeneratedSidecars(dbClient, davItem);
                 _failureTracker.ClearFailure(davItem.Id);
                 davItem.UrgentRepairFailures = null;
-                var searchClause = arrDecision is ArrLinkedRepairDecision.RemoveAndBlocklistSucceededSearchWithheld
+                var searchClause = searchWithheld
                     ? "The automatic replacement search was withheld because the per-media search limit was reached."
                     : "Arr was notified to search for a replacement.";
                 await RecordHealthResult(
@@ -4232,7 +4288,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                     string.Join(" ", [
                         "File failed health validation.",
                         $"Corresponding {linkType} found within Library Dir.",
-                        "Removed the Arr media file and blocklisted its original download.",
+                        blocklistSkipped
+                            ? "Removed the Arr media file. Blocklisting was skipped because original grab history is missing."
+                            : "Removed the Arr media file and blocklisted its original download.",
                         searchClause
                     ]), CancellationToken.None).ConfigureAwait(false);
                 return;
@@ -4368,6 +4426,10 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
     {
         var message = decision switch
         {
+            ArrLinkedRepairDecision.MediaRemovedWithoutBlocklistSearchUnconfirmed =>
+                "Arr accepted removal of the media file. Blocklisting was skipped because original grab history " +
+                "is missing, but the replacement search could not be confirmed. The WebDAV item was retained. " +
+                "Review existing searches in Radarr/Sonarr before retrying repair.",
             ArrLinkedRepairDecision.MediaRemovedBlocklistUnconfirmed =>
                 "Arr accepted removal of the media file, but the original download's failed/blocklist " +
                 "state could not be confirmed. InfiniDysk did not request a replacement search. " +

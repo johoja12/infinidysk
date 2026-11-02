@@ -300,19 +300,21 @@ public sealed class ArrRegrabServiceTests : IAsyncLifetime
         Assert.Equal(ArrRegrabStatus.Replaced, (await SingleRowAsync()).Status);
     }
 
-    [Fact]
-    public async Task RecordHealthRepair_ShowsTheSameRequestedState()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RecordHealthRepair_ShowsTheSameRequestedState(bool blocklisted)
     {
         var (item, linkPath, _) = await SeedLibraryItemAsync();
         var service = NewService();
 
         await service.RecordHealthRepairAsync(item, linkPath, _sonarr.Host,
-            new ArrMediaFileMatch(ArrMediaKind.Episode, 7, [301]), searchWithheld: false, CancellationToken.None);
+            new ArrMediaFileMatch(ArrMediaKind.Episode, 7, [301]), searchWithheld: false, CancellationToken.None, blocklisted: blocklisted);
 
         var row = await SingleRowAsync();
         Assert.Equal(ArrRegrabStatus.Requested, row.Status);
         Assert.Equal(ArrRegrabService.SourceHealthRepair, row.Source);
-        Assert.True(row.Blocklisted);
+        Assert.Equal(blocklisted, row.Blocklisted);
         await using var ctx = CreateContext();
         var states = await service.GetActiveByKeysAsync(ctx, [item.Id], [], CancellationToken.None);
         Assert.Equal(ArrRegrabStatus.Requested, states[$"dav:{item.Id:D}"].Status);

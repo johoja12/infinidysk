@@ -81,6 +81,7 @@ public class RadarrClient(string host, string apiKey) : ArrClient(host, apiKey)
 
         try
         {
+            ct.ThrowIfCancellationRequested();
             await ExecuteWithTransientRetryAsync(
                 token => CommandAsync(
                     new { name = "MoviesSearch", movieIds = match.MediaIds },
@@ -92,7 +93,10 @@ public class RadarrClient(string host, string apiKey) : ArrClient(host, apiKey)
         {
             return LogMissingPayloadSearchFailure(ex, match.FileId);
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException)
+        {
+            return ArrMissingPayloadCleanupOutcome.RemovedSearchFailed;
+        }
         catch (HttpRequestException ex)
         {
             return LogMissingPayloadSearchFailure(ex, match.FileId);

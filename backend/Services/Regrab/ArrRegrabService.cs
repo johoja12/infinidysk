@@ -1074,7 +1074,8 @@ public sealed class ArrRegrabService : IDisposable
         string? arrHost,
         ArrMediaFileMatch? match,
         bool searchWithheld,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool blocklisted = true)
     {
         try
         {
@@ -1103,7 +1104,7 @@ public sealed class ArrRegrabService : IDisposable
             }
 
             row.ArrFileRemoved = true;
-            row.Blocklisted = true;
+            row.Blocklisted = blocklisted;
             row.Attempts = 1;
             row.Status = searchWithheld ? ArrRegrabStatus.SearchWithheld : ArrRegrabStatus.Requested;
             row.RequestedAt = now;

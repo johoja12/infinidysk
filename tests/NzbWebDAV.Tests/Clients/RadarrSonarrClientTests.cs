@@ -402,6 +402,61 @@ public class RadarrSonarrClientTests
             await client.RemoveAndBlocklist(filePath, downloadId));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HealthRepair_MissingGrabDeletesExactFileAndSearchesWithoutBlocklisting(bool failSearch)
+    {
+        const string filePath = "/synthetic/movies/imported.mkv";
+        var downloadId = Guid.Parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
+        var handler = CreateHandler(
+            ("GET /api/v3/rootfolder", JsonResponse("""[{"path":"/synthetic/movies"}]""")),
+            ("GET /api/v3/movie", JsonResponse(
+                $"[{{\"id\":111,\"movieFile\":{{\"id\":211,\"path\":\"{filePath}\"}}}}]")),
+            ($"GET /api/v3/history?downloadId={downloadId:D}&eventType=1&page=1&pageSize=1&sortKey=date&sortDirection=descending",
+                JsonResponse("""{"records":[]}""")),
+            ("GET /api/v3/movie/111", JsonResponse(
+                $"{{\"id\":111,\"movieFile\":{{\"id\":211,\"path\":\"{filePath}\"}}}}")),
+            ("DELETE /api/v3/moviefile/211", Status(HttpStatusCode.NoContent)),
+            ("POST /api/v3/command", failSearch ? Status(HttpStatusCode.BadRequest) : JsonResponse("{}")));
+        using var http = new HttpClient(handler);
+        var client = new TestRadarrClient($"http://health-missing-grab-{failSearch}.test", http);
+
+        var result = await NzbWebDAV.Services.HealthCheckService.DecideArrLinkedRepairAsync(
+            [client], filePath, downloadId, CancellationToken.None);
+
+        Assert.Equal(failSearch
+            ? NzbWebDAV.Services.HealthCheckService.ArrLinkedRepairDecision.MediaRemovedWithoutBlocklistSearchUnconfirmed
+            : NzbWebDAV.Services.HealthCheckService.ArrLinkedRepairDecision.RemoveWithoutBlocklistSucceeded,
+            result.Decision);
+        Assert.Single(handler.Requests, r => r == "DELETE /api/v3/moviefile/211");
+        Assert.Single(handler.Requests, r => r == "POST /api/v3/command");
+        Assert.DoesNotContain(handler.Requests, r => r.StartsWith("POST /api/v3/history/failed/", StringComparison.Ordinal));
+        using var command = JsonDocument.Parse(Assert.Single(handler.Bodies));
+        Assert.Equal("MoviesSearch", command.RootElement.GetProperty("name").GetString());
+        Assert.Equal(111, command.RootElement.GetProperty("movieIds")[0].GetInt32());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ReplacementWithoutBlocklist_CancelledAfterDeletePreservesRemoval(bool sonarr)
+    {
+        using var cancellation = new CancellationTokenSource();
+        var handler = new CancellingResponseHandler(cancellation);
+        using var http = new HttpClient(handler);
+        ArrClient client = sonarr
+            ? new TestSonarrClient("http://cancelled-unblocklisted-sonarr.test", http)
+            : new TestRadarrClient("http://cancelled-unblocklisted-radarr.test", http);
+        var match = new ArrMediaFileMatch(sonarr ? ArrMediaKind.Episode : ArrMediaKind.Movie, 211, [111]);
+
+        var outcome = await client.RemoveMissingPayloadAndSearchAsync(match, ct: cancellation.Token);
+
+        Assert.Equal(ArrMissingPayloadCleanupOutcome.RemovedSearchFailed, outcome);
+        Assert.Single(handler.Requests);
+        Assert.StartsWith("DELETE ", handler.Requests[0], StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task RadarrMissingPayloadCleanup_DeletesAndSearchesWithoutBlocklisting()
     {
