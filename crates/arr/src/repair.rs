@@ -362,7 +362,8 @@ pub async fn all_imports(http: &reqwest::Client, arr: &Arr) -> Result<Vec<Import
 /// Gets `owner` a replacement for download `job`: blocklist the release, give the Arr's
 /// own search `wait` to queue one, else delete our file and search. With no download
 /// known there is nothing to blocklist, so it deletes and searches at once. Returns at
-/// once if a replacement is already imported or queued.
+/// once if a replacement is already imported or queued. A missing grab skips the
+/// automatic-search wait because no blocklist request could start that search.
 pub async fn replace(
     http: &reqwest::Client,
     arr: &Arr,
@@ -384,19 +385,20 @@ pub async fn replace(
         if let Some(grab) = grabbed.records.first() {
             send(call(Method::POST, format!("history/failed/{}", grab.id)).json(&json!({})))
                 .await?;
+            // Only a successful blocklist request can trigger the Arr's own search.
+            let deadline = tokio::time::Instant::now() + wait;
+            while tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(QUEUE_POLL.min(deadline - tokio::time::Instant::now())).await;
+                if replacing(http, arr, Some(job), owner).await? {
+                    return Ok(());
+                }
+            }
         } else {
             tracing::warn!(
                 arr = %arr.name,
                 reason = "no grab in its history",
-                "could not blocklist the broken release"
+                "could not blocklist the broken release; removing the file and searching"
             );
-        }
-        let deadline = tokio::time::Instant::now() + wait;
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(QUEUE_POLL.min(deadline - tokio::time::Instant::now())).await;
-            if replacing(http, arr, Some(job), owner).await? {
-                return Ok(());
-            }
         }
     }
     let (kind, search) = match &owner.media {
