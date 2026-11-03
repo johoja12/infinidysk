@@ -77,6 +77,7 @@ infinidysk-db = { path = "crates/db" }
 infinidysk-fuse = { path = "crates/fuse" }
 infinidysk-health = { path = "crates/health" }
 infinidysk-import = { path = "crates/import" }
+infinidysk-plex = { path = "crates/plex" }
 infinidysk-nntp = { path = "crates/nntp" }
 infinidysk-native-cache = { path = "crates/native-cache" }
 infinidysk-par2 = { path = "crates/par2" }

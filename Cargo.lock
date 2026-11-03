@@ -1148,6 +1148,7 @@ dependencies = [
  "infinidysk-import",
  "infinidysk-native-cache",
  "infinidysk-nntp",
+ "infinidysk-plex",
  "infinidysk-queue",
  "infinidysk-stream",
  "infinidysk-testkit",
@@ -1361,6 +1362,23 @@ version = "0.0.0"
 dependencies = [
  "infinidysk-yenc",
  "md-5",
+]
+
+[[package]]
+name = "infinidysk-plex"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "percent-encoding",
+ "quick-xml",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]
