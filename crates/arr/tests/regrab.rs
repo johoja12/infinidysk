@@ -90,6 +90,7 @@ async fn handler(State(s): State<Arc<Data>>, request: Request) -> Response {
         .into_response();
     }
     Json(match p {
+        "/api/v3/rootfolder"=>if mode==4 {json!([{ "path":"/elsewhere" }])}else if mode==5 {json!([{ "path":"/library/../outside" }])}else if mode==6 {json!([{ "path":"/lib" }])}else if mode==7 {json!([{ "path":"/" }])}else{json!([{ "path":"/library" }])},
         "/api/v3/moviefile/7"=>json!({"id":7,"movieId":3,"path":"/library/file.mkv"}),
         "/api/v3/movie/3"=>json!({"movieFile":if s.replaced.load(Ordering::SeqCst)>0 {json!({"id":8,"path":"/library/replacement.mkv"})}else if s.deleted.load(Ordering::SeqCst)>0 {Value::Null}else{json!({"id":7,"path":"/library/file.mkv"})}}),
         "/api/v3/queue/details"=>json!([]),
@@ -187,4 +188,18 @@ async fn replaced_target_and_failed_checkpoint_cannot_delete_a_file() {
     run(&f, &mut p, &recorder()).await.unwrap();
     assert_eq!(p.stage, RegrabStage::Replaced);
     assert_eq!(f.count("DELETE"), 0);
+}
+
+#[tokio::test]
+async fn current_library_authority_is_required_before_any_mutation() {
+    for mode in [4, 5, 6, 7] {
+        let f = Fixture::new().await;
+        let mut p = progress(&f).await;
+        f.state.mode.store(mode, Ordering::SeqCst);
+        let saved = recorder();
+        assert!(run(&f, &mut p, &saved).await.is_err());
+        assert_eq!(f.count("DELETE"), 0);
+        assert_eq!(f.count("POST"), 0);
+        assert_eq!(p.stage, RegrabStage::Prepared);
+    }
 }

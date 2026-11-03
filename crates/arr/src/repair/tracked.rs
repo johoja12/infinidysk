@@ -143,6 +143,64 @@ async fn target(http: &reqwest::Client, arr: &Arr, owner: &Owner) -> Result<Targ
         Some(_) => Ok(Target::Same),
     }
 }
+/// Arr owns the filesystem operation. Require its current root-folder authority
+/// before dispatch; display/catalogue filename matches never authorize mutation.
+async fn library_authority(http: &reqwest::Client, arr: &Arr, owner: &Owner) -> Result<(), Error> {
+    fn normalized(path: &str) -> Option<String> {
+        if path.len() > 4096 || path.chars().any(char::is_control) {
+            return None;
+        }
+        let path = path.replace('\\', "/");
+        let drive =
+            path.as_bytes().get(1) == Some(&b':') && path.as_bytes()[0].is_ascii_alphabetic();
+        if !(path.starts_with('/') || drive && path.as_bytes().get(2) == Some(&b'/')) {
+            return None;
+        }
+        if path.split('/').any(|p| p == "." || p == "..") {
+            return None;
+        }
+        Some(if drive {
+            path.to_ascii_lowercase()
+        } else {
+            path
+        })
+    }
+    let path = normalized(
+        owner
+            .current
+            .as_ref()
+            .map_or(owner.imported_path.as_str(), |f| f.path.as_str()),
+    )
+    .ok_or(Error::Unexpected(
+        "regrab path is not normalized and absolute",
+    ))?;
+    let roots: Vec<Value> = fetch(call(http, arr, Method::GET, "rootfolder")).await?;
+    if roots.len() > 1000 {
+        return Err(Error::Unexpected("Arr root-folder list exceeds its bound"));
+    }
+    let mut allowed = false;
+    for root in roots {
+        let root = root
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(normalized)
+            .ok_or(Error::Unexpected("Arr returned an invalid library root"))?;
+        let root = root.trim_end_matches('/');
+        if root.len() > 1
+            && path
+                .strip_prefix(root)
+                .is_some_and(|tail| tail.starts_with('/'))
+        {
+            allowed = true;
+        }
+    }
+    if !allowed {
+        return Err(Error::Unexpected(
+            "regrab path is outside the current Arr library roots",
+        ));
+    }
+    Ok(())
+}
 async fn save<F, Fut>(current: &mut Regrab, next: Regrab, checkpoint: &F) -> Result<(), Error>
 where
     F: Fn(Regrab) -> Fut,
@@ -253,6 +311,9 @@ where
             "deleted target reappeared; review before further mutation",
         ));
     }
+    if progress.stage == RegrabStage::Prepared {
+        library_authority(http, arr, &progress.owner).await?;
+    }
     if replacing(http, arr, progress.owner.download_id(), &progress.owner).await? {
         let mut next = progress.clone();
         next.stage = RegrabStage::Submitted;
@@ -304,6 +365,7 @@ where
                 next.stage = RegrabStage::BlocklistPending;
                 next.wait_until =
                     now().saturating_add(wait.as_millis().try_into().unwrap_or(i64::MAX));
+                library_authority(http, arr, &progress.owner).await?;
                 save(progress, next, &checkpoint).await?;
                 send(
                     call(
@@ -351,6 +413,9 @@ where
         } else {
             RegrabStage::DeletePending
         };
+        if next.stage == RegrabStage::DeletePending {
+            library_authority(http, arr, &progress.owner).await?;
+        }
         save(progress, next, &checkpoint).await?;
         if progress.stage == RegrabStage::DeletePending {
             let file = progress
@@ -421,6 +486,7 @@ where
         let mut next = progress.clone();
         next.stage = RegrabStage::SearchPending;
         next.before_command = before;
+        library_authority(http, arr, &progress.owner).await?;
         save(progress, next, &checkpoint).await?;
         // A 2xx body may be malformed after the command was accepted. Keep SearchPending
         // in that case and reconcile by command id/arguments on the next pass.
@@ -439,6 +505,57 @@ where
         next.stage = RegrabStage::Submitted;
         next.command = Some(id);
         save(progress, next, &checkpoint).await?;
+    }
+    Ok(())
+}
+
+/// Advances only facts established by GETs. It never dispatches a mutation.
+pub async fn observe_tracked(
+    http: &reqwest::Client,
+    arr: &Arr,
+    progress: &mut Regrab,
+) -> Result<(), Error> {
+    if progress.version != 1 {
+        return Err(Error::Unexpected("unsupported regrab journal version"));
+    }
+    let current = target(http, arr, &progress.owner).await?;
+    if current == Target::Replaced {
+        progress.stage = RegrabStage::Replaced;
+        return Ok(());
+    }
+    match progress.stage {
+        RegrabStage::DeletePending if current == Target::Gone => {
+            progress.stage = RegrabStage::Deleted;
+        }
+        RegrabStage::SearchPending => {
+            if let Some(command) = commands(http, arr).await?.iter().find(|v| {
+                v.get("id")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|id| id > progress.before_command)
+                    && matches_command(v, &search(&progress.owner))
+            }) {
+                progress.stage = RegrabStage::Submitted;
+                progress.command = command.get("id").and_then(Value::as_i64);
+            }
+        }
+        RegrabStage::BlocklistPending => {
+            if let Some(job) = progress.owner.download_id() {
+                let failed: Page = fetch(call(http, arr, Method::GET, "history").query(&[
+                    ("downloadId", job),
+                    ("eventType", "4"),
+                    ("pageSize", "1"),
+                ]))
+                .await?;
+                if failed.records.iter().any(|r| {
+                    r.download_id
+                        .as_deref()
+                        .is_some_and(|id| id.eq_ignore_ascii_case(job))
+                }) {
+                    progress.stage = RegrabStage::Blocklisted;
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
 }

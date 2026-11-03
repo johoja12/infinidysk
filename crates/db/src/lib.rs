@@ -1412,6 +1412,62 @@ impl Db {
                 == 1,
         )
     }
+    /// Oldest-observed intents first. The detached observer checkpoints every result,
+    /// including failures, so an unavailable Arr cannot starve later records.
+    pub async fn regrab_intents(
+        &self,
+        before: i64,
+        terminal: bool,
+        limit: u32,
+    ) -> Result<Vec<(ItemId, RegrabIntent)>, Error> {
+        let sql = "SELECT item_id,scope,payload,revision,created_at,updated_at,terminal FROM regrab_intents WHERE updated_at<=$1 AND ($2 OR terminal=0) ORDER BY updated_at,item_id LIMIT $3";
+        let rows: Vec<(Uuid, String, String, i64, i64, i64, i16)> = on!(self,pool=>sqlx::query_as(sql).bind(before).bind(terminal).bind(i64::from(limit.clamp(1,100))).fetch_all(pool).await?);
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, scope, payload, revision, created_at, updated_at, terminal)| {
+                    (
+                        ItemId(id),
+                        RegrabIntent {
+                            scope,
+                            payload,
+                            revision,
+                            created_at,
+                            updated_at,
+                            terminal: terminal != 0,
+                        },
+                    )
+                },
+            )
+            .collect())
+    }
+    pub async fn regrab_page(
+        &self,
+        before: i64,
+        after: ItemId,
+        limit: u32,
+    ) -> Result<Vec<(ItemId, RegrabIntent)>, Error> {
+        let sql = "SELECT item_id,scope,payload,revision,created_at,updated_at,terminal FROM regrab_intents WHERE updated_at<$1 OR (updated_at=$1 AND item_id>$2) ORDER BY updated_at DESC,item_id LIMIT $3";
+        let rows: Vec<(Uuid, String, String, i64, i64, i64, i16)> = on!(self,pool=>sqlx::query_as(sql).bind(before).bind(after.0).bind(i64::from(limit.clamp(1,100))).fetch_all(pool).await?);
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, scope, payload, revision, created_at, updated_at, terminal)| {
+                    (
+                        ItemId(id),
+                        RegrabIntent {
+                            scope,
+                            payload,
+                            revision,
+                            created_at,
+                            updated_at,
+                            terminal: terminal != 0,
+                        },
+                    )
+                },
+            )
+            .collect())
+    }
     pub async fn prune_regrab_intents(&self, before: i64) -> Result<(), Error> {
         on!(self,pool=>sqlx::query("DELETE FROM regrab_intents WHERE terminal=1 AND updated_at<$1").bind(before).execute(pool).await?.rows_affected());
         Ok(())

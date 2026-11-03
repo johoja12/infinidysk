@@ -397,6 +397,10 @@ pub async fn serve(
             });
         }
     }));
+    let regrab_observer_task = {
+        let health = Arc::clone(&health);
+        tokio::spawn(async move { health.run_regrab_observer().await })
+    };
     let health_task = {
         let health = Arc::clone(&health);
         tokio::spawn(async move { health.run().await })
@@ -722,6 +726,7 @@ pub async fn serve(
     cancel.cancel();
     worker.abort();
     health_task.abort();
+    regrab_observer_task.abort();
     prefetch_task.abort();
     predictions_task.abort();
     library_metadata_task.abort();

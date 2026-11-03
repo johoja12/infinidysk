@@ -265,6 +265,22 @@ async fn serves_every_api_on_one_port_and_applies_settings_live() {
         "an unknown intent is explicit, not fabricated"
     );
 
+    assert!(spec["paths"]["/api/v1/health/regrabs"]["get"].is_object());
+    assert!(spec["paths"]["/api/v1/health/regrabs/{id}"]["post"].is_object());
+    let request = admin_request("POST", &regrab, r#"{"revision":0,"operation":"abandon"}"#);
+    assert_eq!(status(addr, &request).await, "HTTP/1.1 409 Conflict");
+    let anonymous_control = request.replace("X-Api-Key: adminkey\r\n", "");
+    assert_eq!(
+        status(addr, &anonymous_control).await,
+        "HTTP/1.1 401 Unauthorized"
+    );
+    let (code, body) = send(addr, &admin_request("GET", "/api/v1/health/regrabs", "")).await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap(),
+        json!({"entries":[],"next":null})
+    );
+
     let anonymous = "GET /api/v1/settings HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
     assert_eq!(status(addr, anonymous).await, "HTTP/1.1 401 Unauthorized");
 

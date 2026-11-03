@@ -378,6 +378,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/health/regrabs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["regrab_list"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health/regrabs/{id}": {
         parameters: {
             query?: never;
@@ -387,7 +403,7 @@ export interface paths {
         };
         get: operations["regrab_status"];
         put?: never;
-        post?: never;
+        post: operations["regrab_control"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3704,7 +3720,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a3ad-52ca-760e-a7e2-8ba82a614203
+             * @default 01a1a3c1-dd4b-7361-83ae-59f68061d695
              */
             id: string;
             /**
@@ -4008,7 +4024,25 @@ export interface components {
              */
             since?: number | null;
         };
+        RegrabControl: {
+            operation: components["schemas"]["RegrabOperation"];
+            /** Format: int64 */
+            revision: number;
+        };
+        RegrabCursor: {
+            /** Format: uuid */
+            after: string;
+            /** Format: int64 */
+            before: number;
+        };
+        /** @enum {string} */
+        RegrabOperation: "observe" | "abandon" | "resume";
+        RegrabPage: {
+            entries: components["schemas"]["RegrabStatus"][];
+            next?: components["schemas"]["RegrabCursor"] | null;
+        };
         RegrabStatus: {
+            abandoned: boolean;
             arr_id: string;
             /** Format: int64 */
             command_id?: number | null;
@@ -4016,6 +4050,9 @@ export interface components {
             created_at: number;
             /** Format: uuid */
             item: string;
+            observation?: string | null;
+            /** Format: int64 */
+            observed_at?: number | null;
             /** Format: int64 */
             revision: number;
             stage: string;
@@ -5375,6 +5412,28 @@ export interface operations {
             };
         };
     };
+    regrab_list: {
+        parameters: {
+            query?: {
+                before?: number;
+                after?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RegrabPage"];
+                };
+            };
+        };
+    };
     regrab_status: {
         parameters: {
             query?: never;
@@ -5385,6 +5444,31 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RegrabStatus"] | null;
+                };
+            };
+        };
+    };
+    regrab_control: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegrabControl"];
+            };
+        };
         responses: {
             200: {
                 headers: {

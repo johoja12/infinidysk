@@ -18,6 +18,30 @@ pub(super) struct Saved {
     pub arr_id: String,
     pub job_name: String,
     pub progress: Regrab,
+    #[serde(default)]
+    pub arr_scope: Option<String>,
+    #[serde(default)]
+    pub abandoned: bool,
+    #[serde(default)]
+    pub reviewed_at: i64,
+    #[serde(default)]
+    pub observed_at: Option<i64>,
+    #[serde(default)]
+    pub observation: Option<String>,
+}
+fn arr_scope(arr: &Arr) -> String {
+    let input = format!(
+        "{}\0{}\0{:?}",
+        arr.id,
+        arr.url.trim_end_matches('/'),
+        arr.profile
+    );
+    Sha256::digest(input)
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            write!(s, "{b:02x}").expect("formatting into String cannot fail");
+            s
+        })
 }
 pub(super) async fn scope(db: &Db, item: &Item, arr: &Arr) -> Result<String, Error> {
     let id = item
@@ -43,7 +67,182 @@ pub(super) async fn scope(db: &Db, item: &Item, arr: &Arr) -> Result<String, Err
             s
         }))
 }
+/// Resume keeps the last durable mutation checkpoint. It never resets an uncertain
+/// operation to Prepared or dispatches a replacement command by itself.
+#[derive(Clone, Copy, Debug)]
+pub enum Control {
+    Observe,
+    Abandon,
+    Resume,
+}
 impl Health {
+    pub async fn run_regrab_observer(&self) {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if let Err(error) = self
+                .observe_regrabs(infinidysk_db::now_ms() - 5 * super::MINUTE_MS, 3)
+                .await
+            {
+                tracing::warn!(reason=%error,"regrab observation deferred");
+            }
+        }
+    }
+    /// Observation is independent of source lifetime and performs no external writes.
+    pub async fn observe_regrabs(&self, before: i64, limit: u32) -> Result<u32, Error> {
+        let rows = self.db.regrab_intents(before, false, limit).await?;
+        let mut observed = 0;
+        for (id, row) in rows {
+            let Ok(mut saved) = serde_json::from_str::<Saved>(&row.payload) else {
+                self.db
+                    .checkpoint_regrab(id, &row.scope, row.revision, &row.payload, false)
+                    .await?;
+                tracing::warn!(item=%id,reason="journal unreadable; original retained","regrab observation deferred");
+                continue;
+            };
+            if saved.abandoned || saved.progress.version != 1 {
+                self.db
+                    .checkpoint_regrab(id, &row.scope, row.revision, &row.payload, row.terminal)
+                    .await?;
+                continue;
+            }
+            let result = self.observe_saved(id, &row, &mut saved).await;
+            saved.observed_at = Some(infinidysk_db::now_ms());
+            saved.observation = Some(
+                match result {
+                    Ok(true) => {
+                        saved.progress.stage = RegrabStage::Replaced;
+                        "replacement observed"
+                    }
+                    Ok(false) => "replacement not yet observed",
+                    Err(_) => "source or Arr could not be verified; observation will retry",
+                }
+                .into(),
+            );
+            observed += u32::from(
+                self.db
+                    .checkpoint_regrab(
+                        id,
+                        &row.scope,
+                        row.revision,
+                        &serde_json::to_string(&saved)?,
+                        saved.progress.terminal(),
+                    )
+                    .await?,
+            );
+        }
+        Ok(observed)
+    }
+    async fn observe_saved(
+        &self,
+        id: infinidysk_core::ItemId,
+        row: &RegrabIntent,
+        saved: &mut Saved,
+    ) -> Result<bool, Error> {
+        let configured = self
+            .arr
+            .borrow()
+            .iter()
+            .find(|a| a.id.to_string() == saved.arr_id)
+            .cloned()
+            .ok_or(Error::Regrab("Arr is no longer configured"))?;
+        let expected = arr_scope(&configured);
+        if let Some(item) = self.db.item(id).await? {
+            if scope(&self.db, &item, &configured).await? != row.scope {
+                return Err(Error::Regrab("source identity changed"));
+            }
+        } else if saved.arr_scope.as_deref() != Some(expected.as_str()) {
+            return Err(Error::Regrab(
+                "removed source lacks verified Arr configuration provenance",
+            ));
+        }
+        if saved.arr_scope.as_ref().is_some_and(|s| s != &expected) {
+            return Err(Error::Regrab("Arr identity changed"));
+        }
+        saved.arr_scope = Some(expected);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            arr::observe_tracked(&self.http, &configured, &mut saved.progress),
+        )
+        .await
+        .map_err(|_| Error::Regrab("Arr observation timed out"))?
+        .map_err(|_| Error::Regrab("Arr observation unavailable"))?;
+        Ok(saved.progress.terminal())
+    }
+    pub async fn control_regrab(
+        &self,
+        id: infinidysk_core::ItemId,
+        revision: i64,
+        control: Control,
+    ) -> Result<bool, Error> {
+        let Some(row) = self.db.regrab_intent(id).await? else {
+            return Ok(false);
+        };
+        if row.revision != revision {
+            return Ok(false);
+        }
+        let mut saved: Saved = serde_json::from_str(&row.payload)?;
+        if saved.progress.version != 1 {
+            return Err(Error::Regrab("unsupported regrab journal version"));
+        }
+        if matches!(control, Control::Resume) {
+            let item = self.db.item(id).await?.ok_or(Error::Regrab(
+                "removed sources support observation or abandon only",
+            ))?;
+            let configured = self
+                .arr
+                .borrow()
+                .iter()
+                .find(|a| a.id.to_string() == saved.arr_id)
+                .cloned()
+                .ok_or(Error::Regrab("Arr is no longer configured"))?;
+            if scope(&self.db, &item, &configured).await? != row.scope || saved.progress.terminal()
+            {
+                return Err(Error::Regrab("source or Arr identity changed"));
+            }
+            saved.abandoned = false;
+            saved.reviewed_at = infinidysk_db::now_ms();
+        } else if matches!(control, Control::Abandon) {
+            if saved.progress.terminal() {
+                return Err(Error::Regrab("completed replacement cannot be abandoned"));
+            }
+            saved.abandoned = true;
+            saved.observation =
+                Some("abandoned by administrator; external actions are not undone".into());
+        } else {
+            let replaced = self.observe_saved(id, &row, &mut saved).await?;
+            saved.observed_at = Some(infinidysk_db::now_ms());
+            if replaced {
+                saved.progress.stage = RegrabStage::Replaced;
+            }
+            saved.observation = Some(
+                if replaced {
+                    "replacement observed"
+                } else {
+                    "replacement not yet observed"
+                }
+                .into(),
+            );
+        }
+        if !self
+            .db
+            .checkpoint_regrab(
+                id,
+                &row.scope,
+                revision,
+                &serde_json::to_string(&saved)?,
+                saved.abandoned || saved.progress.terminal(),
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        if matches!(control, Control::Resume) {
+            self.request_repair(id).await?;
+        }
+        Ok(true)
+    }
     pub(super) async fn tracked_regrab(
         &self,
         item: &Item,
@@ -57,6 +256,11 @@ impl Health {
             arr_id: arr.id.to_string(),
             job_name: job_name.to_owned(),
             progress: Regrab::new(owner),
+            arr_scope: Some(arr_scope(arr)),
+            abandoned: false,
+            reviewed_at: 0,
+            observed_at: None,
+            observation: None,
         };
         let row = match existing {
             Some(row) => row,
@@ -72,7 +276,13 @@ impl Health {
             )));
         }
         let mut saved: Saved = serde_json::from_str(&row.payload)?;
-        if infinidysk_db::now_ms().saturating_sub(row.created_at) > super::DAY_MS
+        if saved.abandoned {
+            return Ok(Err(arr::Error::Unexpected(
+                "regrab was abandoned; resume it explicitly",
+            )));
+        }
+        if infinidysk_db::now_ms().saturating_sub(row.created_at.max(saved.reviewed_at))
+            > super::DAY_MS
             && matches!(
                 saved.progress.stage,
                 RegrabStage::BlocklistPending
@@ -89,6 +299,8 @@ impl Health {
         let id = item.id;
         let arr_id = saved.arr_id.clone();
         let name = saved.job_name.clone();
+        let bound_arr = arr_scope(arr);
+        let reviewed_at = saved.reviewed_at;
         let configuration = self.arr.clone();
         let readers = &self.in_use;
         let checkpoint = move |progress: Regrab| {
@@ -99,6 +311,7 @@ impl Health {
                 arr_id.clone(),
                 name.clone(),
             );
+            let bound_arr = bound_arr.clone();
             let configuration = configuration.clone();
             async move {
                 if matches!(
@@ -133,6 +346,11 @@ impl Health {
                     arr_id,
                     job_name,
                     progress,
+                    arr_scope: Some(bound_arr),
+                    abandoned: false,
+                    reviewed_at,
+                    observed_at: None,
+                    observation: None,
                 })
                 .map_err(|_| arr::Error::Checkpoint)?;
                 let revision = version.load(Ordering::Acquire);
@@ -236,6 +454,7 @@ mod tests {
     struct Remote {
         deletes: AtomicUsize,
         searches: AtomicUsize,
+        replaced: AtomicUsize,
     }
     async fn handle(State(s): State<Arc<Remote>>, req: Request) -> Response {
         let path = req.uri().path();
@@ -252,8 +471,9 @@ mod tests {
             return StatusCode::NOT_FOUND.into_response();
         }
         Json(match path {
+            "/api/v3/rootfolder"=>serde_json::json!([{ "path":"/fixture" }]),
             "/api/v3/moviefile/7"=>serde_json::json!({"id":7,"movieId":3,"path":"/fixture/file.mkv"}),
-            "/api/v3/movie/3"=>serde_json::json!({"movieFile":if s.deletes.load(Ordering::SeqCst)>0 {serde_json::Value::Null}else{serde_json::json!({"id":7,"path":"/fixture/file.mkv"})}}),
+            "/api/v3/movie/3"=>serde_json::json!({"movieFile":if s.replaced.load(Ordering::SeqCst)>0 {serde_json::json!({"id":8,"path":"/fixture/replacement.mkv"})}else if s.deletes.load(Ordering::SeqCst)>0 {serde_json::Value::Null}else{serde_json::json!({"id":7,"path":"/fixture/file.mkv"})}}),
             "/api/v3/history"=>serde_json::json!({"records":[],"totalRecords":0}),
             "/api/v3/queue/details"=>serde_json::json!([]),
             "/api/v3/command"=>if s.searches.load(Ordering::SeqCst)>0 {serde_json::json!([{"id":11,"body":{"name":"MoviesSearch","movieIds":[3]}}])}else{serde_json::json!([])},
@@ -313,7 +533,7 @@ mod tests {
         db.record_owner(arr.id, item.id, Some(7), "/fixture/file.mkv", None)
             .await
             .unwrap();
-        let (_tx, arrs) = watch::channel(vec![arr]);
+        let (arr_tx, arrs) = watch::channel(vec![arr]);
         let (_tx, settings) = watch::channel(super::super::Settings::default());
         let client = Arc::new(infinidysk_nntp::Client::new(
             Vec::<infinidysk_nntp::Provider>::new(),
@@ -342,7 +562,7 @@ mod tests {
         drop(health);
         db.close().await;
         let db = Db::connect(&url).await.unwrap();
-        let health = Health::new(db.clone(), client, arrs, settings)
+        let health = Health::new(db.clone(), client, arrs.clone(), settings)
             .unwrap()
             .with_arr_wait(std::time::Duration::ZERO);
         for _ in 0..2 {
@@ -367,6 +587,63 @@ mod tests {
             .progress
             .stage,
             RegrabStage::Submitted
+        );
+        let row = db.regrab_intent(item.id).await.unwrap().unwrap();
+        assert!(
+            !health
+                .control_regrab(item.id, row.revision - 1, Control::Abandon)
+                .await
+                .unwrap()
+        );
+        assert!(
+            health
+                .control_regrab(item.id, row.revision, Control::Abandon)
+                .await
+                .unwrap()
+        );
+        let row = db.regrab_intent(item.id).await.unwrap().unwrap();
+        assert!(row.terminal);
+        assert!(
+            serde_json::from_str::<Saved>(&row.payload)
+                .unwrap()
+                .abandoned
+        );
+        assert_eq!(health.observe_regrabs(i64::MAX, 10).await.unwrap(), 0);
+        assert!(
+            health
+                .control_regrab(item.id, row.revision, Control::Resume)
+                .await
+                .unwrap()
+        );
+        let row = db.regrab_intent(item.id).await.unwrap().unwrap();
+        assert!(!row.terminal);
+        assert_eq!(
+            serde_json::from_str::<Saved>(&row.payload)
+                .unwrap()
+                .progress
+                .stage,
+            RegrabStage::Submitted
+        );
+        db.delete_item(item.id).await.unwrap();
+        let configured = arrs.borrow().clone();
+        arr_tx.send(vec![]).unwrap();
+        assert_eq!(health.observe_regrabs(i64::MAX, 10).await.unwrap(), 1);
+        assert!(!db.regrab_intent(item.id).await.unwrap().unwrap().terminal);
+        arr_tx.send(configured).unwrap();
+        remote.replaced.store(1, Ordering::SeqCst);
+        assert_eq!(health.observe_regrabs(i64::MAX, 10).await.unwrap(), 1);
+        let row = db.regrab_intent(item.id).await.unwrap().unwrap();
+        assert!(row.terminal);
+        let saved: Saved = serde_json::from_str(&row.payload).unwrap();
+        assert_eq!(saved.progress.stage, RegrabStage::Replaced);
+        assert!(saved.observed_at.is_some());
+        assert_eq!(remote.deletes.load(Ordering::SeqCst), 1);
+        assert_eq!(remote.searches.load(Ordering::SeqCst), 1);
+        assert!(
+            health
+                .control_regrab(item.id, row.revision, Control::Resume)
+                .await
+                .is_err()
         );
         task.abort();
         drop(health);

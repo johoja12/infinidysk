@@ -92,6 +92,26 @@ async fn exercise(db: &Db) {
             .payload,
         "delete-pending"
     );
+    let page = db
+        .regrab_page(i64::MAX, ItemId(uuid::Uuid::nil()), 1)
+        .await
+        .expect("journal page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].0, file.id);
+    assert_eq!(page[0].1.revision, 1);
+    assert_eq!(
+        db.regrab_page(page[0].1.updated_at, page[0].0, 1)
+            .await
+            .expect("next journal page"),
+        []
+    );
+    assert_eq!(
+        db.regrab_intents(i64::MAX, false, 10)
+            .await
+            .expect("observer schedule")
+            .len(),
+        1
+    );
     let now = infinidysk_db::now_ms();
     let held = HealthStatus {
         state: HealthState::Repairing,

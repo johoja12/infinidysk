@@ -213,6 +213,7 @@ async fn sonarr(State(state): State<Log>, req: Request) -> Json<Value> {
     }
     let replaced = state.1.load(Ordering::Relaxed);
     Json(match req.uri().path() {
+        "/api/v3/rootfolder" => json!([{ "path":"/tv" }]),
         "/api/v3/history" if event => json!({ "records": [{
             "id": 21, "episodeId": 5,
             "data": { "droppedPath": "/data/strm/tv/job/job.strm", "importedPath": "/tv/Show/a.strm" },
@@ -683,6 +684,7 @@ async fn other_arr(State(log): State<Log>, req: Request) -> axum::response::Resp
         return axum::http::StatusCode::NOT_FOUND.into_response();
     }
     Json(match path {
+        "/rootfolder" => json!([{ "path":"/music" },{ "path":"/movies" }]),
         "/system/status" => json!({ "appName": "Whisparr", "version": "3.0.0.1" }),
         "/history" if query.contains("eventType=3") && lidarr => json!({ "records": [{
             "id": 22, "trackId": 31, "albumId": 9,

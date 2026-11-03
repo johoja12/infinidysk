@@ -4,6 +4,7 @@
 
 mod check;
 mod regrab;
+pub use regrab::Control as RegrabControl;
 mod structure;
 
 use std::collections::HashMap;
