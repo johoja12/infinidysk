@@ -12,7 +12,8 @@ completed-pointer removal, and a first shared final-media cache implementation a
 Rust. Cache settings and basic browsing/pinning/eviction are wired into the UI. The
 full fork port is **not complete**. Plex connections and viewer-safe transport are now implemented; Smart Prefetch,
 library catalogue parity, PAR2 execution, legacy migration adapters and several repair
-scheduler behaviors are still pending. The draft must not be treated as a cutover.
+scheduler behaviors are still pending. A durable manual warming lane is implemented;
+automatic Plex planning and the full warming governor are not yet connected. The draft must not be treated as a cutover.
 
 The 1.x source and production deployment remain unchanged. Port behavior into the
 Rust architecture; do not copy C# storage formats or add a second cache in front of
@@ -33,7 +34,7 @@ acceptance gates below pass.
 | R01 | P0 | Replace an exactly identified damaged import even when its original grab is absent (`ArrClient`, `RadarrClient`, `HealthCheckService`; fork PR #230) | `crates/arr/src/repair.rs` already deletes/searches without a grab, but unnecessarily waits for an automatic search it never triggered. Skip that wait and retain replacement/error guards. | First port implemented; validation recorded below |
 | R02 | P0 | Recover the original download from exact file ID + imported path; reject ambiguity and incomplete history (`ArrDownloadIdResolver`, fork PR #234) | `repair.rs::owner_of_file` and Arr owner backfill exist. Add scoped, fully paginated Radarr history using **`movieIds`**, verify current identity, and carry recovered identity into blocklisting. Do not use a migration job ID as original provenance. Sonarr filtering stays profile-specific. | Implemented; exact scoped/paginated recovery with ambiguity guards |
 | R03 | P0 | Protect live/overlapping reads, but bypass recent-read delay for confirmed damage after readers close (`ConcurrentReadTracker`, fork PR #232) | `health::Health::with_in_use` and VFS read handles exist. Prove FUSE/WebDAV/STRM accounting, cancellation cleanup, and no destructive repair while any reader remains. | Implemented reader-held repair persistence and last-close wakeup; regression validation below |
-| R04 | P0 | Keep read/warm-triggered damaged-file repairs urgent through provider circuit outages (`HealthCheckService`, `PrefetchRepairHistory`, `eafe1705`) | `crates/health`, `crates/nntp` circuit handling; persist priority and bounded retry without treating an open circuit as conclusive missing articles. Warming integration depends on P01. | Port |
+| R04 | P0 | Keep read/warm-triggered damaged-file repairs urgent through provider circuit outages (`HealthCheckService`, `PrefetchRepairHistory`, `eafe1705`) | Persisted urgent health state and bounded inconclusive retry; strict warming failures request the same priority. | Implemented for read and manual warming; automatic prediction integration pending |
 | R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Verify / port gaps |
 | R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Port |
 | R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; this baseline has no equivalent recovery executor in health. Port trusted range/slice identity, bounded repair budgets, durable outcomes and separate worker scheduling before declaring repair parity. | Port |
@@ -42,7 +43,7 @@ acceptance gates below pass.
 | C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Source identity and revision cleanup implemented; PAR2 repair-revision integration pending |
 | C04 | P1 | Progressive cold reads, bounded first-byte fill, coalesced fills, source window reuse (`NativeCachedStream`, `NativeSourceCacheStream`; `c6a70ba8`, `0c3c129f`) | Rust segment cache already coalesces in-flight reads. Benchmark FUSE/WebDAV seeks before adding buffering; preserve foreground priority and bounded memory/I/O under NAS stalls. | Progressive read-through and parallel block commits implemented; controlled performance qualification pending |
 | C05 | P1 | Native cache browser, verified ranges, eviction history, buffer/I/O diagnostics (`NativeCacheBrowser*`, cache APIs) | Rust cache statistics exist; final-media file/range APIs and catalogue UI depend on C01–C03. Queries must not warm files or scan NAS payloads. | Basic settings/browser/ranges/pin/evict implemented; history/traffic diagnostics pending |
-| P01 | P1 | Durable Smart Prefetch queue, policies, pause/resume/cancel, budgets, bounded lanes (`Services/Prefetch`, `PrefetchJobStore`) | Rust stream read-ahead is not the fork's background warming scheduler. Build a separate scheduler using the shared cache and provider workload classes. | Port |
+| P01 | P1 | Durable Smart Prefetch queue, policies, pause/resume/cancel, budgets, bounded lanes (`Services/Prefetch`, `PrefetchJobStore`) | New source-bound durable queue, one strict background lane, manual API/UI and attempted-fill allowance. | Manual warming implemented; automatic planner, wire budget and full fork policy parity pending |
 | P02 | P1 | Plex account/PIN/Home-user authentication, server discovery and mapping (`Services/Plex`, Plex API) | New Rust Plex transport, private connection handles, settings and admin UI. | Implemented; loopback transport/service tests and simulated browser acceptance below; live Plex acceptance pending |
 | P03 | P1 | Viewer-scoped next-episode and partially watched predictions; durable snapshots during Plex outages (`PredictionSnapshot*`, `PlexViewerResolver`) | Depends on P02 and the media catalogue. Preserve account identity validation, viewer exclusions and uncertainty states. | Transport, viewer proof and prediction policy implemented; durable snapshots/planner pending |
 | P04 | P1 | Playback-aware warming priority, viewer lead, own-file warm lane, urgent backfills, cooperative yields (`WarmYieldPolicy`, `WarmConnectionGovernor`, `PrefetchWireBudget`) | Depends on P01 and reader tracking. Cached playback must not consume provider allowance; warming cannot starve an uncached seek. | Port |
@@ -172,8 +173,8 @@ encrypted-member plaintext seeks. Workspace Clippy passed after these additions.
 ### Known remaining gaps
 
 The first cache implementation is not full fork parity: explicit folder probe/scan
-and recovery tooling, legacy cache adoption, persistent traffic/eviction browsing,
-Plex metadata/attribution, cache-aware health policy, background warming/backfill,
+and recovery tooling, persistent traffic/eviction browsing,
+Plex metadata/attribution, automatic warming/backfill,
 and performance envelopes remain pending. The reader-hold scheduling gap is addressed by the increment below. Other recovery
 parity still needs its own evidence.
 
@@ -273,3 +274,56 @@ checks with no page errors: account flow, Home PIN isolation, token-free server 
 connection test, mappings, masked round trip, mobile width and environment locks.
 **The browser responses were simulated.** No real Plex login, cloud acceptance,
 production provider access, prefetch runtime or deployment is claimed.
+
+## Durable manual warming increment
+
+`crates/prefetch` stores a bounded, source-revision-bound job ledger in the existing
+SQLite/PostgreSQL configuration store under a private versioned key. Generic settings
+saves preserve this live ledger. Admission is idempotent for the same intent, revision
+and ranges. A single background lane processes aligned complete final-media blocks,
+without creating playback sessions. It uses a distinct `warm` provider workload,
+a one-article window, strict reads and no fillers, hedges or speculative prewarming.
+The cache reserves foreground capacity. A waiting foreground read interrupts a warm
+transfer; an idle open playback handle does not block warming.
+
+Pause/resume/cancel, bounded retries, expiry, source supersession and history survive
+restart. Restart rechecks retained coverage before advancing progress; evicted bytes
+are fetched again. Progress advances only after cache publication. Cancellation of a
+stalled source never publishes its partial block. A failed database write cannot
+acknowledge a control change. Source errors request urgent health checks and back off;
+cache-publication failures back off without calling the source permanently damaged.
+
+Settings > Background warming provides manual full-file admission and job controls.
+Settings remain environment-authoritative. **Setup-wizard review:** warming is optional,
+off by default and requires the native cache. It remains advanced-only; no wizard
+change/version bump is needed. This increment adds no database migration. Keep a backup
+of `/config` and retain the 1.x rollback cache before any eventual trial or cutover.
+
+The daily allowance is deliberately named **attempted fill bytes**. Each source block
+is charged durably before transfer, including failed/interrupted attempts. Cached
+blocks cost no allowance. Article overfetch and NNTP framing are not measured by it;
+it is not the fork's full wire-budget governor. Source-byte job counters describe
+successfully stored bytes, while provider workload metrics count decoded traffic.
+Automatic Plex snapshots/planning, viewer-lead/own-file lanes and library parity remain
+open work. No complete Smart Prefetch parity, live provider performance or deployment
+is claimed.
+
+Ten focused queue tests passed, covering restart/cache revalidation, idempotence,
+controls/allowance, source replacement, urgent repair, database failure, stalled-source
+cancellation, foreground contention, stored-member offsets, encrypted plaintext/tail
+publication and exact confirmed missing-slice reporting. Inconclusive failures request
+priority without recording a false missing slice. The actual Chromium canary passed nine checks
+against the Rust API and generated NNTP corpus: paused admission, settings toggle,
+submission/idempotence, complete warming, full-file/seek hashes through the shared cache,
+reload persistence, cached retry without source charge, and mobile width. No page errors.
+This is local generated-byte acceptance, distinct from the simulated Plex browser run.
+The initial full run exposed a metrics assertion that still expected three workloads;
+the regression now checks warming's requests/bytes separately.
+
+Latest qualification has an explicit limit: the earlier 368-test workspace checkpoint
+passed, but the final full run stopped after 314 passes on two unchanged queue timing
+cases. Ten warming cases and real PostgreSQL storage passed in that final run; the
+original C# interoperability rerun also passed all three cases. Reducing Tokio workers
+did not consistently resolve the queue failures. The final source must not be described
+as having a green full workspace suite. Details, binary provenance and browser/test
+scope are in [Plex and warming validation](validation/rust-v2-plex-warming-20261103.md).

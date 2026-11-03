@@ -952,6 +952,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/prefetch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["prefetch_status"];
+        put?: never;
+        post: operations["prefetch_enqueue"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/prefetch/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["prefetch_pause"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/prefetch/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["prefetch_control"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/provider-tests": {
         parameters: {
             query?: never;
@@ -2809,7 +2857,7 @@ export interface components {
             top_reads: components["schemas"]["TopRead"][];
             totals: components["schemas"]["Totals"];
             window: components["schemas"]["Window"];
-            /** @description Provider traffic by who asked: `stream`, `queue` and `health`. */
+            /** @description Provider traffic by who asked: `stream`, `queue`, `health` and `warm`. */
             workloads: components["schemas"]["WorkloadView"][];
             writer_error?: string | null;
         };
@@ -3012,6 +3060,89 @@ export interface components {
             ts: number;
             /** Format: int64 */
             unhealthy: number;
+            /** Format: int64 */
+            warm: number;
+        };
+        PrefetchControl: {
+            operation: components["schemas"]["PrefetchOperation"];
+        };
+        PrefetchJob: {
+            /** Format: int32 */
+            attempts: number;
+            /** Format: int64 */
+            cached_bytes: number;
+            /** Format: int64 */
+            created_at: number;
+            /** Format: int64 */
+            expires_at: number;
+            /** Format: uuid */
+            id: string;
+            /**
+             * Format: uuid
+             * @description Opaque intent identity, never a media title, path or token.
+             */
+            intent: string;
+            /** Format: uuid */
+            item: string;
+            /** Format: int64 */
+            next_attempt: number;
+            /** Format: int64 */
+            offset: number;
+            /** Format: int32 */
+            priority: number;
+            range: number;
+            ranges: components["schemas"]["PrefetchRange"][];
+            reason?: string | null;
+            revision: string;
+            /** Format: int64 */
+            size: number;
+            /** Format: int64 */
+            source_bytes: number;
+            state: components["schemas"]["PrefetchState"];
+            /** Format: int64 */
+            updated_at: number;
+            /** Format: int64 */
+            verified_bytes: number;
+        };
+        /** @enum {string} */
+        PrefetchOperation: "pause" | "resume" | "cancel" | "retry";
+        PrefetchPause: {
+            paused: boolean;
+        };
+        PrefetchRange: {
+            /** Format: int64 */
+            end: number;
+            /** Format: int64 */
+            start: number;
+        };
+        PrefetchRequest: {
+            /** Format: uuid */
+            intent: string;
+            /** Format: uuid */
+            item: string;
+            /** Format: int32 */
+            priority: number;
+            ranges?: components["schemas"]["PrefetchRange"][];
+        };
+        PrefetchSettings: {
+            /**
+             * Format: int64
+             * @description Allowance for attempted final-media block fills per UTC day; provider overfetch and wire overhead are excluded.
+             * @default 10000000000
+             */
+            daily_fill_bytes: number;
+            /** @default false */
+            enabled: boolean;
+        };
+        /** @enum {string} */
+        PrefetchState: "queued" | "paused" | "complete" | "cancelled" | "failed" | "superseded" | "expired";
+        PrefetchStatus: {
+            /** Format: int64 */
+            charged_fill_bytes: number;
+            /** Format: int64 */
+            day: number;
+            jobs: components["schemas"]["PrefetchJob"][];
+            paused: boolean;
         };
         /** @enum {string} */
         Preset: "balanced" | "max_playback" | "low_resources";
@@ -3110,7 +3241,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a1cc-fd80-75d8-af1a-710894b3939e
+             * @default 01a1a1fb-8384-7191-a6c5-687b1c75d5c3
              */
             id: string;
             /**
@@ -3748,6 +3879,13 @@ export interface components {
              *     }
              */
             plex: components["schemas"]["PlexSettings"];
+            /**
+             * @default {
+             *       "daily_fill_bytes": 10000000000,
+             *       "enabled": false
+             *     }
+             */
+            prefetch: components["schemas"]["PrefetchSettings"];
             /** @default [] */
             providers: components["schemas"]["Provider"][];
             /**
@@ -4055,7 +4193,7 @@ export interface components {
              * @description Finished requests, cancelled ones left out.
              */
             requests: number;
-            /** @description `stream`, `queue` or `health`. */
+            /** @description `stream`, `queue`, `health` or `warm`. */
             workload: string;
         };
     };
@@ -5671,6 +5809,92 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["PlexLibrary"][];
                 };
+            };
+        };
+    };
+    prefetch_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrefetchStatus"];
+                };
+            };
+        };
+    };
+    prefetch_enqueue: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrefetchRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrefetchJob"];
+                };
+            };
+        };
+    };
+    prefetch_pause: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrefetchPause"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    prefetch_control: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PrefetchControl"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

@@ -60,6 +60,7 @@ import { PerformanceSettings } from "./performance";
 import { NativeCachePanel } from "./native-cache";
 import { Providers } from "./providers";
 import { PlexConnections } from "./plex";
+import { PrefetchPanel } from "./prefetch";
 
 const strategies: { value: Schemas["ImportStrategy"]; title: string; blurb: string }[] = [
   { value: "symlinks", title: "Symlinks", blurb: "Plex, or any media server that sees the mount" },
@@ -164,6 +165,7 @@ const categories = [
     title: "Performance",
     description: "Read-ahead, caching and download speed",
   },
+  { group:"Automation",slug:"prefetch",title:"Background warming",description:"Persistent warming jobs and native cache progress" },
   { group:"Automation",slug:"plex",title:"Plex connections",description:"Accounts, Home profiles and exact library path mappings" },
   {
     group: "Automation",
@@ -672,6 +674,7 @@ export function Settings() {
           {category.slug === "providers" && <Providers title={category.title} description={category.description} />}
           {category.slug === "arr" && <ArrInstances title={category.title} description={category.description} />}
           {category.slug === "plex" && <PlexConnections />}
+          {category.slug === "prefetch" && <PrefetchPanel />}
           <form id="settings" onSubmit={submit}>
             {category.slug === "download-client" && (
               <Section category={category}>

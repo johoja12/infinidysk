@@ -24,6 +24,7 @@ export const series = [
   { key: "stream", label: "Playback", color: "var(--color-chart-playback)" },
   { key: "queue", label: "Imports", color: "var(--color-chart-imports)" },
   { key: "health", label: "Health checks", color: "var(--color-primary)" },
+  { key: "warm", label: "Warming", color: "var(--color-muted-foreground)" },
 ] as const;
 
 export const rate = (bps: number, compact = false) => `${bytes(bps, compact)}/s`;
@@ -439,7 +440,7 @@ const Windowed = memo(function Windowed({ history: h, span }: { history: History
             "Missing articles",
             pct(t.missing, t.requests),
             `${count(t.missing)} of ${count(t.requests)} requests`,
-            trend(p.map((x) => ratio(x.missing, x.stream + x.queue + x.health)), "var(--color-warning)"),
+            trend(p.map((x) => ratio(x.missing, x.stream + x.queue + x.health + x.warm)), "var(--color-warning)"),
           ],
           [
             "Imports",
@@ -491,7 +492,7 @@ const Activity = memo(function Activity({ history: h, span }: { history: History
   const scale = (v: number) => Math.min(1, log ? Math.log10(v + 1) / Math.log10(peak + 1) : v / peak);
   const y = (v: number) => HEIGHT - scale(v) * (HEIGHT - 4);
   const line = (pick: (p: (typeof points)[number]) => number) => points.map((p, i) => `${i + 0.5},${y(pick(p))}`).join(" ");
-  const sum = (key: "stream" | "queue" | "health" | "errors") => points.reduce((s, p) => s + p[key], 0);
+  const sum = (key: "stream" | "queue" | "health" | "warm" | "errors") => points.reduce((s, p) => s + p[key], 0);
   const errors = sum("errors");
   const peakFetch = Math.max(t.peak_fetch_bps, ...points.map((p) => p.peak_fetch_bps));
   const peakRead = Math.max(0, ...points.map((p) => p.peak_bps));
