@@ -26,13 +26,15 @@ public class GetAndHeadHandlerRangeTests
     {
         var trace = new StreamTraceBuffer(100);
         var registry = new ActiveReadRegistry();
+        var itemId = Guid.NewGuid();
+        var concurrent = new ConcurrentReadTracker();
         var config = new ConfigManager();
         using var firstBody = new GatedWriteStream(overlap);
         using var secondBody = new MemoryStream();
         using var shared = new SharedStreamRegistry(config, new ConcurrentReadTracker());
         var handler = new GetAndHeadHandlerPatch(
-            new SingleItemStore(new MemoryStoreItem()), config, new ProviderUsageTracker(),
-            registry, new ConcurrentReadTracker(), trace, new StreamingFailureTracker(), shared);
+            new SingleItemStore(new MemoryStoreItem(uniqueKey: itemId.ToString())), config, new ProviderUsageTracker(),
+            registry, concurrent, trace, new StreamingFailureTracker(), shared);
         var middleware = new WebDavObservabilityMiddleware(async context =>
             await handler.HandleRequestAsync(context), trace);
         var first = NewGetContext("bytes=0-99", firstBody);
@@ -45,6 +47,7 @@ public class GetAndHeadHandlerRangeTests
                 await firstBody.WriteStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
             else
                 await firstRequest;
+            Assert.Equal(overlap, concurrent.HasActiveRead(itemId));
             await middleware.InvokeAsync(second);
         }
         finally
@@ -53,6 +56,7 @@ public class GetAndHeadHandlerRangeTests
             await firstRequest;
         }
 
+        Assert.False(concurrent.HasActiveRead(itemId));
         var session = Assert.Single(trace.ListSessions());
         var events = trace.GetSessionEvents(session.SessionId);
         foreach (var opened in events.Where(entry => entry.Kind == "RangeOpen"))
@@ -125,10 +129,10 @@ public class GetAndHeadHandlerRangeTests
         return context;
     }
 
-    private sealed class MemoryStoreItem(int chunkSize = 1024) : BaseStoreReadonlyItem
+    private sealed class MemoryStoreItem(int chunkSize = 1024, string? uniqueKey = null) : BaseStoreReadonlyItem
     {
         public override string Name => "movie.mkv";
-        public override string UniqueKey => "movie";
+        public override string UniqueKey => uniqueKey ?? "movie";
         public override long FileSize => 1024;
         public override DateTime CreatedAt => DateTime.UnixEpoch;
         public override Task<Stream> GetReadableStreamAsync(CancellationToken cancellationToken)

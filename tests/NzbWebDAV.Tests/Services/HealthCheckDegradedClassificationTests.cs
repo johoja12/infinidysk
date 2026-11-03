@@ -2129,15 +2129,16 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.True(persisted.NextHealthCheck > DateTimeOffset.UtcNow.AddHours(23));
     }
 
-    [Fact]
-    public async Task UrgentRepair_RecentReadDefersDeletionAndRetainsUrgentRetry()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task UrgentRepair_UnconfirmedRecentReadRetainsHoldAndPriority(bool damageConfirmedLater)
     {
         ConfigureAutoRemove(threshold: 1, unlinkedOnly: true);
         var segments = NewSegmentIds(3);
         var (item, blobId) = await AddVideoFileAsync(
             "sample.mkv", segments, [10_000, 10_000, 10_000]);
         item = await MakeUrgentAsync(item, qualifyingFailures: 1);
-        _failureTracker.RecordAttributedFailure(item.Id, segments[1]);
         var clock = new ControllableTimeProvider(DateTimeOffset.UtcNow);
         var activeReads = new ActiveReadRegistry();
         activeReads.RecordFileRead(item.Id, clock.GetUtcNow());
@@ -2157,7 +2158,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.Equal(DateTimeOffset.UnixEpoch, retained.NextHealthCheck);
         Assert.Equal(1, retained.UrgentRepairFailures);
         Assert.True(retained.HealthRepairPending);
-        Assert.Equal(1, _failureTracker.GetFailureCount(item.Id));
+        Assert.Equal(0, _failureTracker.GetFailureCount(item.Id));
         Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, Assert.Single(GetHealthRows(item.Id)).RepairStatus);
         Assert.Single(par2.Requests);
         var deferredLog = Assert.Single(logs, log => log.MessageTemplate.Text ==
@@ -2167,7 +2168,10 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.Empty(await service.SelectNextHealthCheckIdsAsync(
             [], allowChecks: true, allowRepairs: true, maximumCount: 1, CancellationToken.None));
 
-        clock.Advance(lastReadAt + _configManager.GetRepairReadHold() - clock.GetUtcNow());
+        if (damageConfirmedLater)
+            _failureTracker.RecordAttributedFailure(item.Id, segments[1]);
+        else
+            clock.Advance(lastReadAt + _configManager.GetRepairReadHold() - clock.GetUtcNow());
         Assert.Contains(item.Id, await service.SelectNextHealthCheckIdsAsync(
             [], allowChecks: true, allowRepairs: true, maximumCount: 1, CancellationToken.None));
         await _context.Entry(item).ReloadAsync();
@@ -2177,6 +2181,77 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.Throws<InvalidOperationException>(() => ReloadItem(item.Id));
         Assert.Contains(GetHealthRows(item.Id), row =>
             row.RepairStatus == HealthCheckResult.RepairAction.Deleted);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ConfirmedDamage_RecentInactiveReadDoesNotDelayReplacement(bool urgent)
+    {
+        ConfigureAutoRemove(threshold: 1, unlinkedOnly: true);
+        var segments = NewSegmentIds(3);
+        var (item, _) = await AddVideoFileAsync("confirmed-damage.mkv", segments, [10_000, 10_000, 10_000]);
+        item.ArrDownloadId = Guid.NewGuid();
+        await _context.SaveChangesAsync();
+        var libraryPath = Path.Join(_configRoot, "library", "confirmed-damage.strm");
+        await File.WriteAllTextAsync(libraryPath, $"http://localhost:3000/view/.ids/{item.Id}.mkv");
+        if (urgent)
+        {
+            item = await MakeUrgentAsync(item, qualifyingFailures: 1);
+            _failureTracker.RecordAttributedFailure(item.Id, segments[1]);
+        }
+        var activeReads = new ActiveReadRegistry();
+        activeReads.RecordFileRead(item.Id);
+        var (service, par2) = await NewServiceAsync(
+            NewFakeClient(segments, missing: [0, 1, 2]), Par2RepairOutcome.NotRepaired,
+            activeReads: activeReads);
+
+        using var cancellation = new CancellationTokenSource();
+        var arrClient = new PartialRepairArrClient(cancellation, libraryPath, ArrRepairOutcome.RemoveAndBlocklistSucceeded);
+        service.CreateRepairArrClientsOverride = () => [arrClient];
+        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+
+        Assert.Single(par2.Requests);
+        Assert.Equal(1, arrClient.RemoveCalls);
+        Assert.Throws<InvalidOperationException>(() => ReloadItem(item.Id));
+        Assert.Contains(GetHealthRows(item.Id), row => row.RepairStatus == HealthCheckResult.RepairAction.Repaired);
+        Assert.DoesNotContain(GetHealthRows(item.Id), row => row.Message?.StartsWith("Removal and replacement deferred", StringComparison.Ordinal) == true);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(15)]
+    public async Task ConfirmedDamage_StalledLiveReadProtectsFileUntilLastReaderEnds(int holdMinutes)
+    {
+        ConfigureAutoRemove(threshold: 1, unlinkedOnly: true);
+        _configManager.UpdateValues([new ConfigItem { ConfigName = ConfigKeys.RepairReadHoldMinutes, ConfigValue = holdMinutes.ToString(System.Globalization.CultureInfo.InvariantCulture) }]);
+        var segments = NewSegmentIds(3);
+        var (item, _) = await AddVideoFileAsync("live-read.mkv", segments, [10_000, 10_000, 10_000]);
+        item = await MakeUrgentAsync(item, qualifyingFailures: 1);
+        _failureTracker.RecordAttributedFailure(item.Id, segments[1]);
+        var clock = new ControllableTimeProvider(DateTimeOffset.UtcNow);
+        var activeReads = new ActiveReadRegistry();
+        activeReads.RecordFileRead(item.Id, clock.GetUtcNow());
+        var concurrentReads = new ConcurrentReadTracker();
+        using var first = concurrentReads.BeginRead("/view/sample.mkv", 0, ConcurrentReadRegion.Full, item.Id);
+        using var last = concurrentReads.BeginRead("/.ids/sample", 0, ConcurrentReadRegion.Full, item.Id);
+        clock.Advance(TimeSpan.FromMinutes(20));
+        var (service, _) = await NewServiceAsync(NewFakeClient(segments, missing: []), Par2RepairOutcome.NotRepaired,
+            timeProvider: clock, activeReads: activeReads, concurrentReads: concurrentReads);
+        service.CreateDbContextOverride = () => new DavDatabaseContext(_options);
+
+        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+
+        Assert.True(ReloadItem(item.Id).HealthRepairPending);
+        Assert.StartsWith("Removal and replacement deferred while a playback read is active.", Assert.Single(GetHealthRows(item.Id)).Message);
+        clock.Advance(HealthCheckService.ActiveReadRepairRetry + TimeSpan.FromSeconds(1));
+        first.Dispose();
+        Assert.Empty(await service.SelectNextHealthCheckIdsAsync([], true, true, 1, CancellationToken.None));
+        last.Dispose();
+        Assert.Contains(item.Id, await service.SelectNextHealthCheckIdsAsync([], true, true, 1, CancellationToken.None));
+        await _context.Entry(item).ReloadAsync();
+        await service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
+        Assert.Throws<InvalidOperationException>(() => ReloadItem(item.Id));
     }
 
     [Fact]
@@ -2222,17 +2297,20 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         await File.WriteAllTextAsync(libraryPath, $"http://localhost:3000/view/.ids/{item.Id}.mkv");
         var clock = new ControllableTimeProvider(DateTimeOffset.UtcNow);
         var activeReads = new ActiveReadRegistry();
+        var concurrentReads = new ConcurrentReadTracker();
         var (service, _) = await NewServiceAsync(
             NewFakeClient(segments, missing: []),
             Par2RepairOutcome.NotRepaired,
             timeProvider: clock,
-            activeReads: activeReads);
+            activeReads: activeReads,
+            concurrentReads: concurrentReads);
         service.CreateDbContextOverride = () => new DavDatabaseContext(_options);
         var arrClient = new BlockingLookupArrClient();
         service.CreateRepairArrClientsOverride = () => [arrClient];
 
         var repair = service.PerformHealthCheck(item, _dbClient, concurrency: 4, CancellationToken.None);
         await arrClient.LookupStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        using var liveRead = concurrentReads.BeginRead("/content/sample.mkv", 0, ConcurrentReadRegion.Full, item.Id);
         activeReads.RecordFileRead(item.Id, clock.GetUtcNow());
         arrClient.ReleaseLookup.TrySetResult();
         await repair.WaitAsync(TimeSpan.FromSeconds(10));
@@ -2246,7 +2324,7 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         Assert.True(retained.HealthRepairPending);
         var row = Assert.Single(GetHealthRows(item.Id));
         Assert.Equal(HealthCheckResult.RepairAction.ActionNeeded, row.RepairStatus);
-        Assert.StartsWith("Removal and replacement deferred after a recent playback read.", row.Message);
+        Assert.StartsWith("Removal and replacement deferred while a playback read is active.", row.Message);
         Assert.Empty(await service.SelectNextHealthCheckIdsAsync(
             [], allowChecks: true, allowRepairs: true, maximumCount: 1, CancellationToken.None));
     }
@@ -2259,12 +2337,15 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             "sample.mkv", segments, [10_000, 10_000, 10_000]);
         var clock = new ControllableTimeProvider(DateTimeOffset.UtcNow);
         var activeReads = new ActiveReadRegistry();
+        var concurrentReads = new ConcurrentReadTracker();
+        using var liveRead = concurrentReads.BeginRead("/content/sample.mkv", 0, ConcurrentReadRegion.Full, item.Id);
         activeReads.RecordFileRead(item.Id, clock.GetUtcNow());
         var (service, par2) = await NewServiceAsync(
             NewFakeClient(segments, missing: [0, 1, 2]),
             Par2RepairOutcome.NotRepaired,
             timeProvider: clock,
-            activeReads: activeReads);
+            activeReads: activeReads,
+            concurrentReads: concurrentReads);
         par2.Work = async cancellationToken =>
         {
             await using var mutationGate = await _failureTracker
@@ -2810,7 +2891,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
         HealthWorkSchedulePolicy? healthWorkSchedule = null,
         NzbWebDAV.Services.Regrab.ArrRegrabService? regrabService = null,
         NzbWebDAV.Services.NativeCache.NativeCacheService? nativeCache = null,
-        ActiveReadRegistry? activeReads = null)
+        ActiveReadRegistry? activeReads = null,
+        ConcurrentReadTracker? concurrentReads = null)
     {
         await _usenet.ReplaceUnderlyingClientForTestsAsync(fake);
         var par2 = new ScriptedPar2RepairService(_configManager, _patchStore, par2Outcome);
@@ -2829,7 +2911,8 @@ public sealed class HealthCheckDegradedClassificationTests : IAsyncLifetime
             healthWorkSchedule: healthWorkSchedule,
             regrabService: regrabService,
             nativeCache: nativeCache,
-            activeReadRegistry: activeReads);
+            activeReadRegistry: activeReads,
+            concurrentReadTracker: concurrentReads);
         return (service, par2);
     }
 
