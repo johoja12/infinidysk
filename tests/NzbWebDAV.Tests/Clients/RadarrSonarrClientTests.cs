@@ -758,11 +758,32 @@ public class RadarrSonarrClientTests
     }
 
     [Fact]
+    public async Task RadarrHistory_RecoversOldImportWithoutScanningGlobalHistory()
+    {
+        using var handler = new RadarrMovieHistoryHandler();
+        using var http = new HttpClient(handler);
+        var client = new TestRadarrClient("http://radarr-scoped-history.test", http);
+        var match = new ArrMediaFileMatch(ArrMediaKind.Movie, FileId: 201, MediaIds: [101]);
+
+        var collected = await client.CollectMediaImportHistoryAsync(match);
+
+        Assert.True(collected.Exhausted);
+        var import = Assert.Single(collected.Records);
+        var resolution = ArrDownloadIdResolver.Resolve(collected.Records, match, "/synthetic/imported.mkv");
+        Assert.Equal(ArrDownloadIdResolutionKind.Unique, resolution.Kind);
+        Assert.Equal(Guid.Parse("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), resolution.DownloadId);
+        var deletions = await client.GetFileDeletionHistoryAsync(import);
+        Assert.Equal(101, Assert.Single(deletions.Records).MovieId);
+        Assert.Equal("Upgrade", deletions.Records[0].Data!.Reason);
+        Assert.Equal(2, handler.RequestCount);
+    }
+
+    [Fact]
     public async Task RadarrImportHistory_IsScopedToMovieAndImportEventType()
     {
         var match = new ArrMediaFileMatch(ArrMediaKind.Movie, FileId: 201, MediaIds: [101]);
         using var httpClient = new HttpClient(CreateHandler(
-            ("GET /api/v3/history?movieId=101&eventType=3&page=1&pageSize=50&sortKey=date&sortDirection=descending",
+            ("GET /api/v3/history?movieIds=101&eventType=3&page=1&pageSize=50&sortKey=date&sortDirection=descending",
                 JsonResponse("""{"records":[],"totalRecords":0}"""))));
         var client = new TestRadarrClient(httpClient);
 
@@ -802,7 +823,7 @@ public class RadarrSonarrClientTests
     public async Task RadarrFileDeletionHistory_IsScopedToTheImportedMovie()
     {
         using var httpClient = new HttpClient(CreateHandler(
-            ("GET /api/v3/history?movieId=101&eventType=6&page=1&pageSize=50&sortKey=date&sortDirection=descending",
+            ("GET /api/v3/history?movieIds=101&eventType=6&page=1&pageSize=50&sortKey=date&sortDirection=descending",
                 JsonResponse("""{"records":[{"sourceTitle":"/movies/Movie/movie.mkv","data":{"reason":"Upgrade"}}],"totalRecords":1}"""))));
         var client = new TestRadarrClient(httpClient);
 
@@ -829,7 +850,7 @@ public class RadarrSonarrClientTests
     {
         var match = new ArrMediaFileMatch(ArrMediaKind.Movie, FileId: 201, MediaIds: [101]);
         using var httpClient = new HttpClient(CreateHandler(
-            ("GET /api/v3/history?movieId=101&eventType=3&page=1&pageSize=50&sortKey=date&sortDirection=descending",
+            ("GET /api/v3/history?movieIds=101&eventType=3&page=1&pageSize=50&sortKey=date&sortDirection=descending",
                 JsonResponse("""{"records":[{"downloadId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}],"totalRecords":100}"""))));
         var client = new TestRadarrClient(httpClient);
 
@@ -844,7 +865,7 @@ public class RadarrSonarrClientTests
     {
         var match = new ArrMediaFileMatch(ArrMediaKind.Movie, FileId: 201, MediaIds: [101]);
         using var httpClient = new HttpClient(CreateHandler(
-            ("GET /api/v3/history?movieId=101&eventType=3&page=1&pageSize=50&sortKey=date&sortDirection=descending",
+            ("GET /api/v3/history?movieIds=101&eventType=3&page=1&pageSize=50&sortKey=date&sortDirection=descending",
                 JsonResponse("""{"records":[{"downloadId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}]}"""))));
         var client = new TestRadarrClient(httpClient);
 
@@ -859,7 +880,7 @@ public class RadarrSonarrClientTests
     {
         var match = new ArrMediaFileMatch(ArrMediaKind.Movie, FileId: 201, MediaIds: [101]);
         using var httpClient = new HttpClient(CreateHandler(
-            ("GET /api/v3/history?movieId=101&eventType=3&page=1&pageSize=50&sortKey=date&sortDirection=descending",
+            ("GET /api/v3/history?movieIds=101&eventType=3&page=1&pageSize=50&sortKey=date&sortDirection=descending",
                 JsonResponse("""{"records":[{"downloadId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}],"totalRecords":1}"""))));
         var client = new TestRadarrClient(httpClient);
 
@@ -1282,6 +1303,31 @@ public class RadarrSonarrClientTests
         {
             base.Dispose(disposing);
             if (disposing) cancellation.Cancel();
+        }
+    }
+
+    // Radarr ignores movieId on /history; only movieIds limits the global history.
+    private sealed class RadarrMovieHistoryHandler : HttpMessageHandler
+    {
+        public int RequestCount { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            RequestCount++;
+            Assert.Equal(HttpMethod.Get, request.Method);
+            Assert.Equal("/api/v3/history", request.RequestUri!.AbsolutePath);
+            var query = Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(request.RequestUri.Query);
+            var scoped = query.TryGetValue("movieIds", out var ids) && ids == "101";
+            var eventType = int.Parse(query["eventType"].ToString(), System.Globalization.CultureInfo.InvariantCulture);
+            var records = Enumerable.Range(0, scoped ? 1 : 50).Select(index => new
+            {
+                id = index + 1,
+                movieId = scoped ? 101 : 202,
+                eventType,
+                downloadId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                data = new { fileId = scoped ? "201" : "999", importedPath = "/synthetic/imported.mkv", reason = "Upgrade" },
+            });
+            return Task.FromResult(JsonResponse(JsonSerializer.Serialize(new { records, totalRecords = scoped ? 1 : 20_000 })));
         }
     }
 

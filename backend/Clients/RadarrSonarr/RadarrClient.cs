@@ -201,9 +201,10 @@ public class RadarrClient(string host, string apiKey) : ArrClient(host, apiKey)
         if (mediaFile.Kind != ArrMediaKind.Movie || mediaFile.MediaIds.Count == 0)
             return Task.FromResult(new ArrHistory());
 
+        // Radarr ignores singular movieId on this paged endpoint and returns global history.
         var movieId = mediaFile.MediaIds[0];
         return Get<ArrHistory>(
-            $"/history?movieId={movieId}&eventType=3&page={page}&pageSize={pageSize}&sortKey=date&sortDirection=descending",
+            $"/history?movieIds={movieId}&eventType=3&page={page}&pageSize={pageSize}&sortKey=date&sortDirection=descending",
             ct);
     }
 
@@ -212,7 +213,7 @@ public class RadarrClient(string host, string apiKey) : ArrClient(host, apiKey)
         CancellationToken ct = default) =>
         importRecord.MovieId is { } movieId
             ? Get<ArrHistory>(
-                $"/history?movieId={movieId}&eventType=6&page=1&pageSize=50&sortKey=date&sortDirection=descending",
+                $"/history?movieIds={movieId}&eventType=6&page=1&pageSize=50&sortKey=date&sortDirection=descending",
                 ct)
             : Task.FromResult(new ArrHistory());
 
