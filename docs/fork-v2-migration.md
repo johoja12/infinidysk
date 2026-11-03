@@ -7,6 +7,13 @@ The inventory was derived from the fork's non-merge commits and file differences
 against upstream `v1` at `4a630deb6e599f3eadbe071a92417a93d74dc81f` on 2026-11-03.
 It groups related changes into capabilities; it is not a promise of complete parity.
 
+**Current checkpoint:** the missing-grab fallback, exact original-download recovery,
+completed-pointer removal, and a first shared final-media cache implementation are in
+Rust. Cache settings and basic browsing/pinning/eviction are wired into the UI. The
+full fork port is **not complete**. In particular, Plex integration, Smart Prefetch,
+library catalogue parity, PAR2 execution, legacy migration adapters and several repair
+scheduler behaviors are still pending. The draft must not be treated as a cutover.
+
 The 1.x source and production deployment remain unchanged. Port behavior into the
 Rust architecture; do not copy C# storage formats or add a second cache in front of
 FUSE/WebDAV. Keep 1.x synchronization pointed at upstream `v1`. Rust changes follow
@@ -24,17 +31,17 @@ acceptance gates below pass.
 | ID | Priority | Capability and 1.x specification | Rust starting point / work required | Status |
 | --- | --- | --- | --- | --- |
 | R01 | P0 | Replace an exactly identified damaged import even when its original grab is absent (`ArrClient`, `RadarrClient`, `HealthCheckService`; fork PR #230) | `crates/arr/src/repair.rs` already deletes/searches without a grab, but unnecessarily waits for an automatic search it never triggered. Skip that wait and retain replacement/error guards. | First port implemented; validation recorded below |
-| R02 | P0 | Recover the original download from exact file ID + imported path; reject ambiguity and incomplete history (`ArrDownloadIdResolver`, fork PR #234) | `repair.rs::owner_of_file` and Arr owner backfill exist. Add scoped, fully paginated Radarr history using **`movieIds`**, verify current identity, and carry recovered identity into blocklisting. Do not use a migration job ID as original provenance. Sonarr filtering stays profile-specific. | Port |
-| R03 | P0 | Protect live/overlapping reads, but bypass recent-read delay for confirmed damage after readers close (`ConcurrentReadTracker`, fork PR #232) | `health::Health::with_in_use` and VFS read handles exist. Prove FUSE/WebDAV/STRM accounting, cancellation cleanup, and no destructive repair while any reader remains. | Verify |
+| R02 | P0 | Recover the original download from exact file ID + imported path; reject ambiguity and incomplete history (`ArrDownloadIdResolver`, fork PR #234) | `repair.rs::owner_of_file` and Arr owner backfill exist. Add scoped, fully paginated Radarr history using **`movieIds`**, verify current identity, and carry recovered identity into blocklisting. Do not use a migration job ID as original provenance. Sonarr filtering stays profile-specific. | Implemented; exact scoped/paginated recovery with ambiguity guards |
+| R03 | P0 | Protect live/overlapping reads, but bypass recent-read delay for confirmed damage after readers close (`ConcurrentReadTracker`, fork PR #232) | `health::Health::with_in_use` and VFS read handles exist. Prove FUSE/WebDAV/STRM accounting, cancellation cleanup, and no destructive repair while any reader remains. | Reader/eviction overlap verified; last-close repair scheduling still needs a port |
 | R04 | P0 | Keep read/warm-triggered damaged-file repairs urgent through provider circuit outages (`HealthCheckService`, `PrefetchRepairHistory`, `eafe1705`) | `crates/health`, `crates/nntp` circuit handling; persist priority and bounded retry without treating an open circuit as conclusive missing articles. Warming integration depends on P01. | Port |
 | R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Verify / port gaps |
 | R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Port |
 | R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; this baseline has no equivalent recovery executor in health. Port trusted range/slice identity, bounded repair budgets, durable outcomes and separate worker scheduling before declaring repair parity. | Port |
-| C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | Port; design first |
-| C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Port |
-| C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Port |
-| C04 | P1 | Progressive cold reads, bounded first-byte fill, coalesced fills, source window reuse (`NativeCachedStream`, `NativeSourceCacheStream`; `c6a70ba8`, `0c3c129f`) | Rust segment cache already coalesces in-flight reads. Benchmark FUSE/WebDAV seeks before adding buffering; preserve foreground priority and bounded memory/I/O under NAS stalls. | Verify / port gaps |
-| C05 | P1 | Native cache browser, verified ranges, eviction history, buffer/I/O diagnostics (`NativeCacheBrowser*`, cache APIs) | Rust cache statistics exist; final-media file/range APIs and catalogue UI depend on C01–C03. Queries must not warm files or scan NAS payloads. | Port |
+| C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | First implementation in Rust; legacy cache adoption remains M01 |
+| C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins implemented; recovery/probe tools pending |
+| C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Source identity and revision cleanup implemented; PAR2 repair-revision integration pending |
+| C04 | P1 | Progressive cold reads, bounded first-byte fill, coalesced fills, source window reuse (`NativeCachedStream`, `NativeSourceCacheStream`; `c6a70ba8`, `0c3c129f`) | Rust segment cache already coalesces in-flight reads. Benchmark FUSE/WebDAV seeks before adding buffering; preserve foreground priority and bounded memory/I/O under NAS stalls. | Progressive read-through and parallel block commits implemented; controlled performance qualification pending |
+| C05 | P1 | Native cache browser, verified ranges, eviction history, buffer/I/O diagnostics (`NativeCacheBrowser*`, cache APIs) | Rust cache statistics exist; final-media file/range APIs and catalogue UI depend on C01–C03. Queries must not warm files or scan NAS payloads. | Basic settings/browser/ranges/pin/evict implemented; history/traffic diagnostics pending |
 | P01 | P1 | Durable Smart Prefetch queue, policies, pause/resume/cancel, budgets, bounded lanes (`Services/Prefetch`, `PrefetchJobStore`) | Rust stream read-ahead is not the fork's background warming scheduler. Build a separate scheduler using the shared cache and provider workload classes. | Port |
 | P02 | P1 | Plex account/PIN/Home-user authentication, server discovery and mapping (`Services/Plex`, Plex API) | No equivalent Plex account/catalogue service found in the Rust baseline. Keep credentials masked and all provider/account access explicit. | Port |
 | P03 | P1 | Viewer-scoped next-episode and partially watched predictions; durable snapshots during Plex outages (`PredictionSnapshot*`, `PlexViewerResolver`) | Depends on P02 and the media catalogue. Preserve account identity validation, viewer exclusions and uncertainty states. | Port |
@@ -48,7 +55,7 @@ acceptance gates below pass.
 | M02 | P1 | Legacy NZB catalogue recovery, digest-bound mapped export packages and parallel canary mount (`tools/NzbDavMigration`) | Keep existing tools read-only initially. Decide whether to retain the external tool or add a Rust adapter; preserve package digest, source identity and rollback journal. | Replace / adapter |
 | M03 | P1 | Pipelined batches, separate validation slot, resumable priority schedule and failed-import recovery (`NzbDavMigrationController`, `UsenetMigration`) | New Rust queue/admin contracts need adapters and restart-safe checkpoints. No acknowledgement without terminal proof. | Port |
 | M04 | P1 | Resumable external import runner, systemd service and Plex-hub priority ordering (`scripts/operations/plex-import-runner.py`, `plex_hub_priority.py`) | Adapt the operational tools to the new Rust import/admin contracts. Keep existing journals immutable; prove restart, duplicate-submission and priority-snapshot behavior against a separate canary. | Replace / adapter |
-| S01 | P0 | Completed-link removal remains removed across restart (`DatabaseStore`, `3e981833`) | Rust VFS/database cleanup has different links; add protocol + restart tests for `/completed-symlinks` and source ownership. | Verify |
+| S01 | P0 | Completed-link removal remains removed across restart (`DatabaseStore`, `3e981833`) | Rust VFS/database cleanup has different links; add protocol + restart tests for `/completed-symlinks` and source ownership. | Implemented with additive SQLite/PostgreSQL migration and WebDAV/FUSE checks |
 | S02 | P1 | Bounded cancelled-body cleanup and low-latency multipart reads (`UsenetSharp`, `NativeSourceCacheStream`; `963f3090`, `fe73df69`) | Rust uses Drop/lease guards, ordered pipelines and shared streaming. Verify connection/permit release and cold seek benchmarks; do not mechanically copy timeout values. | Verify |
 | S03 | P1 | Validate archived media before import completion; preserve first-volume order (`Queue`, `fe0dd0f2`, `c30fd88e`) | Rust queue/archive analyzer already exists. Port malformed-media and multipart ordering regression scenarios. | Verify |
 | O01 | P0 | Exact source/image provenance and fork version in builds (`scripts/build-prod-image.sh`, `248bd117`) | Rust Docker/release pipeline uses its own embedding. Add fork identity without publishing stable upstream tags; require image/source receipt for trial. | Verify / port gaps |
@@ -108,3 +115,65 @@ passed. `cargo test --workspace --locked` passed: 296 tests, no failures; two ig
 The optional PostgreSQL test returns without exercising PostgreSQL when its URL is
 unset, as in this local run. No live Arr/provider acceptance, UI production build,
 release image, migration rehearsal or performance qualification is claimed.
+
+## Implemented cache and protocol increment
+
+- R02 uses `movieIds` for Radarr and `episodeId` for Sonarr. It requires both the
+  current file ID and exact path, pages to completion within a bounded limit, rejects
+  changed totals/repeated pages/ambiguous identities, and never blocklists a migration
+  job ID merely because the caller supplied one. Seven new HTTP regressions cover it.
+- S01 persists completed-pointer tombstones. Removal affects the pointer subtree,
+  not `/content`, `/.ids`, source blobs or download history. HTTP retries are safe;
+  category roots and content stay read-only. Migration `0009_completed_links` is
+  additive on SQLite and PostgreSQL. **Back up `/config` before upgrading**; the
+  migration applies on startup. It does not migrate a 1.x installation by itself.
+- `crates/native-cache` owns versioned local SQLite metadata and checksummed final-media
+  blocks in chunk files. It verifies folder identity/ownership before writes, retains
+  buffer permits through real I/O completion, protects active/pinned generations,
+  reserves a playback buffer, and supports read-only folders, quotas, placement and
+  bounded age/pressure sweeps. Invalid or incomplete writes never become hits.
+- The VFS wrapper serves FUSE, WebDAV and STRM through the same cache. First cold bytes
+  do not wait for a full block; only complete blocks without gap fillers are retained.
+  Missing/corrupt availability annotations do not change content identity. Message
+  IDs, sizes, part ranges/order and crypto do. Fingerprints are lazy and reused.
+- Performance settings expose the advanced cache controls with environment locking
+  and explicit restart requirements. This is advanced-only: it stays off by default
+  and adds nothing to a new installation's critical setup path. Storage/schema/cache
+  formats are new; existing 1.x cache roots are not adopted automatically.
+- The basic browser reads catalogue metadata, shows coverage and offers guarded
+  pin/unpin/evict actions. This is not the full 1.x library or cache-telemetry UI.
+
+### Local acceptance evidence
+
+Use `crates/infinidysk/examples/fork_local.rs` for a disposable, loopback-only fixture.
+It creates its own database, mount, generated NNTP corpus and cache under a private
+unique temporary directory. No production configuration or provider is used. The
+printed receipt gives its URL and paths, without credentials. Create its `stop` file
+to stop it. Kernel mount checks need a privileged local test environment with FUSE;
+we did not change the host's global `allow_other` policy.
+
+The Chromium run exercised health, a complete generated-file hash on a native cache
+miss, cached range/seek hashes, coverage UI, pin/unpin, settings save/restore and
+restart indication, mobile overflow, active-read eviction protection (including a
+forged size), confirmed eviction and correct source fallback. All ten checks passed,
+with no page errors. This is synthetic byte-stream acceptance, not media-decoder or
+live Plex/Stash/provider qualification.
+
+A busy default-parallel workspace run hit one existing two-second queue timing
+assertion. Its isolated rerun passed. The subsequent full workspace run with two test
+threads passed 325 tests, including PostgreSQL; three tests were ignored there. Both
+kernel FUSE cases (ordinary and native cache, including cross-UID pointer removal)
+passed separately. An additional ownership regression reproduced an unintended lock
+file in a rejected nonempty folder; the follow-up fix validates ownership before
+creating anything. The focused storage suite passed all 14 cases, and the VFS native
+cache suite passed all seven cases, including stored-member range offsets and
+encrypted-member plaintext seeks. Workspace Clippy passed after these additions.
+
+### Known remaining gaps
+
+The first cache implementation is not full fork parity: explicit folder probe/scan
+and recovery tooling, legacy cache adoption, persistent traffic/eviction browsing,
+Plex metadata/attribution, cache-aware health policy, background warming/backfill,
+and performance envelopes remain pending. Existing Rust repair also schedules a
+later retry when a live reader blocks it; immediately waking that repair on the last
+close still needs R03. Do not infer complete recovery parity from reader tracking.
