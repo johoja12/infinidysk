@@ -313,6 +313,61 @@ async fn converts_a_library_both_ways_and_rewrites_on_key_rotation() {
     assert_eq!(owners[0].1.path, "/tv/Show/Season 1/e.mkv");
     assert_eq!(owners[0].1.file_id, Some(9));
 
+    let (code, _) = admin(
+        addr,
+        "POST",
+        "/api/v1/library/catalogue",
+        &json!({"root":lib}).to_string(),
+    )
+    .await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, roots) = admin(addr, "GET", "/api/v1/library/catalogue", "").await;
+        if roots[0]["stale"] == false {
+            break;
+        }
+        assert!(Instant::now() < deadline, "catalogue scan: {roots}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let query = lib.to_str().unwrap().replace('/', "%2F");
+    let (code, groups) = admin(
+        addr,
+        "GET",
+        &format!("/api/v1/library/catalogue/groups?root={query}"),
+        "",
+    )
+    .await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    assert_eq!(groups[0]["group"], "Show");
+    assert_eq!(groups[0]["stale"], false);
+    let (code, files) = admin(
+        addr,
+        "GET",
+        &format!("/api/v1/library/catalogue/files?root={query}&group=Show"),
+        "",
+    )
+    .await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    assert!(
+        files
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["item"] == e.id.to_string())
+    );
+    let (_, details) = admin(addr, "GET", &format!("/api/v1/files/{}", e.id), "").await;
+    assert_eq!(details["library_links"][0]["item"], e.id.to_string());
+    assert_eq!(details["regrab"], Value::Null);
+    let (code, _) = admin(
+        addr,
+        "POST",
+        "/api/v1/library/catalogue",
+        r#"{"root":"/not-configured"}"#,
+    )
+    .await;
+    assert_eq!(code, "HTTP/1.1 400 Bad Request");
+
     db.close().await;
     cancel.cancel();
     server.await.unwrap().unwrap();

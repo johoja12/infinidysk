@@ -25,8 +25,8 @@ use uuid::Uuid;
 
 pub use reader::{PartsReader, Reader};
 pub use session::{
-    Delivery, Handle, Origin, PendingRead, ReadStage, RepairGuard, Request, Session, Sessions,
-    Tracing,
+    Delivery, Handle, Origin, PendingRead, Playback, ReadStage, RepairGuard, Request, Session,
+    Sessions, Tracing,
 };
 
 /// What the kernel applied to the FUSE mount, read back after tuning; `None` where
@@ -642,7 +642,13 @@ impl Vfs {
                             meta.fingerprint()?,
                             item.size.unwrap_or(0),
                         );
-                        native::NativeReader::wrap(reader, Arc::clone(cache), key, gaps)
+                        native::NativeReader::wrap(
+                            reader,
+                            Arc::clone(cache),
+                            key,
+                            gaps,
+                            session.native_cache_counter(),
+                        )
                     }
                     None => reader,
                 };

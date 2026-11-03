@@ -212,6 +212,15 @@ async fn serves_every_api_on_one_port_and_applies_settings_live() {
     assert_eq!(code, "HTTP/1.1 200 OK");
     let spec: Value = serde_json::from_str(&body).unwrap();
     assert!(spec["paths"]["/api/v1/settings"]["put"].is_object());
+    for route in ["/api/v1/library/catalogue", "/api/v1/library/playback"] {
+        assert!(spec["paths"][route]["get"].is_object());
+        let anonymous = format!("GET {route} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        assert_eq!(status(addr, &anonymous).await, "HTTP/1.1 401 Unauthorized");
+        let (code, body) = send(addr, &admin_request("GET", route, "")).await;
+        assert_eq!(code, "HTTP/1.1 200 OK");
+        assert_eq!(body, "[]");
+    }
+
     for route in [
         "/api/v1/native-cache/evictions",
         "/api/v1/native-cache/diagnostics",

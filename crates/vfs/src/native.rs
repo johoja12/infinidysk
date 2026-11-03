@@ -3,7 +3,10 @@
 use std::future::Future;
 use std::io::{self, SeekFrom};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
@@ -23,6 +26,7 @@ struct Fill {
 }
 pub struct NativeReader {
     inner: Box<Reader>,
+    native_cache_bytes: Arc<AtomicU64>,
     cache: Arc<Cache>,
     lease: Arc<Lease>,
     gaps: Arc<Gaps>,
@@ -36,13 +40,20 @@ pub struct NativeReader {
     fill: Option<Fill>,
 }
 impl NativeReader {
-    pub(crate) fn wrap(inner: Reader, cache: Arc<Cache>, key: Key, gaps: Arc<Gaps>) -> Reader {
+    pub(crate) fn wrap(
+        inner: Reader,
+        cache: Arc<Cache>,
+        key: Key,
+        gaps: Arc<Gaps>,
+        native_cache_bytes: Arc<AtomicU64>,
+    ) -> Reader {
         let Some(lease) = cache.lease(key) else {
             return inner;
         };
         let end = lease.key().size();
         Reader::Native(Box::new(Self {
             inner: Box::new(inner),
+            native_cache_bytes,
             cache,
             lease,
             gaps,
@@ -80,6 +91,8 @@ impl NativeReader {
         if let Some(data) = &self.hit {
             let n = (data.len() - within).min(buf.remaining()).min(remaining);
             buf.put_slice(&data[within..within + n]);
+            self.native_cache_bytes
+                .fetch_add(n as u64, Ordering::Relaxed);
             self.pos += n as u64;
             return Poll::Ready(Ok(()));
         }

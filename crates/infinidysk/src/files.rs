@@ -379,6 +379,13 @@ pub struct Contents {
 
 #[derive(Serialize, ToSchema)]
 pub struct FileDetails {
+    source_revision: Option<String>,
+    cached_ranges: Vec<infinidysk_native_cache::Coverage>,
+    cache_available: bool,
+    cache_warning: Option<String>,
+    library_links: Vec<crate::library::catalogue::FileView>,
+    regrab: Option<crate::regrabs::Status>,
+    playback: Vec<crate::library::playback::Burst>,
     entry: FileEntry,
     /// Newest first.
     checks: Vec<HealthCheckView>,
@@ -543,7 +550,59 @@ pub async fn get_file(
     } else {
         None
     };
+    let mut cache_warning = None;
+    let key = if item.meta_blob.is_some() {
+        if let Ok(key) = admin.vfs.cache_key(&item).await {
+            Some(key)
+        } else {
+            cache_warning = Some("Stored source identity could not be read".to_owned());
+            None
+        }
+    } else {
+        None
+    };
+    let cache_available = admin.vfs.native_cache().is_some();
+    let cached_ranges = match (&key, admin.vfs.native_cache()) {
+        (Some(key), Some(cache)) => {
+            if let Ok(ranges) = cache.coverage(key).await {
+                ranges
+            } else {
+                cache_warning = Some("Native cache coverage is unavailable".to_owned());
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    };
+    let roots = crate::library::catalogue::roots(&admin).await?;
+    let library_links = db
+        .catalogue_links(None, None, Some(item.id.0), false, "", 200)
+        .await?
+        .into_iter()
+        .filter_map(|link| {
+            roots
+                .iter()
+                .find(|r| r.root == link.root)
+                .map(|r| crate::library::catalogue::FileView::from_link(link, r.stale))
+        })
+        .collect();
+    let regrab = crate::regrabs::inspect(db, item.id.0).await?;
+    let playback = crate::library::playback::grouped(
+        admin
+            .vfs
+            .sessions()
+            .playback()
+            .into_iter()
+            .filter(|s| s.item == item.id)
+            .collect(),
+    );
     Ok(Json(FileDetails {
+        source_revision: key.map(|k| k.revision().to_owned()),
+        cached_ranges,
+        cache_available,
+        cache_warning,
+        library_links,
+        regrab,
+        playback,
         entry,
         checks: checks.into_iter().map(Into::into).collect(),
         links: links(&admin, &item, job.as_ref()),

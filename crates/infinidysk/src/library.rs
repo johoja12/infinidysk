@@ -6,7 +6,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt as _;
+use std::io::Read as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -34,6 +35,9 @@ use crate::arr::Discovery;
 use crate::config::{self, ConfigStore, ImportStrategy, Settings};
 use crate::handoff::{self, MAX_STRM_BYTES, MAX_SUBTITLE_BYTES};
 use crate::upgrade::{LEGACY_STRM_KEY, LegacyStrm};
+
+pub(crate) mod catalogue;
+pub(crate) mod playback;
 
 /// Config key: the [`Confirmed`] form.
 const FORM_KEY: &str = "library.form";
@@ -458,6 +462,8 @@ pub struct Parts {
 pub struct Library {
     parts: Parts,
     pointer_reads: Arc<tokio::sync::Semaphore>,
+    catalogue_scan: tokio::sync::Mutex<()>,
+    catalogue_wake: Notify,
     job: Mutex<Job>,
     wake: Notify,
 }
@@ -471,6 +477,8 @@ impl Library {
         let library = Self {
             parts,
             pointer_reads: Arc::new(tokio::sync::Semaphore::new(2)),
+            catalogue_scan: tokio::sync::Mutex::new(()),
+            catalogue_wake: Notify::new(),
             job: Mutex::default(),
             wake: Notify::new(),
         };
@@ -2120,7 +2128,22 @@ fn classify(path: &Path, meta: &fs::Metadata, known: &Known) -> Option<Found> {
     if !meta.is_file() || !is_strm || meta.len() > MAX_STRM_BYTES {
         return None;
     }
-    let text = fs::read_to_string(path).ok()?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits() | nix::fcntl::OFlag::O_NONBLOCK.bits())
+        .open(path)
+        .ok()?;
+    let opened = file.metadata().ok()?;
+    if !opened.is_file() || opened.len() > MAX_STRM_BYTES {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(MAX_STRM_BYTES + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() as u64 > MAX_STRM_BYTES {
+        return None;
+    }
     let (item, ids, got) = parse_strm(&text)?;
     let any = known.keys.is_empty() && known.mount_dirs.is_empty();
     let current = || {
@@ -2469,6 +2492,26 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("infinidysk-library-{}", ItemId::new()));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_growing_strm_cannot_bypass_the_pointer_byte_limit() {
+        let dir = temp();
+        let path = dir.join("fixture.strm");
+        let url = format!(
+            "http://fixture/view/{}?downloadKey=fixture",
+            ItemId::new().ids_path()
+        );
+        fs::write(&path, &url).unwrap();
+        let stale = fs::metadata(&path).unwrap();
+        assert!(classify(&path, &stale, &Known::default()).is_some());
+        let grown = format!(
+            "{url}{}",
+            " ".repeat(usize::try_from(MAX_STRM_BYTES + 1).unwrap())
+        );
+        fs::write(&path, grown).unwrap();
+        assert!(classify(&path, &stale, &Known::default()).is_none());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -171,6 +171,16 @@ async fn warm_bytes_and_seeks_are_shared_by_webdav_and_fuse_without_provider_rea
         "cache hits make no provider BODY requests"
     );
     assert!(vfs.sessions().open().is_empty());
+    let rows = vfs.sessions().playback();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.iter().map(|r| r.native_cache_bytes).sum::<u64>(), 4096);
+    assert_eq!(rows.iter().map(|r| r.served).sum::<u64>(), BLOCK + 4096);
+    assert_eq!(vfs.sessions().take_ended().len(), 3);
+    assert_eq!(
+        vfs.sessions().playback().len(),
+        3,
+        "metrics draining cannot consume burst attribution"
+    );
 }
 
 #[tokio::test]

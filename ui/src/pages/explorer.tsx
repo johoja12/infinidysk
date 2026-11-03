@@ -639,6 +639,10 @@ function Details({
                   </Fact>
                   {entry.last_check && <Fact label="Last check">{stamp(entry.last_check)}</Fact>}
                   {entry.next_check && <Fact label="Next check">{stamp(entry.next_check)}</Fact>}
+                  {details.data.source_revision && <Fact label="Source revision"><span className="break-all font-mono text-xs">{details.data.source_revision}</span></Fact>}
+                  {details.data.cache_warning && <Fact label="Cache"><span className="text-warning-text">{details.data.cache_warning}</span></Fact>}
+                  {details.data.cache_available && !details.data.cache_warning && <Fact label="Native cache">{bytes(details.data.cached_ranges.reduce((n, r) => n + r.end - r.start, 0))} committed in {details.data.cached_ranges.length} ranges</Fact>}
+                  {details.data.regrab && <Fact label="Replacement">{details.data.regrab.stage.replaceAll("_", " ")} · revision {details.data.regrab.revision}{details.data.regrab.command_id != null && <> · command {details.data.regrab.command_id}</>}</Fact>}
                   {segments && (
                     <Fact label="Segments">
                       {segments.segments.toLocaleString()}
@@ -662,6 +666,9 @@ function Details({
                 <div className="space-y-4">
                   {media && <Media media={media} />}
                   {file && <ReadHistory id={id} />}
+                  {details.data.library_links.length > 0 && <div><h3 className="text-muted-foreground mb-1.5 text-xs font-medium tracking-wide uppercase">Indexed library links</h3><ul className="space-y-1">{details.data.library_links.map((l) => <li key={l.path} className="break-all font-mono text-xs">{l.path}{l.stale && <span className="text-warning-text"> · stale index</span>}</li>)}</ul></div>}
+                  {details.data.playback.length > 0 && <div><h3 className="text-muted-foreground mb-1.5 text-xs font-medium tracking-wide uppercase">Playback bursts</h3><ul className="space-y-2">{details.data.playback.map((r) => <li key={r.id} className="text-sm"><span className="break-all">{r.client}</span> · {r.delivery} · {r.active_handles ? "active" : "recent"}<p className="text-muted-foreground text-xs">{r.handles} handles · {bytes(r.served_bytes)} served · {bytes(r.native_cache_bytes)} from native cache{r.player && <> · player {r.player}</>}</p></li>)}</ul></div>}
+
                   <div>
                     <h3 className="text-muted-foreground mb-1.5 text-xs font-medium tracking-wide uppercase">Mount paths</h3>
                     {links.length === 0 ? (

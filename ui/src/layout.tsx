@@ -46,6 +46,7 @@ import { Loading } from "./ui";
 const pages = [
   { to: "/overview", label: "Overview", icon: Gauge },
   { to: "/queue", label: "Queue", icon: ListOrdered },
+  { to: "/library", label: "Library", icon: FolderTree },
   { to: "/explorer", label: "Explorer", icon: FolderTree },
   { to: "/health", label: "Health", icon: Activity },
   { to: "/stats", label: "Stats", icon: ChartColumn },

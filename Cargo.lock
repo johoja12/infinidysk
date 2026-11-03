@@ -1156,6 +1156,7 @@ dependencies = [
  "infinidysk-vfs",
  "infinidysk-webdav",
  "jiff",
+ "nix",
  "percent-encoding",
  "regex",
  "reqwest",

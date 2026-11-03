@@ -11,7 +11,7 @@ It groups related changes into capabilities; it is not a promise of complete par
 completed-pointer removal, and a first shared final-media cache implementation are in
 Rust. Cache settings and basic browsing/pinning/eviction are wired into the UI. The
 full fork port is **not complete**. Plex connections and viewer-safe transport are now implemented; Smart Prefetch,
-library catalogue parity, PAR2 execution, legacy migration adapters and several repair
+Plex library metadata matching, PAR2 execution, legacy migration adapters and several repair
 scheduler behaviors are still pending. A durable warming lane and Plex current/history prediction snapshots now run in Rust.
 The full warming governor and library/source catalogue policies remain open. The draft must not be treated as a cutover.
 
@@ -50,10 +50,10 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | P03 | P1 | Viewer-scoped next-episode and partially watched predictions; durable snapshots during Plex outages (`PredictionSnapshot*`, `PlexViewerResolver`) | Depends on P02 and the media catalogue. Preserve account identity validation, viewer exclusions and uncertainty states. | Durable complete snapshots and viewer-verified current/history planner implemented; live Plex acceptance pending |
 | P04 | P1 | Playback-aware warming priority, viewer lead, own-file warm lane, urgent backfills, cooperative yields (`WarmYieldPolicy`, `WarmConnectionGovernor`, `PrefetchWireBudget`) | Depends on P01 and reader tracking. Cached playback must not consume provider allowance; warming cannot starve an uncached seek. | Foreground yields, own-file priority and dedicated warm workload implemented; full governor pending |
 | P05 | P1 | Warming history by source revision/range, fetched bytes, source attribution and repair outcomes (`PrefetchRepairHistory`, `WarmingRateWindow`) | Depends on C01, P01 and R06. Use Rust decimal-byte API/UI conventions. | Port |
-| L01 | P1 | Persisted library link index, additional scan roots, video filter, catalogue/grouped browse (`Services/Library`, `LibraryLinkMaps`) | Rust library conversion/reconciliation exists, but not the fork catalogue and grouping. Preserve exact source-to-link mapping and bounded scans. | Port |
+| L01 | P1 | Persisted library link index, additional scan roots, video filter, catalogue/grouped browse (`Services/Library`, `LibraryLinkMaps`) | Rust library conversion/reconciliation exists, but not the fork catalogue and grouping. Preserve exact source-to-link mapping and bounded scans. | Persistent configuration-bound link snapshots, video grouping and browser implemented; durable paged staging for roots above the scan ceiling remains open |
 | L02 | P1 | Plex metadata matching and indexed library classification (`PlexLibraryMetadataService`, `LibraryCatalogService`) | Depends on P02/L01. Keep matching separate from authority to delete or regrab a file. | Port |
-| L03 | P1 | File details: source identity, current cache ranges, health history, active regrab, manual regrab (`GetLibraryFileDetails`, file modal) | Compose new Rust admin APIs over L01/C05/R06; do not assume 1.x API compatibility. | Port |
-| L04 | P1 | Live playback rows grouped across bursts, imported file ID, viewer attribution and cache-served reads (`ActiveReadRegistry`, `ActiveReadsBroadcaster`) | Rust `vfs::session` and traces exist; add only missing correlation/attribution and prove cleanup on reader drop. | Verify / port gaps |
+| L03 | P1 | File details: source identity, current cache ranges, health history, active regrab, manual regrab (`GetLibraryFileDetails`, file modal) | Compose new Rust admin APIs over L01/C05/R06; do not assume 1.x API compatibility. | Details now include source revision, cache ranges, indexed paths, active regrab and recent grouped reads; manual outcome controls and Plex metadata remain open |
+| L04 | P1 | Live playback rows grouped across bursts, imported file ID, viewer attribution and cache-served reads (`ActiveReadRegistry`, `ActiveReadsBroadcaster`) | Rust `vfs::session` and traces exist; add only missing correlation/attribution and prove cleanup on reader drop. | Source/client/player burst grouping and exact native-cache served bytes implemented; verified Plex viewer correlation remains open |
 | M01 | P0 | Import our actual fork data without losing ownership or repair state (`NzbDavMigration`, fork DB additions) | `crates/import` imports C# data, but fork tables/settings/cache layouts need an explicit compatibility report. Inventory unsupported settings and records; fail or report them rather than silently discard. | Verify / port gaps |
 | M02 | P1 | Legacy NZB catalogue recovery, digest-bound mapped export packages and parallel canary mount (`tools/NzbDavMigration`) | Keep existing tools read-only initially. Decide whether to retain the external tool or add a Rust adapter; preserve package digest, source identity and rollback journal. | Replace / adapter |
 | M03 | P1 | Pipelined batches, separate validation slot, resumable priority schedule and failed-import recovery (`NzbDavMigrationController`, `UsenetMigration`) | New Rust queue/admin contracts need adapters and restart-safe checkpoints. No acknowledgement without terminal proof. | Port |
@@ -431,3 +431,38 @@ No settings or schema changes are added in this increment. Tools operate on the
 separate Rust cache; they do not adopt or write into original 1.x cache roots. Setup
 wizard behavior is unchanged. Validation is recorded in
 [cache tool validation](validation/rust-v2-cache-tools-20261103.md).
+
+
+## Persistent library catalogue and playback increment
+
+A new authenticated Library page browses video pointers by configured root and top-level
+group. Pagination and file details use the persisted index, without walking NAS folders
+or opening media payloads. Background scans run only while playback/imports are idle,
+one root at a time; least-recently-attempted roots run first. Request generations retain
+same-time refreshes admitted during a scan. Configuration/signing changes invalidate
+old scopes. A complete result replaces its root atomically; incomplete scans preserve
+the last full result with explicit stale/error state.
+
+The first scanner has explicit ceilings: 25 seconds, 150,000 filesystem entries,
+50,000 pointers and 16 MB of path/pointer text per root. Refresh cadence is 15 minutes
+with a one-minute scheduler tick; failure backoff is five minutes unless a new request
+arrives. Directory symlinks are skipped, protected mount/cache/STRM directories are
+excluded, and STRM reads are capped after opening. Larger roots require durable paged
+staging before this row can be treated as full library parity. Exceeding a ceiling
+retains the previous index; it never publishes a partial replacement.
+
+File details compose source revision, current native cache ranges, indexed library
+links, saved regrab stage/command and recent playback bursts. Burst grouping preserves
+source, delivery, client and signed player identity, with a 30-second idle gap. A
+separate bounded lightweight history survives metrics draining, without retaining trace
+buffers. Bytes returned directly from native cache are counted per handle and grouped
+explicitly. Client text does not prove a Plex viewer; the UI makes no such inference.
+Plex metadata matching and viewer correlation remain separate work.
+
+**Upgrade/setup review:** migration 0014 adds catalogue tables/indexes on SQLite and
+PostgreSQL; it is additive. Back up `/config` before upgrading. Existing
+`imports.library_dirs` controls roots; no setting or wizard field is introduced. A new
+install has no roots, so indexing is inactive until folders are configured. The scan
+is read-only and never rewrites library links, adopts cache roots or triggers regrabs.
+
+Validation is recorded in [catalogue validation](validation/rust-v2-catalogue-20261104.md).

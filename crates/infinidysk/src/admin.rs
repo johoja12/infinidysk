@@ -81,6 +81,8 @@ pub struct Admin {
 #[openapi(
     info(title = "infinidysk admin API"),
     paths(
+        library::playback::status,
+        library::catalogue::status,library::catalogue::refresh,library::catalogue::groups,library::catalogue::files,
         crate::native_cache::evictions,crate::native_cache::diagnostics,crate::native_cache::probe,
         crate::native_cache::status,
         crate::native_cache::files,
@@ -347,6 +349,19 @@ pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
             "/api/v1/upgrade/report/seen",
             post(upgrade::post_upgrade_report_seen),
         )
+        .route(
+            "/api/v1/library/catalogue",
+            get(library::catalogue::status).post(library::catalogue::refresh),
+        )
+        .route(
+            "/api/v1/library/catalogue/groups",
+            get(library::catalogue::groups),
+        )
+        .route(
+            "/api/v1/library/catalogue/files",
+            get(library::catalogue::files),
+        )
+        .route("/api/v1/library/playback", get(library::playback::status))
         .route("/api/v1/library", get(library::get_library))
         .route(
             "/api/v1/library/preview",
@@ -1649,6 +1664,7 @@ struct ReadView {
     size: u64,
     /// Bytes returned to the reader.
     served: u64,
+    native_cache_bytes: u64,
     position: u64,
     traced: bool,
     /// Player id from a signed `/view` link.
@@ -1676,6 +1692,7 @@ fn read_view(session: &Session) -> ReadView {
         closed_at: session.closed_at().map(unix_ms),
         size: session.size,
         served: session.served(),
+        native_cache_bytes: session.native_cache_bytes(),
         position: session.pos(),
         traced: session.trace.is_some(),
         player: session.player.clone(),

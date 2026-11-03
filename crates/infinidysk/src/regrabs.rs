@@ -31,13 +31,16 @@ pub async fn status(
     State(admin): State<Arc<Admin>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Option<Status>>, Fail> {
-    let Some(row) = admin.vfs.db().regrab_intent(ItemId(id)).await? else {
-        return Ok(Json(None));
+    Ok(Json(inspect(admin.vfs.db(), id).await?))
+}
+pub(crate) async fn inspect(db: &infinidysk_db::Db, id: Uuid) -> Result<Option<Status>, Fail> {
+    let Some(row) = db.regrab_intent(ItemId(id)).await? else {
+        return Ok(None);
     };
     let saved: Saved = serde_json::from_str(&row.payload).map_err(|_| {
         Fail::Unavailable("Regrab journal could not be read; retain it for recovery".to_owned())
     })?;
-    Ok(Json(Some(Status {
+    Ok(Some(Status {
         item: id,
         arr_id: saved.arr_id,
         stage: saved.progress.stage.label().to_owned(),
@@ -46,5 +49,5 @@ pub async fn status(
         created_at: row.created_at,
         updated_at: row.updated_at,
         terminal: row.terminal,
-    })))
+    }))
 }

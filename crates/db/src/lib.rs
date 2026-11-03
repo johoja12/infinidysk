@@ -170,6 +170,8 @@ macro_rules! on {
     };
 }
 
+pub mod catalogue;
+
 /// A file or directory in the virtual tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {

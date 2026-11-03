@@ -546,6 +546,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/library/catalogue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["library_catalogue_roots"];
+        put?: never;
+        post: operations["library_catalogue_refresh"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/library/catalogue/files": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["library_catalogue_files"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/library/catalogue/groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["library_catalogue_groups"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/library/check": {
         parameters: {
             query?: never;
@@ -614,6 +662,22 @@ export interface paths {
         put?: never;
         /** Stops accepting C#'s earlier STRM key form at once. */
         post: operations["post_library_legacy_stop"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/library/playback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["library_playback"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1935,16 +1999,23 @@ export interface components {
             title: string;
         };
         FileDetails: {
+            cache_available: boolean;
+            cache_warning?: string | null;
+            cached_ranges: components["schemas"]["NativeCacheCoverage"][];
             /** @description Newest first. */
             checks: components["schemas"]["HealthCheckView"][];
             contents?: components["schemas"]["Contents"] | null;
             entry: components["schemas"]["FileEntry"];
             has_nzb: boolean;
             job?: components["schemas"]["JobView"] | null;
+            library_links: components["schemas"]["LibraryCatalogueFile"][];
             /** @description Paths under the mount directory that reach this file. */
             links: string[];
             media?: components["schemas"]["MediaView"] | null;
+            playback: components["schemas"]["LibraryPlayback"][];
+            regrab?: components["schemas"]["RegrabStatus"] | null;
             segments?: components["schemas"]["SegmentStats"] | null;
+            source_revision?: string | null;
         };
         FileEntry: {
             /**
@@ -2219,12 +2290,72 @@ export interface components {
          * @enum {string}
          */
         Level: "error" | "warn" | "info" | "debug" | "trace";
+        LibraryCatalogueFile: {
+            group: string;
+            /** Format: uuid */
+            item: string;
+            link_kind: string;
+            path: string;
+            relative_path: string;
+            root: string;
+            stale: boolean;
+        };
+        LibraryCatalogueGroup: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            files: number;
+            group: string;
+            root: string;
+            stale: boolean;
+            /** Format: int64 */
+            unavailable: number;
+        };
+        LibraryCatalogueRefresh: {
+            root?: string | null;
+        };
+        LibraryCatalogueRoot: {
+            /** Format: int64 */
+            completed_generation: number;
+            error?: string | null;
+            /** Format: int64 */
+            requested_at: number;
+            /** Format: int64 */
+            requested_generation: number;
+            root: string;
+            /** Format: int64 */
+            scanned_at?: number | null;
+            stale: boolean;
+        };
         /** @description A folder of an Arr's library. */
         LibraryDir: {
             /** @description As the Arrs see it; empty when that is `path`. */
             arr_path: string;
             /** @description As seen from here. */
             path: string;
+        };
+        LibraryPlayback: {
+            /** Format: int32 */
+            active_handles: number;
+            client: string;
+            delivery: string;
+            /** Format: int32 */
+            handles: number;
+            /** Format: int64 */
+            id: number;
+            /** Format: uuid */
+            item: string;
+            /** Format: int64 */
+            last_seen_at: number;
+            /** Format: int64 */
+            native_cache_bytes: number;
+            /** Format: int64 */
+            opened_at: number;
+            player?: string | null;
+            /** Format: int64 */
+            position_bytes: number;
+            /** Format: int64 */
+            served_bytes: number;
         };
         LibraryView: {
             /** @description The saved settings are the confirmed form; otherwise a preview applies them. */
@@ -3508,7 +3639,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a2fa-d879-75d4-8338-4ab049d98dfc
+             * @default 01a1a31d-0de7-77ce-89ad-f3bb63e70ff7
              */
             id: string;
             /**
@@ -3740,6 +3871,8 @@ export interface components {
             id: number;
             /** Format: uuid */
             item_id: string;
+            /** Format: int64 */
+            native_cache_bytes: number;
             /**
              * Format: int64
              * @description Unix milliseconds.
@@ -5408,6 +5541,94 @@ export interface operations {
             };
         };
     };
+    library_catalogue_roots: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryCatalogueRoot"][];
+                };
+            };
+        };
+    };
+    library_catalogue_refresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LibraryCatalogueRefresh"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    library_catalogue_files: {
+        parameters: {
+            query: {
+                root: string;
+                group?: string;
+                after?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryCatalogueFile"][];
+                };
+            };
+        };
+    };
+    library_catalogue_groups: {
+        parameters: {
+            query: {
+                root: string;
+                group?: string;
+                after?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryCatalogueGroup"][];
+                };
+            };
+        };
+    };
     post_library_check: {
         parameters: {
             query?: never;
@@ -5497,6 +5718,25 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LibraryView"];
+                };
+            };
+        };
+    };
+    library_playback: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LibraryPlayback"][];
                 };
             };
         };

@@ -548,6 +548,7 @@ pub async fn serve(
         .await,
     );
     let library_task = tokio::spawn(Arc::clone(&library).run());
+    let catalogue_task = tokio::spawn(Arc::clone(&library).run_catalogue());
     let maintenance = crate::maintenance::Maintenance::load(crate::maintenance::Parts {
         db: db.clone(),
         vfs: Arc::clone(&vfs),
@@ -712,6 +713,7 @@ pub async fn serve(
     discovery_task.abort();
     cleanup_task.abort();
     library_task.abort();
+    catalogue_task.abort();
     maintenance_task.abort();
     update_task.abort();
     warm_task.abort();

@@ -8,6 +8,7 @@ use infinidysk_db::{
 /// Exercises the tree, blob and config paths that must behave the same on both backends.
 async fn exercise(db: &Db) {
     fair_rechecks(db).await;
+    library_catalogue(db).await;
     // Unreferenced NZBs go at once until the retention section at the end.
     db.set_nzb_retention_days(0);
     let content = db
@@ -1410,4 +1411,156 @@ async fn fair_rechecks(db: &Db) {
         "completed work yields to imports"
     );
     db.delete_item(dir.id).await.expect("cleanup");
+}
+
+async fn library_catalogue(db: &Db) {
+    use infinidysk_db::catalogue::Link;
+    let content = db
+        .item(ItemId::CONTENT)
+        .await
+        .expect("content")
+        .expect("exists");
+    let mut item = Item::child(&content, "catalogue-fixture.mkv", ItemKind::NzbFile).expect("file");
+    item.size = Some(900);
+    db.insert(std::slice::from_ref(&item), &[])
+        .await
+        .expect("insert");
+    let root = "/catalogue-fixture";
+    let link = Link {
+        root: root.into(),
+        path: format!("{root}/Collection/file.mkv"),
+        relative_path: "Collection/file.mkv".into(),
+        group_name: "Collection".into(),
+        item_id: item.id.0,
+        pointer_hash: "fingerprint".into(),
+        link_kind: 1,
+        video: 1,
+    };
+    db.catalogue_replace(root, "scope-a", std::slice::from_ref(&link), 100, 0)
+        .await
+        .expect("snapshot");
+    let read = || {
+        db.catalogue_links(
+            Some(root),
+            Some("Collection"),
+            Some(item.id.0),
+            true,
+            "",
+            10,
+        )
+    };
+    assert_eq!(
+        read().await.expect("links").as_slice(),
+        std::slice::from_ref(&link)
+    );
+    let grouped = db.catalogue_groups(root, "", 10).await.expect("groups");
+    assert_eq!(
+        (grouped[0].files, grouped[0].bytes, grouped[0].unavailable),
+        (1, 900, 0)
+    );
+    db.catalogue_failed(root, "scope-b", "storage unavailable", 0)
+        .await
+        .expect("failure");
+    let roots = db.catalogue_roots().await.expect("roots");
+    let saved = roots.iter().find(|r| r.root == root).expect("root");
+    assert_eq!(
+        saved.scope, "scope-a",
+        "failed scope never replaces authority"
+    );
+    assert_eq!(saved.scanned_at, Some(100));
+    assert_eq!(
+        read().await.expect("retained").as_slice(),
+        std::slice::from_ref(&link)
+    );
+    assert!(
+        db.catalogue_replace(root, "scope-b", &[link.clone(), link.clone()], 200, 0)
+            .await
+            .is_err(),
+        "duplicate row rejects the entire transaction"
+    );
+    assert_eq!(
+        read().await.expect("rolled back").as_slice(),
+        std::slice::from_ref(&link)
+    );
+    db.catalogue_request(root, "scope-a", 300)
+        .await
+        .expect("refresh request");
+    db.catalogue_replace(root, "scope-a", std::slice::from_ref(&link), 300, 0)
+        .await
+        .expect("snapshot");
+    assert!(
+        db.catalogue_roots()
+            .await
+            .expect("roots")
+            .iter()
+            .find(|r| r.root == root)
+            .expect("root")
+            .requested_generation
+            > 0,
+        "concurrent request survives publication"
+    );
+    db.catalogue_request(root, "scope-a", 300)
+        .await
+        .expect("same millisecond request");
+    db.catalogue_replace(root, "scope-a", std::slice::from_ref(&link), 300, 1)
+        .await
+        .expect("complete earlier request");
+    let saved = db
+        .catalogue_roots()
+        .await
+        .expect("roots")
+        .into_iter()
+        .find(|r| r.root == root)
+        .expect("root");
+    assert_eq!(
+        (saved.requested_generation, saved.completed_generation),
+        (2, 1),
+        "same-time later request survives"
+    );
+    db.delete_item(item.id).await.expect("source removal");
+    assert_eq!(
+        db.catalogue_groups(root, "", 10)
+            .await
+            .expect("dangling group")[0]
+            .unavailable,
+        1,
+        "index does not pretend source removal is a completed scan"
+    );
+    db.catalogue_replace(root, "scope-a", &[], 400, 2)
+        .await
+        .expect("complete empty scan");
+    assert_eq!(read().await.expect("removed link"), [] as [Link; 0]);
+}
+
+#[tokio::test]
+async fn library_index_survives_database_restart() {
+    use infinidysk_db::catalogue::Link;
+    let path = std::env::temp_dir().join(format!("infinidysk-catalogue-{}.sqlite", ItemId::new()));
+    let url = format!("sqlite:{}", path.display());
+    let db = Db::connect(&url).await.expect("open");
+    let link = Link {
+        root: "/library".into(),
+        path: "/library/Collection/file.mkv".into(),
+        relative_path: "Collection/file.mkv".into(),
+        group_name: "Collection".into(),
+        item_id: ItemId::new().0,
+        pointer_hash: "fingerprint".into(),
+        link_kind: 1,
+        video: 1,
+    };
+    db.catalogue_replace("/library", "scope", std::slice::from_ref(&link), 100, 0)
+        .await
+        .expect("publish");
+    db.close().await;
+    drop(db);
+    let db = Db::connect(&url).await.expect("reopen");
+    assert_eq!(
+        db.catalogue_links(Some("/library"), None, None, true, "", 10)
+            .await
+            .expect("index"),
+        [link]
+    );
+    db.close().await;
+    drop(db);
+    let _ = std::fs::remove_file(path);
 }

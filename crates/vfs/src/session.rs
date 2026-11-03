@@ -59,6 +59,37 @@ pub struct Tracing {
     pub capacity: usize,
 }
 
+/// Lightweight attribution across short HTTP/FUSE handle bursts. No trace buffers.
+#[derive(Clone, Debug)]
+pub struct Playback {
+    pub id: u64,
+    pub item: ItemId,
+    pub delivery: Delivery,
+    pub client: String,
+    pub player: Option<String>,
+    pub opened_at: SystemTime,
+    pub closed_at: Option<SystemTime>,
+    pub served: u64,
+    pub native_cache_bytes: u64,
+    pub position: u64,
+}
+impl Playback {
+    fn from_session(s: &Session) -> Self {
+        Self {
+            id: s.id,
+            item: s.item,
+            delivery: s.delivery,
+            client: s.client.chars().take(512).collect(),
+            player: s.player.clone(),
+            opened_at: s.opened_at,
+            closed_at: s.closed_at(),
+            served: s.served(),
+            native_cache_bytes: s.native_cache_bytes(),
+            position: s.pos(),
+        }
+    }
+}
+
 /// One open of one item file.
 pub struct Session {
     pub id: u64,
@@ -71,6 +102,7 @@ pub struct Session {
     pub size: u64,
     pub trace: Option<Arc<Trace>>,
     served: AtomicU64,
+    native_cache_bytes: Arc<AtomicU64>,
     pos: AtomicU64,
     /// Nanoseconds from the first read request to its first byte; `u64::MAX` before it.
     first_byte_ns: AtomicU64,
@@ -156,6 +188,10 @@ impl Session {
             self.stalls.load(Ordering::Relaxed),
             Duration::from_nanos(self.stall_ns.load(Ordering::Relaxed)),
         )
+    }
+
+    pub fn native_cache_bytes(&self) -> u64 {
+        self.native_cache_bytes.load(Ordering::Relaxed)
     }
 
     pub fn seeks(&self) -> u64 {
@@ -253,6 +289,7 @@ pub struct Sessions {
 #[derive(Default)]
 struct Inner {
     repairing: HashSet<ItemId>,
+    recent: VecDeque<Playback>,
     open: Vec<Arc<Session>>,
     /// Newest last.
     finished: VecDeque<Arc<Session>>,
@@ -305,6 +342,22 @@ impl Sessions {
         self.lock().open.clone()
     }
 
+    /// Active and recently closed handles; metrics collection cannot consume this view.
+    pub fn playback(&self) -> Vec<Playback> {
+        let inner = self.lock();
+        let mut reads: Vec<_> = inner
+            .recent
+            .iter()
+            .filter(|r| {
+                r.closed_at
+                    .is_some_and(|t| t.elapsed().unwrap_or_default() <= Duration::from_secs(120))
+            })
+            .cloned()
+            .collect();
+        reads.extend(inner.open.iter().map(|s| Playback::from_session(s)));
+        reads
+    }
+
     /// Traced reads, open and finished, newest first.
     pub fn traced(&self) -> Vec<Arc<Session>> {
         let inner = self.lock();
@@ -355,6 +408,7 @@ impl Sessions {
             size,
             trace,
             served: AtomicU64::new(0),
+            native_cache_bytes: Arc::new(AtomicU64::new(0)),
             pos: AtomicU64::new(0),
             first_byte_ns: AtomicU64::new(u64::MAX),
             stall_ns: AtomicU64::new(0),
@@ -406,6 +460,9 @@ pub(crate) struct Guard {
 }
 
 impl Guard {
+    pub(crate) fn native_cache_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.session.native_cache_bytes)
+    }
     pub(crate) fn trace(&self) -> Option<Arc<Trace>> {
         self.session.trace.clone()
     }
@@ -425,6 +482,10 @@ impl Drop for Guard {
             inner.ended.pop_front();
         }
         inner.ended.push_back(Arc::clone(session));
+        if inner.recent.len() == 500 {
+            inner.recent.pop_front();
+        }
+        inner.recent.push_back(Playback::from_session(session));
         if let Some(trace) = &session.trace {
             trace.record(Event::End {
                 bytes: session.served(),
