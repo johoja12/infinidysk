@@ -984,6 +984,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/prefetch/predictions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["plex_predictions"];
+        put?: never;
+        post: operations["plex_predictions_refresh"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/prefetch/{id}": {
         parameters: {
             query?: never;
@@ -2974,6 +2990,116 @@ export interface components {
             local_path?: string | null;
             plex_path: string;
         };
+        PlexPrediction: {
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            item?: string | null;
+            ranges: components["schemas"]["PrefetchRange"][];
+            rating_key: string;
+            revision?: string | null;
+            server: string;
+            /** Format: int64 */
+            size: number;
+            source: components["schemas"]["PlexPredictionSource"];
+            title: string;
+            viewer: string;
+            warning?: string | null;
+        };
+        PlexPredictionPolicy: {
+            /**
+             * Format: int32
+             * @default 50
+             */
+            confidence_percent: number;
+            /** @default [] */
+            excluded_shows: string[];
+            /** @default true */
+            full_file: boolean;
+            /**
+             * Format: int64
+             * @default 16777216
+             */
+            head_bytes: number;
+            /**
+             * Format: int32
+             * @default 7
+             */
+            lookback_days: number;
+            /**
+             * Format: int32
+             * @default 2
+             */
+            min_distinct_episodes: number;
+            /** @default true */
+            movies: boolean;
+            /**
+             * Format: int32
+             * @default 7
+             */
+            partial_movie_lookback_days: number;
+            /**
+             * Format: int64
+             * @default 8388608
+             */
+            tail_bytes: number;
+            /** @default true */
+            television: boolean;
+            /**
+             * @description Exact `server:viewer` identities; names do not authorize or select profiles.
+             * @default []
+             */
+            viewers: string[];
+        };
+        PlexPredictionSnapshot: {
+            error?: string | null;
+            predictions: components["schemas"]["PlexPrediction"][];
+            refreshing: boolean;
+            stale: boolean;
+            /** Format: int64 */
+            updated_at?: number | null;
+            warning?: string | null;
+        };
+        /** @enum {string} */
+        PlexPredictionSource: "playback" | "next_episode" | "partial_movie";
+        /** @enum {string} */
+        PlexPrefetchLocalFiles: "disabled" | "imported_pointers";
+        PlexPrefetchSettings: {
+            /** @default false */
+            enabled: boolean;
+            /** @default false */
+            history: boolean;
+            /** @default disabled */
+            local_files: components["schemas"]["PlexPrefetchLocalFiles"];
+            /**
+             * Format: int32
+             * @default 2
+             */
+            next_episodes: number;
+            /**
+             * @default {
+             *       "confidence_percent": 50,
+             *       "excluded_shows": [],
+             *       "full_file": true,
+             *       "head_bytes": 16777216,
+             *       "lookback_days": 7,
+             *       "min_distinct_episodes": 2,
+             *       "movies": true,
+             *       "partial_movie_lookback_days": 7,
+             *       "tail_bytes": 8388608,
+             *       "television": true,
+             *       "viewers": []
+             *     }
+             */
+            policy: components["schemas"]["PlexPredictionPolicy"];
+            /** @default true */
+            realtime: boolean;
+            /**
+             * Format: int32
+             * @default 60
+             */
+            refresh_seconds: number;
+        };
         PlexSelectServer: {
             handle: string;
             url: string;
@@ -3069,6 +3195,7 @@ export interface components {
         PrefetchJob: {
             /** Format: int32 */
             attempts: number;
+            automatic_scope?: string | null;
             /** Format: int64 */
             cached_bytes: number;
             /** Format: int64 */
@@ -3133,6 +3260,30 @@ export interface components {
             daily_fill_bytes: number;
             /** @default false */
             enabled: boolean;
+            /**
+             * @default {
+             *       "enabled": false,
+             *       "history": false,
+             *       "local_files": "disabled",
+             *       "next_episodes": 2,
+             *       "policy": {
+             *         "confidence_percent": 50,
+             *         "excluded_shows": [],
+             *         "full_file": true,
+             *         "head_bytes": 16777216,
+             *         "lookback_days": 7,
+             *         "min_distinct_episodes": 2,
+             *         "movies": true,
+             *         "partial_movie_lookback_days": 7,
+             *         "tail_bytes": 8388608,
+             *         "television": true,
+             *         "viewers": []
+             *       },
+             *       "realtime": true,
+             *       "refresh_seconds": 60
+             *     }
+             */
+            plex: components["schemas"]["PlexPrefetchSettings"];
         };
         /** @enum {string} */
         PrefetchState: "queued" | "paused" | "complete" | "cancelled" | "failed" | "superseded" | "expired";
@@ -3241,7 +3392,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a1fb-8384-7191-a6c5-687b1c75d5c3
+             * @default 01a1a291-ab11-7276-82f6-95fa800d2cef
              */
             id: string;
             /**
@@ -3882,7 +4033,28 @@ export interface components {
             /**
              * @default {
              *       "daily_fill_bytes": 10000000000,
-             *       "enabled": false
+             *       "enabled": false,
+             *       "plex": {
+             *         "enabled": false,
+             *         "history": false,
+             *         "local_files": "disabled",
+             *         "next_episodes": 2,
+             *         "policy": {
+             *           "confidence_percent": 50,
+             *           "excluded_shows": [],
+             *           "full_file": true,
+             *           "head_bytes": 16777216,
+             *           "lookback_days": 7,
+             *           "min_distinct_episodes": 2,
+             *           "movies": true,
+             *           "partial_movie_lookback_days": 7,
+             *           "tail_bytes": 8388608,
+             *           "television": true,
+             *           "viewers": []
+             *         },
+             *         "realtime": true,
+             *         "refresh_seconds": 60
+             *       }
              *     }
              */
             prefetch: components["schemas"]["PrefetchSettings"];
@@ -5872,6 +6044,44 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    plex_predictions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexPredictionSnapshot"];
+                };
+            };
+        };
+    };
+    plex_predictions_refresh: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexPredictionSnapshot"];
+                };
             };
         };
     };

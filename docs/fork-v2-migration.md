@@ -12,8 +12,8 @@ completed-pointer removal, and a first shared final-media cache implementation a
 Rust. Cache settings and basic browsing/pinning/eviction are wired into the UI. The
 full fork port is **not complete**. Plex connections and viewer-safe transport are now implemented; Smart Prefetch,
 library catalogue parity, PAR2 execution, legacy migration adapters and several repair
-scheduler behaviors are still pending. A durable manual warming lane is implemented;
-automatic Plex planning and the full warming governor are not yet connected. The draft must not be treated as a cutover.
+scheduler behaviors are still pending. A durable warming lane and Plex current/history prediction snapshots now run in Rust.
+The full warming governor and library/source catalogue policies remain open. The draft must not be treated as a cutover.
 
 The 1.x source and production deployment remain unchanged. Port behavior into the
 Rust architecture; do not copy C# storage formats or add a second cache in front of
@@ -22,6 +22,8 @@ upstream `main`. Do not merge this migration into the production branch until th
 acceptance gates below pass.
 
 ## Status and order
+
+Later increments supersede pending lists in earlier checkpoint sections.
 
 - **Port**: a fork behavior needs an implementation in Rust.
 - **Verify**: upstream has a corresponding subsystem; parity needs tests or inspection.
@@ -43,10 +45,10 @@ acceptance gates below pass.
 | C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Source identity and revision cleanup implemented; PAR2 repair-revision integration pending |
 | C04 | P1 | Progressive cold reads, bounded first-byte fill, coalesced fills, source window reuse (`NativeCachedStream`, `NativeSourceCacheStream`; `c6a70ba8`, `0c3c129f`) | Rust segment cache already coalesces in-flight reads. Benchmark FUSE/WebDAV seeks before adding buffering; preserve foreground priority and bounded memory/I/O under NAS stalls. | Progressive read-through and parallel block commits implemented; controlled performance qualification pending |
 | C05 | P1 | Native cache browser, verified ranges, eviction history, buffer/I/O diagnostics (`NativeCacheBrowser*`, cache APIs) | Rust cache statistics exist; final-media file/range APIs and catalogue UI depend on C01–C03. Queries must not warm files or scan NAS payloads. | Basic settings/browser/ranges/pin/evict implemented; history/traffic diagnostics pending |
-| P01 | P1 | Durable Smart Prefetch queue, policies, pause/resume/cancel, budgets, bounded lanes (`Services/Prefetch`, `PrefetchJobStore`) | New source-bound durable queue, one strict background lane, manual API/UI and attempted-fill allowance. | Manual warming implemented; automatic planner, wire budget and full fork policy parity pending |
+| P01 | P1 | Durable Smart Prefetch queue, policies, pause/resume/cancel, budgets, bounded lanes (`Services/Prefetch`, `PrefetchJobStore`) | New source-bound durable queue, one strict background lane, manual API/UI and attempted-fill allowance. | Manual and Plex current/history warming implemented; wire budget, catalogue sources and full fork policy parity pending |
 | P02 | P1 | Plex account/PIN/Home-user authentication, server discovery and mapping (`Services/Plex`, Plex API) | New Rust Plex transport, private connection handles, settings and admin UI. | Implemented; loopback transport/service tests and simulated browser acceptance below; live Plex acceptance pending |
-| P03 | P1 | Viewer-scoped next-episode and partially watched predictions; durable snapshots during Plex outages (`PredictionSnapshot*`, `PlexViewerResolver`) | Depends on P02 and the media catalogue. Preserve account identity validation, viewer exclusions and uncertainty states. | Transport, viewer proof and prediction policy implemented; durable snapshots/planner pending |
-| P04 | P1 | Playback-aware warming priority, viewer lead, own-file warm lane, urgent backfills, cooperative yields (`WarmYieldPolicy`, `WarmConnectionGovernor`, `PrefetchWireBudget`) | Depends on P01 and reader tracking. Cached playback must not consume provider allowance; warming cannot starve an uncached seek. | Port |
+| P03 | P1 | Viewer-scoped next-episode and partially watched predictions; durable snapshots during Plex outages (`PredictionSnapshot*`, `PlexViewerResolver`) | Depends on P02 and the media catalogue. Preserve account identity validation, viewer exclusions and uncertainty states. | Durable complete snapshots and viewer-verified current/history planner implemented; live Plex acceptance pending |
+| P04 | P1 | Playback-aware warming priority, viewer lead, own-file warm lane, urgent backfills, cooperative yields (`WarmYieldPolicy`, `WarmConnectionGovernor`, `PrefetchWireBudget`) | Depends on P01 and reader tracking. Cached playback must not consume provider allowance; warming cannot starve an uncached seek. | Foreground yields, own-file priority and dedicated warm workload implemented; full governor pending |
 | P05 | P1 | Warming history by source revision/range, fetched bytes, source attribution and repair outcomes (`PrefetchRepairHistory`, `WarmingRateWindow`) | Depends on C01, P01 and R06. Use Rust decimal-byte API/UI conventions. | Port |
 | L01 | P1 | Persisted library link index, additional scan roots, video filter, catalogue/grouped browse (`Services/Library`, `LibraryLinkMaps`) | Rust library conversion/reconciliation exists, but not the fork catalogue and grouping. Preserve exact source-to-link mapping and bounded scans. | Port |
 | L02 | P1 | Plex metadata matching and indexed library classification (`PlexLibraryMetadataService`, `LibraryCatalogService`) | Depends on P02/L01. Keep matching separate from authority to delete or regrab a file. | Port |
@@ -327,3 +329,48 @@ original C# interoperability rerun also passed all three cases. Reducing Tokio w
 did not consistently resolve the queue failures. The final source must not be described
 as having a green full workspace suite. Details, binary provenance and browser/test
 scope are in [Plex and warming validation](validation/rust-v2-plex-warming-20261103.md).
+
+
+## Durable Plex prediction and automatic admission increment
+
+Rust now refreshes complete, configuration-bound snapshots for current playback,
+viewer-scoped next episodes and partially watched movies. The planner uses verified
+viewer credentials for metadata and watched state. Unresolved profiles are visible as
+ineligible; they never fall back to the owner. Positive watched counts are excluded
+from next-episode choices, malformed watched state fails the pass, and mismatched
+playing media versions are not guessed from metadata's first Part.
+
+The read-only snapshot keeps the last complete result during a failed/incomplete
+refresh and marks it stale after restoration or an outage. Configuration revisions
+hash account/server/policy/mapping settings without persisting raw credentials.
+Changed configurations hide old results and discard in-flight publication. Results
+are bounded to 100 candidates / 2 MB, refresh fetches to 25 seconds, and queue admission
+to five seconds. Saved-format errors warn and recover on a fresh complete pass.
+
+Automatic intents carry configuration ownership and an exact source revision. Policy
+changes cancel obsolete automatic work while preserving manual requests and explicit
+cancellations. Completed intents whose coverage was evicted become pending again;
+failed/cancelled intents do not get replaced by endless duplicate retries. Admission
+rejects metadata that changed during the preview. Both warming and playback use the
+existing shared native cache; no second delivery cache is added.
+
+History reads the newest 1000 events with bounded complete paging. Rewatches use event
+identity rather than treating repeated media IDs as duplicate pages. Exact DAV mappings
+and recognized local imported pointers are supported. Local pointers are opt-in, verify
+known mount/key identity, and have two bounded blocking-I/O slots retained through real
+completion. Local lookup uncertainty retains the previous snapshot. No arbitrary local
+media is read for warming.
+
+Settings > Background warming includes policy controls and attributed preview rows,
+with environment locks and explicit stale/error state. **Setup review:** Plex prediction
+is optional and default-off; history and local pointers remain off by default, realtime
+is selected when prediction is enabled, and downloading still requires warming/native
+cache enablement. This is advanced-only; no setup wizard/version bump is needed. Existing
+1.x prefetch settings/journals are not automatically activated by this increment.
+
+Validation and remaining scope are recorded in
+[Plex prediction validation](validation/rust-v2-predictions-20261103.md). The latest full
+run passed 329 tests, including PostgreSQL, and then stopped on the unchanged stalled-job
+queue timing test. It is not a green full-suite result. Library catalogue/hub-source
+policies, the full wire/lead/minimum/finish-watched governor, repair integration, broader
+migration and controlled live performance acceptance remain open.

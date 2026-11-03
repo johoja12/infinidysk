@@ -6,6 +6,7 @@ import { bytes } from "../format";
 import { Failure, Field, Loading, Locked, SettingsPanel, Toggle } from "../ui";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { PlexPredictions } from "./plex-predictions";
 
 type Operation = Schemas["PrefetchOperation"];
 export function PrefetchPanel() {
@@ -64,7 +65,7 @@ export function PrefetchPanel() {
       <SettingsPanel title="Background warming">
         <p className="text-muted-foreground text-sm">
           Keeps verified blocks in the same native cache used by playback. Jobs
-          survive restarts. Automatic Plex predictions are still being ported.
+          survive restarts. Plex predictions can add verified current and next files.
         </p>
         <Toggle
           id="prefetch-enabled"
@@ -123,6 +124,7 @@ export function PrefetchPanel() {
           </p>
         )}
       </SettingsPanel>
+      <PlexPredictions />
       <SettingsPanel title="Warm a file">
         <p className="text-muted-foreground text-sm">
           Use the imported file ID from Explore or the cache catalogue. This
