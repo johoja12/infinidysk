@@ -1264,6 +1264,16 @@ impl Db {
         items: &[(Item, HealthStatus)],
         blobs: &[(BlobId, &[u8])],
     ) -> Result<(), Error> {
+        self.import_items_with_sources(items, blobs, &[]).await
+    }
+
+    /// Atomically carry source provenance with the imported metadata it identifies.
+    pub async fn import_items_with_sources(
+        &self,
+        items: &[(Item, HealthStatus)],
+        blobs: &[(BlobId, &[u8])],
+        sources: &[(ItemId, String)],
+    ) -> Result<(), Error> {
         on!(self, pool => {
             let mut tx = pool.begin().await?;
             insert_rows!(tx, &[] as &[Item], blobs);
@@ -1291,9 +1301,50 @@ impl Db {
                 .execute(&mut *tx)
                 .await?;
             }
+            for (item, provenance) in sources {
+                sqlx::query("INSERT INTO import_sources(item_id, provenance) VALUES($1,$2)")
+                    .bind(item.0).bind(provenance).execute(&mut *tx).await?;
+            }
             tx.commit().await?;
         });
         Ok(())
+    }
+
+    pub async fn import_source(&self, item: ItemId) -> Result<Option<String>, Error> {
+        let sql = "SELECT provenance FROM import_sources WHERE item_id=$1";
+        Ok(on!(self, pool => sqlx::query_scalar(sql).bind(item.0).fetch_optional(pool).await?))
+    }
+
+    /// Only a reader-held repair can be advanced on last close; other backoffs stay intact.
+    pub async fn hold_repair_for_reader(&self, item: ItemId) -> Result<(), Error> {
+        let sql =
+            "INSERT INTO health_reader_holds(item_id) VALUES($1) ON CONFLICT(item_id) DO NOTHING";
+        on!(self, pool => sqlx::query(sql).bind(item.0).execute(pool).await?.rows_affected());
+        Ok(())
+    }
+
+    pub async fn reader_held_repairs(&self) -> Result<Vec<ItemId>, Error> {
+        let sql = "SELECT item_id FROM health_reader_holds ORDER BY item_id LIMIT 1000";
+        let ids: Vec<Uuid> = on!(self, pool => sqlx::query_scalar(sql).fetch_all(pool).await?);
+        Ok(ids.into_iter().map(ItemId).collect())
+    }
+
+    pub async fn release_reader_repair(&self, item: ItemId) -> Result<bool, Error> {
+        let changed = on!(self, pool => {
+            let mut tx = pool.begin().await?;
+            let held = sqlx::query("DELETE FROM health_reader_holds WHERE item_id=$1")
+                .bind(item.0).execute(&mut *tx).await?.rows_affected() > 0;
+            let changed = if held {
+                sqlx::query("UPDATE items SET next_health_check=$2 WHERE id=$1 AND health_state=4")
+                    .bind(item.0).bind(now_ms()).execute(&mut *tx).await?.rows_affected() > 0
+            } else { false };
+            tx.commit().await?;
+            changed
+        });
+        if changed {
+            self.notify(Change::Health);
+        }
+        Ok(changed)
     }
 
     /// Records finished jobs carried over from another install, in one transaction.
@@ -1995,8 +2046,8 @@ impl Db {
             "WHERE kind <> $1 AND meta_blob IS NOT NULL AND ( \
                 (recheck_requested <> 0 AND health_state NOT IN (4, 5)) \
                 OR (COALESCE(next_health_check, 0) <= $2 \
-                    AND (health_state IN (4, 5) OR ($3 AND health_state <> 7)))) \
-             ORDER BY CASE WHEN recheck_requested = 2 THEN 0 WHEN health_state = 0 THEN 1 \
+                    AND (health_state IN (4, 5) OR (($3 OR EXISTS (SELECT 1 FROM urgent_health u WHERE u.item_id=items.id)) AND health_state <> 7)))) \
+             ORDER BY CASE WHEN recheck_requested = 2 OR EXISTS (SELECT 1 FROM urgent_health u WHERE u.item_id=items.id) THEN 0 WHEN health_state = 0 THEN 1 \
                 WHEN recheck_requested = 1 THEN 2 ELSE 3 END, \
                 COALESCE(next_health_check, 0), COALESCE(release_date, created_at) DESC \
              LIMIT $4"
@@ -2046,6 +2097,13 @@ impl Db {
             .execute(pool)
             .await?
             .rows_affected());
+        if matches!(
+            status.state,
+            HealthState::Healthy | HealthState::Degraded | HealthState::Ignored
+        ) {
+            let sql = "DELETE FROM urgent_health WHERE item_id=$1 AND EXISTS(SELECT 1 FROM items WHERE id=$1 AND recheck_requested=0)";
+            on!(self, pool => sqlx::query(sql).bind(id.0).execute(pool).await?.rows_affected());
+        }
         self.notify(Change::Health);
         Ok(())
     }
@@ -2066,6 +2124,10 @@ impl Db {
 
     /// Asks for a check of `id` ahead of its schedule; a more urgent pending reason wins.
     pub async fn request_recheck(&self, id: ItemId, reason: Recheck) -> Result<(), Error> {
+        if reason == Recheck::Playback {
+            let sql = "INSERT INTO urgent_health(item_id) SELECT id FROM items WHERE id=$1 ON CONFLICT(item_id) DO NOTHING";
+            on!(self, pool => sqlx::query(sql).bind(id.0).execute(pool).await?.rows_affected());
+        }
         let sql = "UPDATE items SET recheck_requested = $2 \
                    WHERE id = $1 AND recheck_requested < $2";
         on!(self, pool => sqlx::query(sql)
@@ -2075,6 +2137,11 @@ impl Db {
             .await?
             .rows_affected());
         Ok(())
+    }
+
+    pub async fn health_is_urgent(&self, id: ItemId) -> Result<bool, Error> {
+        let sql = "SELECT EXISTS(SELECT 1 FROM urgent_health WHERE item_id=$1)";
+        Ok(on!(self, pool => sqlx::query_scalar(sql).bind(id.0).fetch_one(pool).await?))
     }
 
     /// Files per health state.

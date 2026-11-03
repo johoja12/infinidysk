@@ -37,6 +37,88 @@ async fn exercise(db: &Db) {
     .await
     .expect("insert");
 
+    let now = infinidysk_db::now_ms();
+    let held = HealthStatus {
+        state: HealthState::Repairing,
+        next_check: Some(now + 900_000),
+        ..HealthStatus::default()
+    };
+    db.set_health(file.id, &held, Recheck::None)
+        .await
+        .expect("health persistence");
+    db.hold_repair_for_reader(file.id)
+        .await
+        .expect("health persistence");
+    assert_eq!(
+        db.reader_held_repairs().await.expect("health persistence"),
+        [file.id]
+    );
+    assert!(
+        db.release_reader_repair(file.id)
+            .await
+            .expect("health persistence")
+    );
+    assert!(
+        !db.release_reader_repair(file.id)
+            .await
+            .expect("health persistence")
+    );
+    let suspect = HealthStatus {
+        state: HealthState::Suspect,
+        next_check: Some(now + 300_000),
+        ..held
+    };
+    db.set_health(file.id, &suspect, Recheck::None)
+        .await
+        .expect("health persistence");
+    db.request_recheck(file.id, Recheck::Playback)
+        .await
+        .expect("health persistence");
+    db.postpone_health(file.id, now + 300_000)
+        .await
+        .expect("health persistence");
+    assert!(
+        db.health_is_urgent(file.id)
+            .await
+            .expect("health persistence")
+    );
+    assert_eq!(
+        db.due_health_work(now, false, 10)
+            .await
+            .expect("health persistence"),
+        [] as [(Item, HealthStatus); 0]
+    );
+    assert_eq!(
+        db.due_health_work(now + 300_001, false, 10)
+            .await
+            .expect("health persistence")[0]
+            .0
+            .id,
+        file.id
+    );
+    db.set_health(file.id, &HealthStatus::default(), Recheck::Playback)
+        .await
+        .expect("health persistence");
+    // Only terminal outcomes clear persistent playback urgency.
+    db.set_health(
+        file.id,
+        &HealthStatus {
+            state: HealthState::Healthy,
+            ..HealthStatus::default()
+        },
+        Recheck::None,
+    )
+    .await
+    .expect("health persistence");
+    assert!(
+        !db.health_is_urgent(file.id)
+            .await
+            .expect("health persistence")
+    );
+
+    db.set_health(file.id, &HealthStatus::default(), Recheck::None)
+        .await
+        .expect("restore initial state");
     assert_eq!(file.path, "/content/job/b.mkv");
     assert_eq!(
         db.item_by_path(&file.path).await.expect("query"),
@@ -1121,4 +1203,58 @@ async fn completed_pointer_removal_survives_a_database_restart() {
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
+}
+
+#[tokio::test]
+async fn fork_import_provenance_and_reader_holds_survive_restart_and_cascade() {
+    let path = std::env::temp_dir().join(format!("id-fork-provenance-{}.sqlite", ItemId::new()));
+    let url = format!("sqlite:{}", path.display());
+    let db = Db::connect(&url).await.expect("database");
+    let content = db
+        .item(ItemId::CONTENT)
+        .await
+        .expect("root")
+        .expect("root exists");
+    let item = Item::child(&content, "fixture.dat", ItemKind::NzbFile).expect("item");
+    let status = HealthStatus {
+        state: HealthState::Repairing,
+        next_check: Some(infinidysk_db::now_ms() + 900_000),
+        ..HealthStatus::default()
+    };
+    db.import_items_with_sources(
+        &[(item.clone(), status)],
+        &[],
+        &[(item.id, "source-receipt".into())],
+    )
+    .await
+    .expect("atomic import");
+    db.hold_repair_for_reader(item.id).await.expect("hold");
+    db.request_recheck(item.id, Recheck::Playback)
+        .await
+        .expect("urgency");
+    drop(db);
+    let db = Db::connect(&url).await.expect("reopen");
+    assert_eq!(
+        db.import_source(item.id)
+            .await
+            .expect("provenance")
+            .as_deref(),
+        Some("source-receipt")
+    );
+    assert_eq!(db.reader_held_repairs().await.expect("holds"), [item.id]);
+    assert!(
+        db.health_is_urgent(item.id)
+            .await
+            .expect("urgency survives")
+    );
+    assert!(db.release_reader_repair(item.id).await.expect("release"));
+    db.delete_item(item.id).await.expect("delete");
+    assert_eq!(db.import_source(item.id).await.expect("cascade"), None);
+    assert_eq!(
+        db.reader_held_repairs().await.expect("cascade"),
+        [] as [ItemId; 0]
+    );
+    assert!(!db.health_is_urgent(item.id).await.expect("cascade"));
+    drop(db);
+    let _ = std::fs::remove_file(path);
 }
