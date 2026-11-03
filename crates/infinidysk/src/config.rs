@@ -156,6 +156,7 @@ pub struct Settings {
     pub mount: Mount,
     pub performance: Performance,
     pub native_cache: infinidysk_native_cache::Settings,
+    pub plex: infinidysk_plex::Settings,
     pub providers: Vec<Provider>,
     pub arr_instances: Vec<ArrInstance>,
     pub arr: ArrOptions,
@@ -921,6 +922,7 @@ impl Settings {
         out.webdav.password = out.webdav.password.masked();
         out.webdav.download_key = out.webdav.download_key.masked();
         out.imports.strm_key = out.imports.strm_key.masked();
+        out.plex = out.plex.masked(MASK);
         for p in &mut out.providers {
             p.password = p.password.masked();
         }
@@ -932,6 +934,7 @@ impl Settings {
 
     /// Replaces [`MASK`] placeholders with the secrets in `current`.
     fn restore_secrets(&mut self, current: &Self) {
+        self.plex.restore(&current.plex, MASK);
         self.sab.api_key.restore(&current.sab.api_key);
         self.auth.api_key.restore(&current.auth.api_key);
         self.auth.session_key.restore(&current.auth.session_key);
@@ -1036,6 +1039,9 @@ impl Settings {
 
     /// Checks every field and fills the provider fields that come from the catalog.
     pub fn validate(&mut self) -> Result<(), Error> {
+        self.plex
+            .validate()
+            .map_err(|e| invalid("plex", e.to_string()))?;
         self.native_cache
             .validate()
             .map_err(|e| invalid("native_cache", e.to_string()))?;

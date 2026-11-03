@@ -14,6 +14,7 @@ mod library;
 pub mod logs;
 mod maintenance;
 pub mod metrics;
+mod plex;
 mod probe;
 mod provider_status;
 mod provider_test;

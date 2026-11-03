@@ -63,6 +63,7 @@ pub struct Admin {
     pub metrics: Arc<Metrics>,
     pub arr: Arc<arr::Discovery>,
     pub tests: provider_test::Tests,
+    pub plex: Arc<crate::plex::Service>,
     /// `Ok` while FUSE is mounted, otherwise why not.
     pub mount: watch::Receiver<Result<infinidysk_vfs::Kernel, String>>,
     pub library: Arc<crate::library::Library>,
@@ -83,6 +84,9 @@ pub struct Admin {
         crate::native_cache::action,
         crate::native_cache::coverage,
         crate::native_cache::import_legacy,
+        crate::plex::start, crate::plex::poll, crate::plex::cancel,
+        crate::plex::discover, crate::plex::select, crate::plex::home,
+        crate::plex::switch_home, crate::plex::libraries,
         get_settings,
         put_settings,
         get_key,
@@ -188,6 +192,24 @@ impl Modify for Security {
 
 pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
     Router::new()
+        .route("/api/v1/plex/login", post(crate::plex::start))
+        .route(
+            "/api/v1/plex/login/{handle}",
+            get(crate::plex::poll).delete(crate::plex::cancel),
+        )
+        .route(
+            "/api/v1/plex/accounts/{id}/discover",
+            post(crate::plex::discover),
+        )
+        .route(
+            "/api/v1/plex/accounts/{id}/home",
+            get(crate::plex::home).post(crate::plex::switch_home),
+        )
+        .route("/api/v1/plex/servers", post(crate::plex::select))
+        .route(
+            "/api/v1/plex/servers/{id}/libraries",
+            get(crate::plex::libraries),
+        )
         .route("/api/v1/native-cache", get(crate::native_cache::status))
         .route(
             "/api/v1/native-cache/import-legacy",
@@ -467,7 +489,11 @@ async fn put_settings(
             format!("Cannot write STRM files in {dir:?}: {reason}"),
         ));
     }
+    let previous_accounts = store.settings().plex.accounts.clone();
     store.save(settings).await?;
+    if store.settings().plex.accounts != previous_accounts {
+        admin.plex.invalidate_pending();
+    }
     store.generate_missing_secrets().await?;
     if let Err(error) = admin.live.apply(store.settings()).await {
         return Err(Fail::Bad(format!("saved, but could not apply: {error:#}")));

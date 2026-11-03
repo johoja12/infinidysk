@@ -399,7 +399,7 @@ fn sign(key: &str, expiry: &str, admin: &Admin) -> Hmac<Sha256> {
     mac
 }
 
-fn cookie(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn cookie(headers: &HeaderMap) -> Option<&str> {
     headers
         .get_all(header::COOKIE)
         .iter()

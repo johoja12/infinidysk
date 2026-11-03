@@ -574,7 +574,13 @@ pub async fn serve(
         tokio::spawn(async move { updates.run(cancel).await })
     };
     let restart = Arc::new(AtomicBool::new(false));
+    let plex = Arc::new(
+        crate::plex::Service::load(&db)
+            .await
+            .context("initializing Plex integration")?,
+    );
     let admin = Arc::new(Admin {
+        plex,
         config: Arc::clone(&config),
         queue: Arc::clone(&queue),
         client,

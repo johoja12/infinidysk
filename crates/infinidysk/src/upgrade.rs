@@ -174,6 +174,8 @@ fn basic(headers: &HeaderMap) -> Option<(String, String)> {
 
 /// C# settings with a counterpart or their own note here.
 const MAPPED: &[&str] = &[
+    "plex.accounts",
+    "plex.servers",
     "api.key",
     "api.categories",
     "api.manual-category",
@@ -349,6 +351,23 @@ pub fn settings(cs: &Config) -> Upgrade {
         Err(error) => notes.push(format!(
             "Arr instances: the C# list is unreadable ({error}); add them again"
         )),
+    }
+    let plex = (|| {
+        let accounts = cs
+            .get("plex.accounts")
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or_default();
+        let servers = cs
+            .get("plex.servers")
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or_default();
+        Ok::<_, serde_json::Error>(infinidysk_plex::Settings { accounts, servers })
+    })();
+    match plex {
+        Ok(plex) if plex.validate().is_ok() => s.plex=plex,
+        _ => notes.push("Plex connections were not carried over: invalid legacy settings; reconnect from Plex settings".into()),
     }
     keep_valid(&mut s, &mut notes);
     let dropped: Vec<&str> = cs.keys().filter(|k| !MAPPED.contains(k)).collect();

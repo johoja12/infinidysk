@@ -243,6 +243,9 @@ async fn build(
         for p in &mut settings.providers {
             mask(&mut p.username);
         }
+        for account in &mut settings.plex.accounts {
+            mask(&mut account.name);
+        }
         mask(&mut settings.webdav.user);
         let locked: Vec<String> = store.locked().collect();
         (
@@ -455,12 +458,12 @@ fn write(
 }
 
 /// URL query values, URL logins and `Authorization` values.
-static CREDENTIALS: LazyLock<[(Regex, &str); 3]> = LazyLock::new(|| {
+static CREDENTIALS: LazyLock<[(Regex, &str); 5]> = LazyLock::new(|| {
     let re = |p| Regex::new(p).expect("the pattern is a valid literal");
     [
         (
             re(
-                r#"(?i)([?&](?:apikey|api_key|access_token|token|pass|password|auth|downloadkey|key)=)[^&\s"'#\[]+"#,
+                r#"(?i)([?&](?:apikey|api_key|access_token|token|x-plex-token|pass|password|auth|downloadkey|key)=)[^&\s"'#\[]+"#,
             ),
             "${1}[REDACTED]",
         ),
@@ -471,6 +474,14 @@ static CREDENTIALS: LazyLock<[(Regex, &str); 3]> = LazyLock::new(|| {
         (
             re(r"(?i)\b(basic|bearer)\s+[A-Za-z0-9._~+/=-]{8,}"),
             "$1 [REDACTED]",
+        ),
+        (
+            re(r#"(?i)\b(x-plex-token|x-plex-auth-token)(\s*:\s*)[^\s,"']+"#),
+            "${1}${2}[REDACTED]",
+        ),
+        (
+            re(r#"(?i)("(?:authToken|accessToken|X-Plex-Token)"\s*:\s*")(?:[^"\\]|\\.)*(")"#),
+            "${1}[REDACTED]${2}",
         ),
     ]
 });
@@ -509,6 +520,9 @@ impl Redactor {
         .chain(settings.providers.iter().map(|p| &p.password))
         .chain(settings.arr_instances.iter().map(|a| &a.api_key))
         .map(|s| s.0.clone())
+        .chain(settings.plex.accounts.iter().map(|a| a.token.0.clone()))
+        .chain(settings.plex.servers.iter().map(|s| s.token.0.clone()))
+        .chain(settings.plex.accounts.iter().map(|a| a.name.clone()))
         .chain(settings.providers.iter().map(|p| p.username.clone()))
         .filter(|s| s.chars().count() >= 4)
         .flat_map(|s| {
@@ -605,5 +619,27 @@ mod tests {
             r#"login [REDACTED] pw {"p":"[REDACTED]"} url http://[REDACTED]@h/x?apikey=[REDACTED]&a=1 Bearer [REDACTED] from [IP-1] and [IP-1], 192.168.1.2, [IP-2], ::1 ua Chrome/120.0.0.0 at infinidysk::admin 12:03:04"#
         );
         assert_eq!((r.secrets_found, r.credentials_found), (2, 3));
+    }
+    #[test]
+    fn redacts_current_and_historical_plex_credentials() {
+        let mut settings = Settings::default();
+        settings.plex.accounts.push(infinidysk_plex::Account {
+            id: "profile".into(),
+            name: "private-viewer".into(),
+            token: infinidysk_plex::Token("current-fixture-token".into()),
+            numeric_id: None,
+        });
+        let mut redactor = Redactor::new(&settings);
+        let out=redactor.redact(r#"private-viewer current-fixture-token https://plex.invalid/x?X-Plex-Token=historical-query X-Plex-Token: historical-header {"authToken":"old-json-token","accessToken":"old-resource-token"}"#);
+        for value in [
+            "private-viewer",
+            "current-fixture-token",
+            "historical-query",
+            "historical-header",
+            "old-json-token",
+            "old-resource-token",
+        ] {
+            assert!(!out.contains(value), "{value}");
+        }
     }
 }
