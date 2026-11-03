@@ -856,6 +856,102 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/plex/accounts/{id}/discover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["plex_discover_servers"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plex/accounts/{id}/home": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["plex_home_users"];
+        put?: never;
+        post: operations["plex_switch_home"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plex/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["plex_login_start"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plex/login/{handle}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["plex_login_poll"];
+        put?: never;
+        post?: never;
+        delete: operations["plex_login_cancel"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plex/servers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["plex_select_server"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plex/servers/{id}/libraries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["plex_libraries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/provider-tests": {
         parameters: {
             query?: never;
@@ -2785,6 +2881,75 @@ export interface components {
             /** @description Every preset's values, to show what picking one changes. */
             presets: components["schemas"]["PresetView"][];
         };
+        PlexAccount: {
+            id: string;
+            name: string;
+            numeric_id?: string | null;
+            token: components["schemas"]["PlexToken"];
+        };
+        PlexConnection: {
+            local: boolean;
+            relay: boolean;
+            uri: string;
+        };
+        PlexDiscoveredServer: {
+            connections: components["schemas"]["PlexConnection"][];
+            handle: string;
+            id: string;
+            name: string;
+            owned: boolean;
+        };
+        PlexHomeUser: {
+            admin: boolean;
+            id: string;
+            name: string;
+            protected: boolean;
+        };
+        PlexLibrary: {
+            id: string;
+            kind: string;
+            title: string;
+        };
+        PlexLoginStart: {
+            /** Format: int64 */
+            expires_at_ms: number;
+            handle: string;
+            url: string;
+        };
+        PlexLoginStatus: {
+            /** Format: int64 */
+            expires_at_ms: number;
+            state: string;
+        };
+        PlexPathMapping: {
+            dav_path?: string | null;
+            local_path?: string | null;
+            plex_path: string;
+        };
+        PlexSelectServer: {
+            handle: string;
+            url: string;
+        };
+        PlexServer: {
+            account_id?: string | null;
+            enabled?: boolean;
+            id: string;
+            name: string;
+            path_mappings?: components["schemas"]["PlexPathMapping"][];
+            token: components["schemas"]["PlexToken"];
+            url: string;
+        };
+        PlexSettings: {
+            /** @default [] */
+            accounts: components["schemas"]["PlexAccount"][];
+            /** @default [] */
+            servers: components["schemas"]["PlexServer"][];
+        };
+        PlexSwitchHome: {
+            pin?: components["schemas"]["Secret"] | null;
+            user_id: string;
+        };
+        PlexToken: string;
         /** @description Bytes and requests in one bucket starting at `ts`. */
         Point: {
             /** Format: int64 */
@@ -2945,7 +3110,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a17b-5ee2-74c6-a42b-359f6fd470e9
+             * @default 01a1a1cc-fd80-75d8-af1a-710894b3939e
              */
             id: string;
             /**
@@ -3576,6 +3741,13 @@ export interface components {
              *     }
              */
             performance: components["schemas"]["Performance"];
+            /**
+             * @default {
+             *       "accounts": [],
+             *       "servers": []
+             *     }
+             */
+            plex: components["schemas"]["PlexSettings"];
             /** @default [] */
             providers: components["schemas"]["Provider"][];
             /**
@@ -5326,6 +5498,178 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PerformanceView"];
+                };
+            };
+        };
+    };
+    plex_discover_servers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexDiscoveredServer"][];
+                };
+            };
+        };
+    };
+    plex_home_users: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexHomeUser"][];
+                };
+            };
+        };
+    };
+    plex_switch_home: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlexSwitchHome"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+        };
+    };
+    plex_login_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexLoginStart"];
+                };
+            };
+        };
+    };
+    plex_login_poll: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                handle: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexLoginStatus"];
+                };
+            };
+        };
+    };
+    plex_login_cancel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                handle: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexLoginStatus"];
+                };
+            };
+        };
+    };
+    plex_select_server: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlexSelectServer"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": string;
+                };
+            };
+        };
+    };
+    plex_libraries: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexLibrary"][];
                 };
             };
         };

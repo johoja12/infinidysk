@@ -10,7 +10,7 @@ It groups related changes into capabilities; it is not a promise of complete par
 **Current checkpoint:** the missing-grab fallback, exact original-download recovery,
 completed-pointer removal, and a first shared final-media cache implementation are in
 Rust. Cache settings and basic browsing/pinning/eviction are wired into the UI. The
-full fork port is **not complete**. In particular, Plex integration, Smart Prefetch,
+full fork port is **not complete**. Plex connections and viewer-safe transport are now implemented; Smart Prefetch,
 library catalogue parity, PAR2 execution, legacy migration adapters and several repair
 scheduler behaviors are still pending. The draft must not be treated as a cutover.
 
@@ -43,8 +43,8 @@ acceptance gates below pass.
 | C04 | P1 | Progressive cold reads, bounded first-byte fill, coalesced fills, source window reuse (`NativeCachedStream`, `NativeSourceCacheStream`; `c6a70ba8`, `0c3c129f`) | Rust segment cache already coalesces in-flight reads. Benchmark FUSE/WebDAV seeks before adding buffering; preserve foreground priority and bounded memory/I/O under NAS stalls. | Progressive read-through and parallel block commits implemented; controlled performance qualification pending |
 | C05 | P1 | Native cache browser, verified ranges, eviction history, buffer/I/O diagnostics (`NativeCacheBrowser*`, cache APIs) | Rust cache statistics exist; final-media file/range APIs and catalogue UI depend on C01–C03. Queries must not warm files or scan NAS payloads. | Basic settings/browser/ranges/pin/evict implemented; history/traffic diagnostics pending |
 | P01 | P1 | Durable Smart Prefetch queue, policies, pause/resume/cancel, budgets, bounded lanes (`Services/Prefetch`, `PrefetchJobStore`) | Rust stream read-ahead is not the fork's background warming scheduler. Build a separate scheduler using the shared cache and provider workload classes. | Port |
-| P02 | P1 | Plex account/PIN/Home-user authentication, server discovery and mapping (`Services/Plex`, Plex API) | No equivalent Plex account/catalogue service found in the Rust baseline. Keep credentials masked and all provider/account access explicit. | Port |
-| P03 | P1 | Viewer-scoped next-episode and partially watched predictions; durable snapshots during Plex outages (`PredictionSnapshot*`, `PlexViewerResolver`) | Depends on P02 and the media catalogue. Preserve account identity validation, viewer exclusions and uncertainty states. | Port |
+| P02 | P1 | Plex account/PIN/Home-user authentication, server discovery and mapping (`Services/Plex`, Plex API) | New Rust Plex transport, private connection handles, settings and admin UI. | Implemented; loopback transport/service tests and simulated browser acceptance below; live Plex acceptance pending |
+| P03 | P1 | Viewer-scoped next-episode and partially watched predictions; durable snapshots during Plex outages (`PredictionSnapshot*`, `PlexViewerResolver`) | Depends on P02 and the media catalogue. Preserve account identity validation, viewer exclusions and uncertainty states. | Transport, viewer proof and prediction policy implemented; durable snapshots/planner pending |
 | P04 | P1 | Playback-aware warming priority, viewer lead, own-file warm lane, urgent backfills, cooperative yields (`WarmYieldPolicy`, `WarmConnectionGovernor`, `PrefetchWireBudget`) | Depends on P01 and reader tracking. Cached playback must not consume provider allowance; warming cannot starve an uncached seek. | Port |
 | P05 | P1 | Warming history by source revision/range, fetched bytes, source attribution and repair outcomes (`PrefetchRepairHistory`, `WarmingRateWindow`) | Depends on C01, P01 and R06. Use Rust decimal-byte API/UI conventions. | Port |
 | L01 | P1 | Persisted library link index, additional scan roots, video filter, catalogue/grouped browse (`Services/Library`, `LibraryLinkMaps`) | Rust library conversion/reconciliation exists, but not the fork catalogue and grouping. Preserve exact source-to-link mapping and bounded scans. | Port |
@@ -236,3 +236,40 @@ The final checkpoint validation is recorded in
 [`validation/rust-v2-cache-interop-20261103.md`](validation/rust-v2-cache-interop-20261103.md):
 337 workspace tests, PostgreSQL, three real C# interoperability cases, privileged FUSE,
 Chromium and storage-interruption/resume checks. This is not full fork feature parity.
+
+## Plex connection and viewer-policy increment
+
+`crates/plex` implements PIN authentication, Plex Home profiles, discovery, protected
+server validation, complete bounded library paging, sessions/history and viewer-scoped
+metadata and next-episode requests. Viewer access requires account and server proof;
+a display name or claimed player ID never selects another account's watched state.
+Redirects are disabled, request/response sizes and time are bounded, credentials stay
+in sensitive headers, and errors do not echo upstream bodies. Prediction policy keeps
+viewers separate, filters specials and duplicate episodes, and uses exact path mapping.
+This policy is not yet a durable Smart Prefetch planner.
+
+The admin service keeps login and discovered-token handles private, expiring and bound
+to the authenticated administrator. Configuration changes invalidate pending work.
+Home selection verifies the actual returned identity and rechecks its parent credential
+before saving. Server selection only accepts an advertised URI, verifies machine identity
+and library authorization, and rejects stale configuration. Existing mappings survive
+credential refresh. Support packs redact current and historical Plex token forms.
+The C# settings adapter carries valid account/server lists over, including numeric
+legacy account IDs; invalid lists produce an explicit migration note.
+
+The optional Settings > Plex page supports accounts, Home profiles, discovered servers,
+connection tests and exact DAV/local mappings. Tokens remain masked. Environment-managed
+lists remain locked. **Setup-wizard review:** Plex is optional and default-empty, outside
+a new installation's critical path; no wizard change or version bump is needed.
+No database schema change is introduced by this increment.
+
+Local evidence: the workspace run passed **360 tests, zero failures, six ignored**.
+The PostgreSQL environment was unset in that run; the separate
+`postgres_storage_round_trips` run against local PostgreSQL 17 passed. Workspace
+formatting, all-target Clippy and the TypeScript/Vite build also passed. Six connection-service cases and sixteen transport/
+policy cases cover account ownership, cancellation, identity changes, authorization,
+paging, bounds, masking and path/range policy. The Chromium fixture passed eight UI
+checks with no page errors: account flow, Home PIN isolation, token-free server selection,
+connection test, mappings, masked round trip, mobile width and environment locks.
+**The browser responses were simulated.** No real Plex login, cloud acceptance,
+production provider access, prefetch runtime or deployment is claimed.

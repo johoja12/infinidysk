@@ -59,6 +59,7 @@ import { ArrInstances } from "./arr";
 import { PerformanceSettings } from "./performance";
 import { NativeCachePanel } from "./native-cache";
 import { Providers } from "./providers";
+import { PlexConnections } from "./plex";
 
 const strategies: { value: Schemas["ImportStrategy"]; title: string; blurb: string }[] = [
   { value: "symlinks", title: "Symlinks", blurb: "Plex, or any media server that sees the mount" },
@@ -163,6 +164,7 @@ const categories = [
     title: "Performance",
     description: "Read-ahead, caching and download speed",
   },
+  { group:"Automation",slug:"plex",title:"Plex connections",description:"Accounts, Home profiles and exact library path mappings" },
   {
     group: "Automation",
     slug: "arr",
@@ -669,6 +671,7 @@ export function Settings() {
         <div className="min-w-0">
           {category.slug === "providers" && <Providers title={category.title} description={category.description} />}
           {category.slug === "arr" && <ArrInstances title={category.title} description={category.description} />}
+          {category.slug === "plex" && <PlexConnections />}
           <form id="settings" onSubmit={submit}>
             {category.slug === "download-client" && (
               <Section category={category}>
