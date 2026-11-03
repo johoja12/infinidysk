@@ -330,6 +330,7 @@ pub struct SegmentReader {
     prewarm: bool,
     /// Background-priority reads that fail instead of filling, padding or cutting.
     strict: bool,
+    background: Workload,
     budget: Option<Budget>,
     cache: Option<Arc<Cache>>,
     /// Segments from here on are fetched only when read: the caller's range ends before.
@@ -382,6 +383,7 @@ impl SegmentReader {
             prefetch,
             prewarm: true,
             strict: false,
+            background: Workload::Health,
             budget: None,
             cache: None,
             end,
@@ -422,6 +424,17 @@ impl SegmentReader {
     pub const fn with_strict(mut self) -> Self {
         self.strict = true;
         self.prewarm = false;
+        self
+    }
+
+    /// Strict background warming, accounted separately from health and playback.
+    #[must_use]
+    pub const fn with_warming(mut self) -> Self {
+        self.strict = true;
+        self.prewarm = false;
+        self.background = Workload::Warm;
+        self.prefetch = 1;
+        self.initial = 1;
         self
     }
 
@@ -619,13 +632,14 @@ impl SegmentReader {
         // The segment being read is always fetched, even past the range end.
         let end = self.end.max(read_index + 1).min(self.layout.segments.len());
         while self.next < end && self.next - self.head < ahead {
-            let (client, layout, cache, hole, index, strict) = (
+            let (client, layout, cache, hole, index, strict, background) = (
                 Arc::clone(&self.client),
                 Arc::clone(&self.layout),
                 self.cache.clone(),
                 self.hole(self.next),
                 self.next,
                 self.strict,
+                self.background,
             );
             if !strict && hole.gaps.as_ref().is_some_and(|g| g.is_hole(index)) {
                 let size = usize::try_from(layout.segments[index].size).unwrap_or(0);
@@ -701,7 +715,7 @@ impl SegmentReader {
                         Some(&probe),
                         (!strict).then_some(progress),
                         &hole,
-                        strict,
+                        strict.then_some(background),
                     )
                     .await?;
                     Ok(((data, permit, filled), started.elapsed()))
@@ -845,7 +859,7 @@ impl SegmentReader {
                     Some(&probe),
                     None,
                     &hole,
-                    false,
+                    None,
                 )
                 .await
             }));
@@ -1033,16 +1047,13 @@ async fn fetch(
     probe: Option<&Probe>,
     progress: Option<Progress>,
     hole: &Hole,
-    strict: bool,
+    background: Option<Workload>,
 ) -> io::Result<(Bytes, bool)> {
     let size = usize::try_from(segment.size)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "segment too large"))?;
     let (id, begin) = (&segment.message_id, segment.begin);
-    let workload = if strict {
-        Workload::Health
-    } else {
-        Workload::Stream
-    };
+    let strict = background.is_some();
+    let workload = background.unwrap_or(Workload::Stream);
     let body = match source {
         Source::Direct => client
             .body_with(id, workload, probe, progress.as_ref(), begin)
@@ -1059,10 +1070,17 @@ async fn fetch(
     };
     match body {
         Ok(data) if data.len() == size => Ok((data, false)),
-        Ok(_) if strict => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "decoded size differs from layout",
-        )),
+        Ok(_) if strict => {
+            if background == Some(Workload::Warm)
+                && let Some(report) = &hole.report
+            {
+                report(hole.index, Fault::Corrupt);
+            }
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decoded size differs from layout",
+            ))
+        }
         Ok(data) => {
             if let Some(suppressed) = hole.gaps.as_ref().map_or(Some(0), |gaps| gaps.log()) {
                 tracing::warn!(
@@ -1109,7 +1127,25 @@ async fn fetch(
             }
             Ok((hole.filler.fill(hole.at, size).into(), true))
         }
-        Err(error) => Err(io::Error::other(error)),
+        Err(error) => {
+            if background == Some(Workload::Warm)
+                && matches!(
+                    *error,
+                    Error::NotFound | Error::CrcMismatch { .. } | Error::Yenc(_)
+                )
+                && let Some(report) = &hole.report
+            {
+                report(
+                    hole.index,
+                    if matches!(*error, Error::NotFound) {
+                        Fault::Missing
+                    } else {
+                        Fault::Corrupt
+                    },
+                );
+            }
+            Err(io::Error::other(error))
+        }
     }
 }
 

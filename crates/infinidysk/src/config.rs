@@ -157,6 +157,7 @@ pub struct Settings {
     pub performance: Performance,
     pub native_cache: infinidysk_native_cache::Settings,
     pub plex: infinidysk_plex::Settings,
+    pub prefetch: infinidysk_prefetch::Settings,
     pub providers: Vec<Provider>,
     pub arr_instances: Vec<ArrInstance>,
     pub arr: ArrOptions,
@@ -1039,6 +1040,15 @@ impl Settings {
 
     /// Checks every field and fills the provider fields that come from the catalog.
     pub fn validate(&mut self) -> Result<(), Error> {
+        self.prefetch
+            .validate()
+            .map_err(|e| invalid("prefetch", e.to_string()))?;
+        if self.prefetch.enabled && !self.native_cache.enabled {
+            return Err(invalid(
+                "prefetch",
+                "Enable the native cache before background warming".to_owned(),
+            ));
+        }
         self.plex
             .validate()
             .map_err(|e| invalid("plex", e.to_string()))?;

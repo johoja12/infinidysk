@@ -64,6 +64,7 @@ pub struct Admin {
     pub arr: Arc<arr::Discovery>,
     pub tests: provider_test::Tests,
     pub plex: Arc<crate::plex::Service>,
+    pub prefetch: Arc<infinidysk_prefetch::Queue>,
     /// `Ok` while FUSE is mounted, otherwise why not.
     pub mount: watch::Receiver<Result<infinidysk_vfs::Kernel, String>>,
     pub library: Arc<crate::library::Library>,
@@ -84,6 +85,7 @@ pub struct Admin {
         crate::native_cache::action,
         crate::native_cache::coverage,
         crate::native_cache::import_legacy,
+        crate::prefetch::status,crate::prefetch::enqueue,crate::prefetch::pause,crate::prefetch::control,
         crate::plex::start, crate::plex::poll, crate::plex::cancel,
         crate::plex::discover, crate::plex::select, crate::plex::home,
         crate::plex::switch_home, crate::plex::libraries,
@@ -192,6 +194,12 @@ impl Modify for Security {
 
 pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
     Router::new()
+        .route(
+            "/api/v1/prefetch",
+            get(crate::prefetch::status).post(crate::prefetch::enqueue),
+        )
+        .route("/api/v1/prefetch/pause", post(crate::prefetch::pause))
+        .route("/api/v1/prefetch/{id}", post(crate::prefetch::control))
         .route("/api/v1/plex/login", post(crate::plex::start))
         .route(
             "/api/v1/plex/login/{handle}",

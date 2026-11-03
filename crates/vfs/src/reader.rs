@@ -202,6 +202,22 @@ impl Reader {
         }
     }
 
+    /// Strict one-article window, using the provider warming class.
+    pub(crate) fn into_warming(self) -> Self {
+        match self {
+            Self::Memory(_) | Self::Native(_) => self,
+            Self::Segments(r) => Self::Segments(r.with_warming()),
+            Self::Parts(mut r) => {
+                r.inner = r.inner.with_warming();
+                Self::Parts(r)
+            }
+            Self::Crypt(mut r) => {
+                r.inner.inner = r.inner.inner.with_warming();
+                Self::Crypt(r)
+            }
+        }
+    }
+
     /// The caller reads no further than `end`, so read-ahead stops there.
     pub fn set_end(&mut self, end: u64) {
         match self {

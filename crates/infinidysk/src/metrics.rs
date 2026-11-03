@@ -352,7 +352,7 @@ pub struct Overview {
     /// Since the metrics store was created.
     lifetime: Totals,
     providers: Vec<ProviderScore>,
-    /// Provider traffic by who asked: `stream`, `queue` and `health`.
+    /// Provider traffic by who asked: `stream`, `queue`, `health` and `warm`.
     workloads: Vec<WorkloadView>,
     rescues: Vec<RescueView>,
     /// Rescues in the window just before this one; none for `all`.
@@ -384,6 +384,7 @@ struct Point {
     stream: u64,
     queue: u64,
     health: u64,
+    warm: u64,
     /// Requests that failed for the caller after every retry and fallback; missing
     /// articles not counted.
     errors: u64,
@@ -500,7 +501,7 @@ struct ProviderScore {
 
 #[derive(Default, Serialize, ToSchema)]
 struct WorkloadView {
-    /// `stream`, `queue` or `health`.
+    /// `stream`, `queue`, `health` or `warm`.
     workload: &'static str,
     bytes: u64,
     /// Finished requests, cancelled ones left out.
@@ -1137,6 +1138,7 @@ impl Metrics {
                             Workload::Stream => point.stream += value,
                             Workload::Queue => point.queue += value,
                             Workload::Health => point.health += value,
+                            Workload::Warm => point.warm += value,
                         }
                         spark.requests += value;
                         if outcome == Outcome::NotFound {
@@ -2287,6 +2289,8 @@ mod tests {
             ("p.a.stream.bytes".to_owned(), 100),
             ("p.b.stream.bytes".to_owned(), 50),
             ("p.a.health.bytes".to_owned(), 7),
+            ("p.a.warm.bytes".to_owned(), 11),
+            (format!("p.a.warm.{ok}"), 2),
             (format!("p.a.stream.{ok}"), 3),
             (format!("p.b.stream.{missing}"), 2),
             (format!("p.a.stream.{cancelled}"), 9),
@@ -2303,7 +2307,8 @@ mod tests {
             [
                 ("stream", 150, 5, 2),
                 ("queue", 0, 0, 0),
-                ("health", 7, 0, 0)
+                ("health", 7, 0, 0),
+                ("warm", 11, 2, 0)
             ]
         );
     }

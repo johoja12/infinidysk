@@ -15,10 +15,11 @@ pub enum Workload {
     Stream,
     Queue,
     Health,
+    Warm,
 }
 
 impl Workload {
-    pub const ALL: [Self; 3] = [Self::Stream, Self::Queue, Self::Health];
+    pub const ALL: [Self; 4] = [Self::Stream, Self::Queue, Self::Health, Self::Warm];
 
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -26,6 +27,7 @@ impl Workload {
             Self::Stream => "stream",
             Self::Queue => "queue",
             Self::Health => "health",
+            Self::Warm => "warm",
         }
     }
 }

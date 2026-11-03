@@ -579,7 +579,28 @@ pub async fn serve(
             .await
             .context("initializing Plex integration")?,
     );
+    let prefetch = infinidysk_prefetch::Queue::load(db.clone(), Arc::clone(&vfs))
+        .await
+        .context("loading warming jobs")?;
+    let prefetch_task = {
+        let prefetch = Arc::clone(&prefetch);
+        let config = Arc::clone(&config);
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! { ()=stop.cancelled()=>break, _=interval.tick()=>{} }
+                let settings = config.read().await.settings().prefetch.clone();
+                tokio::select! {
+                    ()=stop.cancelled()=>break,
+                    result=prefetch.tick(&settings)=>if let Err(error)=result {warn!(reason=%error,"warming step deferred");}
+                }
+            }
+        })
+    };
     let admin = Arc::new(Admin {
+        prefetch,
         plex,
         config: Arc::clone(&config),
         queue: Arc::clone(&queue),
@@ -635,6 +656,7 @@ pub async fn serve(
     cancel.cancel();
     worker.abort();
     health_task.abort();
+    prefetch_task.abort();
     discovery_task.abort();
     cleanup_task.abort();
     library_task.abort();

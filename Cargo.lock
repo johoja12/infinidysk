@@ -1149,6 +1149,7 @@ dependencies = [
  "infinidysk-native-cache",
  "infinidysk-nntp",
  "infinidysk-plex",
+ "infinidysk-prefetch",
  "infinidysk-queue",
  "infinidysk-stream",
  "infinidysk-testkit",
@@ -1376,6 +1377,26 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "infinidysk-prefetch"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "infinidysk-core",
+ "infinidysk-db",
+ "infinidysk-native-cache",
+ "infinidysk-nntp",
+ "infinidysk-stream",
+ "infinidysk-testkit",
+ "infinidysk-vfs",
+ "serde",
+ "serde_json",
  "tokio",
  "utoipa",
  "uuid",

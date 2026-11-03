@@ -647,6 +647,24 @@ impl Vfs {
         self.open_meta(&*self.meta(item).await?)
     }
 
+    /// Background warming has no playback session, filler, hedges or segment read-ahead.
+    pub async fn open_warming(&self, item: &Item) -> Result<Reader, Error> {
+        let report = self.report.as_ref().map(|report| {
+            let (report, id) = (Arc::clone(report), item.id);
+            Arc::new(move |index, fault| report(id, index, fault)) as Report
+        });
+        Ok(Reader::new(
+            &*self.meta(item).await?,
+            &self.client,
+            &self.budget,
+            None,
+            0,
+            None,
+            report.as_ref(),
+        )?
+        .into_warming())
+    }
+
     /// The file's decoded metadata; concurrent first opens fetch it once.
     async fn meta(&self, item: &Item) -> Result<Arc<CachedMeta>, Error> {
         let id = item

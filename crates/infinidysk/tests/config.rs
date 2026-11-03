@@ -241,3 +241,57 @@ fn validation_rejects_unknown_catalog_entries_and_bad_arr_urls() {
     public.network.public_url = "media.example.com".into();
     assert!(matches!(public.validate(), Err(Error::Invalid { .. })));
 }
+
+#[tokio::test]
+async fn warming_settings_preserve_live_private_ledger_and_respect_environment_authority() {
+    let path =
+        std::env::temp_dir().join(format!("infinidysk-config-{}.sqlite", uuid::Uuid::now_v7()));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("connect");
+    db.write_config(&[("fork_prefetch_v1", "{\"generation\":1}")], &[])
+        .await
+        .expect("initial ledger");
+    let env = [(
+        "INFINIDYSK__PREFETCH__DAILY_FILL_BYTES".to_owned(),
+        "20000000000".to_owned(),
+    )];
+    let mut store = ConfigStore::load(db.clone(), env).await.expect("load");
+    db.write_config(&[("fork_prefetch_v1", "{\"generation\":2}")], &[])
+        .await
+        .expect("worker advances ledger");
+    let mut next = store.settings().clone();
+    next.prefetch.enabled = true;
+    assert!(
+        matches!(
+            store.save(next).await,
+            Err(Error::Invalid {
+                path: "prefetch",
+                ..
+            })
+        ),
+        "warming requires native cache"
+    );
+    let mut next = store.settings().clone();
+    next.prefetch.daily_fill_bytes = 10_000_000_000;
+    assert!(
+        matches!(store.save(next).await,Err(Error::Locked(p)) if p=="prefetch.daily_fill_bytes")
+    );
+    let mut next = store.settings().clone();
+    next.sab.manual_category = "fixture".into();
+    store.save(next).await.expect("unrelated settings save");
+    let ledger = db
+        .config()
+        .await
+        .expect("read config")
+        .into_iter()
+        .find(|(k, _)| k == "fork_prefetch_v1")
+        .expect("private ledger")
+        .1;
+    assert_eq!(
+        ledger, "{\"generation\":2}",
+        "stale Settings snapshot must not rewrite the worker ledger"
+    );
+    db.close().await;
+    let _ = std::fs::remove_file(path);
+}

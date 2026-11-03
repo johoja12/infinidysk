@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 infinidysk-native-cache.workspace = true
 infinidysk-plex.workspace = true
+infinidysk-prefetch.workspace = true
 anyhow.workspace = true
 percent-encoding.workspace = true
 argon2.workspace = true
