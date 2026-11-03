@@ -21,6 +21,7 @@ mod probe;
 mod provider_status;
 mod provider_test;
 mod quota;
+mod regrabs;
 mod release_notes;
 pub mod sab;
 mod ui;

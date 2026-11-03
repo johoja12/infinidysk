@@ -35,10 +35,10 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | --- | --- | --- | --- | --- |
 | R01 | P0 | Replace an exactly identified damaged import even when its original grab is absent (`ArrClient`, `RadarrClient`, `HealthCheckService`; fork PR #230) | `crates/arr/src/repair.rs` already deletes/searches without a grab, but unnecessarily waits for an automatic search it never triggered. Skip that wait and retain replacement/error guards. | First port implemented; validation recorded below |
 | R02 | P0 | Recover the original download from exact file ID + imported path; reject ambiguity and incomplete history (`ArrDownloadIdResolver`, fork PR #234) | `repair.rs::owner_of_file` and Arr owner backfill exist. Add scoped, fully paginated Radarr history using **`movieIds`**, verify current identity, and carry recovered identity into blocklisting. Do not use a migration job ID as original provenance. Sonarr filtering stays profile-specific. | Implemented; exact scoped/paginated recovery with ambiguity guards |
-| R03 | P0 | Protect live/overlapping reads, but bypass recent-read delay for confirmed damage after readers close (`ConcurrentReadTracker`, fork PR #232) | `health::Health::with_in_use` and VFS read handles exist. Prove FUSE/WebDAV/STRM accounting, cancellation cleanup, and no destructive repair while any reader remains. | Implemented reader-held repair persistence and last-close wakeup; regression validation below |
+| R03 | P0 | Protect live/overlapping reads, but bypass recent-read delay for confirmed damage after readers close (`ConcurrentReadTracker`, fork PR #232) | `health::Health::with_in_use` and VFS read handles exist. Prove FUSE/WebDAV/STRM accounting, cancellation cleanup, and no destructive repair while any reader remains. | Implemented persisted reader holds, last-close wakeup and atomic reader/repair admission; regression validation below |
 | R04 | P0 | Keep read/warm-triggered damaged-file repairs urgent through provider circuit outages (`HealthCheckService`, `PrefetchRepairHistory`, `eafe1705`) | Persisted urgent health state and bounded inconclusive retry; strict warming failures request the same priority. | Implemented for read and manual warming; automatic prediction integration pending |
-| R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Verify / port gaps |
-| R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Port |
+| R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Request generations and explicit-request scheduling implemented; resumable full-content sweep remains open |
+| R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Durable source-bound mutation journal, CAS checkpoints and uncertain-response observation implemented; detached worker, library-root authority and manual outcome controls remain open |
 | R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; this baseline has no equivalent recovery executor in health. Port trusted range/slice identity, bounded repair budgets, durable outcomes and separate worker scheduling before declaring repair parity. | Port |
 | C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | First implementation in Rust; verified 1.x copy import implemented; broader fork data import remains M01 |
 | C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins implemented; recovery/probe tools pending |
@@ -374,3 +374,37 @@ run passed 329 tests, including PostgreSQL, and then stopped on the unchanged st
 queue timing test. It is not a green full-suite result. Library catalogue/hub-source
 policies, the full wire/lead/minimum/finish-watched governor, repair integration, broader
 migration and controlled live performance acceptance remain open.
+
+
+## Durable repair and health request increment
+
+Health now persists a source- and Arr-bound regrab intent before dispatching external
+mutations. Revision compare-and-swap prevents stale workers from advancing the same
+intent. Original file identity survives missing Arr file records and source removal.
+A lost blocklist, delete or search response leads to read-only observation, rather
+than replay. Deletion must be observed before search; accepted search commands are
+matched by fresh command ID and exact arguments. Saved records contain no credentials.
+Each checkpoint revalidates the configured Arr and current content revision.
+
+A repair pass is bounded to 25 seconds and waits for automatic search by scheduling a
+later pass, without sleeping in the health worker. Uncertain mutations older than one
+day require review. Terminal journals retain 30 days of observations. The authenticated
+`GET /api/v1/health/regrabs/{id}` reports stage, revision and command ID without exposing
+job names or imported paths. There is no manual abandon/reissue action yet.
+
+VFS playback opens and repair admission use the same lock. An admitted reader prevents
+mutation until its last handle closes. A repair owner temporarily rejects new opens
+(WebDAV 503 with Retry-After; FUSE EAGAIN); stale nodes reload visibility and metadata.
+Request generations preserve a same-priority request arriving during health work or
+exception backoff. Explicit user requests precede unchecked imports, with persisted
+admission time and stable ID ties. This does not implement the resumable full-content
+sweep or a full scheduling quota policy.
+
+**Upgrade/setup review:** migrations 0012 and 0013 are additive on SQLite and
+PostgreSQL. Back up `/config` before upgrading; migrations apply at startup. No new
+configuration or setup-wizard controls are added. Detached journal observation after
+source removal, library-root deletion authority, explicit manual recovery controls,
+full sweep/PAR2 execution and the other inventory gaps remain open. No production
+cutover is implied.
+
+Validation is recorded in [repair recovery validation](validation/rust-v2-regrab-20261103.md).

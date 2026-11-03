@@ -349,7 +349,15 @@ pub async fn serve(
     let mut health = Health::new(db.clone(), Arc::clone(&client), arr_rx, health_rx)
         .context("setting up health checks")?
         .with_gates(importing.clone(), streaming.clone())
-        .with_in_use(in_use);
+        .with_in_use(in_use)
+        .with_read_gate({
+            let vfs = Arc::clone(&vfs);
+            move |id| {
+                vfs.sessions()
+                    .try_repair(id)
+                    .map(|guard| Box::new(guard) as infinidysk_health::ReadHold)
+            }
+        });
     let busy = {
         let (importing, streaming) = (importing.clone(), streaming.clone());
         move || importing() || streaming()

@@ -212,6 +212,20 @@ async fn serves_every_api_on_one_port_and_applies_settings_live() {
     assert_eq!(code, "HTTP/1.1 200 OK");
     let spec: Value = serde_json::from_str(&body).unwrap();
     assert!(spec["paths"]["/api/v1/settings"]["put"].is_object());
+    assert!(spec["paths"]["/api/v1/health/regrabs/{id}"]["get"].is_object());
+    let regrab = format!("/api/v1/health/regrabs/{}", ItemId::new());
+    let anonymous_regrab = format!("GET {regrab} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    assert_eq!(
+        status(addr, &anonymous_regrab).await,
+        "HTTP/1.1 401 Unauthorized"
+    );
+    let (code, body) = send(addr, &admin_request("GET", &regrab, "")).await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    assert_eq!(
+        body, "null",
+        "an unknown intent is explicit, not fabricated"
+    );
+
     let anonymous = "GET /api/v1/settings HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
     assert_eq!(status(addr, anonymous).await, "HTTP/1.1 401 Unauthorized");
 

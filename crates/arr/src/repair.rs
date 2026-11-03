@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use reqwest::Method;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{Arr, Error, Profile, call, fetch, send, version};
@@ -30,6 +30,7 @@ pub struct Import {
 }
 
 /// The media an Arr imported from a download, and the file it holds for it now.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Owner {
     media: Media,
     imported_path: String,
@@ -42,6 +43,7 @@ pub struct Owner {
     download_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 enum Media {
     Episodes(Vec<i64>),
     Movie(i64),
@@ -143,7 +145,7 @@ struct Data {
     imported_path: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct MediaFile {
     id: i64,
@@ -582,3 +584,5 @@ mod tests {
         assert!(owner("2024-06-01T00:00:00Z").replaced());
     }
 }
+
+pub(crate) mod tracked;

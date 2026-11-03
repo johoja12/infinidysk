@@ -378,6 +378,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/health/regrabs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["regrab_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health/rejected": {
         parameters: {
             query?: never;
@@ -3392,7 +3408,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a291-ab11-7276-82f6-95fa800d2cef
+             * @default 01a1a2f2-b700-72df-82cd-2dbea793cc6f
              */
             id: string;
             /**
@@ -3693,6 +3709,21 @@ export interface components {
              * @description Oldest hour of history kept.
              */
             since?: number | null;
+        };
+        RegrabStatus: {
+            arr_id: string;
+            /** Format: int64 */
+            command_id?: number | null;
+            /** Format: int64 */
+            created_at: number;
+            /** Format: uuid */
+            item: string;
+            /** Format: int64 */
+            revision: number;
+            stage: string;
+            terminal: boolean;
+            /** Format: int64 */
+            updated_at: number;
         };
         /**
          * @description A release health asked an Arr to replace. NZBs with its name or any of its articles
@@ -5030,6 +5061,27 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthHistoryEntry"][];
+                };
+            };
+        };
+    };
+    regrab_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RegrabStatus"] | null;
                 };
             };
         };

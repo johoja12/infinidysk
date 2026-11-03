@@ -29,6 +29,16 @@ pub const SEARCH_WINDOW_MS: i64 = 30 * 60 * 1000;
 /// How long a SQLite write waits for another connection's lock before it fails.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Durable repair state, retained independently from the source's lifetime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegrabIntent {
+    pub scope: String,
+    pub payload: String,
+    pub revision: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub terminal: bool,
+}
 /// A SQLite file's size and how much of it is unused pages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqliteStats {
@@ -311,6 +321,8 @@ pub struct HealthStatus {
     /// Unix milliseconds.
     pub hidden_until: Option<i64>,
     pub recheck: Recheck,
+    /// Captured request generation; prevents completing work from consuming a newer request.
+    pub recheck_generation: i64,
     /// Unix milliseconds of the first confirmed article miss; stored only while `suspect`.
     pub suspect_since: Option<i64>,
 }
@@ -324,6 +336,7 @@ struct HealthWorkRow {
     repair_attempts: i16,
     hidden_until: Option<i64>,
     recheck_requested: i16,
+    recheck_generation: i64,
     suspect_since: Option<i64>,
 }
 
@@ -344,6 +357,7 @@ impl TryFrom<HealthWorkRow> for (Item, HealthStatus) {
                 2 => Recheck::Playback,
                 _ => return Err(Error::Corrupt("unknown recheck reason")),
             },
+            recheck_generation: r.recheck_generation,
             suspect_since: r.suspect_since,
         };
         Ok((item, status))
@@ -745,7 +759,7 @@ macro_rules! select_health {
             "SELECT ",
             item_columns!(),
             ", last_health_check, next_health_check, repair_attempts, hidden_until, \
-             recheck_requested, suspect_since FROM items ",
+             recheck_requested, recheck_generation, suspect_since FROM items ",
             $filter
         )
     };
@@ -1307,6 +1321,54 @@ impl Db {
             }
             tx.commit().await?;
         });
+        Ok(())
+    }
+
+    pub async fn regrab_intent(&self, item: ItemId) -> Result<Option<RegrabIntent>, Error> {
+        let sql = "SELECT scope,payload,revision,created_at,updated_at,terminal FROM regrab_intents WHERE item_id=$1";
+        let row: Option<(String, String, i64, i64, i64, i16)> =
+            on!(self,pool=>sqlx::query_as(sql).bind(item.0).fetch_optional(pool).await?);
+        Ok(row.map(
+            |(scope, payload, revision, created_at, updated_at, terminal)| RegrabIntent {
+                scope,
+                payload,
+                revision,
+                created_at,
+                updated_at,
+                terminal: terminal != 0,
+            },
+        ))
+    }
+    /// One coordinator wins admission. Existing intent identity is never overwritten.
+    pub async fn prepare_regrab(
+        &self,
+        item: ItemId,
+        scope: &str,
+        payload: &str,
+    ) -> Result<RegrabIntent, Error> {
+        let now = now_ms();
+        let sql = "INSERT INTO regrab_intents(item_id,scope,payload,created_at,updated_at) VALUES($1,$2,$3,$4,$4) ON CONFLICT(item_id) DO NOTHING";
+        on!(self,pool=>sqlx::query(sql).bind(item.0).bind(scope).bind(payload).bind(now).execute(pool).await?.rows_affected());
+        self.regrab_intent(item)
+            .await?
+            .ok_or(Error::Sqlx(sqlx::Error::RowNotFound))
+    }
+    pub async fn checkpoint_regrab(
+        &self,
+        item: ItemId,
+        scope: &str,
+        revision: i64,
+        payload: &str,
+        terminal: bool,
+    ) -> Result<bool, Error> {
+        let sql = "UPDATE regrab_intents SET payload=$4,revision=revision+1,updated_at=$5,terminal=$6 WHERE item_id=$1 AND scope=$2 AND revision=$3";
+        Ok(
+            on!(self,pool=>sqlx::query(sql).bind(item.0).bind(scope).bind(revision).bind(payload).bind(now_ms()).bind(i16::from(terminal)).execute(pool).await?.rows_affected())
+                == 1,
+        )
+    }
+    pub async fn prune_regrab_intents(&self, before: i64) -> Result<(), Error> {
+        on!(self,pool=>sqlx::query("DELETE FROM regrab_intents WHERE terminal=1 AND updated_at<$1").bind(before).execute(pool).await?.rows_affected());
         Ok(())
     }
 
@@ -2031,7 +2093,8 @@ impl Db {
     }
 
     /// Up to `limit` items with health work due at `now`, most urgent first: playback
-    /// reports, never checked, user rechecks, then by schedule (newest release on ties).
+    /// reports, explicit user requests, pending repairs, unchecked imports, then routine work.
+    /// Requests retain their first admission time; stable IDs break ties.
     /// Without `routine` only rechecks and pending repairs are returned.
     // ponytail: never-checked rows are not in the `next_health_check` index; a scan is
     // fine at library scale and polls are rare.
@@ -2047,9 +2110,9 @@ impl Db {
                 (recheck_requested <> 0 AND health_state NOT IN (4, 5)) \
                 OR (COALESCE(next_health_check, 0) <= $2 \
                     AND (health_state IN (4, 5) OR (($3 OR EXISTS (SELECT 1 FROM urgent_health u WHERE u.item_id=items.id)) AND health_state <> 7)))) \
-             ORDER BY CASE WHEN recheck_requested = 2 OR EXISTS (SELECT 1 FROM urgent_health u WHERE u.item_id=items.id) THEN 0 WHEN health_state = 0 THEN 1 \
-                WHEN recheck_requested = 1 THEN 2 ELSE 3 END, \
-                COALESCE(next_health_check, 0), COALESCE(release_date, created_at) DESC \
+             ORDER BY CASE WHEN recheck_requested = 2 OR EXISTS (SELECT 1 FROM urgent_health u WHERE u.item_id=items.id) THEN 0 WHEN recheck_requested = 1 THEN 1 \
+                WHEN health_state IN (4, 5) THEN 2 WHEN health_state = 0 THEN 3 ELSE 4 END, \
+                COALESCE(health_requested_at, next_health_check, 0), COALESCE(release_date, created_at) DESC, id \
              LIMIT $4"
         );
         let rows: Vec<HealthWorkRow> = on!(self, pool => sqlx::query_as(sql)
@@ -2080,7 +2143,9 @@ impl Db {
     ) -> Result<(), Error> {
         let sql = "UPDATE items SET health_state = $2, last_health_check = $3, \
                    next_health_check = $4, repair_attempts = $5, hidden_until = $6, \
-                   recheck_requested = CASE WHEN recheck_requested = $7 THEN 0 \
+                   health_requested_at = CASE WHEN recheck_requested = $7 AND recheck_generation = $9 THEN NULL \
+                   WHEN recheck_requested = $7 THEN $10 ELSE health_requested_at END, \
+                   recheck_requested = CASE WHEN recheck_requested = $7 AND recheck_generation = $9 THEN 0 \
                    ELSE recheck_requested END, suspect_since = $8 WHERE id = $1";
         let suspect_since = status
             .suspect_since
@@ -2094,6 +2159,8 @@ impl Db {
             .bind(status.hidden_until)
             .bind(handled as i16)
             .bind(suspect_since)
+            .bind(status.recheck_generation)
+            .bind(now_ms())
             .execute(pool)
             .await?
             .rows_affected());
@@ -2108,13 +2175,20 @@ impl Db {
         Ok(())
     }
 
-    /// Moves `id`'s next health work to `next_check` and drops its recheck request,
-    /// leaving its state alone.
-    pub async fn postpone_health(&self, id: ItemId, next_check: i64) -> Result<(), Error> {
-        let sql = "UPDATE items SET next_health_check = $2, recheck_requested = 0 WHERE id = $1";
+    /// Moves failed work back without consuming requests that arrived during the attempt.
+    pub async fn postpone_health(
+        &self,
+        id: ItemId,
+        next_check: i64,
+        generation: i64,
+    ) -> Result<(), Error> {
+        let sql = "UPDATE items SET next_health_check = $2, \
+                   health_requested_at = CASE WHEN recheck_generation = $3 THEN NULL ELSE health_requested_at END, \
+                   recheck_requested = CASE WHEN recheck_generation = $3 THEN 0 ELSE recheck_requested END WHERE id = $1";
         on!(self, pool => sqlx::query(sql)
             .bind(id.0)
             .bind(next_check)
+            .bind(generation)
             .execute(pool)
             .await?
             .rows_affected());
@@ -2124,18 +2198,22 @@ impl Db {
 
     /// Asks for a check of `id` ahead of its schedule; a more urgent pending reason wins.
     pub async fn request_recheck(&self, id: ItemId, reason: Recheck) -> Result<(), Error> {
-        if reason == Recheck::Playback {
-            let sql = "INSERT INTO urgent_health(item_id) SELECT id FROM items WHERE id=$1 ON CONFLICT(item_id) DO NOTHING";
-            on!(self, pool => sqlx::query(sql).bind(id.0).execute(pool).await?.rows_affected());
+        if reason == Recheck::None {
+            return Ok(());
         }
-        let sql = "UPDATE items SET recheck_requested = $2 \
-                   WHERE id = $1 AND recheck_requested < $2";
-        on!(self, pool => sqlx::query(sql)
-            .bind(id.0)
-            .bind(reason as i16)
-            .execute(pool)
-            .await?
-            .rows_affected());
+        on!(self, pool => {
+            let mut tx = pool.begin().await?;
+            if reason == Recheck::Playback {
+                sqlx::query("INSERT INTO urgent_health(item_id) SELECT id FROM items WHERE id=$1 ON CONFLICT(item_id) DO NOTHING")
+                    .bind(id.0).execute(&mut *tx).await?;
+            }
+            sqlx::query("UPDATE items SET \
+                health_requested_at = CASE WHEN recheck_requested = 0 THEN $3 ELSE health_requested_at END, \
+                recheck_requested = CASE WHEN recheck_requested < $2 THEN $2 ELSE recheck_requested END, \
+                recheck_generation = recheck_generation + 1 WHERE id = $1")
+                .bind(id.0).bind(reason as i16).bind(now_ms()).execute(&mut *tx).await?;
+            tx.commit().await?;
+        });
         Ok(())
     }
 

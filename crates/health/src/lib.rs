@@ -3,6 +3,7 @@
 //! through the Arr that imported them.
 
 mod check;
+mod regrab;
 mod structure;
 
 use std::collections::HashMap;
@@ -57,6 +58,10 @@ pub const BACKFILLED_KEY: &str = "reconcile.linked_at";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{0}")]
+    Regrab(&'static str),
+    #[error("regrab journal is unreadable")]
+    Journal(#[from] serde_json::Error),
     #[error("health storage failed")]
     Db(#[from] infinidysk_db::Error),
     #[error("stored metadata is unreadable")]
@@ -125,7 +130,9 @@ pub type Analyzer = Arc<dyn Fn(Item) -> BoxFuture<'static, Analysis> + Send + Sy
 
 pub type CachedCopy = Arc<dyn Fn(Item) -> BoxFuture<'static, Option<bool>> + Send + Sync>;
 
+pub type ReadHold = Box<dyn std::any::Any + Send + Sync>;
 pub struct Health {
+    read_gate: Option<Box<dyn Fn(ItemId) -> Option<ReadHold> + Send + Sync>>,
     db: Db,
     client: Arc<Client>,
     arr: watch::Receiver<Vec<Arr>>,
@@ -185,8 +192,10 @@ impl Health {
     ) -> Result<Self, Error> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
         Ok(Self {
+            read_gate: None,
             db,
             client,
             arr,
@@ -224,6 +233,16 @@ impl Health {
         self
     }
 
+    /// The production VFS grants this only after all readers close, and blocks opens
+    /// until the returned guard drops. Standalone callers may keep the predicate only.
+    #[must_use]
+    pub fn with_read_gate(
+        mut self,
+        gate: impl Fn(ItemId) -> Option<ReadHold> + Send + Sync + 'static,
+    ) -> Self {
+        self.read_gate = Some(Box::new(gate));
+        self
+    }
     /// Some(true) means a complete verified final-media copy; None means storage
     /// uncertainty. Neither authorizes deleting the source. Some(false) permits repair.
     #[must_use]
@@ -307,6 +326,9 @@ impl Health {
         if let Err(error) = self.db.prune_health_checks(now - RETENTION_MS).await {
             tracing::warn!(reason = %error, "could not prune health check results");
         }
+        if let Err(error) = self.db.prune_regrab_intents(now - RETENTION_MS).await {
+            tracing::warn!(reason=%error,"could not prune completed regrab intents");
+        }
         if let Err(error) = self.db.prune_rejected_releases(now).await {
             tracing::warn!(reason = %error, "could not prune rejected releases");
         }
@@ -369,7 +391,9 @@ impl Health {
                 .unwrap_or_else(|| "unknown panic".to_owned()),
         };
         tracing::warn!(item = %item.id, path = %item.path, reason = %reason, "health work on a file failed; retrying in an hour");
-        self.db.postpone_health(item.id, now_ms() + HOUR_MS).await?;
+        self.db
+            .postpone_health(item.id, now_ms() + HOUR_MS, status.recheck_generation)
+            .await?;
         Ok(true)
     }
 
@@ -503,7 +527,9 @@ impl Health {
     ) -> Result<(), Error> {
         let Some((blob_id, mut meta)) = self.meta(item).await? else {
             tracing::warn!(item = %item.id, path = %item.path, reason = "its stored metadata is gone", "cannot check a file; retrying tomorrow");
-            self.db.postpone_health(item.id, now_ms() + DAY_MS).await?;
+            self.db
+                .postpone_health(item.id, now_ms() + DAY_MS, status.recheck_generation)
+                .await?;
             return Ok(());
         };
         let opts = check::Options {
@@ -771,40 +797,91 @@ impl Health {
                 }
             }
         }
+        let _read_hold = if let Some(gate) = &self.read_gate {
+            if let Some(hold) = gate(item.id) {
+                Some(hold)
+            } else {
+                self.db.hold_repair_for_reader(item.id).await?;
+                let next = HealthStatus {
+                    next_check: Some(now + SUSPECT_RECHECK_MS),
+                    ..status
+                };
+                self.db.set_health(item.id, &next, status.recheck).await?;
+                return Ok(());
+            }
+        } else {
+            None
+        };
         if self.db.item_remap_pending(item.id).await? {
             let reason = "its Arr is rescanning a converted library file";
             return self.retry(item, status, reason, true).await;
         }
-        let (arr, owner, job, job_name) = match self.owner(item).await? {
-            Lookup::Found {
-                arr,
-                owner,
-                job,
-                job_name,
-            } => (arr, owner, job, job_name),
-            Lookup::Unowned(reason) => {
-                return match settings.unowned_action {
-                    UnownedAction::Delete => {
-                        tracing::warn!(path = %item.path, reason = %reason, "deleted a broken file no Arr can replace");
-                        self.record(
-                            item,
-                            HealthResult::Missing,
-                            Repair::Deleted,
-                            &format!("{reason}; deleted"),
-                        )
-                        .await?;
-                        Ok(self.db.delete_item(item.id).await?)
-                    }
-                    UnownedAction::ActionNeeded => self.give_up(item, status, &reason).await,
-                };
+        let existing = self.db.regrab_intent(item.id).await?;
+        let (arr, owner, job_name) = if let Some(row) = &existing {
+            let saved: regrab::Saved = serde_json::from_str(&row.payload)?;
+            let configured = self
+                .arr
+                .borrow()
+                .iter()
+                .find(|a| a.id.to_string() == saved.arr_id)
+                .cloned();
+            let Some(arr) = configured else {
+                return self
+                    .give_up(
+                        item,
+                        status,
+                        "Arr for the outstanding regrab is unavailable; review its intent",
+                    )
+                    .await;
+            };
+            if regrab::scope(&self.db, item, &arr).await? != row.scope {
+                return self
+                    .give_up(
+                        item,
+                        status,
+                        "source or Arr changed during regrab; review the outstanding intent",
+                    )
+                    .await;
             }
-            Lookup::Failed { message, transient } => {
-                return self.retry(item, status, &message, transient).await;
+            (arr, Box::new(saved.progress.owner), saved.job_name)
+        } else {
+            match self.owner(item).await? {
+                Lookup::Found {
+                    arr,
+                    owner,
+                    job,
+                    job_name,
+                } => {
+                    let _ = job;
+                    (arr, owner, job_name)
+                }
+                Lookup::Unowned(reason) => {
+                    return match settings.unowned_action {
+                        UnownedAction::Delete => {
+                            tracing::warn!(path = %item.path, reason = %reason, "deleted a broken file no Arr can replace");
+                            self.record(
+                                item,
+                                HealthResult::Missing,
+                                Repair::Deleted,
+                                &format!("{reason}; deleted"),
+                            )
+                            .await?;
+                            Ok(self.db.delete_item(item.id).await?)
+                        }
+                        UnownedAction::ActionNeeded => self.give_up(item, status, &reason).await,
+                    };
+                }
+                Lookup::Failed { message, transient } => {
+                    return self.retry(item, status, &message, transient).await;
+                }
             }
         };
         // Blocklisting makes the Arr search, so the shared search limit applies first.
         let (kind, ids) = owner.searches();
-        if !owner.replaced() && !self.db.reserve_searches(arr.id, kind, ids, now).await? {
+        if existing.is_none()
+            && !owner.replaced()
+            && !self.db.reserve_searches(arr.id, kind, ids, now).await?
+        {
             tracing::info!(path = %item.path, arr = %arr.name, "search limit reached; repair waits");
             let next = HealthStatus {
                 next_check: Some(now + SEARCH_WAIT_MS),
@@ -813,8 +890,10 @@ impl Health {
             self.db.set_health(item.id, &next, status.recheck).await?;
             return Ok(());
         }
-        let job_id = job.map(|j| j.to_string());
-        match arr::replace(&self.http, &arr, job_id.as_deref(), &owner, self.arr_wait).await {
+        let outcome = self
+            .tracked_regrab(item, &arr, &owner, &job_name, existing)
+            .await?;
+        match outcome {
             Ok(()) => {
                 self.reject(item, &job_name).await?;
                 self.count(REPAIRED);
@@ -834,6 +913,16 @@ impl Health {
                     hidden_until: Some(now + HIDDEN_WAIT_MS),
                     ..status
                 };
+                self.db.set_health(item.id, &next, status.recheck).await?;
+                Ok(())
+            }
+            Err(arr::Error::Uncertain(message)) => {
+                let next = HealthStatus {
+                    next_check: Some(now + MINUTE_MS),
+                    ..status
+                };
+                self.record(item, HealthResult::Inconclusive, Repair::None, message)
+                    .await?;
                 self.db.set_health(item.id, &next, status.recheck).await?;
                 Ok(())
             }
@@ -896,6 +985,16 @@ impl Health {
             next_check: Some(now + HOUR_MS),
             ..status
         };
+        if self.observe_regrab(item).await? {
+            self.record(
+                item,
+                HealthResult::Missing,
+                Repair::Replaced,
+                "Arr imported the journaled replacement",
+            )
+            .await?;
+            return Ok(self.db.delete_item(item.id).await?);
+        }
         let lookup = self.owner(item).await?;
         match lookup {
             Lookup::Found { arr, owner, .. } if owner.replaced() => {

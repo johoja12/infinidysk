@@ -1045,6 +1045,7 @@ impl Filesystem for Fs {
                 player: None,
             };
             let file = match self.vfs.open(&node, origin).await {
+                Err(infinidysk_vfs::Error::Repairing) => return Err(libc::EAGAIN.into()),
                 Ok(Some(reader)) => OpenFile {
                     path,
                     session: reader.session().cloned(),

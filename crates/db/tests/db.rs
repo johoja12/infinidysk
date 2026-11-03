@@ -7,6 +7,7 @@ use infinidysk_db::{
 
 /// Exercises the tree, blob and config paths that must behave the same on both backends.
 async fn exercise(db: &Db) {
+    fair_rechecks(db).await;
     // Unreferenced NZBs go at once until the retention section at the end.
     db.set_nzb_retention_days(0);
     let content = db
@@ -37,6 +38,41 @@ async fn exercise(db: &Db) {
     .await
     .expect("insert");
 
+    let intent = db
+        .prepare_regrab(file.id, "scope", "prepared")
+        .await
+        .expect("prepare regrab");
+    assert_eq!(intent.revision, 0);
+    assert_eq!(
+        db.prepare_regrab(file.id, "other-scope", "wrong")
+            .await
+            .expect("existing regrab")
+            .scope,
+        "scope"
+    );
+    assert!(
+        db.checkpoint_regrab(file.id, "scope", 0, "delete-pending", false)
+            .await
+            .expect("checkpoint")
+    );
+    assert!(
+        !db.checkpoint_regrab(file.id, "scope", 0, "stale", false)
+            .await
+            .expect("stale checkpoint")
+    );
+    assert!(
+        !db.checkpoint_regrab(file.id, "other-scope", 1, "wrong", false)
+            .await
+            .expect("wrong scope")
+    );
+    assert_eq!(
+        db.regrab_intent(file.id)
+            .await
+            .expect("read intent")
+            .expect("intent retained")
+            .payload,
+        "delete-pending"
+    );
     let now = infinidysk_db::now_ms();
     let held = HealthStatus {
         state: HealthState::Repairing,
@@ -74,9 +110,18 @@ async fn exercise(db: &Db) {
     db.request_recheck(file.id, Recheck::Playback)
         .await
         .expect("health persistence");
-    db.postpone_health(file.id, now + 300_000)
-        .await
-        .expect("health persistence");
+    db.postpone_health(
+        file.id,
+        now + 300_000,
+        db.health(file.id)
+            .await
+            .expect("health")
+            .expect("item")
+            .1
+            .recheck_generation,
+    )
+    .await
+    .expect("health persistence");
     assert!(
         db.health_is_urgent(file.id)
             .await
@@ -392,6 +437,13 @@ async fn exercise(db: &Db) {
     );
 
     db.delete_item(dir.id).await.expect("delete");
+    assert!(
+        db.regrab_intent(file.id)
+            .await
+            .expect("detached intent")
+            .is_some(),
+        "repair observations survive source removal"
+    );
     assert_eq!(
         db.item(file.id).await.expect("query"),
         None,
@@ -1257,4 +1309,105 @@ async fn fork_import_provenance_and_reader_holds_survive_restart_and_cascade() {
     assert!(!db.health_is_urgent(item.id).await.expect("cascade"));
     drop(db);
     let _ = std::fs::remove_file(path);
+}
+
+/// Shared SQLite/PostgreSQL proof: imports cannot starve explicit work, and completion
+/// or exception backoff cannot consume a same-priority request admitted during work.
+async fn fair_rechecks(db: &Db) {
+    let content = db
+        .item(ItemId::CONTENT)
+        .await
+        .expect("content")
+        .expect("exists");
+    let dir = Item::child(&content, "fair-health", ItemKind::Directory).expect("directory");
+    let mut requested = Item::child(&dir, "requested.bin", ItemKind::NzbFile).expect("file");
+    let mut imported = Item::child(&dir, "imported.bin", ItemKind::NzbFile).expect("file");
+    let meta = BlobId::new();
+    requested.meta_blob = Some(meta);
+    let imported_meta = BlobId::new();
+    imported.meta_blob = Some(imported_meta);
+    db.insert(
+        &[dir.clone(), requested.clone(), imported.clone()],
+        &[(meta, b"meta"), (imported_meta, b"meta")],
+    )
+    .await
+    .expect("insert");
+    db.request_recheck(requested.id, Recheck::User)
+        .await
+        .expect("request");
+    let (_, captured) = db
+        .health(requested.id)
+        .await
+        .expect("health")
+        .expect("exists");
+    let first = db
+        .due_health_work(infinidysk_db::now_ms(), true, 1)
+        .await
+        .expect("queue");
+    assert_eq!(
+        first[0].0.id, requested.id,
+        "explicit requests precede unchecked imports"
+    );
+    db.request_recheck(requested.id, Recheck::User)
+        .await
+        .expect("concurrent request");
+    let healthy = HealthStatus {
+        state: HealthState::Healthy,
+        next_check: Some(i64::MAX),
+        ..captured
+    };
+    db.set_health(requested.id, &healthy, captured.recheck)
+        .await
+        .expect("complete");
+    let (_, pending) = db
+        .health(requested.id)
+        .await
+        .expect("health")
+        .expect("exists");
+    assert_eq!(
+        pending.recheck,
+        Recheck::User,
+        "new request survives completion"
+    );
+    assert!(pending.recheck_generation > captured.recheck_generation);
+    db.postpone_health(requested.id, i64::MAX, captured.recheck_generation)
+        .await
+        .expect("stale failure");
+    assert_eq!(
+        db.health(requested.id)
+            .await
+            .expect("health")
+            .expect("exists")
+            .1
+            .recheck,
+        Recheck::User,
+        "stale failure cannot clear new work"
+    );
+    let (_, pending) = db
+        .health(requested.id)
+        .await
+        .expect("health")
+        .expect("exists");
+    db.set_health(requested.id, &pending, pending.recheck)
+        .await
+        .expect("complete newer request");
+    assert_eq!(
+        db.health(requested.id)
+            .await
+            .expect("health")
+            .expect("exists")
+            .1
+            .recheck,
+        Recheck::None
+    );
+    assert_eq!(
+        db.due_health_work(infinidysk_db::now_ms(), true, 1)
+            .await
+            .expect("queue")[0]
+            .0
+            .id,
+        imported.id,
+        "completed work yields to imports"
+    );
+    db.delete_item(dir.id).await.expect("cleanup");
 }

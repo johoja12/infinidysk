@@ -384,6 +384,13 @@ fn forwarded(headers: &HeaderMap, peer: IpAddr, trusted: &[IpNet]) -> Option<IpA
 }
 
 fn failed(error: &infinidysk_vfs::Error) -> Response {
+    if matches!(error, infinidysk_vfs::Error::Repairing) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, "1")],
+        )
+            .into_response();
+    }
     tracing::warn!(reason = %error, "webdav request failed");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
@@ -850,5 +857,11 @@ mod tests {
         assert_eq!(client_ip(&h, proxy, &trusted), None, "no X-Forwarded-For");
         h.insert("x-forwarded-for", HeaderValue::from_static("192.168.1.5"));
         assert_eq!(client_ip(&h, proxy, &trusted), ip("192.168.1.5"));
+    }
+    #[test]
+    fn repair_exclusion_is_retryable_instead_of_an_internal_error() {
+        let response = failed(&infinidysk_vfs::Error::Repairing);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
     }
 }

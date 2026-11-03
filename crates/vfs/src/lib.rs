@@ -25,7 +25,8 @@ use uuid::Uuid;
 
 pub use reader::{PartsReader, Reader};
 pub use session::{
-    Delivery, Handle, Origin, PendingRead, ReadStage, Request, Session, Sessions, Tracing,
+    Delivery, Handle, Origin, PendingRead, ReadStage, RepairGuard, Request, Session, Sessions,
+    Tracing,
 };
 
 /// What the kernel applied to the FUSE mount, read back after tuning; `None` where
@@ -55,6 +56,8 @@ impl Kernel {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("file repair is in progress; retry shortly")]
+    Repairing,
     #[error(transparent)]
     Db(#[from] infinidysk_db::Error),
     #[error("stored blob is unreadable")]
@@ -602,10 +605,18 @@ impl Vfs {
                 memory(blob::decode_nzb(&raw)?)
             }
             Node::Item(item) | Node::IdFile(item) if item.kind != ItemKind::Directory => {
+                let session = self
+                    .sessions
+                    .start(item.id, item.path.clone(), item.size.unwrap_or(0), origin)
+                    .ok_or(Error::Repairing)?;
+                let current = self
+                    .db
+                    .item(item.id)
+                    .await?
+                    .filter(visible)
+                    .ok_or(Error::Repairing)?;
+                let item = &current;
                 let meta = self.meta(item).await?;
-                let session =
-                    self.sessions
-                        .start(item.id, item.path.clone(), item.size.unwrap_or(0), origin);
                 let trace = session.trace();
                 let report = self.report.as_ref().map(|report| {
                     let (report, id) = (Arc::clone(report), item.id);

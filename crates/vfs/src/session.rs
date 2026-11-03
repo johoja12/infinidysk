@@ -1,6 +1,6 @@
 //! Open reads of item files, for the dashboard, and their optional traces.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, SeekFrom};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -252,6 +252,7 @@ pub struct Sessions {
 
 #[derive(Default)]
 struct Inner {
+    repairing: HashSet<ItemId>,
     open: Vec<Arc<Session>>,
     /// Newest last.
     finished: VecDeque<Arc<Session>>,
@@ -261,6 +262,18 @@ struct Inner {
 }
 
 impl Sessions {
+    /// Atomically exclude new opens only when every current reader has closed.
+    pub fn try_repair(self: &Arc<Self>, item: ItemId) -> Option<RepairGuard> {
+        let mut inner = self.lock();
+        if inner.open.iter().any(|s| s.item == item) || !inner.repairing.insert(item) {
+            return None;
+        }
+        drop(inner);
+        Some(RepairGuard {
+            sessions: Arc::clone(self),
+            item,
+        })
+    }
     /// Called outside the session lock when the last overlapping handle closes.
     pub fn on_last_close(&self, callback: LastClose) {
         *self
@@ -322,8 +335,12 @@ impl Sessions {
         path: String,
         size: u64,
         origin: Origin,
-    ) -> Guard {
-        let trace = self.tracing().map(|t| Arc::new(Trace::new(t.capacity)));
+    ) -> Option<Guard> {
+        let mut inner = self.lock();
+        if inner.repairing.contains(&item) {
+            return None;
+        }
+        let trace = inner.tracing.map(|t| Arc::new(Trace::new(t.capacity)));
         if let Some(trace) = &trace {
             trace.record(Event::Open { size });
         }
@@ -349,15 +366,36 @@ impl Sessions {
             last_read: AtomicU64::new(0),
             requests: Mutex::default(),
         });
-        self.lock().open.push(Arc::clone(&session));
-        Guard {
+        inner.open.push(Arc::clone(&session));
+        drop(inner);
+        Some(Guard {
             session,
             sessions: Arc::clone(self),
-        }
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Blocks new playback handles while a source mutation is in progress.
+pub struct RepairGuard {
+    sessions: Arc<Sessions>,
+    item: ItemId,
+}
+impl Drop for RepairGuard {
+    fn drop(&mut self) {
+        self.sessions.lock().repairing.remove(&self.item);
+        let callback = self
+            .sessions
+            .on_last_close
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(callback) = callback {
+            callback(self.item);
+        }
     }
 }
 
@@ -554,11 +592,43 @@ mod tests {
             client: "fixture".into(),
             player: None,
         };
-        let first = sessions.start(item, "/fixture".into(), 1, origin(Delivery::Fuse));
-        let second = sessions.start(item, "/fixture".into(), 1, origin(Delivery::WebDav));
+        let first = sessions
+            .start(item, "/fixture".into(), 1, origin(Delivery::Fuse))
+            .unwrap();
+        let second = sessions
+            .start(item, "/fixture".into(), 1, origin(Delivery::WebDav))
+            .unwrap();
         drop(first);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         drop(second);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn repair_guard_and_reader_admission_are_mutually_exclusive() {
+        let sessions = Arc::new(Sessions::default());
+        let item = ItemId::new();
+        let origin = || Origin {
+            delivery: Delivery::WebDav,
+            client: "fixture".into(),
+            player: None,
+        };
+        let first = sessions
+            .start(item, "/fixture".into(), 1, origin())
+            .unwrap();
+        assert!(sessions.try_repair(item).is_none());
+        drop(first);
+        let repair = sessions.try_repair(item).unwrap();
+        assert!(
+            sessions
+                .start(item, "/fixture".into(), 1, origin())
+                .is_none()
+        );
+        assert!(sessions.try_repair(item).is_none());
+        drop(repair);
+        assert!(
+            sessions
+                .start(item, "/fixture".into(), 1, origin())
+                .is_some()
+        );
     }
 }

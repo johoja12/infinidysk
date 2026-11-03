@@ -402,3 +402,36 @@ async fn stored_member_ranges_are_cached_as_final_bytes() {
 async fn encrypted_members_are_cached_and_seeked_as_plaintext() {
     member_cache_case(true).await;
 }
+
+#[tokio::test]
+async fn repair_exclusion_blocks_new_delivery_handles_and_rechecks_stale_nodes() {
+    let t = Temp::new();
+    let (vfs, node, _cache, _corpus, _server) = fixture(&t, false).await;
+    let Node::Item(item) = &node else {
+        unreachable!()
+    };
+    let reader = vfs
+        .open(&node, origin(Delivery::WebDav))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(vfs.sessions().try_repair(item.id).is_none());
+    drop(reader);
+    let guard = vfs.sessions().try_repair(item.id).unwrap();
+    for delivery in [Delivery::Fuse, Delivery::WebDav] {
+        assert!(matches!(
+            vfs.open(&node, origin(delivery)).await,
+            Err(infinidysk_vfs::Error::Repairing)
+        ));
+    }
+    drop(guard);
+    vfs.db().delete_item(item.id).await.unwrap();
+    assert!(
+        matches!(
+            vfs.open(&node, origin(Delivery::Fuse)).await,
+            Err(infinidysk_vfs::Error::Repairing)
+        ),
+        "a stale inode must not revive removed content"
+    );
+    assert!(vfs.sessions().open().is_empty());
+}

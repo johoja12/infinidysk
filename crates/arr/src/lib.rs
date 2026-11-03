@@ -14,6 +14,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
 
+pub use repair::tracked::{Regrab, RegrabStage, regrab_replaced, replace_tracked};
 pub use repair::{Import, Owner, all_imports, imports, owner, owner_of_file, replace};
 
 /// What the Arr shows in place of a stored secret.
@@ -87,6 +88,10 @@ impl Profile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{0}")]
+    Uncertain(&'static str),
+    #[error("regrab journal checkpoint failed")]
+    Checkpoint,
     #[error("{}", with_cause(.0))]
     Http(#[from] reqwest::Error),
     #[error("{status} for {url}: {reason}")]
@@ -109,6 +114,7 @@ impl Error {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
+            Self::Uncertain(_) | Self::Checkpoint => true,
             Self::Http(e) => {
                 e.is_connect() || e.is_timeout() || e.status().is_some_and(|s| s.is_server_error())
             }
