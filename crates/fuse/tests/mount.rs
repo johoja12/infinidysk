@@ -23,6 +23,16 @@ const ARTICLE: usize = 4096;
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs /dev/fuse and root for cross-UID checks"]
 async fn reads_the_tree_through_the_kernel() {
+    kernel(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs /dev/fuse and root for cross-UID checks"]
+async fn reads_the_tree_through_native_cache() {
+    kernel(true).await;
+}
+
+async fn kernel(native: bool) {
     assert!(
         nix::unistd::geteuid().is_root(),
         "cross-UID checks require root"
@@ -106,14 +116,39 @@ async fn reads_the_tree_through_the_kernel() {
     let mount_str = mount.to_str().unwrap().to_owned();
     let cancel = CancellationToken::new();
     let (state, mut kernel) = tokio::sync::watch::channel(Err(String::new()));
+    let cache = if native {
+        let data = tmp.join("native");
+        std::fs::create_dir_all(&data).unwrap();
+        Some(
+            infinidysk_native_cache::Cache::open(infinidysk_native_cache::Settings {
+                enabled: true,
+                min_file_mb: 0,
+                metadata_path: tmp.join("native-meta").to_str().unwrap().to_owned(),
+                folders: vec![infinidysk_native_cache::FolderSettings {
+                    id: ItemId::new().0,
+                    path: data.to_str().unwrap().to_owned(),
+                    min_free_bytes: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        )
+    } else {
+        None
+    };
     let task = tokio::spawn(run(
-        Arc::new(Vfs::new(
-            db.clone(),
-            client,
-            Budget::new(1 << 20),
-            1 << 20,
-            &mount_str,
-        )),
+        Arc::new(
+            Vfs::new(
+                db.clone(),
+                client,
+                Budget::new(1 << 20),
+                1 << 20,
+                &mount_str,
+            )
+            .with_native_cache(cache.clone()),
+        ),
         Config {
             mount_dir: mount.clone(),
             uid: 1234,
@@ -265,6 +300,12 @@ async fn reads_the_tree_through_the_kernel() {
     cancel.cancel();
     task.await.unwrap();
     result.unwrap();
+    if let Some(cache) = cache {
+        assert!(
+            cache.stats().await.unwrap().bytes > 0,
+            "kernel reads filled the native cache"
+        );
+    }
     let reported = reported.expect("the mount reports its kernel limits");
     assert_eq!(reported.max_background, Some(64));
     assert_eq!(reported.congestion_threshold, Some(48));

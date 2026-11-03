@@ -23,3 +23,5 @@ pub mod sab;
 mod ui;
 pub mod update;
 pub mod upgrade;
+
+pub mod native_cache;

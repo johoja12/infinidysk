@@ -57,6 +57,7 @@ import {
 } from "../ui";
 import { ArrInstances } from "./arr";
 import { PerformanceSettings } from "./performance";
+import { NativeCachePanel } from "./native-cache";
 import { Providers } from "./providers";
 
 const strategies: { value: Schemas["ImportStrategy"]; title: string; blurb: string }[] = [
@@ -1198,6 +1199,7 @@ export function Settings() {
                   limit={draft.network.download_limit_mb_per_s ?? null}
                   onLimit={(download_limit_mb_per_s) => patch("network", { download_limit_mb_per_s })}
                 />
+                <NativeCachePanel value={draft.native_cache} locked={locked} onChange={native_cache=>patch("native_cache",native_cache)} />
               </Section>
             )}
 

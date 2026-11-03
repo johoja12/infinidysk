@@ -17,7 +17,7 @@ infinidysk-nntp.workspace = true
 nix = { workspace = true, features = ["fs"] }
 quick_cache.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]

@@ -1,0 +1,270 @@
+//! Fault and restart checks use private temporary directories; no provider is used.
+#![allow(clippy::unwrap_used)] // Fixture setup failures are assertions.
+use bytes::Bytes;
+use infinidysk_native_cache::{BLOCK, BLOCK_BYTES, Cache, FolderSettings, Key, Settings};
+use std::path::PathBuf;
+use std::sync::Arc;
+use uuid::Uuid;
+
+struct Temp(PathBuf);
+impl Temp {
+    fn new() -> Self {
+        let p = std::env::temp_dir().join(format!("id-native-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(p.join("data")).unwrap();
+        Self(p)
+    }
+    fn settings(&self) -> Settings {
+        Settings {
+            enabled: true,
+            metadata_path: self.0.join("metadata").to_str().unwrap().to_owned(),
+            min_file_mb: 0,
+            folders: vec![FolderSettings {
+                id: Uuid::from_u128(1),
+                path: self.0.join("data").to_str().unwrap().to_owned(),
+                quota_bytes: 100 * BLOCK,
+                min_free_bytes: 0,
+                ..FolderSettings::default()
+            }],
+            ..Settings::default()
+        }
+    }
+    fn payload(&self, key: &Key, chunk: u64) -> PathBuf {
+        self.0.join("data").join(format!(
+            "{}-{}-{chunk}.data",
+            key.item().simple(),
+            key.revision()
+        ))
+    }
+}
+impl Drop for Temp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn key(size: u64) -> Key {
+    Key::new(Uuid::from_u128(2), b"metadata", size)
+}
+fn data(value: u8) -> Bytes {
+    Bytes::from(vec![value; BLOCK_BYTES])
+}
+
+#[tokio::test]
+async fn committed_blocks_survive_restart_and_partial_blocks_are_not_coverage() {
+    let t = Temp::new();
+    let settings = t.settings();
+    let k = key(2 * BLOCK + 12);
+    let cache = Cache::open(settings.clone()).await.unwrap();
+    let lease = cache.lease(k.clone()).unwrap();
+    assert!(
+        !cache
+            .put(&lease, 0, Bytes::from_static(b"short"))
+            .await
+            .unwrap()
+    );
+    assert!(cache.put(&lease, 0, data(7)).await.unwrap());
+    assert!(
+        cache
+            .put(&lease, 2, Bytes::from(vec![9; 12]))
+            .await
+            .unwrap()
+    );
+    let ranges = cache.coverage(&k).await.unwrap();
+    assert_eq!(ranges.len(), 2);
+    assert_eq!(ranges[0].end, BLOCK);
+    assert_eq!(cache.get(&lease, 0).await.unwrap(), data(7));
+    drop(lease);
+    drop(cache);
+    let cache = Cache::open(settings).await.unwrap();
+    let lease = cache.lease(k).unwrap();
+    assert_eq!(cache.get(&lease, 0).await.unwrap(), data(7));
+    assert_eq!(
+        cache.get(&lease, 2).await.unwrap(),
+        Bytes::from(vec![9; 12])
+    );
+    assert_eq!(cache.stats().await.unwrap().bytes, BLOCK + 12);
+}
+
+#[tokio::test]
+async fn corruption_is_a_miss_and_a_later_verified_fill_restores_coverage() {
+    let t = Temp::new();
+    let cache = Cache::open(t.settings()).await.unwrap();
+    let k = key(BLOCK);
+    let lease = cache.lease(k.clone()).unwrap();
+    cache.put(&lease, 0, data(7)).await.unwrap();
+    std::fs::write(t.payload(&k, 0), b"torn").unwrap();
+    assert!(cache.get(&lease, 0).await.is_none());
+    assert!(cache.coverage(&k).await.unwrap().is_empty());
+    assert!(cache.put(&lease, 0, data(8)).await.unwrap());
+    assert_eq!(cache.get(&lease, 0).await.unwrap(), data(8));
+}
+
+#[tokio::test]
+async fn changed_source_or_length_cannot_reuse_old_bytes() {
+    let t = Temp::new();
+    let cache = Cache::open(t.settings()).await.unwrap();
+    let k = key(BLOCK);
+    let lease = cache.lease(k.clone()).unwrap();
+    cache.put(&lease, 0, data(7)).await.unwrap();
+    let revised = cache
+        .lease(Key::new(k.item(), b"different metadata", BLOCK))
+        .unwrap();
+    assert!(cache.get(&revised, 0).await.is_none());
+    let resized = cache.lease(key(BLOCK + 1)).unwrap();
+    assert!(cache.get(&resized, 0).await.is_none());
+}
+
+#[tokio::test]
+async fn active_and_pinned_files_cannot_be_evicted() {
+    let t = Temp::new();
+    let cache = Cache::open(t.settings()).await.unwrap();
+    let k = key(BLOCK);
+    let lease = cache.lease(k.clone()).unwrap();
+    cache.put(&lease, 0, data(7)).await.unwrap();
+    assert!(!cache.evict(&k, "test").await.unwrap());
+    drop(lease);
+    assert!(cache.pin(&k, true).await.unwrap());
+    assert!(!cache.evict(&k, "test").await.unwrap());
+    cache.pin(&k, false).await.unwrap();
+    assert!(cache.evict(&k, "test").await.unwrap());
+    assert!(!t.payload(&k, 0).exists());
+}
+
+#[tokio::test]
+async fn quota_declines_a_fill_without_evicting_an_active_file() {
+    let t = Temp::new();
+    let mut settings = t.settings();
+    settings.folders[0].quota_bytes = 2 * BLOCK;
+    let cache = Cache::open(settings).await.unwrap();
+    let k = key(2 * BLOCK);
+    let lease = cache.lease(k.clone()).unwrap();
+    assert!(cache.put(&lease, 0, data(7)).await.unwrap());
+    assert!(!cache.put(&lease, 1, data(8)).await.unwrap());
+    assert_eq!(cache.stats().await.unwrap().bytes, BLOCK);
+}
+
+#[tokio::test]
+async fn read_only_folder_serves_old_data_but_cannot_accept_new_fills() {
+    let t = Temp::new();
+    let mut settings = t.settings();
+    let cache = Cache::open(settings.clone()).await.unwrap();
+    let k = key(2 * BLOCK);
+    let lease = cache.lease(k.clone()).unwrap();
+    cache.put(&lease, 0, data(7)).await.unwrap();
+    drop(lease);
+    drop(cache);
+    settings.folders[0].read_only = true;
+    let cache = Cache::open(settings).await.unwrap();
+    let lease = cache.lease(k).unwrap();
+    assert_eq!(cache.get(&lease, 0).await.unwrap(), data(7));
+    assert!(!cache.put(&lease, 1, data(8)).await.unwrap());
+}
+
+#[tokio::test]
+async fn another_owner_cannot_open_the_same_folder() {
+    let t = Temp::new();
+    let settings = t.settings();
+    let cache = Cache::open(settings.clone()).await.unwrap();
+    assert!(Cache::open(settings).await.is_err());
+    assert_eq!(Arc::strong_count(&cache), 1);
+}
+
+#[tokio::test]
+async fn changing_the_marker_or_mount_declines_reads_and_writes() {
+    let t = Temp::new();
+    let cache = Cache::open(t.settings()).await.unwrap();
+    let k = key(2 * BLOCK);
+    let lease = cache.lease(k.clone()).unwrap();
+    cache.put(&lease, 0, data(7)).await.unwrap();
+    std::fs::rename(t.0.join("data"), t.0.join("previous")).unwrap();
+    std::fs::create_dir(t.0.join("data")).unwrap();
+    assert!(cache.get(&lease, 0).await.is_none());
+    assert!(!cache.put(&lease, 1, data(8)).await.unwrap());
+    assert!(!t.payload(&k, 0).exists());
+}
+
+#[tokio::test]
+async fn a_symlink_payload_never_writes_the_target() {
+    let t = Temp::new();
+    let cache = Cache::open(t.settings()).await.unwrap();
+    let k = key(BLOCK);
+    let lease = cache.lease(k.clone()).unwrap();
+    let victim = t.0.join("victim");
+    std::fs::write(&victim, b"keep").unwrap();
+    std::os::unix::fs::symlink(&victim, t.payload(&k, 0)).unwrap();
+    assert!(!cache.put(&lease, 0, data(7)).await.unwrap());
+    assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+    assert!(cache.coverage(&k).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn saturated_fills_reserve_a_buffer_for_cached_playback() {
+    let t = Temp::new();
+    let cache = Cache::open(t.settings()).await.unwrap();
+    let k = key(BLOCK);
+    let lease = cache.lease(k).unwrap();
+    cache.put(&lease, 0, data(7)).await.unwrap();
+    let mut held = Vec::new();
+    while let Some(slot) = cache.try_buffer() {
+        held.push(slot);
+    }
+    assert_eq!(cache.get(&lease, 0).await.unwrap(), data(7));
+    assert!(!cache.put(&lease, 0, data(7)).await.unwrap());
+    drop(held);
+    assert_eq!(cache.get(&lease, 0).await.unwrap(), data(7));
+}
+
+#[tokio::test]
+async fn different_blocks_of_one_chunk_can_commit_concurrently() {
+    let t = Temp::new();
+    let cache = Cache::open(t.settings()).await.unwrap();
+    let k = key(3 * BLOCK);
+    let lease = cache.lease(k).unwrap();
+    let (first, second, third) = tokio::join!(
+        cache.put(&lease, 0, data(1)),
+        cache.put(&lease, 1, data(2)),
+        cache.put(&lease, 2, data(3))
+    );
+    assert!(first.unwrap() && second.unwrap() && third.unwrap());
+    for (block, value) in [(0, 1), (1, 2), (2, 3)] {
+        assert_eq!(cache.get(&lease, block).await.unwrap(), data(value));
+    }
+    assert_eq!(cache.stats().await.unwrap().bytes, 3 * BLOCK);
+}
+
+#[tokio::test]
+async fn pressure_sweep_frees_unpinned_closed_files_and_preserves_readers() {
+    let t = Temp::new();
+    let mut settings = t.settings();
+    settings.folders[0].quota_bytes = 3 * BLOCK;
+    let cache = Cache::open(settings).await.unwrap();
+    let old_key = key(2 * BLOCK);
+    let old = cache.lease(old_key.clone()).unwrap();
+    assert!(cache.put(&old, 0, data(1)).await.unwrap());
+    assert!(cache.put(&old, 1, data(2)).await.unwrap());
+    let new = cache
+        .lease(Key::new(Uuid::from_u128(3), b"new", BLOCK))
+        .unwrap();
+    assert!(!cache.put(&new, 0, data(3)).await.unwrap());
+    cache.maintain().await.unwrap();
+    assert_eq!(cache.stats().await.unwrap().bytes, 2 * BLOCK);
+    drop(old);
+    assert!(!cache.put(&new, 0, data(3)).await.unwrap());
+    cache.maintain().await.unwrap();
+    assert_eq!(cache.stats().await.unwrap().bytes, 0);
+    assert!(!t.payload(&old_key, 0).exists());
+    assert!(cache.put(&new, 0, data(3)).await.unwrap());
+}
+
+#[tokio::test]
+async fn client_supplied_size_cannot_bypass_an_active_entry_lease() {
+    let t = Temp::new();
+    let cache = Cache::open(t.settings()).await.unwrap();
+    let k = key(BLOCK);
+    let lease = cache.lease(k.clone()).unwrap();
+    cache.put(&lease, 0, data(7)).await.unwrap();
+    let mut entry = cache.entries(0, 1).await.unwrap().remove(0);
+    entry.size_bytes = 1;
+    let canonical = cache.resolve(&entry).await.unwrap().unwrap();
+    assert_eq!(canonical.size(), BLOCK);
+    assert!(!cache.evict(&canonical, "test").await.unwrap());
+}

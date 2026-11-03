@@ -19,6 +19,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+infinidysk-native-cache.workspace = true
 infinidysk-core.workspace = true
 infinidysk-db.workspace = true
 infinidysk-nntp.workspace = true

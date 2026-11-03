@@ -7,6 +7,7 @@
 //! - `/nzbs/<category>/<file>`: queued NZBs.
 //! - `/README`.
 
+mod native;
 mod reader;
 mod session;
 
@@ -14,7 +15,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::hash::RandomState;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use infinidysk_core::{BlobId, FileMeta, ItemId, ItemKind, blob, media};
 use infinidysk_db::{Db, HealthState, Item, QueueEntry};
@@ -179,6 +180,7 @@ pub struct Vfs {
     client: Arc<Client>,
     budget: Budget,
     cache: Option<Arc<Cache>>,
+    native_cache: Option<Arc<infinidysk_native_cache::Cache>>,
     report: Option<FaultReport>,
     /// Bytes each reader keeps in flight ahead of its position.
     read_ahead: AtomicU64,
@@ -203,18 +205,38 @@ const SEGMENT_BYTES: u64 = 112;
 /// file's metadata is several MB. Opens are too rare to contend on it.
 type Metas = quick_cache::sync::Cache<
     (BlobId, u64),
-    Arc<FileMeta>,
+    Arc<CachedMeta>,
     BySegments,
     RandomState,
-    quick_cache::sync::DefaultLifecycle<(BlobId, u64), Arc<FileMeta>>,
+    quick_cache::sync::DefaultLifecycle<(BlobId, u64), Arc<CachedMeta>>,
 >;
+
+struct CachedMeta {
+    file: FileMeta,
+    fingerprint: OnceLock<[u8; 32]>,
+}
+impl CachedMeta {
+    fn fingerprint(&self) -> Result<[u8; 32], Error> {
+        if let Some(value) = self.fingerprint.get() {
+            return Ok(*value);
+        }
+        let digest = infinidysk_native_cache::Key::fingerprint(&self.file.content_identity()?);
+        Ok(*self.fingerprint.get_or_init(|| digest))
+    }
+}
+impl std::ops::Deref for CachedMeta {
+    type Target = FileMeta;
+    fn deref(&self) -> &FileMeta {
+        &self.file
+    }
+}
 
 #[derive(Clone)]
 struct BySegments;
 
-impl quick_cache::Weighter<(BlobId, u64), Arc<FileMeta>> for BySegments {
-    fn weight(&self, _: &(BlobId, u64), meta: &Arc<FileMeta>) -> u64 {
-        let segments = match &**meta {
+impl quick_cache::Weighter<(BlobId, u64), Arc<CachedMeta>> for BySegments {
+    fn weight(&self, _: &(BlobId, u64), meta: &Arc<CachedMeta>) -> u64 {
+        let segments = match &meta.file {
             FileMeta::Nzb(f) => f.segments.items.len(),
             FileMeta::Multipart(f) => f.parts.iter().map(|p| p.segments.items.len()).sum(),
         };
@@ -236,6 +258,7 @@ impl Vfs {
             client,
             budget,
             cache: None,
+            native_cache: None,
             report: None,
             read_ahead: AtomicU64::new(read_ahead),
             gap_tolerance: AtomicBool::new(true),
@@ -261,6 +284,17 @@ impl Vfs {
     pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
         self.cache = Some(cache);
         self
+    }
+
+    /// Uses one final-media cache for every delivery method.
+    #[must_use]
+    pub fn with_native_cache(mut self, cache: Option<Arc<infinidysk_native_cache::Cache>>) -> Self {
+        self.native_cache = cache;
+        self
+    }
+
+    pub fn native_cache(&self) -> Option<&Arc<infinidysk_native_cache::Cache>> {
+        self.native_cache.as_ref()
     }
 
     /// Tells `report` about every segment playback could not get.
@@ -541,6 +575,16 @@ impl Vfs {
         Ok(true)
     }
 
+    /// Source identity for final-media caching; never reads Usenet or payload volumes.
+    pub async fn cache_key(&self, item: &Item) -> Result<infinidysk_native_cache::Key, Error> {
+        let meta = self.meta(item).await?;
+        Ok(infinidysk_native_cache::Key::from_fingerprint(
+            item.id.0,
+            meta.fingerprint()?,
+            item.size.unwrap_or(0),
+        ))
+    }
+
     /// A reader over a file's bytes; `None` for directories. Item files are listed in
     /// [`sessions`](Self::sessions) while open.
     pub async fn open(&self, node: &Node, origin: Origin) -> Result<Option<Handle>, Error> {
@@ -567,6 +611,7 @@ impl Vfs {
                     let (report, id) = (Arc::clone(report), item.id);
                     Arc::new(move |index, fault| report(id, index, fault)) as Report
                 });
+                let gaps = self.gaps(item, &meta);
                 let reader = Reader::new(
                     &meta,
                     &self.client,
@@ -577,8 +622,19 @@ impl Vfs {
                     report.as_ref(),
                 )?
                 .with_filler(&meta, &item.name)
-                .with_gaps(self.gaps(item, &meta))
+                .with_gaps(Arc::clone(&gaps))
                 .with_watch(session.watch());
+                let reader = match &self.native_cache {
+                    Some(cache) => {
+                        let key = infinidysk_native_cache::Key::from_fingerprint(
+                            item.id.0,
+                            meta.fingerprint()?,
+                            item.size.unwrap_or(0),
+                        );
+                        native::NativeReader::wrap(reader, Arc::clone(cache), key, gaps)
+                    }
+                    None => reader,
+                };
                 Ok(Some(Handle::new(reader, Some(session))))
             }
             _ => Ok(None),
@@ -592,7 +648,7 @@ impl Vfs {
     }
 
     /// The file's decoded metadata; concurrent first opens fetch it once.
-    async fn meta(&self, item: &Item) -> Result<Arc<FileMeta>, Error> {
+    async fn meta(&self, item: &Item) -> Result<Arc<CachedMeta>, Error> {
         let id = item
             .meta_blob
             .ok_or(Error::Corrupt("file has no metadata"))?;
@@ -605,7 +661,12 @@ impl Vfs {
                     .blob(id)
                     .await?
                     .ok_or(Error::Corrupt("metadata blob is missing"))?;
-                Ok(Arc::new(blob::decode_meta(&raw)?))
+                let file = blob::decode_meta(&raw)?;
+
+                Ok(Arc::new(CachedMeta {
+                    file,
+                    fingerprint: OnceLock::new(),
+                }))
             })
             .await
     }

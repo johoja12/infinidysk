@@ -758,6 +758,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/native-cache": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["native_cache_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/native-cache/coverage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["native_cache_coverage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/native-cache/files": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["native_cache_files"];
+        put?: never;
+        post: operations["native_cache_action"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/overview": {
         parameters: {
             query?: never;
@@ -2442,6 +2490,124 @@ export interface components {
             /** @description Why it is not mounted. */
             reason?: string | null;
         };
+        NativeCacheAction: {
+            entry: components["schemas"]["NativeCacheEntry"];
+            operation: components["schemas"]["NativeCacheOperation"];
+        };
+        NativeCacheCoverage: {
+            /** Format: int64 */
+            end: number;
+            /** Format: int64 */
+            start: number;
+        };
+        NativeCacheEntry: {
+            /** Format: int64 */
+            cached_bytes: number;
+            /** Format: uuid */
+            folder_id: string;
+            /** Format: uuid */
+            item: string;
+            /** Format: int64 */
+            last_used_ms: number;
+            pinned: boolean;
+            revision: string;
+            /** Format: int64 */
+            size_bytes: number;
+        };
+        NativeCacheFolder: {
+            /** @default true */
+            enabled: boolean;
+            /**
+             * Format: int32
+             * @default 90
+             */
+            high_percent: number;
+            /**
+             * Format: uuid
+             * @default 00000000-0000-0000-0000-000000000000
+             */
+            id: string;
+            /**
+             * Format: int32
+             * @default 80
+             */
+            low_percent: number;
+            /**
+             * Format: int32
+             * @default 0
+             */
+            max_age_hours: number;
+            /**
+             * Format: int64
+             * @default 1000000000
+             */
+            min_free_bytes: number;
+            /** @default  */
+            path: string;
+            /**
+             * Format: int32
+             * @default 0
+             */
+            priority: number;
+            /**
+             * Format: int64
+             * @default 100000000000
+             */
+            quota_bytes: number;
+            /** @default false */
+            read_only: boolean;
+        };
+        /** @enum {string} */
+        NativeCacheOperation: "pin" | "unpin" | "evict";
+        NativeCacheSettings: {
+            /**
+             * Format: int32
+             * @default 32
+             */
+            buffer_mb: number;
+            /**
+             * Format: int32
+             * @description New entries retain this layout even after the configured value changes.
+             * @default 64
+             */
+            chunk_mb: number;
+            /** @default false */
+            enabled: boolean;
+            /** @default [] */
+            folders: components["schemas"]["NativeCacheFolder"][];
+            /**
+             * Format: int32
+             * @default 1000
+             */
+            io_timeout_ms: number;
+            /** @default /config/native-cache-v2 */
+            metadata_path: string;
+            /**
+             * Format: int32
+             * @default 100
+             */
+            min_file_mb: number;
+        };
+        NativeCacheStats: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            failed: number;
+            /** Format: int64 */
+            files: number;
+            /** Format: int64 */
+            hits: number;
+            /** Format: int64 */
+            misses: number;
+            /** Format: int64 */
+            skipped: number;
+        };
+        NativeCacheStatus: {
+            available: boolean;
+            configured: boolean;
+            reason?: string | null;
+            stats?: components["schemas"]["NativeCacheStats"] | null;
+        };
         Network: {
             /**
              * Format: int32
@@ -2736,7 +2902,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a197d7-c8d3-77b0-9bed-a029e2c4747e
+             * @default 01a1a0e6-eb0d-76e6-b16a-c322e3a8f66a
              */
             id: string;
             /**
@@ -3322,6 +3488,18 @@ export interface components {
              *     }
              */
             mount: components["schemas"]["Mount"];
+            /**
+             * @default {
+             *       "buffer_mb": 32,
+             *       "chunk_mb": 64,
+             *       "enabled": false,
+             *       "folders": [],
+             *       "io_timeout_ms": 1000,
+             *       "metadata_path": "/config/native-cache-v2",
+             *       "min_file_mb": 100
+             *     }
+             */
+            native_cache: components["schemas"]["NativeCacheSettings"];
             /**
              * @default {
              *       "download_limit_mb_per_s": null,
@@ -4951,6 +5129,93 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    native_cache_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeCacheStatus"];
+                };
+            };
+        };
+    };
+    native_cache_coverage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NativeCacheEntry"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeCacheCoverage"][];
+                };
+            };
+        };
+    };
+    native_cache_files: {
+        parameters: {
+            query?: {
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeCacheEntry"][];
+                };
+            };
+        };
+    };
+    native_cache_action: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NativeCacheAction"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": boolean;
                 };
             };
         };

@@ -9,6 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+bytes.workspace = true
+tracing.workspace = true
+infinidysk-native-cache.workspace = true
 infinidysk-core.workspace = true
 infinidysk-db.workspace = true
 infinidysk-nntp.workspace = true

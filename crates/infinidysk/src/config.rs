@@ -155,6 +155,7 @@ pub struct Settings {
     pub webdav: WebDav,
     pub mount: Mount,
     pub performance: Performance,
+    pub native_cache: infinidysk_native_cache::Settings,
     pub providers: Vec<Provider>,
     pub arr_instances: Vec<ArrInstance>,
     pub arr: ArrOptions,
@@ -1035,6 +1036,16 @@ impl Settings {
 
     /// Checks every field and fills the provider fields that come from the catalog.
     pub fn validate(&mut self) -> Result<(), Error> {
+        self.native_cache
+            .validate()
+            .map_err(|e| invalid("native_cache", e.to_string()))?;
+        if self.native_cache.enabled && self.performance.effective().disk_cache_enabled {
+            return Err(invalid(
+                "native_cache",
+                "Disable the disk segment cache before enabling final-media caching".to_owned(),
+            ));
+        }
+
         if !self.mount.dir.starts_with('/') {
             return Err(invalid(
                 "mount.dir",

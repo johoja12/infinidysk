@@ -211,6 +211,29 @@ pub async fn serve(
             }
         })
     };
+    let (native_cache, native_cache_error) = if settings.native_cache.enabled {
+        let settings = settings.native_cache.clone();
+        let opening = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current()
+                .block_on(infinidysk_native_cache::Cache::open(settings))
+        });
+        match tokio::time::timeout(Duration::from_secs(5), opening).await {
+            Ok(Ok(Ok(cache))) => (Some(cache), None),
+            result => {
+                let reason=match result {
+                    Ok(Ok(Err(error)))=>error.to_string(),
+                    _=>"Native cache startup did not finish; inspect its local catalogue and storage mount".to_owned(),
+                };
+                warn!(
+                    reason,
+                    "native cache is unavailable; playback uses the source"
+                );
+                (None, Some(reason))
+            }
+        }
+    } else {
+        (None, None)
+    };
     let cache = Arc::new(Cache::new(
         tuning.memory_cache_enabled,
         u64::from(tuning.memory_cache_mb) * MB,
@@ -248,6 +271,7 @@ pub async fn serve(
             &settings.mount.dir,
         )
         .with_cache(Arc::clone(&cache))
+        .with_native_cache(native_cache)
         .with_report(Arc::new(move |id, index, fault| {
             // Fails only at shutdown, when nobody records damage anymore.
             let _ = fault_tx.send((id, index, fault));
@@ -277,6 +301,47 @@ pub async fn serve(
         let vfs = Arc::clone(&vfs);
         move || !vfs.sessions().open().is_empty()
     };
+    if let Some(cache) = vfs.native_cache().cloned() {
+        let vfs = Arc::clone(&vfs);
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut offset = 0;
+            loop {
+                tokio::select! {()=stop.cancelled()=>break, _=tick.tick()=>{}, ()=cache.maintenance_requested()=>{}}
+                if let Err(error) = cache.maintain().await {
+                    warn!(reason=%error,"native cache maintenance deferred");
+                }
+                match cache.entries(offset, 100).await {
+                    Ok(entries) => {
+                        if entries.len() < 100 {
+                            offset = 0;
+                        } else {
+                            offset += 100;
+                        }
+                        for entry in entries {
+                            let current =
+                                match vfs.db().item(infinidysk_core::ItemId(entry.item)).await {
+                                    Ok(Some(item)) => match vfs.cache_key(&item).await {
+                                        Ok(key) => Some(key.revision() == entry.revision),
+                                        Err(_) => None,
+                                    },
+                                    Ok(None) => Some(false),
+                                    Err(_) => None,
+                                };
+                            if current == Some(false)
+                                && let Ok(Some(key)) = cache.resolve(&entry).await
+                            {
+                                let _ = cache.evict(&key, "source changed or removed").await;
+                            }
+                        }
+                    }
+                    Err(error) => warn!(reason=%error,"native cache revision sweep deferred"),
+                }
+            }
+        });
+    }
     let in_use = {
         let vfs = Arc::clone(&vfs);
         move |id| vfs.sessions().open().iter().any(|s| s.item == id)
@@ -407,6 +472,8 @@ pub async fn serve(
         mount_dir: settings.mount.dir.clone(),
         epoch_times: settings.mount.epoch_times,
         tuning,
+        native_settings: settings.native_cache.clone(),
+        native_cache_error,
         experiments: settings.experiments.clone(),
         handoff: Arc::clone(&handoff),
     };
@@ -675,6 +742,8 @@ pub struct Live {
     epoch_times: bool,
     /// Tuning at startup, for the parts that need a restart.
     tuning: Tuning,
+    native_settings: infinidysk_native_cache::Settings,
+    native_cache_error: Option<String>,
     experiments: Vec<String>,
     handoff: Arc<crate::handoff::Writer>,
 }
@@ -752,12 +821,17 @@ impl Live {
     // resize them live if restarts for tuning become a nuisance.
     pub fn restart_required(&self, settings: &Settings) -> bool {
         let tuning = settings.performance.effective();
-        settings.mount.dir != self.mount_dir
+        settings.native_cache != self.native_settings
+            || settings.mount.dir != self.mount_dir
             || settings.mount.epoch_times != self.epoch_times
             || tuning.read_ahead_memory_mb != self.tuning.read_ahead_memory_mb
             || tuning.fuse_max_readahead_kb != self.tuning.fuse_max_readahead_kb
             || tuning.fuse_max_background != self.tuning.fuse_max_background
             || settings.experiments != self.experiments
+    }
+
+    pub fn native_cache_error(&self) -> Option<&str> {
+        self.native_cache_error.as_deref()
     }
 
     pub const fn cache(&self) -> &Arc<Cache> {

@@ -20,6 +20,52 @@ impl FileMeta {
         }
     }
 
+    /// Canonical content-defining metadata for cache identity. Availability and
+    /// verification annotations do not change posted bytes or the archive member.
+    pub fn content_identity(&self) -> Result<Vec<u8>, crate::blob::Error> {
+        #[derive(Serialize)]
+        struct SourceSegment<'a> {
+            id: &'a str,
+            size: u32,
+        }
+        #[derive(Serialize)]
+        struct SourcePart<'a> {
+            segments: Vec<SourceSegment<'a>>,
+            offset: u64,
+            data: &'a ByteRange,
+        }
+        #[derive(Serialize)]
+        enum Source<'a> {
+            Nzb(Vec<SourceSegment<'a>>),
+            Multipart(Vec<SourcePart<'a>>, Option<&'a Crypt>),
+        }
+        fn segments(s: &Segments) -> Vec<SourceSegment<'_>> {
+            s.items
+                .iter()
+                .map(|s| SourceSegment {
+                    id: &s.id,
+                    size: s.size,
+                })
+                .collect()
+        }
+        let source = match self {
+            Self::Nzb(file) => Source::Nzb(segments(&file.segments)),
+            Self::Multipart(file) => Source::Multipart(
+                file.parts
+                    .iter()
+                    .map(|p| SourcePart {
+                        segments: segments(&p.segments),
+                        offset: p.offset,
+                        data: &p.data,
+                    })
+                    .collect(),
+                file.crypt.as_ref(),
+            ),
+        };
+        // Version the cache identity independently from persisted metadata blobs.
+        Ok(postcard::to_stdvec(&(1_u8, source))?)
+    }
+
     /// Whether reads go through AES.
     #[must_use]
     pub const fn encrypted(&self) -> bool {
@@ -118,4 +164,62 @@ pub struct Par2Proof {
     pub file_id: [u8; 16],
     pub file_md5: [u8; 16],
     pub md5_16k: [u8; 16],
+}
+
+#[cfg(test)]
+mod content_identity_tests {
+    use super::*;
+    fn file() -> FileMeta {
+        FileMeta::Nzb(NzbFile {
+            segments: Segments {
+                items: vec![Segment {
+                    id: "fixture@loopback".to_owned(),
+                    size: 100,
+                    fallbacks: vec![],
+                }],
+                ..Segments::default()
+            },
+            proof: None,
+        })
+    }
+    #[test]
+    fn availability_annotations_do_not_discard_good_cached_bytes() {
+        let original = file();
+        let mut annotated = original.clone();
+        let FileMeta::Nzb(f) = &mut annotated else {
+            unreachable!()
+        };
+        f.segments.missing = vec![0];
+        f.segments.corrupt = vec![0];
+        f.segments.sizes_trusted = true;
+        f.segments.items[0]
+            .fallbacks
+            .push("unused@loopback".to_owned());
+        assert_eq!(
+            original.content_identity().expect("encode"),
+            annotated.content_identity().expect("encode")
+        );
+    }
+    #[test]
+    fn different_sources_or_geometry_change_cache_identity() {
+        let original = file();
+        let mut changed = original.clone();
+        let FileMeta::Nzb(f) = &mut changed else {
+            unreachable!()
+        };
+        f.segments.items[0].size += 1;
+        assert_ne!(
+            original.content_identity().expect("encode"),
+            changed.content_identity().expect("encode")
+        );
+        let FileMeta::Nzb(f) = &mut changed else {
+            unreachable!()
+        };
+        f.segments.items[0].size -= 1;
+        f.segments.items[0].id = "replacement@loopback".to_owned();
+        assert_ne!(
+            original.content_identity().expect("encode"),
+            changed.content_identity().expect("encode")
+        );
+    }
 }

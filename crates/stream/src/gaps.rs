@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ const LOG_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Default)]
 pub struct Gaps {
+    fills: AtomicU64,
     state: Mutex<State>,
 }
 
@@ -38,6 +40,11 @@ struct State {
 }
 
 impl Gaps {
+    /// Monotonic, so cache fills can reject any block that saw replacement bytes.
+    pub fn fill_generation(&self) -> u64 {
+        self.fills.load(Ordering::Relaxed)
+    }
+
     /// Takes the file's recorded holes (flat segment indices) as of this open; `budget`
     /// when the file may play with damage up to health's caps.
     pub fn refresh(&self, known: BTreeSet<usize>, budget: bool) {
@@ -78,6 +85,7 @@ impl Gaps {
     /// The reader moved onto the filled segment `index` of a file with segment `sizes`;
     /// fails once the file has more damage than playback should paper over.
     pub(crate) fn filled(&self, index: usize, sizes: impl FnOnce() -> Vec<u64>) -> io::Result<()> {
+        self.fills.fetch_add(1, Ordering::Relaxed);
         let mut state = self.lock();
         state.expire();
         let now = Instant::now();

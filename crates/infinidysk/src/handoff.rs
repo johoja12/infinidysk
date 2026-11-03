@@ -207,6 +207,7 @@ impl Writer {
             .read_to_end(&mut bytes)
             .await
             .map_err(|e| e.to_string())?;
+        drop(reader);
         Ok(bytes)
     }
 

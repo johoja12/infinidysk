@@ -1156,6 +1156,7 @@ impl Library {
             .read_to_end(&mut bytes)
             .await
             .map_err(|e| Fault::File(format!("reading the subtitle: {e}")))?;
+        drop(reader);
         let (path, from, owner) = (
             f.path.clone(),
             f.pointer.clone(),

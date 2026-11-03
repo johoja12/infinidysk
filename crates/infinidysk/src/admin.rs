@@ -78,6 +78,10 @@ pub struct Admin {
 #[openapi(
     info(title = "infinidysk admin API"),
     paths(
+        crate::native_cache::status,
+        crate::native_cache::files,
+        crate::native_cache::action,
+        crate::native_cache::coverage,
         get_settings,
         put_settings,
         get_key,
@@ -183,6 +187,15 @@ impl Modify for Security {
 
 pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
     Router::new()
+        .route("/api/v1/native-cache", get(crate::native_cache::status))
+        .route(
+            "/api/v1/native-cache/files",
+            get(crate::native_cache::files).post(crate::native_cache::action),
+        )
+        .route(
+            "/api/v1/native-cache/coverage",
+            post(crate::native_cache::coverage),
+        )
         .route("/api/v1/settings", get(get_settings).put(put_settings))
         .route("/api/v1/settings/keys/{name}", get(get_key))
         .route("/api/v1/catalog", get(get_catalog))
