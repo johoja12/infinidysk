@@ -806,6 +806,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/native-cache/diagnostics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["native_cache_diagnostics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/native-cache/evictions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["native_cache_evictions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/native-cache/files": {
         parameters: {
             query?: never;
@@ -832,6 +864,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["native_cache_import_legacy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/native-cache/probe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["native_cache_probe"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2733,6 +2781,18 @@ export interface components {
             /** Format: int64 */
             size_bytes: number;
         };
+        NativeCacheEviction: {
+            /** Format: int64 */
+            at_ms: number;
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            cursor: number;
+            /** Format: uuid */
+            item: string;
+            reason: string;
+            revision: string;
+        };
         NativeCacheFolder: {
             /** @default true */
             enabled: boolean;
@@ -2776,8 +2836,48 @@ export interface components {
             /** @default false */
             read_only: boolean;
         };
+        NativeCacheFolderDiagnostic: {
+            /** Format: int64 */
+            checked_at_ms: number;
+            /** Format: int64 */
+            committed_bytes: number;
+            /** Format: uuid */
+            folder_id: string;
+            /** Format: int64 */
+            free_bytes?: number | null;
+            identity_ok?: boolean | null;
+            /** Format: int64 */
+            invalid_blocks: number;
+            /** Format: int64 */
+            minimum_free_bytes: number;
+            /** Format: int64 */
+            quota_bytes: number;
+            read_only: boolean;
+        };
         /** @enum {string} */
         NativeCacheOperation: "pin" | "unpin" | "evict";
+        NativeCacheProbe: {
+            /** Format: int32 */
+            checked: number;
+            /** Format: int32 */
+            invalidated: number;
+            /**
+             * Format: int64
+             * @description Pass this as the next request's `after_block`. None means this pass is complete.
+             */
+            next_block?: number | null;
+            /** Format: int32 */
+            unavailable: number;
+            /** Format: int32 */
+            verified: number;
+        };
+        NativeCacheProbeRequest: {
+            /** Format: int64 */
+            after_block?: number;
+            entry: components["schemas"]["NativeCacheEntry"];
+            /** Format: int32 */
+            limit?: number | null;
+        };
         NativeCacheSettings: {
             /**
              * Format: int32
@@ -3408,7 +3508,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a2f2-b700-72df-82cd-2dbea793cc6f
+             * @default 01a1a2fa-d879-75d4-8338-4ab049d98dfc
              */
             id: string;
             /**
@@ -5752,6 +5852,47 @@ export interface operations {
             };
         };
     };
+    native_cache_diagnostics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeCacheFolderDiagnostic"][];
+                };
+            };
+        };
+    };
+    native_cache_evictions: {
+        parameters: {
+            query?: {
+                before?: number;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeCacheEviction"][];
+                };
+            };
+        };
+    };
     native_cache_files: {
         parameters: {
             query?: {
@@ -5816,6 +5957,29 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LegacyCacheReport"];
+                };
+            };
+        };
+    };
+    native_cache_probe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NativeCacheProbeRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeCacheProbe"];
                 };
             };
         };

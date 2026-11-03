@@ -41,10 +41,10 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Durable source-bound mutation journal, CAS checkpoints and uncertain-response observation implemented; detached worker, library-root authority and manual outcome controls remain open |
 | R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; this baseline has no equivalent recovery executor in health. Port trusted range/slice identity, bounded repair budgets, durable outcomes and separate worker scheduling before declaring repair parity. | Port |
 | C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | First implementation in Rust; verified 1.x copy import implemented; broader fork data import remains M01 |
-| C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins implemented; recovery/probe tools pending |
+| C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins and bounded block/folder probes implemented; offline catalogue reconstruction remains open |
 | C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Source identity and revision cleanup implemented; PAR2 repair-revision integration pending |
 | C04 | P1 | Progressive cold reads, bounded first-byte fill, coalesced fills, source window reuse (`NativeCachedStream`, `NativeSourceCacheStream`; `c6a70ba8`, `0c3c129f`) | Rust segment cache already coalesces in-flight reads. Benchmark FUSE/WebDAV seeks before adding buffering; preserve foreground priority and bounded memory/I/O under NAS stalls. | Progressive read-through and parallel block commits implemented; controlled performance qualification pending |
-| C05 | P1 | Native cache browser, verified ranges, eviction history, buffer/I/O diagnostics (`NativeCacheBrowser*`, cache APIs) | Rust cache statistics exist; final-media file/range APIs and catalogue UI depend on C01–C03. Queries must not warm files or scan NAS payloads. | Basic settings/browser/ranges/pin/evict implemented; history/traffic diagnostics pending |
+| C05 | P1 | Native cache browser, verified ranges, eviction history, buffer/I/O diagnostics (`NativeCacheBrowser*`, cache APIs) | Rust cache statistics exist; final-media file/range APIs and catalogue UI depend on C01–C03. Queries must not warm files or scan NAS payloads. | Settings/browser/ranges/pin/evict and eviction-history/folder-diagnostic APIs implemented; tool UI and detailed traffic diagnostics remain open |
 | P01 | P1 | Durable Smart Prefetch queue, policies, pause/resume/cancel, budgets, bounded lanes (`Services/Prefetch`, `PrefetchJobStore`) | New source-bound durable queue, one strict background lane, manual API/UI and attempted-fill allowance. | Manual and Plex current/history warming implemented; wire budget, catalogue sources and full fork policy parity pending |
 | P02 | P1 | Plex account/PIN/Home-user authentication, server discovery and mapping (`Services/Plex`, Plex API) | New Rust Plex transport, private connection handles, settings and admin UI. | Implemented; loopback transport/service tests and simulated browser acceptance below; live Plex acceptance pending |
 | P03 | P1 | Viewer-scoped next-episode and partially watched predictions; durable snapshots during Plex outages (`PredictionSnapshot*`, `PlexViewerResolver`) | Depends on P02 and the media catalogue. Preserve account identity validation, viewer exclusions and uncertainty states. | Durable complete snapshots and viewer-verified current/history planner implemented; live Plex acceptance pending |
@@ -408,3 +408,26 @@ full sweep/PAR2 execution and the other inventory gaps remain open. No productio
 cutover is implied.
 
 Validation is recorded in [repair recovery validation](validation/rust-v2-regrab-20261103.md).
+
+
+## Cache inspection and storage-outage increment
+
+Authenticated admin APIs now expose cursor-paged persistent eviction history, read-only
+folder diagnostics, and a bounded checksum probe over committed cache blocks. A probe
+checks at most 16 blocks and returns a resume cursor. Confirmed corruption removes
+coverage; storage uncertainty retains the record and retries the same cursor. The
+probe never fetches provider bytes. Folder checks validate the existing owner/mount
+identity and free space without creating a marker, payload, or write-test file.
+Request deadlines bound API waits while actual blocking I/O retains its permit.
+
+A missing cache folder/ownership marker is now distinct from a missing payload on a
+verified folder. This prevents an unavailable mount from clearing good coverage.
+Eviction history remains in the local catalogue across restart, capped at 10,000
+rows. Cursors exclude newer events without shifting earlier pages. These are admin
+API tools; dedicated UI controls, offline catalogue reconstruction, detailed traffic
+attribution and PAR2 repair-revision execution remain pending.
+
+No settings or schema changes are added in this increment. Tools operate on the
+separate Rust cache; they do not adopt or write into original 1.x cache roots. Setup
+wizard behavior is unchanged. Validation is recorded in
+[cache tool validation](validation/rust-v2-cache-tools-20261103.md).

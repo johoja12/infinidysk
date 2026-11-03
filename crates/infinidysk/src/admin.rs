@@ -81,6 +81,7 @@ pub struct Admin {
 #[openapi(
     info(title = "infinidysk admin API"),
     paths(
+        crate::native_cache::evictions,crate::native_cache::diagnostics,crate::native_cache::probe,
         crate::native_cache::status,
         crate::native_cache::files,
         crate::native_cache::action,
@@ -226,6 +227,18 @@ pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
             get(crate::plex::libraries),
         )
         .route("/api/v1/native-cache", get(crate::native_cache::status))
+        .route(
+            "/api/v1/native-cache/evictions",
+            get(crate::native_cache::evictions),
+        )
+        .route(
+            "/api/v1/native-cache/diagnostics",
+            get(crate::native_cache::diagnostics),
+        )
+        .route(
+            "/api/v1/native-cache/probe",
+            post(crate::native_cache::probe),
+        )
         .route(
             "/api/v1/native-cache/import-legacy",
             post(crate::native_cache::import_legacy),

@@ -277,3 +277,62 @@ async fn legacy_mapping(
             .then_some(key),
     )
 }
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in=Query)]
+pub struct EvictionPage {
+    pub before: Option<i64>,
+    pub limit: Option<u32>,
+}
+#[utoipa::path(get,operation_id="native_cache_evictions",path="/api/v1/native-cache/evictions",params(EvictionPage),responses((status=200,body=Vec<infinidysk_native_cache::Eviction>)))]
+pub async fn evictions(
+    State(admin): State<Arc<Admin>>,
+    Query(page): Query<EvictionPage>,
+) -> Result<Json<Vec<infinidysk_native_cache::Eviction>>, Fail> {
+    let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
+    Ok(Json(
+        cache
+            .evictions(page.before, page.limit.unwrap_or(100))
+            .await
+            .map_err(|e| fail(&e))?,
+    ))
+}
+#[utoipa::path(get,operation_id="native_cache_diagnostics",path="/api/v1/native-cache/diagnostics",responses((status=200,body=Vec<infinidysk_native_cache::FolderDiagnostic>)))]
+pub async fn diagnostics(
+    State(admin): State<Arc<Admin>>,
+) -> Result<Json<Vec<infinidysk_native_cache::FolderDiagnostic>>, Fail> {
+    let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), cache.diagnostics())
+        .await
+        .map_err(|_| {
+            Fail::Unavailable("Cache diagnostic pass timed out; storage is uncertain".into())
+        })?;
+    Ok(Json(result.map_err(|e| fail(&e))?))
+}
+#[derive(Deserialize, ToSchema)]
+#[schema(as=NativeCacheProbeRequest)]
+pub struct ProbeRequest {
+    pub entry: Entry,
+    #[serde(default)]
+    pub after_block: u64,
+    pub limit: Option<u32>,
+}
+#[utoipa::path(post,operation_id="native_cache_probe",path="/api/v1/native-cache/probe",request_body=ProbeRequest,responses((status=200,body=infinidysk_native_cache::Probe)))]
+pub async fn probe(
+    State(admin): State<Arc<Admin>>,
+    Json(request): Json<ProbeRequest>,
+) -> Result<Json<infinidysk_native_cache::Probe>, Fail> {
+    let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
+    let key = cache
+        .resolve(&request.entry)
+        .await
+        .map_err(|e| fail(&e))?
+        .ok_or(Fail::NotFound)?;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        cache.probe(&key, request.after_block, request.limit.unwrap_or(8)),
+    )
+    .await
+    .map_err(|_| Fail::Unavailable("Cache probe timed out; retry the same cursor".into()))?;
+    Ok(Json(result.map_err(|e| fail(&e))?))
+}

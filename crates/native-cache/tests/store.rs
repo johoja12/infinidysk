@@ -309,3 +309,100 @@ async fn complete_copy_verification_rejects_partial_and_corrupt_payloads() {
     assert_eq!(cache.verify_complete(&key).await.unwrap(), Some(false));
     assert!(cache.coverage(&key).await.unwrap()[0].start > 0);
 }
+
+#[tokio::test]
+async fn probe_pages_confirm_corruption_without_counting_storage_outages_as_damage() {
+    let t = Temp::new();
+    let cache = Cache::open(t.settings()).await.unwrap();
+    let k = key(3 * BLOCK);
+    let lease = cache.lease(k.clone()).unwrap();
+    for block in 0..3 {
+        assert!(cache.put(&lease, block, data(7)).await.unwrap());
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(t.payload(&k, 0))
+        .unwrap()
+        .write_all_at(b"corrupt", BLOCK)
+        .unwrap();
+    let first = cache.probe(&k, 0, 1).await.unwrap();
+    assert_eq!((first.verified, first.next_block), (1, Some(1)));
+    let bad = cache.probe(&k, first.next_block.unwrap(), 1).await.unwrap();
+    assert_eq!((bad.invalidated, bad.next_block), (1, Some(2)));
+    let final_page = cache.probe(&k, bad.next_block.unwrap(), 1).await.unwrap();
+    assert_eq!((final_page.verified, final_page.next_block), (1, None));
+    let before = cache.coverage(&k).await.unwrap();
+    assert_eq!(before.len(), 2);
+    let diagnostics = cache.diagnostics().await.unwrap();
+    assert_eq!(diagnostics[0].invalid_blocks, 1);
+    assert_eq!(diagnostics[0].identity_ok, Some(true));
+    assert!(diagnostics[0].free_bytes.is_some());
+    std::fs::rename(t.0.join("data"), t.0.join("previous")).unwrap();
+    let missing_mount = cache.probe(&k, 0, 16).await.unwrap();
+    assert_eq!(
+        (missing_mount.unavailable, missing_mount.invalidated),
+        (1, 0),
+        "a missing mount must not invalidate cached coverage"
+    );
+    std::fs::create_dir(t.0.join("data")).unwrap();
+    let diagnostics = cache.diagnostics().await.unwrap();
+    assert_eq!(diagnostics[0].identity_ok, Some(false));
+    let uncertain = cache.probe(&k, 0, 16).await.unwrap();
+    assert_eq!(
+        (
+            uncertain.unavailable,
+            uncertain.invalidated,
+            uncertain.next_block
+        ),
+        (1, 0, Some(0))
+    );
+    assert_eq!(
+        cache
+            .coverage(&k)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| (r.start, r.end))
+            .collect::<Vec<_>>(),
+        before.iter().map(|r| (r.start, r.end)).collect::<Vec<_>>()
+    );
+    assert!(
+        std::fs::read_dir(t.0.join("data"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "diagnostics never repair ownership by writing markers"
+    );
+    std::fs::remove_dir(t.0.join("data")).unwrap();
+    std::fs::rename(t.0.join("previous"), t.0.join("data")).unwrap();
+    assert_eq!(cache.probe(&k, 0, 16).await.unwrap().verified, 2);
+}
+
+#[tokio::test]
+async fn eviction_cursors_are_persistent_and_ignore_newer_events_between_pages() {
+    let t = Temp::new();
+    let settings = t.settings();
+    let cache = Cache::open(settings.clone()).await.unwrap();
+    for revision in [b"first".as_slice(), b"second"] {
+        let k = Key::new(Uuid::from_u128(2), revision, BLOCK);
+        let lease = cache.lease(k.clone()).unwrap();
+        assert!(cache.put(&lease, 0, data(7)).await.unwrap());
+        drop(lease);
+        assert!(cache.evict(&k, "manual").await.unwrap());
+    }
+    let newest = cache.evictions(None, 1).await.unwrap();
+    assert_eq!(newest.len(), 1);
+    assert_eq!(newest[0].bytes, BLOCK);
+    let cursor = newest[0].cursor;
+    let older = cache.evictions(Some(cursor), 1).await.unwrap();
+    assert_eq!(older.len(), 1);
+    assert!(older[0].cursor < cursor);
+    assert_ne!(older[0].revision, newest[0].revision);
+    drop(cache);
+    let cache = Cache::open(settings).await.unwrap();
+    assert_eq!(cache.evictions(None, 1).await.unwrap()[0].cursor, cursor);
+    assert_eq!(
+        cache.evictions(Some(cursor), 1).await.unwrap()[0].cursor,
+        older[0].cursor
+    );
+}

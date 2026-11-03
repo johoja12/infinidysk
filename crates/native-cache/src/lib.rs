@@ -1,6 +1,8 @@
 //! Final-media bytes, below delivery: checksummed blocks in bounded chunk files.
 //! The catalogue stays on local storage; browsing never scans payload volumes.
+mod diagnostics;
 pub mod legacy;
+pub use diagnostics::{Eviction, FolderDiagnostic, Probe};
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -233,7 +235,9 @@ impl Folder {
         Ok(())
     }
     fn file(&self, name: &str, write: bool) -> io::Result<File> {
-        self.validate()?;
+        // A missing mount or ownership marker is storage uncertainty, not a missing
+        // payload. Keep it distinct from NotFound returned by the payload open below.
+        self.validate().map_err(io::Error::other)?;
         let flags = if write {
             OFlag::O_RDWR | OFlag::O_CREAT
         } else {

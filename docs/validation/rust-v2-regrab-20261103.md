@@ -32,9 +32,17 @@ Plex or deployment was touched.
 The first full workspace run passed **334 tests**, failed **one**, and ignored **five**
 before stopping. Its failure is the unchanged
 `a_stalled_job_does_not_hold_up_the_next_one` two-second deadline at
-`crates/queue/tests/import.rs:1027`. The wider pass does not override that failed gate.
-The latest transaction adjustment was then checked by workspace Clippy and fresh
-SQLite/PostgreSQL tests. No test deadline was relaxed and no failure was excluded.
+`crates/queue/tests/import.rs:1027`. The latest transaction adjustment was checked by workspace Clippy and fresh
+SQLite/PostgreSQL tests. An intermediate wider run also hit that timing failure and
+a doc-build mismatch caused by editing source while the run was still active; that
+run is not final-source qualification.
+
+After freezing source, the final workspace run passed **395 tests**, with **zero
+failures and six ignored**, including PostgreSQL, all doc builds, and the unchanged
+stalled-job case. Both privileged FUSE and all three original-writer checks passed
+separately. No test deadline was relaxed and no failure was excluded. The earlier
+timing failures remain evidence of a flaky gate; this increment does not fix that
+queue behavior. See also the final [cache tool receipt](rust-v2-cache-tools-20261103.md).
 
 ## Reproduction and upgrade
 
@@ -61,5 +69,5 @@ No configuration/setup-wizard change is required.
 Detached observation worker, manual abandon/reissue controls, library-root deletion
 authority, resumable full-content sweep and PAR2 execution remain pending. A submitted
 search is not evidence of a successful replacement. Library, full prefetch policies,
-cache diagnostics and broader migration remain separate inventory work. This branch
+further cache recovery UI and broader migration remain separate inventory work. This branch
 must not be treated as a finished port or production-ready cutover.
