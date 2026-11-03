@@ -65,6 +65,7 @@ pub struct Admin {
     pub tests: provider_test::Tests,
     pub plex: Arc<crate::plex::Service>,
     pub prefetch: Arc<infinidysk_prefetch::Queue>,
+    pub predictions: Arc<crate::predictions::Predictions>,
     /// `Ok` while FUSE is mounted, otherwise why not.
     pub mount: watch::Receiver<Result<infinidysk_vfs::Kernel, String>>,
     pub library: Arc<crate::library::Library>,
@@ -85,6 +86,7 @@ pub struct Admin {
         crate::native_cache::action,
         crate::native_cache::coverage,
         crate::native_cache::import_legacy,
+        crate::predictions::status,crate::predictions::refresh,
         crate::prefetch::status,crate::prefetch::enqueue,crate::prefetch::pause,crate::prefetch::control,
         crate::plex::start, crate::plex::poll, crate::plex::cancel,
         crate::plex::discover, crate::plex::select, crate::plex::home,
@@ -194,6 +196,10 @@ impl Modify for Security {
 
 pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
     Router::new()
+        .route(
+            "/api/v1/prefetch/predictions",
+            get(crate::predictions::status).post(crate::predictions::refresh),
+        )
         .route(
             "/api/v1/prefetch",
             get(crate::prefetch::status).post(crate::prefetch::enqueue),
@@ -502,6 +508,18 @@ async fn put_settings(
     if store.settings().plex.accounts != previous_accounts {
         admin.plex.invalidate_pending();
     }
+    admin
+        .prefetch
+        .reconcile_automatic(
+            crate::predictions::automatic_scope(store.settings()).as_deref(),
+            None,
+        )
+        .await
+        .map_err(|_| {
+            Fail::Unavailable(
+                "Settings saved; automatic warming cancellation needs retry".to_owned(),
+            )
+        })?;
     store.generate_missing_secrets().await?;
     if let Err(error) = admin.live.apply(store.settings()).await {
         return Err(Fail::Bad(format!("saved, but could not apply: {error:#}")));

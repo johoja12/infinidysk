@@ -457,6 +457,7 @@ pub struct Parts {
 
 pub struct Library {
     parts: Parts,
+    pointer_reads: Arc<tokio::sync::Semaphore>,
     job: Mutex<Job>,
     wake: Notify,
 }
@@ -469,6 +470,7 @@ impl Library {
     pub async fn load(parts: Parts) -> Self {
         let library = Self {
             parts,
+            pointer_reads: Arc::new(tokio::sync::Semaphore::new(2)),
             job: Mutex::default(),
             wake: Notify::new(),
         };
@@ -581,6 +583,37 @@ impl Library {
             legacy: self.legacy_accepted(),
             skip,
         }
+    }
+
+    /// Read-only prediction lookup. Bound abandoned NAS operations even after timeout.
+    pub(crate) async fn prediction_pointer(&self, path: String) -> Result<Option<ItemId>, ()> {
+        let permit = Arc::clone(&self.pointer_reads)
+            .try_acquire_owned()
+            .map_err(|_| ())?;
+        let settings = self.settings().await;
+        let previous: Vec<PreviousKey> = self.stored(KEYS_KEY).await.unwrap_or_default();
+        let known = Known {
+            mount_dirs: mount_dirs(&self.parts.db, &settings).await,
+            keys: std::iter::once(settings.imports.strm_key.0)
+                .chain(previous.into_iter().map(|k| k.key))
+                .filter(|k| !k.is_empty())
+                .collect(),
+            legacy: self.legacy_accepted(),
+            skip: Vec::new(),
+        };
+        let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let path = Path::new(&path);
+            match fs::symlink_metadata(path) {
+                Ok(meta) => Ok(classify(path, &meta, &known).map(|found| found.item)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(_) => Err(()),
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?
     }
 
     /// Our pointers in the library folders, in path order; any unreadable folder fails.

@@ -582,6 +582,35 @@ pub async fn serve(
     let prefetch = infinidysk_prefetch::Queue::load(db.clone(), Arc::clone(&vfs))
         .await
         .context("loading warming jobs")?;
+    let local: crate::predictions::LocalResolver = {
+        let library = Arc::clone(&library);
+        Arc::new(move |path| {
+            let library = Arc::clone(&library);
+            Box::pin(async move { library.prediction_pointer(path).await })
+        })
+    };
+    let predictions = crate::predictions::Predictions::load(
+        db.clone(),
+        plex.client.clone(),
+        Arc::clone(&config),
+        Arc::clone(&vfs),
+        Arc::clone(&prefetch),
+        local,
+    )
+    .await
+    .context("loading Plex predictions")?;
+    let predictions_task = {
+        let predictions = Arc::clone(&predictions);
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {()=stop.cancelled()=>break,_=tick.tick()=>{}}
+                tokio::select! {()=stop.cancelled()=>break,result=predictions.tick(false)=>if let Err(error)=result {warn!(reason=%error,"Plex predictions deferred");}}
+            }
+        })
+    };
     let prefetch_task = {
         let prefetch = Arc::clone(&prefetch);
         let config = Arc::clone(&config);
@@ -591,7 +620,20 @@ pub async fn serve(
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! { ()=stop.cancelled()=>break, _=interval.tick()=>{} }
-                let settings = config.read().await.settings().prefetch.clone();
+                let settings = {
+                    let config = config.read().await;
+                    if let Err(error) = prefetch
+                        .reconcile_automatic(
+                            crate::predictions::automatic_scope(config.settings()).as_deref(),
+                            None,
+                        )
+                        .await
+                    {
+                        warn!(reason=%error,"automatic warming cleanup deferred");
+                        continue;
+                    }
+                    config.settings().prefetch.clone()
+                };
                 tokio::select! {
                     ()=stop.cancelled()=>break,
                     result=prefetch.tick(&settings)=>if let Err(error)=result {warn!(reason=%error,"warming step deferred");}
@@ -600,6 +642,7 @@ pub async fn serve(
         })
     };
     let admin = Arc::new(Admin {
+        predictions,
         prefetch,
         plex,
         config: Arc::clone(&config),
@@ -657,6 +700,7 @@ pub async fn serve(
     worker.abort();
     health_task.abort();
     prefetch_task.abort();
+    predictions_task.abort();
     discovery_task.abort();
     cleanup_task.abort();
     library_task.abort();
