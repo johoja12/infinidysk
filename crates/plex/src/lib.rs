@@ -229,6 +229,8 @@ pub struct Media {
     pub season: Option<u32>,
     pub episode: Option<u32>,
     pub file: Option<String>,
+    #[serde(default)]
+    pub view_count: u32,
     pub view_offset_ms: u64,
     pub duration_ms: u64,
     pub viewed_at: Option<i64>,

@@ -336,6 +336,16 @@ impl Client {
         tag: &str,
         limit: u32,
     ) -> Result<Vec<xml::Node>, Error> {
+        self.pages_window(server, path, tag, limit, None).await
+    }
+    async fn pages_window(
+        &self,
+        server: &Server,
+        path: &str,
+        tag: &str,
+        limit: u32,
+        window: Option<u32>,
+    ) -> Result<Vec<xml::Node>, Error> {
         let mut out = Vec::new();
         let mut bytes = 0_usize;
         let mut seen = HashSet::new();
@@ -390,13 +400,28 @@ impl Client {
                 return Err(Error::Invalid("Plex page exceeds snapshot bounds"));
             }
             for item in page {
-                let key = item
-                    .text("ratingKey")
-                    .or_else(|| item.text("key"))
-                    .or_else(|| item.text("id"))
-                    .or_else(|| item.text("hubIdentifier"))
-                    .ok_or(Error::Invalid("Plex snapshot identity missing"))?
-                    .to_owned();
+                let history = path.starts_with("/status/sessions/history/");
+                let event = history
+                    .then(|| {
+                        item.text("historyKey").map(str::to_owned).or_else(|| {
+                            Some(format!(
+                                "{}:{}:{}",
+                                item.text("ratingKey")?,
+                                item.text("accountID")?,
+                                item.text("viewedAt")?
+                            ))
+                        })
+                    })
+                    .flatten();
+                let key = event
+                    .or_else(|| {
+                        item.text("ratingKey")
+                            .or_else(|| item.text("key"))
+                            .or_else(|| item.text("id"))
+                            .or_else(|| item.text("hubIdentifier"))
+                            .map(str::to_owned)
+                    })
+                    .ok_or(Error::Invalid("Plex snapshot identity missing"))?;
                 if !seen.insert(key) {
                     return Err(Error::Invalid("duplicate Plex snapshot record"));
                 }
@@ -407,7 +432,10 @@ impl Client {
                 out.push(item);
             }
             start += count;
-            if total == Some(start) || (total.is_none() && count < 100) {
+            if window.is_some_and(|n| start >= n)
+                || total == Some(start)
+                || (total.is_none() && count < 100)
+            {
                 return Ok(out);
             }
             if count == 0 || (count < 100 && total.is_some_and(|total| start < total)) {
@@ -525,6 +553,21 @@ impl Client {
             });
         }
         Ok(result)
+    }
+    /// A complete newest-first window, rather than an unbounded lifetime history.
+    /// The planner's policy considers at most these 1000 distinct history records.
+    pub async fn recent_history(&self, server: &Server) -> Result<Vec<Media>, Error> {
+        self.pages_window(
+            server,
+            "/status/sessions/history/all?sort=viewedAt%3Adesc",
+            "Video",
+            u32::MAX,
+            Some(1000),
+        )
+        .await?
+        .iter()
+        .map(media)
+        .collect()
     }
     pub async fn history(&self, server: &Server) -> Result<Vec<Media>, Error> {
         self.pages(
@@ -661,6 +704,12 @@ fn media(node: &xml::Node) -> Result<Media, Error> {
         season: node.number("parentIndex"),
         episode: node.number("index"),
         file,
+        view_count: node
+            .text("viewCount")
+            .map(str::parse::<u32>)
+            .transpose()
+            .map_err(|_| Error::Invalid("invalid Plex watched state"))?
+            .unwrap_or(0),
         view_offset_ms: node.number("viewOffset").unwrap_or(0),
         duration_ms: node.number("duration").unwrap_or(0),
         viewed_at: node.number("viewedAt"),
@@ -977,5 +1026,56 @@ mod tests {
         .expect("safe XML");
         assert_eq!(root.text("title"), Some("fixture & item"));
         assert_eq!(root.children.len(), 1);
+    }
+    #[tokio::test]
+    async fn recent_history_is_a_complete_bounded_window() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called = Arc::clone(&calls);
+        let f = fixture(move |uri, _| {
+            called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let start = uri
+                .query()
+                .unwrap_or_default()
+                .split('&')
+                .find_map(|v| v.strip_prefix("X-Plex-Container-Start="))
+                .unwrap()
+                .parse::<u32>()
+                .unwrap();
+            response(200, xml_page(start, 50_000, start..start + 100))
+        })
+        .await;
+        let items = f
+            .client
+            .recent_history(&f.server)
+            .await
+            .expect("bounded complete window");
+        assert_eq!(items.len(), 1000);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 10);
+    }
+    #[tokio::test]
+    async fn history_rewatches_preserve_distinct_event_identity() {
+        let f=fixture(|_,_|response(200,r#"<MediaContainer totalSize="2" offset="0"><Video ratingKey="1" accountID="7" viewedAt="1000"/><Video ratingKey="1" accountID="7" viewedAt="1001"/></MediaContainer>"#)).await;
+        assert_eq!(
+            f.client
+                .recent_history(&f.server)
+                .await
+                .expect("rewatch events")
+                .len(),
+            2
+        );
+    }
+    #[tokio::test]
+    async fn malformed_watched_state_cannot_be_treated_as_unwatched() {
+        let f = fixture(|_, _| {
+            response(
+                200,
+                r#"<MediaContainer><Video ratingKey="1" viewCount="unknown"/></MediaContainer>"#,
+            )
+        })
+        .await;
+        assert!(matches!(
+            f.client.metadata(&f.server, "1").await,
+            Err(Error::Invalid(_))
+        ));
     }
 }

@@ -1,5 +1,5 @@
 //! Policy never authorizes account access. A scheduler must resolve the viewer first.
-use crate::{Error, Media, PathMapping, safe_path};
+use crate::{Error, Media, PathMapping, identity, safe_path};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use utoipa::ToSchema;
@@ -46,6 +46,15 @@ impl PredictionPolicy {
             || !(1..=100).contains(&self.min_distinct_episodes)
             || self.confidence_percent > 100
             || self.viewers.len() > 1000
+            || self.viewers.iter().any(|value| {
+                value
+                    .split_once(':')
+                    .is_none_or(|(s, v)| identity(s).is_err() || identity(v).is_err())
+            })
+            || self
+                .excluded_shows
+                .iter()
+                .any(|value| identity(value).is_err())
             || self.excluded_shows.len() > 10_000
             || self.head_bytes > 1024 * 1024 * 1024
             || self.tail_bytes > 1024 * 1024 * 1024
@@ -184,6 +193,7 @@ pub fn next_episodes(current: &Media, items: &[Media], limit: usize) -> Vec<Medi
         .iter()
         .filter(|item| {
             item.kind == "episode"
+                && item.view_count == 0
                 && item.show.as_ref() == Some(show)
                 && item.rating_key != current.rating_key
                 && item.season.is_some_and(|s| s > 0)
@@ -271,6 +281,7 @@ mod tests {
             season: Some(1),
             episode: Some(episode),
             file: None,
+            view_count: 0,
             view_offset_ms: 1,
             duration_ms: 100,
             viewed_at: Some(1000),
@@ -360,5 +371,15 @@ mod tests {
                 assert!(start <= length && len <= length - start);
             }
         }
+    }
+    #[test]
+    fn viewer_filters_require_exact_ids_instead_of_display_names() {
+        let mut policy = PredictionPolicy {
+            viewers: vec!["display name".into()],
+            ..Default::default()
+        };
+        assert!(policy.validate().is_err());
+        policy.viewers = vec!["machine:7".into()];
+        assert!(policy.validate().is_ok());
     }
 }
