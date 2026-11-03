@@ -7,7 +7,7 @@ use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -29,6 +29,8 @@ use crate::nzb::Nzb;
 
 /// Requests in flight per import, across all its steps.
 const CONCURRENCY: usize = 16;
+/// Futures one [`join_all`] runs at once: enough to keep every request slot busy.
+const WINDOW: usize = 4 * CONCURRENCY;
 const PAR2_MAGIC: &[u8] = b"PAR2\0PKT";
 const PAR2_MAX_BYTES: usize = 32_000_000;
 const PAR2_MAX_ARTICLES: usize = 64;
@@ -36,6 +38,11 @@ const PAR2_MAX_ARTICLES: usize = 64;
 const PAR2_TOTAL_BYTES: usize = 128_000_000;
 const PAR2_TOTAL_ARTICLES: usize = 256;
 const STAT_ATTEMPTS: usize = 3;
+/// Archive key derivations running at once across all imports: half the cores, at least one,
+/// so the rest stay free for playback.
+static DERIVATIONS: LazyLock<Semaphore> = LazyLock::new(|| {
+    Semaphore::new(std::thread::available_parallelism().map_or(1, |n| n.get().div_ceil(2)))
+});
 /// Requests a first health check expects per file: two random bodies and a box walk; the
 /// first segment is usually held already.
 const FIRST_CHECK_REQUESTS: usize = 3;
@@ -606,19 +613,30 @@ pub async fn import(
 
 /// Runs `futures` concurrently, returning results in input order. Requests are bounded by
 /// the job's budget in [`fetch`] and [`stat`], so nested calls do not multiply it.
-async fn join_all<T, F>(futures: impl IntoIterator<Item = F>) -> Vec<T>
+/// At most [`WINDOW`] of them run at once.
+async fn join_all<'a, T, F, I>(futures: I) -> Vec<T>
 where
+    I: IntoIterator<Item = F>,
+    I::IntoIter: Send + 'a,
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    // Erased: a caller's borrowing closure held across `.await` defeats the `Send` proof.
+    let mut pending: Box<dyn Iterator<Item = (usize, F)> + Send + 'a> =
+        Box::new(futures.into_iter().enumerate());
     let mut set = JoinSet::new();
-    let mut count = 0;
-    for (index, future) in futures.into_iter().enumerate() {
-        set.spawn(async move { (index, future.await) });
-        count += 1;
-    }
-    let mut out: Vec<Option<T>> = std::iter::repeat_with(|| None).take(count).collect();
-    while let Some(joined) = set.join_next().await {
+    let mut out: Vec<Option<T>> = Vec::new();
+    loop {
+        while set.len() < WINDOW {
+            let Some((index, future)) = pending.next() else {
+                break;
+            };
+            out.push(None);
+            set.spawn(async move { (index, future.await) });
+        }
+        let Some(joined) = set.join_next().await else {
+            break;
+        };
         match joined {
             Ok((index, value)) => out[index] = Some(value),
             Err(error) => {
@@ -700,6 +718,7 @@ async fn read_par2(
         )
     });
     let mut files: Vec<(u64, infinidysk_par2::File)> = Vec::new();
+    let mut seen = HashSet::new();
     let (mut articles, mut bytes) = (0, 0);
     for i in candidates {
         let vol = nzb.files[i].name().to_ascii_lowercase().contains(".vol");
@@ -736,7 +755,7 @@ async fn read_par2(
         bytes += reader.buffered();
         let index = reader.index();
         for f in index.files {
-            if !files.iter().any(|(_, g)| g.id == f.id) {
+            if seen.insert(f.id) {
                 files.push((index.slice_size, f));
             }
         }
@@ -1169,7 +1188,16 @@ async fn key(job: &Job, name: &str, kdf: &Kdf) -> Result<Derived, Error> {
         .get_or_try_init(|| {
             let (kdf, password) = (kdf.clone(), password.clone());
             async move {
-                match tokio::task::spawn_blocking(move || kdf.derive(&password)).await {
+                let permit = DERIVATIONS
+                    .acquire()
+                    .await
+                    .expect("DERIVATIONS is a static semaphore that is never closed");
+                match tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    kdf.derive(&password)
+                })
+                .await
+                {
                     Ok(derived) => derived.map_err(|e| archive_error(name, &e)),
                     Err(e) => Err(failed(format!("{name}: key derivation failed: {e}"))),
                 }
@@ -1911,6 +1939,46 @@ mod tests {
         assert!(issued > 0 && issued <= CONCURRENCY as u64, "{issued}");
     }
 
+    #[tokio::test]
+    async fn key_derivations_wait_for_a_free_slot() {
+        let job = Arc::new(Job {
+            client: Arc::new(Client::new([])),
+            requests: Semaphore::new(CONCURRENCY),
+            progress: Arc::new(Progress::default()),
+            blocklist: Vec::new(),
+            bodies: Mutex::default(),
+            password: Some("secret".to_owned()),
+            keys: Mutex::default(),
+            waits: Mutex::default(),
+        });
+        let kdf = Kdf::SevenZip {
+            salt: Vec::new(),
+            cycles: 0,
+        };
+        let held = DERIVATIONS
+            .acquire_many(u32::try_from(DERIVATIONS.available_permits()).unwrap())
+            .await
+            .unwrap();
+
+        let mut task = tokio::spawn({
+            let job = Arc::clone(&job);
+            async move { key(&job, "archive.7z", &kdf).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut task)
+                .await
+                .is_err(),
+            "derived while every slot was taken"
+        );
+
+        drop(held);
+        let derived = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(derived.is_ok());
+    }
+
     #[test]
     fn progress_never_goes_back_and_stops_short_of_done() {
         let p = Progress::default();
@@ -1971,5 +2039,66 @@ mod tests {
         }];
         assert!(require(&disc, &[media::Kind::Video]).is_err());
         assert!(require(&disc, &[]).is_ok(), "unowned categories keep it");
+    }
+
+    #[tokio::test]
+    async fn join_all_admits_a_bounded_window_and_keeps_order() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct Drops(Arc<AtomicUsize>);
+        impl Drop for Drops {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn gated(
+            n: usize,
+            started: &Arc<AtomicUsize>,
+            dropped: &Arc<AtomicUsize>,
+            gate: &Arc<Semaphore>,
+        ) -> tokio::task::JoinHandle<Vec<usize>> {
+            let futures: Vec<_> = (0..n)
+                .map(|i| {
+                    let (started, gate) = (Arc::clone(started), Arc::clone(gate));
+                    let dropped = Arc::clone(dropped);
+                    async move {
+                        let _guard = Drops(dropped);
+                        started.fetch_add(1, Ordering::SeqCst);
+                        let _ = gate.acquire().await;
+                        i
+                    }
+                })
+                .collect();
+            tokio::spawn(join_all(futures))
+        }
+
+        async fn until(what: impl Fn() -> bool) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !what() {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("condition reached in time");
+        }
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(0));
+        let task = gated(1000, &started, &dropped, &gate);
+        until(|| started.load(Ordering::SeqCst) >= WINDOW).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(started.load(Ordering::SeqCst), WINDOW);
+        gate.close();
+        assert_eq!(task.await.unwrap(), (0..1000).collect::<Vec<_>>());
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(0));
+        let task = gated(1000, &started, &dropped, &gate);
+        until(|| started.load(Ordering::SeqCst) >= WINDOW).await;
+        task.abort();
+        until(|| dropped.load(Ordering::SeqCst) == started.load(Ordering::SeqCst)).await;
     }
 }

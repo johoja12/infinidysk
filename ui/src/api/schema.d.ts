@@ -3704,7 +3704,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a350-746b-779d-8358-62b414c5fac6
+             * @default 01a1a3ad-52ca-760e-a7e2-8ba82a614203
              */
             id: string;
             /**
@@ -4621,19 +4621,29 @@ export interface components {
         UpgradeProgress: {
             /**
              * Format: int64
-             * @description Estimated seconds remaining in file conversion; absent until measurable or while finalizing.
+             * @description Items this stage has finished; in `files`, files written.
              */
-            eta_seconds?: number | null;
-            /** Format: int64 */
-            files: number;
-            /** Format: int64 */
-            skipped: number;
+            done: number;
             /**
              * Format: int64
-             * @description Files remaining at the start of this attempt, excluding previously written files.
+             * @description Estimated seconds left in this stage; absent until measurable.
              */
-            total: number;
+            eta_seconds?: number | null;
+            /**
+             * Format: int64
+             * @description Files not carried over in `files`.
+             */
+            skipped: number;
+            stage: components["schemas"]["UpgradeStage"];
+            /**
+             * Format: int64
+             * @description Items this stage has to do in this attempt, excluding earlier attempts' work;
+             *     absent while counting.
+             */
+            total?: number | null;
         };
+        /** @enum {string} */
+        UpgradeStage: "checking" | "directories" | "nzbs" | "files" | "finishing";
         /** @enum {string} */
         UpgradeState: "none" | "importing" | "done" | "failed";
         UpgradeStatus: {

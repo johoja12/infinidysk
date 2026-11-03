@@ -10,15 +10,23 @@ mod password;
 mod settings;
 
 use std::fmt;
+use std::fs::File;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
+use nix::fcntl::{OFlag, openat};
+use nix::sys::stat::Mode;
 use sqlx::ConnectOptions as _;
 use sqlx::SqliteConnection;
 use sqlx::sqlite::SqliteConnectOptions;
 use uuid::Uuid;
 
 pub use crate::apply::{
-    Imported, Progress, apply, apply_with_progress, retry_files, stamp_download_ids,
+    Imported, Progress, Stage, apply, apply_with_progress, restore_nzb_downloads, retry_files,
+    stamp_download_ids,
 };
 use crate::csharp::{LongRange, decode};
 pub use crate::password::{is_legacy, legacy_hash, verify_legacy};
@@ -28,6 +36,9 @@ pub use crate::settings::{ArrInstance, ArrKind, Config, Provider, ProviderKind};
 /// to `HealthRepairPending`.
 const OLDEST_MIGRATION: &str = "20260824160000";
 const SHOWN_FAILURES: usize = 20;
+const PROGRESS_EVERY: Duration = Duration::from_secs(1);
+/// Progress reports between log lines while checking file metadata.
+const LOG_EVERY: u32 = 30;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -102,6 +113,15 @@ async fn open(config: &Path) -> Result<SqliteConnection, Error> {
 
 /// Surveys the C# `/config` at `config` without changing it.
 pub async fn survey(config: &Path) -> Result<Survey, Error> {
+    survey_with_progress(config, |_| {}).await
+}
+
+/// Like [`survey`], reporting [`Stage::Checking`] as it reads the file metadata blobs.
+pub async fn survey_with_progress(
+    config: &Path,
+    progress: impl Fn(Progress),
+) -> Result<Survey, Error> {
+    progress(Progress::counting(Stage::Checking));
     let mut db = open(config).await?;
     let count = |n: i64| u64::try_from(n).unwrap_or_default();
     let migration = sqlx::query_scalar(
@@ -145,15 +165,52 @@ pub async fn survey(config: &Path) -> Result<Survey, Error> {
     .fetch_all(&mut db)
     .await?;
     drop(db);
+    let total = files.len() as u64;
+    progress(Progress::at(Stage::Checking, 0, total));
+    tracing::info!(files = total, "C# import: checking file metadata");
+    let started = Instant::now();
+    let checked = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&checked);
     let blobs = config.join("blobs");
-    tokio::task::spawn_blocking(move || {
+    let scan = tokio::task::spawn_blocking(move || {
         for file in files {
             s.file(&blobs, file);
+            counter.fetch_add(1, Ordering::Relaxed);
         }
         s
-    })
-    .await
-    .map_err(Error::from)
+    });
+    let survey = track_scan(scan, &checked, total, &progress).await?;
+    tracing::info!(
+        files = total,
+        seconds = started.elapsed().as_secs(),
+        "C# import: file metadata checked"
+    );
+    Ok(survey)
+}
+
+async fn track_scan(
+    mut scan: tokio::task::JoinHandle<Survey>,
+    checked: &AtomicU64,
+    total: u64,
+    progress: &impl Fn(Progress),
+) -> Result<Survey, Error> {
+    let mut tick = tokio::time::interval(PROGRESS_EVERY);
+    let mut ticks = 0_u32;
+    let s = loop {
+        tokio::select! {
+            result = &mut scan => break result?,
+            _ = tick.tick() => {
+                let done = checked.load(Ordering::Relaxed);
+                progress(Progress::at(Stage::Checking, done, total));
+                ticks = ticks.wrapping_add(1);
+                if ticks.is_multiple_of(LOG_EVERY) {
+                    tracing::info!(checked = done, total, "C# import: checking file metadata");
+                }
+            }
+        }
+    };
+    progress(Progress::at(Stage::Checking, total, total));
+    Ok(s)
 }
 
 /// `(id, sub type, size, metadata blob, NZB blob, has a STRM output)`.
@@ -169,16 +226,18 @@ type FileRow = (
 impl Survey {
     fn file(&mut self, blobs: &Path, (id, sub_type, size, meta, nzb, strm): FileRow) {
         self.strm_outputs += u64::from(strm);
-        if !nzb.is_some_and(|n| blob_path(blobs, &n).is_some_and(|p| p.is_file())) {
+        // Counts what `import_nzbs` will carry over: no symlinks, nothing above the cap.
+        let carried = nzb.and_then(|n| open_blob(blobs, &n).ok().flatten());
+        if !carried.is_some_and(|f| f.metadata().is_ok_and(|m| m.len() <= MAX_NZB_BLOB_BYTES)) {
             self.missing_nzb_blobs += 1;
         }
-        let Some(path) = meta.and_then(|m| blob_path(blobs, &m)) else {
+        let Some(meta) = meta else {
             self.missing_file_blobs += 1;
             return;
         };
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let file = match open_blob(blobs, &meta) {
+            Ok(Some(file)) => file,
+            Ok(None) => {
                 self.missing_file_blobs += 1;
                 return;
             }
@@ -188,15 +247,15 @@ impl Survey {
         let result = match sub_type {
             201 => {
                 self.nzb_files += 1;
-                decode(&bytes, csharp::nzb_file).map(|f| self.nzb(&f, size))
+                decode(file, csharp::nzb_file).map(|f| self.nzb(&f, size))
             }
             202 => {
                 self.rar_files += 1;
-                decode(&bytes, csharp::rar_file).map(|f| self.rar(&f, size))
+                decode(file, csharp::rar_file).map(|f| self.rar(&f, size))
             }
             203 => {
                 self.multipart_files += 1;
-                decode(&bytes, csharp::multipart_file).map(|f| self.multipart(&f, size))
+                decode(file, csharp::multipart_file).map(|f| self.multipart(&f, size))
             }
             other => return self.fail(id, format!("unknown file type {other}")),
         };
@@ -288,10 +347,67 @@ impl Survey {
 }
 
 /// `blobs/<2 hex>/<2 hex>/<id>`, as C# lays them out.
+#[cfg(test)]
 fn blob_path(blobs: &Path, id: &str) -> Option<PathBuf> {
     let id = Uuid::parse_str(id).ok()?;
     let hex = id.simple().to_string();
     Some(blobs.join(&hex[..2]).join(&hex[2..4]).join(id.to_string()))
+}
+
+/// Matches C#'s current NZB ingestion limit; new uploads use the queue's separate cap.
+pub(crate) const MAX_NZB_BLOB_BYTES: u64 = 268_435_456;
+
+/// Reads blob `id` below the folder `blobs`, following no symlink below it and reading at
+/// most `limit` bytes; `None` when it is not there.
+fn read_blob(blobs: &Path, id: &str, limit: u64) -> io::Result<Option<Vec<u8>>> {
+    let Some(file) = open_blob(blobs, id)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("larger than {limit} bytes"),
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+/// Opens blob `id` below the folder `blobs`, following no symlink below it; the blob must
+/// be a regular file. `None` when it is not there.
+fn open_blob(blobs: &Path, id: &str) -> io::Result<Option<File>> {
+    let Ok(id) = Uuid::parse_str(id) else {
+        return Ok(None);
+    };
+    let hex = id.simple().to_string();
+    let dir = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    // O_NONBLOCK: opening a planted FIFO must not wait for a writer.
+    let leaf = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
+    let opened = (|| -> io::Result<File> {
+        // Follows a symlinked root; O_DIRECTORY refuses a FIFO there instead of waiting.
+        let root = nix::fcntl::open(blobs, dir.difference(OFlag::O_NOFOLLOW), Mode::empty())?;
+        let a = openat(&root, &hex[..2], dir, Mode::empty())?;
+        let b = openat(&a, &hex[2..4], dir, Mode::empty())?;
+        Ok(File::from(openat(
+            &b,
+            id.to_string().as_str(),
+            leaf,
+            Mode::empty(),
+        )?))
+    })();
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    Ok(Some(file))
 }
 
 impl fmt::Display for Survey {
@@ -368,6 +484,38 @@ impl fmt::Display for Survey {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn checking_reports_progress_before_the_scan_finishes() {
+        let checked = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&checked);
+        let (reported, received) = std::sync::mpsc::channel();
+        let scan = tokio::task::spawn_blocking(move || {
+            for done in 1..3 {
+                counter.store(done, Ordering::Relaxed);
+                assert_eq!(received.recv_timeout(Duration::from_secs(5)).unwrap(), done);
+            }
+            counter.store(3, Ordering::Relaxed);
+            Survey::default()
+        });
+        let updates = std::sync::Mutex::new(Vec::<Progress>::new());
+        track_scan(scan, &checked, 3, &|progress| {
+            let mut updates = updates.lock().unwrap();
+            let previous = updates.last().map_or(0, |previous| previous.done);
+            updates.push(progress);
+            drop(updates);
+            if progress.done > previous && progress.done < 3 {
+                reported.send(progress.done).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        let updates = updates.into_inner().unwrap();
+        assert!(updates.contains(&Progress::at(Stage::Checking, 1, 3)));
+        assert!(updates.contains(&Progress::at(Stage::Checking, 2, 3)));
+        assert_eq!(updates.last(), Some(&Progress::at(Stage::Checking, 3, 3)));
+        assert!(updates.windows(2).all(|pair| pair[0].done <= pair[1].done));
+    }
+
     #[test]
     fn a_schema_before_the_oldest_is_refused_not_failed() {
         let dir = std::env::temp_dir().join(format!("infinidysk-survey-{}", Uuid::now_v7()));
@@ -397,5 +545,114 @@ mod tests {
         });
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(!survey.unwrap().supported());
+    }
+
+    #[test]
+    fn the_survey_counts_nzb_blobs_the_import_would_skip_as_missing() {
+        let dir = std::env::temp_dir().join(format!("infinidysk-nzbs-{}", Uuid::now_v7()));
+        let blobs = dir.join("blobs");
+        let place = |id: &str| {
+            let path = blob_path(&blobs, id).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            path
+        };
+        let regular = Uuid::now_v7().to_string();
+        std::fs::write(place(&regular), b"nzb").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(place(&regular))
+            .unwrap()
+            .set_len(MAX_NZB_BLOB_BYTES)
+            .unwrap();
+        let linked = Uuid::now_v7().to_string();
+        std::os::unix::fs::symlink(place(&regular), place(&linked)).unwrap();
+
+        let mut survey = Survey::default();
+        for nzb in [regular, linked] {
+            survey.file(&blobs, (String::new(), 201, None, None, Some(nzb), false));
+        }
+        let oversized = Uuid::now_v7().to_string();
+        File::create(place(&oversized))
+            .unwrap()
+            .set_len(MAX_NZB_BLOB_BYTES + 1)
+            .unwrap();
+        survey.file(
+            &blobs,
+            (String::new(), 201, None, None, Some(oversized), false),
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(survey.missing_nzb_blobs, 2);
+    }
+
+    #[test]
+    fn read_blob_follows_no_symlink_below_the_blobs_folder() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("infinidysk-blobs-{}", Uuid::now_v7()));
+        let (blobs, outside) = (dir.join("blobs"), dir.join("outside"));
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let write = |id: &str, bytes: &[u8]| {
+            let path = blob_path(&blobs, id).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+
+        let id = Uuid::now_v7().to_string();
+        write(&id, b"blob");
+        assert_eq!(read_blob(&blobs, &id, 64).unwrap(), Some(b"blob".to_vec()));
+        assert_eq!(
+            read_blob(&blobs, &Uuid::now_v7().to_string(), 64).unwrap(),
+            None
+        );
+        let linked = dir.join("linked-blobs");
+        symlink(&blobs, &linked).unwrap();
+        assert_eq!(read_blob(&linked, &id, 64).unwrap(), Some(b"blob".to_vec()));
+
+        let big = Uuid::now_v7().to_string();
+        write(&big, b"12345");
+        let error = read_blob(&blobs, &big, 4).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        std::fs::write(outside.join("secret"), b"secret").unwrap();
+        let leaf = Uuid::now_v7().to_string();
+        let path = blob_path(&blobs, &leaf).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        symlink(outside.join("secret"), &path).unwrap();
+        let error = read_blob(&blobs, &leaf, 64).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+
+        // v7 ids above share their first byte; flip it so the symlink is the only way in.
+        let mut bytes = Uuid::now_v7().into_bytes();
+        bytes[0] ^= 0xff;
+        let parent = Uuid::from_bytes(bytes);
+        let hex = parent.simple().to_string();
+        let target = outside.join("p").join(&hex[2..4]);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(parent.to_string()), b"secret").unwrap();
+        symlink(outside.join("p"), blobs.join(&hex[..2])).unwrap();
+        assert!(read_blob(&blobs, &parent.to_string(), 64).is_err());
+
+        let fifo = Uuid::now_v7().to_string();
+        let path = blob_path(&blobs, &fifo).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = blobs.clone();
+        std::thread::spawn(move || tx.send(read_blob(&reader, &fifo, 64).map_err(|e| e.kind())));
+        let read = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO must not block the read");
+        assert_eq!(read, Err(io::ErrorKind::InvalidData));
+
+        let root = dir.join("fifo-blobs");
+        nix::unistd::mkfifo(&root, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(read_blob(&root, &id, 64).is_err()));
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO blobs folder must not block the read");
+        assert!(refused);
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

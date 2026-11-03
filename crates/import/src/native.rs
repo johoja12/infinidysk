@@ -33,7 +33,38 @@ pub struct Source {
     pub size: u64,
 }
 impl Source {
-    pub(crate) fn capture(file: &CsFile, bytes: &[u8]) -> Self {
+    /// Hash the original compressed stream without buffering a second metadata copy.
+    /// Draining after a successful parse also covers bytes read beyond known fields.
+    pub(crate) fn capture_reader(
+        input: impl std::io::Read,
+        parse: impl FnOnce(&mut dyn std::io::Read) -> Result<CsFile, String>,
+    ) -> Result<(CsFile, Self), String> {
+        struct Hashed<R> {
+            input: R,
+            hash: Sha256,
+        }
+        impl<R: std::io::Read> std::io::Read for Hashed<R> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.input.read(bytes)?;
+                self.hash.update(&bytes[..n]);
+                Ok(n)
+            }
+        }
+        let mut reader = Hashed {
+            input,
+            hash: Sha256::new(),
+        };
+        let file = parse(&mut reader)?;
+        std::io::copy(&mut reader, &mut std::io::sink())
+            .map_err(|e| format!("metadata blob: {e}"))?;
+        let source = Self::capture_hash(&file, &reader.hash.finalize());
+        Ok((file, source))
+    }
+    #[cfg(test)]
+    fn capture(file: &CsFile, bytes: &[u8]) -> Self {
+        Self::capture_hash(file, &Sha256::digest(bytes))
+    }
+    fn capture_hash(file: &CsFile, compressed_hash: &[u8]) -> Self {
         let mut dependencies = Vec::new();
         let mut add = |ids: &[String], fallbacks: Option<&[Vec<String>]>| {
             dependencies.extend(ids.iter().map(|id| upper(&Sha256::digest(id.as_bytes()))));
@@ -48,13 +79,13 @@ impl Source {
         let base_generation = match file {
             CsFile::Nzb(file) => {
                 add(&file.segment_ids, file.fallbacks.as_deref());
-                format!("v2:{{blob}}:{}", upper(&Sha256::digest(bytes)))
+                format!("v2:{{blob}}:{}", upper(compressed_hash))
             }
             CsFile::Rar(file) => {
                 for part in &file.parts {
                     add(&part.segment_ids, part.fallbacks.as_deref());
                 }
-                format!("v2:{{blob}}:{}", upper(&Sha256::digest(bytes)))
+                format!("v2:{{blob}}:{}", upper(compressed_hash))
             }
             CsFile::Multipart(file) => {
                 for part in &file.parts {
@@ -205,6 +236,37 @@ mod tests {
     use super::*;
     use crate::csharp;
 
+    #[test]
+    fn streamed_provenance_hashes_the_full_input_after_a_short_parser_read() {
+        let bytes = vec![17_u8; 128 * 1024 + 7];
+        let (file, source) = Source::capture_reader(bytes.as_slice(), |reader| {
+            let mut first = [0; 3];
+            reader.read_exact(&mut first).map_err(|e| e.to_string())?;
+            assert_eq!(first, [17; 3]);
+            Ok(CsFile::Nzb(csharp::NzbFile::default()))
+        })
+        .unwrap();
+        assert_eq!(
+            source.base_generation,
+            Source::capture(&file, &bytes).base_generation
+        );
+    }
+    #[test]
+    fn incomplete_provenance_reads_never_publish_a_source_generation() {
+        use std::io::Read as _;
+        struct Failed;
+        impl std::io::Read for Failed {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("fixture input failure"))
+            }
+        }
+        assert!(
+            Source::capture_reader([0_u8; 3].as_slice().chain(Failed), |_| {
+                Ok(CsFile::Nzb(csharp::NzbFile::default()))
+            })
+            .is_err()
+        );
+    }
     /// Run after the linked C# writer, using its receipt path. No provider is contacted.
     #[tokio::test]
     #[ignore = "requires the real 1.x C# writer fixture; see scripts/fixtures/legacy-native-cache"]
@@ -216,7 +278,7 @@ mod tests {
             let dir = std::path::Path::new(receipt["metadata_path"].as_str().unwrap());
             let bytes = std::fs::read(dir.join("source.blob")).unwrap();
             let file = if receipt["multipart"].as_bool().unwrap() {
-                let mut file = csharp::decode(&bytes, csharp::multipart_file).unwrap();
+                let mut file = csharp::decode(bytes.as_slice(), csharp::multipart_file).unwrap();
                 assert_eq!(
                     multipart_identity(&file),
                     receipt["content"].as_str().unwrap()
@@ -229,7 +291,7 @@ mod tests {
                 file.content_identity = None;
                 CsFile::Multipart(file)
             } else {
-                CsFile::Nzb(csharp::decode(&bytes, csharp::nzb_file).unwrap())
+                CsFile::Nzb(csharp::decode(bytes.as_slice(), csharp::nzb_file).unwrap())
             };
             let mut source = Source::capture(&file, &bytes);
             source.base_generation = source

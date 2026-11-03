@@ -22,7 +22,7 @@ use jiff::tz::TimeZone;
 use uuid::Uuid;
 
 use crate::csharp::{self, LongRange, decode};
-use crate::{Error, blob_path, open};
+use crate::{Error, MAX_NZB_BLOB_BYTES, open, open_blob, read_blob};
 
 /// C#'s fixed folders (`/`, `/nzbs`, `/content`, `/completed-symlinks`, `/.ids`) have
 /// ids up to this one.
@@ -72,12 +72,49 @@ pub struct Imported {
     pub skipped_count: u64,
 }
 
-/// File conversion in this attempt; previously imported files are not counted.
+/// What an import is doing, in order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stage {
+    /// Reading the C# database and every file's metadata blob.
+    #[default]
+    Checking,
+    Directories,
+    Nzbs,
+    Files,
+    /// History, queue and settings.
+    Finishing,
+}
+
+/// One stage of this attempt; items an earlier attempt wrote are not counted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Progress {
-    pub files: u64,
-    pub total: u64,
+    pub stage: Stage,
+    /// Items this stage has finished; in [`Stage::Files`], files written.
+    pub done: u64,
+    /// Items this stage has to do; `None` while still counting them.
+    pub total: Option<u64>,
+    /// Files not carried over in [`Stage::Files`].
     pub skipped: u64,
+}
+
+impl Progress {
+    pub(crate) const fn counting(stage: Stage) -> Self {
+        Self {
+            stage,
+            done: 0,
+            total: None,
+            skipped: 0,
+        }
+    }
+
+    pub(crate) const fn at(stage: Stage, done: u64, total: u64) -> Self {
+        Self {
+            stage,
+            done,
+            total: Some(total),
+            skipped: 0,
+        }
+    }
 }
 
 impl Imported {
@@ -193,7 +230,7 @@ pub async fn apply(
     apply_with_progress(config, db, client, storage_root, |_| {}).await
 }
 
-/// Like [`apply`], reporting committed files and skipped files during conversion.
+/// Like [`apply`], reporting each stage after the survey and its counts.
 pub async fn apply_with_progress(
     config: &Path,
     db: &Db,
@@ -219,17 +256,22 @@ pub async fn apply_with_progress(
         );
     }
     let mut done = Imported::default();
+    progress(Progress::counting(Stage::Directories));
     let tree = tree(&mut cs, db, &tz, &mut done).await?;
+    let total = tree.dirs.len() as u64;
+    progress(Progress::at(Stage::Directories, 0, total));
     for chunk in tree.dirs.chunks(BATCH) {
         db.import_items(chunk, &[]).await?;
         done.directories += chunk.len() as u64;
+        progress(Progress::at(Stage::Directories, done.directories, total));
     }
     tracing::info!(
         directories = done.directories,
         "C# import: directories written"
     );
-    let nzbs = import_nzbs(&mut cs, db, &blobs, None, &mut done).await?;
+    let nzbs = import_nzbs(&mut cs, db, &blobs, None, &mut done, &progress).await?;
     convert_files(tree.files, &blobs, client, &nzbs, db, &mut done, &progress).await?;
+    progress(Progress::counting(Stage::Finishing));
     let items: HashSet<Uuid> = db.item_ids().await?.into_iter().map(|i| i.0).collect();
     record_handoffs(&mut cs, db, &items).await?;
 
@@ -343,6 +385,57 @@ pub async fn apply_with_progress(
     Ok(done)
 }
 
+/// Restores missing NZB downloads for surviving C# items and history entries.
+pub async fn restore_nzb_downloads(config: &Path, db: &Db) -> Result<u64, Error> {
+    let (items, history) = db.missing_nzb_links().await?;
+    let items: HashSet<_> = items.into_iter().map(|id| id.0).collect();
+    let history: HashSet<_> = history.into_iter().map(|id| id.0).collect();
+    let mut source = open(config).await?;
+    let item_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT Id, NzbBlobId FROM DavItems WHERE NzbBlobId IS NOT NULL")
+            .fetch_all(&mut source)
+            .await?;
+    let history_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT Id, NzbBlobId FROM HistoryItems WHERE NzbBlobId IS NOT NULL")
+            .fetch_all(&mut source)
+            .await?;
+    let links = |rows: Vec<(String, String)>, missing: &HashSet<Uuid>| {
+        rows.into_iter()
+            .filter_map(|(id, blob)| {
+                let id = uuid(&id)?;
+                missing.contains(&id).then_some((id, uuid(&blob)?))
+            })
+            .collect::<Vec<_>>()
+    };
+    let items = links(item_rows, &items);
+    let history = links(history_rows, &history);
+    let wanted = items
+        .iter()
+        .chain(&history)
+        .map(|(_, blob)| *blob)
+        .collect();
+    let available = import_nzbs(
+        &mut source,
+        db,
+        &config.join("blobs"),
+        Some(&wanted),
+        &mut Imported::default(),
+        &|_| {},
+    )
+    .await?;
+    let items: Vec<_> = items
+        .into_iter()
+        .filter(|(_, blob)| available.contains(blob))
+        .map(|(id, blob)| (ItemId(id), BlobId(blob)))
+        .collect();
+    let history: Vec<_> = history
+        .into_iter()
+        .filter(|(_, blob)| available.contains(blob))
+        .map(|(id, blob)| (JobId(id), BlobId(blob)))
+        .collect();
+    Ok(db.restore_nzb_links(&items, &history).await?)
+}
+
 /// Writes the C# files in `config` that `db` lacks and `keep` accepts by id and path,
 /// with the folders above them, as [`apply`] would have. A file whose path or folder
 /// path another item holds is skipped. Meant for files an earlier import skipped.
@@ -402,7 +495,7 @@ pub async fn retry_files(
         .iter()
         .filter_map(|f| f.nzb.as_deref().and_then(uuid))
         .collect();
-    let nzbs = import_nzbs(&mut cs, db, &blobs, Some(&wanted), &mut done).await?;
+    let nzbs = import_nzbs(&mut cs, db, &blobs, Some(&wanted), &mut done, &|_| {}).await?;
     let ids: HashSet<Uuid> = files.iter().filter_map(|f| uuid(&f.id)).collect();
     convert_files(files, &blobs, client, &nzbs, db, &mut done, &|_| {}).await?;
     let written: HashSet<Uuid> = db
@@ -543,8 +636,9 @@ async fn convert_files(
     let skipped_before = done.skipped_count;
     let report = |done: &Imported| {
         progress(Progress {
-            files: done.files,
-            total,
+            stage: Stage::Files,
+            done: done.files,
+            total: Some(total),
             skipped: done.skipped_count - skipped_before,
         });
     };
@@ -658,7 +752,9 @@ async fn import_nzbs(
     blobs: &Path,
     only: Option<&HashSet<Uuid>>,
     done: &mut Imported,
+    progress: &(dyn Fn(Progress) + Sync),
 ) -> Result<HashSet<Uuid>, Error> {
+    progress(Progress::counting(Stage::Nzbs));
     let stored: HashSet<Uuid> = db.blob_ids().await?.into_iter().map(|b| b.0).collect();
     let ids: Vec<String> = sqlx::query_scalar(
         "SELECT NzbBlobId FROM DavItems WHERE NzbBlobId IS NOT NULL \
@@ -673,14 +769,25 @@ async fn import_nzbs(
         .collect();
     let mut available: HashSet<Uuid> = wanted.intersection(&stored).copied().collect();
     let todo: Vec<Uuid> = wanted.difference(&stored).copied().collect();
+    let total = todo.len() as u64;
+    let mut handled = 0;
+    progress(Progress::at(Stage::Nzbs, handled, total));
     let mut encoded = stream::iter(todo)
         .map(|id| {
-            let path = blob_path(blobs, &id.to_string());
+            let blobs = blobs.to_owned();
             tokio::task::spawn_blocking(move || {
-                let Some(xml) = path.and_then(|p| std::fs::read(p).ok()) else {
-                    return Ok((id, None));
-                };
-                blob::encode_nzb(&xml).map(|b| (id, Some(b)))
+                match read_blob(&blobs, &id.to_string(), MAX_NZB_BLOB_BYTES) {
+                    Ok(Some(xml)) => blob::encode_nzb(&xml).map(|b| (id, Some(b))),
+                    Ok(None) => Ok((id, None)),
+                    Err(error) => {
+                        tracing::warn!(
+                            blob = %id,
+                            reason = %error,
+                            "C# import: skipped an NZB blob it could not read safely"
+                        );
+                        Ok((id, None))
+                    }
+                }
             })
         })
         .buffer_unordered(PARALLEL);
@@ -688,17 +795,23 @@ async fn import_nzbs(
     let mut bytes = 0;
     while let Some(result) = encoded.next().await {
         let (id, nzb) = result??;
-        let Some(nzb) = nzb else {
-            continue;
-        };
-        bytes += nzb.len();
-        batch.push((BlobId(id), nzb));
-        if bytes >= NZB_BATCH {
-            write_blobs(db, &mut batch, &mut available, done).await?;
-            bytes = 0;
+        handled += 1;
+        if let Some(nzb) = nzb {
+            bytes += nzb.len();
+            batch.push((BlobId(id), nzb));
+            if bytes >= NZB_BATCH {
+                write_blobs(db, &mut batch, &mut available, done).await?;
+                bytes = 0;
+            }
         }
+        progress(Progress::at(
+            Stage::Nzbs,
+            handled - batch.len() as u64,
+            total,
+        ));
     }
     write_blobs(db, &mut batch, &mut available, done).await?;
+    progress(Progress::at(Stage::Nzbs, handled, total));
     tracing::info!(nzbs = available.len(), "C# import: NZBs written");
     Ok(available)
 }
@@ -850,23 +963,23 @@ async fn convert(
     blobs: &Path,
     sizer: &mut Sizer<'_>,
 ) -> Result<(FileMeta, bool, String), String> {
-    let path = row
-        .meta
-        .as_deref()
-        .and_then(|m| blob_path(blobs, m))
-        .ok_or("no metadata blob")?;
+    let id = row.meta.clone().ok_or("no metadata blob")?;
+    let blobs = blobs.to_owned();
     let sub_type = row.sub_type;
     let (file, source) = tokio::task::spawn_blocking(move || {
-        let bytes = std::fs::read(path).map_err(|e| format!("metadata blob: {e}"))?;
-        let file = match sub_type {
-            201 => decode(&bytes, csharp::nzb_file).map(CsFile::Nzb),
-            202 => decode(&bytes, csharp::rar_file).map(CsFile::Rar),
-            203 => decode(&bytes, csharp::multipart_file).map(CsFile::Multipart),
-            other => return Err(format!("unknown file type {other}")),
-        };
-        let file = file.map_err(|e| format!("metadata blob: {e}"))?;
-        let source = crate::native::Source::capture(&file, &bytes);
-        Ok::<_, String>((file, source))
+        let input = open_blob(&blobs, &id)
+            .map_err(|e| format!("metadata blob: {e}"))?
+            .ok_or("metadata blob: not found")?;
+        crate::native::Source::capture_reader(input, |input| {
+            let file = match sub_type {
+                201 => decode(input, csharp::nzb_file).map(CsFile::Nzb),
+                202 => decode(input, csharp::rar_file).map(CsFile::Rar),
+                203 => decode(input, csharp::multipart_file).map(CsFile::Multipart),
+                other => return Err(format!("unknown file type {other}")),
+            };
+            let file = file.map_err(|e| format!("metadata blob: {e}"))?;
+            Ok(file)
+        })
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -1789,6 +1902,7 @@ fn parent(id: Uuid) -> ItemId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blob_path;
 
     #[test]
     fn derives_even_splits_and_refuses_others() {
@@ -2046,7 +2160,8 @@ mod tests {
         rt().block_on(async {
             use sqlx::ConnectOptions as _;
             let (config, job) = seed("/content", "/content/job").await;
-            let db = Db::connect(&format!("sqlite:{}", tmp().join("db.sqlite").display()))
+            let destination = tmp().join("db.sqlite");
+            let db = Db::connect(&format!("sqlite:{}", destination.display()))
                 .await
                 .unwrap();
             let client = Client::new(Vec::<infinidysk_nntp::Provider>::new());
@@ -2055,22 +2170,83 @@ mod tests {
                 .connect()
                 .await
                 .unwrap();
+            let nzb = Uuid::now_v7();
+            let missing_nzb = Uuid::now_v7();
+            let nzb_path = blob_path(&config.join("blobs"), &nzb.to_string()).unwrap();
+            std::fs::create_dir_all(nzb_path.parent().unwrap()).unwrap();
+            std::fs::write(nzb_path, b"<nzb/>").unwrap();
             for index in 0..3 {
                 let meta = (index < 2).then(|| multipart_blob(&config.join("blobs")));
                 sqlx::query(
                     "INSERT INTO DavItems (Id, ParentId, Name, Path, CreatedAt, Type, SubType, \
-                     FileSize, FileBlobId) VALUES ($1, $2, $3, $4, '2025-01-01', 2, 203, 100, $5)",
+                     FileSize, FileBlobId, NzbBlobId) \
+                     VALUES ($1, $2, $3, $4, '2025-01-01', 2, 203, 100, $5, $6)",
                 )
                 .bind(Uuid::now_v7().to_string())
                 .bind(job.to_string())
                 .bind(format!("file-{index}.mkv"))
                 .bind(format!("/content/job/file-{index}.mkv"))
                 .bind(meta)
+                .bind(if index == 1 { missing_nzb } else { nzb }.to_string())
                 .execute(&mut source)
                 .await
                 .unwrap();
             }
-            for (total, written) in [(3, 2), (1, 0)] {
+            sqlx::raw_sql(
+                "CREATE TABLE __EFMigrationsHistory (MigrationId TEXT, ProductVersion TEXT);
+                 INSERT INTO __EFMigrationsHistory VALUES ('20260824160000_Test', '10.0.0');",
+            )
+            .execute(&mut source)
+            .await
+            .unwrap();
+            let checks = std::sync::Mutex::new(Vec::new());
+            crate::survey_with_progress(&config, |progress| {
+                checks.lock().unwrap().push(progress);
+            })
+            .await
+            .unwrap();
+            let checks = checks.into_inner().unwrap();
+            let last = *checks.last().unwrap();
+            assert_eq!(checks[0], Progress::counting(Stage::Checking));
+            assert_eq!(last.total, Some(last.done));
+            assert!(last.done >= 3);
+            assert!(checks[1..].windows(2).all(|w| w[0].done <= w[1].done));
+            let mut destination = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(destination)
+                .connect()
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "CREATE TRIGGER reject_blob BEFORE INSERT ON blobs \
+                 BEGIN SELECT RAISE(FAIL, 'test write failure'); END;",
+            )
+            .execute(&mut destination)
+            .await
+            .unwrap();
+            let failed_updates = std::sync::Mutex::new(Vec::new());
+            let result = import_nzbs(
+                &mut source,
+                &db,
+                &config.join("blobs"),
+                None,
+                &mut Imported::default(),
+                &|progress| failed_updates.lock().unwrap().push(progress),
+            )
+            .await;
+            assert!(result.is_err());
+            assert!(
+                failed_updates
+                    .into_inner()
+                    .unwrap()
+                    .iter()
+                    .all(|progress| { progress.total.is_none_or(|total| progress.done < total) })
+            );
+            assert_eq!(db.blob_ids().await.unwrap(), [] as [BlobId; 0]);
+            sqlx::query("DROP TRIGGER reject_blob")
+                .execute(&mut destination)
+                .await
+                .unwrap();
+            for (total, written, directories, nzbs) in [(3, 2, 2, 2), (1, 0, 0, 1)] {
                 let updates = std::sync::Mutex::new(Vec::new());
                 let imported = apply_with_progress(&config, &db, &client, "/mnt", |progress| {
                     updates.lock().unwrap().push(progress);
@@ -2078,18 +2254,43 @@ mod tests {
                 .await
                 .unwrap();
                 let updates = updates.into_inner().unwrap();
+                let mut stages: Vec<Stage> = updates.iter().map(|p| p.stage).collect();
+                stages.dedup();
                 assert_eq!(
-                    updates[0],
-                    Progress {
-                        total,
-                        ..Progress::default()
-                    }
+                    stages,
+                    [
+                        Stage::Directories,
+                        Stage::Nzbs,
+                        Stage::Files,
+                        Stage::Finishing
+                    ]
                 );
+                for (stage, total) in [(Stage::Directories, directories), (Stage::Nzbs, nzbs)] {
+                    let stage_updates: Vec<_> = updates
+                        .iter()
+                        .filter(|update| update.stage == stage)
+                        .collect();
+                    assert_eq!(*stage_updates[0], Progress::counting(stage));
+                    assert_eq!(*stage_updates[1], Progress::at(stage, 0, total));
+                    assert_eq!(
+                        **stage_updates.last().unwrap(),
+                        Progress::at(stage, total, total)
+                    );
+                    assert!(stage_updates.iter().all(|update| update.done <= total));
+                }
+                assert_eq!(imported.nzbs, nzbs - 1);
+                assert!(db.blob_ids().await.unwrap().contains(&BlobId(nzb)));
+                let updates: Vec<Progress> = updates
+                    .into_iter()
+                    .filter(|p| p.stage == Stage::Files)
+                    .collect();
+                assert_eq!(updates[0], Progress::at(Stage::Files, 0, total));
                 assert_eq!(
                     updates.last(),
                     Some(&Progress {
-                        files: written,
-                        total,
+                        stage: Stage::Files,
+                        done: written,
+                        total: Some(total),
                         skipped: 1
                     })
                 );
@@ -2098,7 +2299,7 @@ mod tests {
                 assert!(
                     updates
                         .iter()
-                        .all(|progress| progress.files + progress.skipped <= total)
+                        .all(|progress| progress.done + progress.skipped <= total)
                 );
             }
         });
@@ -2170,6 +2371,105 @@ mod tests {
                 db.job_at("/content/tv/a").await.unwrap(),
                 Some((JobId(download), "a".to_owned()))
             );
+        });
+    }
+
+    #[test]
+    fn restores_missing_downloads_without_replacing_links_or_recreating_records() {
+        rt().block_on(async {
+            use sqlx::ConnectOptions as _;
+            let (config, job) = seed("/content", "/content/job").await;
+            let mut source = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(config.join("db.sqlite")).connect().await.unwrap();
+            let download = Uuid::now_v7();
+            let history = Uuid::now_v7();
+            let file = Uuid::now_v7();
+            sqlx::query(
+                "INSERT INTO DavItems (Id, ParentId, Name, Path, CreatedAt, Type, SubType, \
+                 FileSize, FileBlobId, NzbBlobId) \
+                 VALUES ($1, $2, 'file.mkv', '/content/job/file.mkv', '2025-01-01', 2, 203, 100, $3, $4)",
+            ).bind(file.to_string()).bind(job.to_string())
+                .bind(multipart_blob(&config.join("blobs"))).bind(download.to_string())
+                .execute(&mut source).await.unwrap();
+            sqlx::query(
+                "INSERT INTO HistoryItems VALUES ($1, '2025-01-01', 'job.nzb', \
+                 'job', '', 1, 100, 1, NULL, $2, $3)",
+            ).bind(history.to_string()).bind(job.to_string()).bind(download.to_string())
+                .execute(&mut source).await.unwrap();
+            let db = Db::connect("sqlite::memory:").await.unwrap();
+            let client = Client::new(Vec::<infinidysk_nntp::Provider>::new());
+            apply(&config, &db, &client, "/mnt").await.unwrap();
+            assert_eq!(db.item(ItemId(file)).await.unwrap().unwrap().nzb_blob, None);
+            assert_eq!(db.history_entry(JobId(history)).await.unwrap().unwrap().nzb_blob, None);
+
+            let path = blob_path(&config.join("blobs"), &download.to_string()).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"<nzb/>").unwrap();
+            let deleted = Uuid::now_v7();
+            sqlx::query(
+                "INSERT INTO HistoryItems VALUES ($1, '2025-01-01', 'job.nzb', \
+                 'job', '', 1, 100, 1, NULL, $2, $3)",
+            ).bind(Uuid::now_v7().to_string()).bind(job.to_string()).bind(deleted.to_string())
+                .execute(&mut source).await.unwrap();
+            let deleted_path = blob_path(&config.join("blobs"), &deleted.to_string()).unwrap();
+            std::fs::create_dir_all(deleted_path.parent().unwrap()).unwrap();
+            std::fs::write(deleted_path, b"<nzb/>").unwrap();
+
+            assert_eq!(restore_nzb_downloads(&config, &db).await.unwrap(), 2);
+            assert_eq!(db.item(ItemId(file)).await.unwrap().unwrap().nzb_blob, Some(BlobId(download)));
+            assert_eq!(db.history_entry(JobId(history)).await.unwrap().unwrap().nzb_blob, Some(BlobId(download)));
+            assert!(db.blob(BlobId(deleted)).await.unwrap().is_none());
+            assert_eq!(restore_nzb_downloads(&config, &db).await.unwrap(), 0);
+            assert_eq!(db.restore_nzb_links(
+                &[(ItemId(file), BlobId(deleted))], &[(JobId(history), BlobId(deleted))],
+            ).await.unwrap(), 0);
+            db.close().await;
+        });
+    }
+
+    #[test]
+    fn a_symlinked_nzb_blob_is_not_imported() {
+        rt().block_on(async {
+            use sqlx::ConnectOptions as _;
+            let (cs, job) = seed("/content", "/content/job").await;
+            let nzb =
+                b"<?xml version=\"1.0\"?><nzb xmlns=\"http://www.newzbin.com/DTD/2003/nzb\"></nzb>";
+            let outside = tmp().join("outside.nzb");
+            std::fs::write(&outside, nzb).unwrap();
+            let (kept, linked) = (Uuid::now_v7(), Uuid::now_v7());
+            for id in [kept, linked] {
+                let path = blob_path(&cs.join("blobs"), &id.to_string()).unwrap();
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                if id == kept {
+                    std::fs::write(&path, nzb).unwrap();
+                } else {
+                    std::os::unix::fs::symlink(&outside, &path).unwrap();
+                }
+            }
+            let mut c = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(cs.join("db.sqlite"))
+                .connect()
+                .await
+                .unwrap();
+            for id in [kept, linked] {
+                sqlx::query(
+                    "INSERT INTO HistoryItems VALUES ($1, '2025-01-01 00:00:00', 'job.nzb', \
+                     'job', '', 1, 100, 1, NULL, $2, $3)",
+                )
+                .bind(Uuid::now_v7().to_string())
+                .bind(job.to_string())
+                .bind(id.to_string())
+                .execute(&mut c)
+                .await
+                .unwrap();
+            }
+            let db = Db::connect(&format!("sqlite:{}", tmp().join("db.sqlite").display()))
+                .await
+                .unwrap();
+            let client = Client::new(Vec::<infinidysk_nntp::Provider>::new());
+            apply(&cs, &db, &client, "/mnt").await.unwrap();
+            assert!(db.blob(BlobId(kept)).await.unwrap().is_some());
+            assert!(db.blob(BlobId(linked)).await.unwrap().is_none());
         });
     }
 

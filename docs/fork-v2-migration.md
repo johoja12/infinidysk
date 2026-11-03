@@ -21,6 +21,13 @@ FUSE/WebDAV. Keep 1.x synchronization pointed at upstream `v1`. Rust changes fol
 upstream `main`. Do not merge this migration into the production branch until the
 acceptance gates below pass.
 
+## Latest upstream sync
+
+On 2026-11-04 the migration branch incorporated all 14 upstream commits through
+`27ce0448d4b6a27f4ffe990dadf2b195c29d72e5`. The original baseline above remains the
+historical starting point. Conflict decisions and validation are recorded in
+[upstream sync validation](validation/rust-v2-upstream-sync-20261104.md).
+
 ## Status and order
 
 Later increments supersede pending lists in earlier checkpoint sections.
