@@ -1392,6 +1392,7 @@ dependencies = [
  "infinidysk-db",
  "infinidysk-native-cache",
  "infinidysk-nntp",
+ "infinidysk-plex",
  "infinidysk-stream",
  "infinidysk-testkit",
  "infinidysk-vfs",

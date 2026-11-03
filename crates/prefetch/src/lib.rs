@@ -28,23 +28,82 @@ pub struct Settings {
     pub enabled: bool,
     /// Allowance for attempted final-media block fills per UTC day; provider overfetch and wire overhead are excluded.
     pub daily_fill_bytes: u64,
+    pub plex: PlexSettings,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
             daily_fill_bytes: 10_000_000_000,
+            plex: PlexSettings::default(),
         }
     }
 }
 impl Settings {
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.plex.validate()?;
         ensure!(
             (BLOCK..=100_000_000_000_000).contains(&self.daily_fill_bytes),
             "invalid prefetch daily fill-byte allowance"
         );
         Ok(())
     }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as=PlexPrefetchLocalFiles)]
+pub enum LocalFiles {
+    #[default]
+    Disabled,
+    ImportedPointers,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+#[schema(as=PlexPrefetchSettings)]
+pub struct PlexSettings {
+    pub enabled: bool,
+    pub history: bool,
+    pub realtime: bool,
+    pub local_files: LocalFiles,
+    pub next_episodes: u8,
+    pub refresh_seconds: u32,
+    pub policy: infinidysk_plex::PredictionPolicy,
+}
+impl Default for PlexSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            history: false,
+            realtime: true,
+            local_files: LocalFiles::Disabled,
+            next_episodes: 2,
+            refresh_seconds: 60,
+            policy: infinidysk_plex::PredictionPolicy::default(),
+        }
+    }
+}
+impl PlexSettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        ensure!(
+            (30..=3600).contains(&self.refresh_seconds),
+            "Plex refresh must be 30 to 3600 seconds"
+        );
+        ensure!(
+            (1..=20).contains(&self.next_episodes),
+            "Plex next-episode limit must be 1 to 20"
+        );
+        self.policy.validate()?;
+        Ok(())
+    }
+}
+/// Internal admission carries the source revision and configuration that authorized it.
+pub struct Automatic<'a> {
+    pub item: ItemId,
+    pub ranges: &'a [Range],
+    pub priority: u8,
+    pub intent: Uuid,
+    pub revision: &'a str,
+    pub scope: &'a str,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(as=PrefetchRange)]
@@ -75,6 +134,8 @@ pub struct Job {
     pub priority: u8,
     /// Opaque intent identity, never a media title, path or token.
     pub intent: Uuid,
+    #[serde(default)]
+    pub automatic_scope: Option<String>,
     pub state: State,
     pub created_at: i64,
     pub updated_at: i64,
@@ -192,6 +253,87 @@ impl Queue {
         priority: u8,
         intent: Uuid,
     ) -> anyhow::Result<Job> {
+        self.admit(item, ranges, priority, intent, None).await
+    }
+    pub async fn enqueue_automatic(&self, request: Automatic<'_>) -> anyhow::Result<Job> {
+        let job = self
+            .admit(
+                request.item,
+                request.ranges,
+                request.priority,
+                request.intent,
+                Some((request.scope, request.revision)),
+            )
+            .await?;
+        if job.state == State::Complete {
+            let item = self
+                .db
+                .item(request.item)
+                .await?
+                .context("prediction source no longer exists")?;
+            let key = self.vfs.cache_key(&item).await?;
+            ensure!(
+                key.revision() == request.revision,
+                "prediction source revision changed"
+            );
+            let cache = self
+                .vfs
+                .native_cache()
+                .context("native cache is unavailable")?;
+            let coverage = cache.coverage(&key).await?;
+            if !job.ranges.iter().all(|r| {
+                coverage
+                    .iter()
+                    .any(|c| c.start <= r.start && c.end >= r.end)
+            }) {
+                self.control(job.id, Operation::Retry).await?;
+                return self
+                    .status()
+                    .await
+                    .jobs
+                    .into_iter()
+                    .find(|j| j.id == job.id)
+                    .context("prediction job no longer exists");
+            }
+        }
+        Ok(job)
+    }
+    /// Scope changes cancel only automatic jobs. A complete new pass can additionally
+    /// retire intents no longer predicted; an incomplete pass must never do so.
+    pub async fn reconcile_automatic(
+        &self,
+        scope: Option<&str>,
+        wanted: Option<&std::collections::HashSet<Uuid>>,
+    ) -> anyhow::Result<()> {
+        let mut current = self.ledger.lock().await;
+        let mut next = current.clone();
+        let mut changed = false;
+        for job in &mut next.jobs {
+            if let Some(owner) = &job.automatic_scope
+                && matches!(job.state, State::Queued | State::Paused)
+                && (scope != Some(owner.as_str())
+                    || wanted.is_some_and(|ids| !ids.contains(&job.intent)))
+            {
+                job.state = State::Cancelled;
+                job.updated_at = now_ms();
+                job.reason = Some("Automatic policy no longer requests this job".to_owned());
+                changed = true;
+            }
+        }
+        if changed {
+            self.save(&mut current, next).await?;
+        }
+        drop(current);
+        Ok(())
+    }
+    async fn admit(
+        &self,
+        item: ItemId,
+        ranges: &[Range],
+        priority: u8,
+        intent: Uuid,
+        automatic: Option<(&str, &str)>,
+    ) -> anyhow::Result<Job> {
         ensure!(priority <= 100, "invalid prefetch priority");
         let item = self
             .db
@@ -199,6 +341,16 @@ impl Queue {
             .await?
             .context("prefetch source no longer exists")?;
         let key = self.vfs.cache_key(&item).await?;
+        if let Some((scope, revision)) = automatic {
+            ensure!(
+                scope.len() == 64 && scope.bytes().all(|b| b.is_ascii_hexdigit()),
+                "invalid automatic policy scope"
+            );
+            ensure!(
+                key.revision() == revision,
+                "prediction source revision changed"
+            );
+        }
         let ranges = normalize(ranges, key.size())?;
         ensure!(
             self.vfs.native_cache().is_some(),
@@ -210,7 +362,8 @@ impl Queue {
                 && j.revision == key.revision()
                 && j.intent == intent
                 && j.ranges == ranges
-                && matches!(j.state, State::Queued | State::Paused | State::Complete)
+                && (automatic.is_some()
+                    || matches!(j.state, State::Queued | State::Paused | State::Complete))
         }) {
             return Ok(existing.clone());
         }
@@ -236,6 +389,7 @@ impl Queue {
             range: 0,
             priority,
             intent,
+            automatic_scope: automatic.map(|(scope, _)| scope.to_owned()),
             state: State::Queued,
             created_at: now,
             updated_at: now,

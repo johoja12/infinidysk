@@ -12,6 +12,7 @@ publish.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 infinidysk-core.workspace = true
+infinidysk-plex.workspace = true
 infinidysk-db.workspace = true
 infinidysk-native-cache.workspace = true
 infinidysk-vfs.workspace = true

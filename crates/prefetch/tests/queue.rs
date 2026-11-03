@@ -165,6 +165,7 @@ fn settings() -> WarmSettings {
     WarmSettings {
         enabled: true,
         daily_fill_bytes: 100 * BLOCK,
+        ..Default::default()
     }
 }
 async fn enqueue(queue: &Queue, item: &Item) -> infinidysk_prefetch::Job {
@@ -278,6 +279,7 @@ async fn pause_cancel_daily_allowance_and_idempotence_are_durable() {
     let limited = WarmSettings {
         enabled: true,
         daily_fill_bytes: BLOCK,
+        ..Default::default()
     };
     assert!(q.tick(&limited).await.unwrap());
     let before = server.body_commands();
