@@ -165,9 +165,7 @@ impl Node {
 /// 2000-01-01 UTC. Constant so media servers never see fixed folders as changed.
 const FIXED_MODIFIED: i64 = 946_684_800_000;
 
-/// Whether deleting `path` should report success without changing anything: apps delete a
-/// download's links and folder under `/completed-symlinks/<category>/` once they imported it.
-// ponytail: accepted without hiding the entry; hide it for a while if apps retry.
+/// Whether `path` is inside one download's completed pointers. Category roots stay read-only.
 pub fn ignores_delete(path: &str) -> bool {
     path.strip_prefix("/completed-symlinks/")
         .is_some_and(|rest| rest.split('/').filter(|p| !p.is_empty()).count() > 1)
@@ -400,6 +398,9 @@ impl Vfs {
         else {
             return Ok(None);
         };
+        if self.db.completed_link_removed(item.id).await? {
+            return Ok(None);
+        }
         let job = match rest.len() {
             1 => None,
             2 => Some(item.id),
@@ -511,7 +512,7 @@ impl Vfs {
                 .collect(),
             Node::Links(Some(dir)) => self
                 .db
-                .children(dir.id)
+                .completed_link_children(dir.id)
                 .await?
                 .into_iter()
                 .filter(visible)
@@ -522,6 +523,22 @@ impl Vfs {
                 .collect(),
             _ => Vec::new(),
         })
+    }
+
+    /// Remove a completed pointer, preserving `/content`, `/.ids`, blobs and history.
+    /// Already-removed pointers are accepted so Arr cleanup retries are safe.
+    pub async fn remove_completed_link(&self, path: &str) -> Result<bool, Error> {
+        if !ignores_delete(path) {
+            return Ok(false);
+        }
+        match self.lookup(path).await? {
+            Some(Node::Link { item, .. } | Node::Links(Some(item))) => {
+                self.db.remove_completed_links(item.id).await?;
+            }
+            None => {}
+            _ => return Ok(false),
+        }
+        Ok(true)
     }
 
     /// A reader over a file's bytes; `None` for directories. Item files are listed in

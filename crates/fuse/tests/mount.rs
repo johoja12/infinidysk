@@ -211,10 +211,7 @@ async fn reads_the_tree_through_the_kernel() {
             std::fs::write(mount.join("README"), b"x").is_err(),
             "read-only"
         );
-        // Arr apps move a link by linking the new path, then unlinking the old one.
-        std::fs::remove_file(&link).unwrap();
-        std::fs::remove_dir(mount.join("completed-symlinks/tv/my job")).unwrap();
-        assert!(link.exists(), "deleting a link changes nothing");
+        // Source content stays read-only; completed pointers may be removed.
         assert!(std::fs::remove_dir(mount.join("completed-symlinks/tv")).is_err());
         assert!(std::fs::remove_file(&path).is_err());
         assert!(std::fs::rename(&path, mount.join("content/tv/b.mkv")).is_err());
@@ -233,16 +230,8 @@ async fn reads_the_tree_through_the_kernel() {
             assert_eq!(nix::unistd::setfsuid(user), user, "fsuid must change");
             std::fs::remove_file(&link)?;
             std::fs::remove_dir(&job_dir)?;
-            assert!(
-                std::fs::symlink_metadata(&link)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
-            assert!(
-                job_dir.is_dir(),
-                "accepted deletes must leave the tree intact"
-            );
+            assert!(std::fs::symlink_metadata(&link).is_err());
+            assert!(!job_dir.exists(), "removed completed pointers disappear");
             Ok::<(), std::io::Error>(())
         })
         .join()

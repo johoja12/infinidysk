@@ -397,3 +397,61 @@ async fn unreachable_providers_answer_retryable_503_before_the_body() {
         assert_eq!(r.headers()[header::RETRY_AFTER], "5");
     }
 }
+
+#[tokio::test]
+async fn completed_pointer_delete_is_visible_and_preserves_source_content() {
+    let data = vec![7; 2 * ARTICLE];
+    let (_server, app, _, _) = setup(&data).await;
+    let auth = [("authorization", BASIC)];
+    let link = "/completed-symlinks/tv/my%20job/a.mkv.rclonelink";
+    assert_eq!(
+        send(&app, "GET", link, &auth, Vec::new()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&app, "DELETE", link, &auth, Vec::new()).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(&app, "GET", link, &auth, Vec::new()).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(&app, "DELETE", link, &auth, Vec::new()).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        body(send(&app, "GET", "/content/tv/my%20job/a.mkv", &auth, Vec::new()).await).await,
+        data
+    );
+    assert_eq!(
+        send(
+            &app,
+            "DELETE",
+            "/completed-symlinks/tv/my%20job",
+            &auth,
+            Vec::new()
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        send(
+            &app,
+            "PROPFIND",
+            "/completed-symlinks/tv/my%20job",
+            &auth,
+            Vec::new()
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(&app, "DELETE", "/completed-symlinks/tv", &auth, Vec::new())
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+}

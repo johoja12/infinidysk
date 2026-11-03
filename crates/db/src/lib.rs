@@ -1147,6 +1147,26 @@ impl Db {
         rows.into_iter().map(Item::try_from).collect()
     }
 
+    /// Children still visible as completed-download pointers; source items stay intact.
+    pub async fn completed_link_children(&self, parent: ItemId) -> Result<Vec<Item>, Error> {
+        let sql = select_items!(
+            "WHERE parent_id=$1 AND id NOT IN (SELECT item_id FROM completed_link_removals) ORDER BY name"
+        );
+        let rows: Vec<ItemRow> =
+            on!(self,pool=>sqlx::query_as(sql).bind(parent.0).fetch_all(pool).await?);
+        rows.into_iter().map(Item::try_from).collect()
+    }
+    pub async fn completed_link_removed(&self, item: ItemId) -> Result<bool, Error> {
+        let found: Option<i32> = on!(self,pool=>sqlx::query_scalar("SELECT 1 FROM completed_link_removals WHERE item_id=$1").bind(item.0).fetch_optional(pool).await?);
+        Ok(found.is_some())
+    }
+    /// Idempotently remove one download's pointer subtree, never its source content.
+    pub async fn remove_completed_links(&self, item: ItemId) -> Result<(), Error> {
+        on!(self,pool=>sqlx::query("WITH RECURSIVE sub(id) AS (SELECT id FROM items WHERE id=$1 UNION ALL SELECT i.id FROM items i JOIN sub ON i.parent_id=sub.id) INSERT INTO completed_link_removals(item_id,removed_at) SELECT id,$2 FROM sub WHERE 1=1 ON CONFLICT(item_id) DO NOTHING")
+            .bind(item.0).bind(now_ms()).execute(pool).await?.rows_affected());
+        Ok(())
+    }
+
     /// Files (not directories) with ids in `start..end`, ordered by id.
     pub async fn files_in_id_range(
         &self,
@@ -1167,7 +1187,7 @@ impl Db {
     /// Children of `parent` that are the directory of a completed download, by name.
     pub async fn completed_dirs(&self, parent: ItemId) -> Result<Vec<Item>, Error> {
         let sql = select_items!(
-            "WHERE parent_id = $1 AND id IN (SELECT download_dir FROM history WHERE status = $2) ORDER BY name"
+            "WHERE parent_id = $1 AND id IN (SELECT download_dir FROM history WHERE status = $2) AND id NOT IN (SELECT item_id FROM completed_link_removals) ORDER BY name"
         );
         let rows: Vec<ItemRow> = on!(self, pool => sqlx::query_as(sql)
             .bind(parent.0)

@@ -723,7 +723,8 @@ async fn delete(vfs: &Vfs, path: &str) -> Result<Response, infinidysk_vfs::Error
         }
         .into_response());
     }
-    if infinidysk_vfs::ignores_delete(path) {
+    let completed = path.strip_suffix(LINK_SUFFIX).unwrap_or(path);
+    if vfs.remove_completed_link(completed).await? {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
     Ok(StatusCode::FORBIDDEN.into_response())

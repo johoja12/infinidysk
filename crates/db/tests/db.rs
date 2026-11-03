@@ -960,6 +960,7 @@ async fn sqlite_storage_round_trips() {
         .await
         .expect("connect");
     exercise(&db).await;
+    completed_pointer_removal(&db).await;
     db.close().await;
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
@@ -1043,7 +1044,81 @@ async fn postgres_storage_round_trips() {
         .await
         .expect("connect");
     exercise(&db).await;
+    completed_pointer_removal(&db).await;
     db.close().await;
     let drop = sqlx::AssertSqlSafe(format!("DROP DATABASE {name}"));
     sqlx::query(drop).execute(&admin).await.expect("drop");
+}
+
+async fn completed_pointer_removal(db: &Db) {
+    let root = db
+        .item(ItemId::CONTENT)
+        .await
+        .expect("completed-pointer fixture")
+        .expect("completed-pointer fixture");
+    let dir = Item::child(&root, "completed-pointer-fixture", ItemKind::Directory)
+        .expect("completed-pointer fixture");
+    let file = Item::child(&dir, "file.mkv", ItemKind::NzbFile).expect("completed-pointer fixture");
+    db.insert(&[dir.clone(), file.clone()], &[])
+        .await
+        .expect("completed-pointer fixture");
+    assert!(
+        !db.completed_link_removed(file.id)
+            .await
+            .expect("completed-pointer fixture")
+    );
+    db.remove_completed_links(file.id)
+        .await
+        .expect("completed-pointer fixture");
+    db.remove_completed_links(file.id)
+        .await
+        .expect("completed-pointer fixture");
+    assert!(
+        db.completed_link_removed(file.id)
+            .await
+            .expect("completed-pointer fixture")
+    );
+    assert_eq!(
+        db.completed_link_children(dir.id)
+            .await
+            .expect("completed-pointer fixture"),
+        Vec::<Item>::new()
+    );
+    assert_eq!(
+        db.item(file.id).await.expect("completed-pointer fixture"),
+        Some(file.clone())
+    );
+    db.remove_completed_links(dir.id)
+        .await
+        .expect("completed-pointer fixture");
+    assert!(
+        db.completed_link_removed(dir.id)
+            .await
+            .expect("completed-pointer fixture")
+    );
+    assert_eq!(
+        db.item(file.id).await.expect("completed-pointer fixture"),
+        Some(file)
+    );
+}
+
+#[tokio::test]
+async fn completed_pointer_removal_survives_a_database_restart() {
+    let path = std::env::temp_dir().join(format!("id-completed-removal-{}.sqlite", ItemId::new()));
+    let url = format!("sqlite:{}", path.display());
+    let db = Db::connect(&url).await.unwrap();
+    completed_pointer_removal(&db).await;
+    let file = db
+        .item_by_path("/content/completed-pointer-fixture/file.mkv")
+        .await
+        .unwrap()
+        .unwrap();
+    db.close().await;
+    let reopened = Db::connect(&url).await.unwrap();
+    assert!(reopened.completed_link_removed(file.id).await.unwrap());
+    assert!(reopened.item(file.id).await.unwrap().is_some());
+    reopened.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }

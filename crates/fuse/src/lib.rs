@@ -806,7 +806,15 @@ impl Fs {
     async fn delete(&self, parent: Inode, name: &OsStr) -> Result<()> {
         let path = child_path(&self.path(parent)?, name)?;
         self.node(&path).await?;
-        if infinidysk_vfs::ignores_delete(&path) {
+        if self
+            .vfs
+            .remove_completed_link(&path)
+            .await
+            .map_err(|error| {
+                warn!(reason=%error,"FUSE completed-pointer removal failed");
+                Errno::from(libc::EIO)
+            })?
+        {
             Ok(())
         } else {
             Err(libc::EROFS.into())
