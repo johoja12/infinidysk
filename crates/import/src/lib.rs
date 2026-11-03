@@ -3,6 +3,7 @@
 
 mod apply;
 mod csharp;
+pub mod fork;
 mod memorypack;
 pub mod native;
 mod password;

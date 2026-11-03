@@ -95,6 +95,16 @@ impl Config {
             .filter(|v| !v.is_empty())
     }
 
+    /// Effective legacy values for private archival only; includes secrets.
+    pub fn archival_values(&self) -> &BTreeMap<String, String> {
+        &self.values
+    }
+
+    /// Only the six legacy fallback variables, for private archival.
+    pub fn archival_fallbacks(&self) -> &BTreeMap<&'static str, String> {
+        &self.vars
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.values.keys().map(String::as_str)
     }

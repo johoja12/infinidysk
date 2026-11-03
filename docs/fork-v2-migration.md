@@ -36,7 +36,7 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | R01 | P0 | Replace an exactly identified damaged import even when its original grab is absent (`ArrClient`, `RadarrClient`, `HealthCheckService`; fork PR #230) | `crates/arr/src/repair.rs` already deletes/searches without a grab, but unnecessarily waits for an automatic search it never triggered. Skip that wait and retain replacement/error guards. | First port implemented; validation recorded below |
 | R02 | P0 | Recover the original download from exact file ID + imported path; reject ambiguity and incomplete history (`ArrDownloadIdResolver`, fork PR #234) | `repair.rs::owner_of_file` and Arr owner backfill exist. Add scoped, fully paginated Radarr history using **`movieIds`**, verify current identity, and carry recovered identity into blocklisting. Do not use a migration job ID as original provenance. Sonarr filtering stays profile-specific. | Implemented; exact scoped/paginated recovery with ambiguity guards |
 | R03 | P0 | Protect live/overlapping reads, but bypass recent-read delay for confirmed damage after readers close (`ConcurrentReadTracker`, fork PR #232) | `health::Health::with_in_use` and VFS read handles exist. Prove FUSE/WebDAV/STRM accounting, cancellation cleanup, and no destructive repair while any reader remains. | Implemented persisted reader holds, last-close wakeup and atomic reader/repair admission; regression validation below |
-| R04 | P0 | Keep read/warm-triggered damaged-file repairs urgent through provider circuit outages (`HealthCheckService`, `PrefetchRepairHistory`, `eafe1705`) | Persisted urgent health state and bounded inconclusive retry; strict warming failures request the same priority. | Implemented for read and manual warming; automatic prediction integration pending |
+| R04 | P0 | Keep read/warm-triggered damaged-file repairs urgent through provider circuit outages (`HealthCheckService`, `PrefetchRepairHistory`, `eafe1705`) | Persisted urgent health state and bounded inconclusive retry; strict warming failures request the same priority. | Implemented for playback and the shared warming executor, including admitted current/history predictions; other source policies remain open |
 | R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Request generations and explicit-request scheduling implemented; resumable full-content sweep remains open |
 | R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Durable source-bound mutation journal, CAS checkpoints and uncertain-response observation implemented; detached worker, library-root authority and manual outcome controls remain open |
 | R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; this baseline has no equivalent recovery executor in health. Port trusted range/slice identity, bounded repair budgets, durable outcomes and separate worker scheduling before declaring repair parity. | Port |
@@ -54,7 +54,7 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | L02 | P1 | Plex metadata matching and indexed library classification (`PlexLibraryMetadataService`, `LibraryCatalogService`) | Depends on P02/L01. Keep matching separate from authority to delete or regrab a file. | Opt-in complete persistent metadata snapshots, exact mapped/indexed paths and ambiguity-guarded display fallback implemented; live Plex acceptance pending |
 | L03 | P1 | File details: source identity, current cache ranges, health history, active regrab, manual regrab (`GetLibraryFileDetails`, file modal) | Compose new Rust admin APIs over L01/C05/R06; do not assume 1.x API compatibility. | Details now include source revision, cache ranges, indexed paths, active regrab and recent grouped reads; Plex classification included; manual outcome controls remain open |
 | L04 | P1 | Live playback rows grouped across bursts, imported file ID, viewer attribution and cache-served reads (`ActiveReadRegistry`, `ActiveReadsBroadcaster`) | Rust `vfs::session` and traces exist; add only missing correlation/attribution and prove cleanup on reader drop. | Source/client/player burst grouping and exact native-cache served bytes implemented; verified Plex viewer correlation remains open |
-| M01 | P0 | Import our actual fork data without losing ownership or repair state (`NzbDavMigration`, fork DB additions) | `crates/import` imports C# data, but fork tables/settings/cache layouts need an explicit compatibility report. Inventory unsupported settings and records; fail or report them rather than silently discard. | Verify / port gaps |
+| M01 | P0 | Import our actual fork data without losing ownership or repair state (`NzbDavMigration`, fork DB additions) | `crates/import` imports C# data, but fork tables/settings/cache layouts need an explicit compatibility report. Inventory unsupported settings and records; fail or report them rather than silently discard. | Private digest-bound SQLite export/verification preserves legacy settings, unknown DB tables and known journals; PostgreSQL-source translation, typed activation and operational parity remain open |
 | M02 | P1 | Legacy NZB catalogue recovery, digest-bound mapped export packages and parallel canary mount (`tools/NzbDavMigration`) | Keep existing tools read-only initially. Decide whether to retain the external tool or add a Rust adapter; preserve package digest, source identity and rollback journal. | Replace / adapter |
 | M03 | P1 | Pipelined batches, separate validation slot, resumable priority schedule and failed-import recovery (`NzbDavMigrationController`, `UsenetMigration`) | New Rust queue/admin contracts need adapters and restart-safe checkpoints. No acknowledgement without terminal proof. | Port |
 | M04 | P1 | Resumable external import runner, systemd service and Plex-hub priority ordering (`scripts/operations/plex-import-runner.py`, `plex_hub_priority.py`) | Adapt the operational tools to the new Rust import/admin contracts. Keep existing journals immutable; prove restart, duplicate-submission and priority-snapshot behavior against a separate canary. | Replace / adapter |
@@ -511,3 +511,23 @@ adopts an unavailable volume.
 This UI-only increment changes no schema, settings or setup wizard. Existing additive
 migrations still require backing up `/config` before an eventual upgrade. Validation
 is in [cache inspection UI validation](validation/rust-v2-cache-ui-20261104.md).
+
+
+## Legacy fork-state preservation increment
+
+The `fork-export` / `fork-verify` CLI provides a private, receipt-bound evidence
+package before migration. It snapshots the legacy SQLite databases with committed WAL
+data, retains unknown fork tables/settings, archives known repair/prefetch/library/
+health journals, and accepts explicit operational-runner journals. Effective legacy
+environment overrides are recorded separately from stored values. Numeric package
+filenames, private permissions, size/count bounds, source content-witness checks and a synced
+manifest prevent silent partial export or overwriting prior packages. Verification
+checks all payloads and the digest recorded outside the package.
+
+This is preservation for later adapters, not job activation or full restore. Source
+cache payloads and `/config` blobs remain in their original backup. No uncertain Arr
+write or old import acknowledgement is replayed. No schema/settings/setup change is
+introduced; existing additive migrations still require a `/config` backup.
+
+Usage and limits: [fork-state export](fork-state-export.md). PostgreSQL-source translation, typed settings adoption,
+old journal interpretation and restart-safe operational-runner adapters remain open.

@@ -25,6 +25,50 @@ async fn main() -> anyhow::Result<()> {
         print!("{}", infinidysk::upgrade::report(config.as_ref()).await?);
         return Ok(());
     }
+    if std::env::args().nth(1).as_deref() == Some("fork-export") {
+        let args: Vec<_> = std::env::args_os()
+            .skip(2)
+            .map(std::path::PathBuf::from)
+            .collect();
+        anyhow::ensure!(
+            args.len() >= 2,
+            "usage: infinidysk fork-export CONFIG NEW_PACKAGE [EXTRA_JOURNAL ...]"
+        );
+        let manifest = infinidysk_import::fork::export(
+            &args[0],
+            &args[1],
+            &args[2..],
+            std::env::vars().collect(),
+        )
+        .await?;
+        println!(
+            "legacy evidence package: {} files, digest {}",
+            manifest.entries.len(),
+            manifest.digest
+        );
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("fork-verify") {
+        let args: Vec<_> = std::env::args_os()
+            .skip(2)
+            .map(std::path::PathBuf::from)
+            .collect();
+        anyhow::ensure!(
+            args.len() == 2,
+            "usage: infinidysk fork-verify PACKAGE EXPECTED_DIGEST"
+        );
+        let manifest = infinidysk_import::fork::verify(&args[0])?;
+        anyhow::ensure!(
+            args[1].to_str() == Some(manifest.digest.as_str()),
+            "legacy evidence digest does not match the expected export receipt"
+        );
+        println!(
+            "legacy evidence verified: {} files, digest {}",
+            manifest.entries.len(),
+            manifest.digest
+        );
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
         let listen = infinidysk::app::listen_from_env()?;
         match infinidysk::healthcheck::probe(listen).await {
