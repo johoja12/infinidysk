@@ -1,5 +1,7 @@
 //! Final-media bytes, below delivery: checksummed blocks in bounded chunk files.
 //! The catalogue stays on local storage; browsing never scans payload volumes.
+pub mod legacy;
+
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -833,6 +835,30 @@ impl Cache {
             key.size = size.cast_unsigned();
             key
         }))
+    }
+
+    /// Full committed coverage is checked from disk before destructive recovery. A
+    /// storage timeout is uncertainty, never evidence that the copy is absent.
+    pub async fn verify_complete(&self, key: &Key) -> Result<Option<bool>, Error> {
+        let full = |ranges: &[Coverage]| {
+            ranges.len() == 1 && ranges[0].start == 0 && ranges[0].end == key.size
+        };
+        if key.size == 0 || !full(&self.coverage(key).await?) {
+            return Ok(Some(false));
+        }
+        let Some(lease) = self.lease(key.clone()) else {
+            return Ok(None);
+        };
+        for block in 0..key.size.div_ceil(BLOCK) {
+            if self.get(&lease, block).await.is_none() {
+                return Ok(if full(&self.coverage(key).await?) {
+                    None
+                } else {
+                    Some(false)
+                });
+            }
+        }
+        Ok(Some(true))
     }
 
     pub async fn coverage(&self, key: &Key) -> Result<Vec<Coverage>, Error> {

@@ -82,6 +82,7 @@ pub struct Admin {
         crate::native_cache::files,
         crate::native_cache::action,
         crate::native_cache::coverage,
+        crate::native_cache::import_legacy,
         get_settings,
         put_settings,
         get_key,
@@ -188,6 +189,10 @@ impl Modify for Security {
 pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
     Router::new()
         .route("/api/v1/native-cache", get(crate::native_cache::status))
+        .route(
+            "/api/v1/native-cache/import-legacy",
+            post(crate::native_cache::import_legacy),
+        )
         .route(
             "/api/v1/native-cache/files",
             get(crate::native_cache::files).post(crate::native_cache::action),

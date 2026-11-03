@@ -80,6 +80,7 @@ pub struct MultipartFile {
     /// Trailing RAR volumes C# resolves on first read.
     pub pending: Vec<PendingPart>,
     pub expected_size: Option<i64>,
+    pub content_identity: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -182,6 +183,7 @@ pub fn multipart_file(o: &Object<'_>) -> Result<MultipartFile, Error> {
                         .flatten()
                         .unwrap_or_default(),
                     expected_size: m.field(6, Reader::opt_i64)?.flatten(),
+                    content_identity: m.field(7, Reader::string)?.flatten(),
                 })
             })
         })?

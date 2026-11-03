@@ -806,6 +806,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/native-cache/import-legacy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["native_cache_import_legacy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/overview": {
         parameters: {
             query?: never;
@@ -1932,6 +1948,33 @@ export interface components {
         };
         /** @enum {string} */
         Kind: "speed" | "tune";
+        LegacyCacheCursor: {
+            /** @description Last fully processed entry. The next entry's last processed block is `offset`. */
+            after_key?: string;
+            /** Format: int64 */
+            offset?: number;
+        };
+        LegacyCacheFolder: {
+            id: string;
+            path: string;
+        };
+        LegacyCacheImport: {
+            cursor?: components["schemas"]["LegacyCacheCursor"];
+            folders: components["schemas"]["LegacyCacheFolder"][];
+            /** @description Offline/checkpointed 1.x native metadata directory, containing both ledgers. */
+            metadata_path: string;
+        };
+        LegacyCacheReport: {
+            complete: boolean;
+            cursor: components["schemas"]["LegacyCacheCursor"];
+            paused: boolean;
+            /** Format: int64 */
+            processed_bytes: number;
+            /** Format: int32 */
+            rejected_blocks: number;
+            /** Format: int32 */
+            rejected_entries: number;
+        };
         LegacyView: {
             /**
              * Format: int64
@@ -2902,7 +2945,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a0e6-eb0d-76e6-b16a-c322e3a8f66a
+             * @default 01a1a17b-5ee2-74c6-a42b-359f6fd470e9
              */
             id: string;
             /**
@@ -5216,6 +5259,29 @@ export interface operations {
                 };
                 content: {
                     "text/plain": boolean;
+                };
+            };
+        };
+    };
+    native_cache_import_legacy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LegacyCacheImport"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LegacyCacheReport"];
                 };
             };
         };

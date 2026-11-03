@@ -4,6 +4,7 @@
 mod apply;
 mod csharp;
 mod memorypack;
+pub mod native;
 mod password;
 mod settings;
 

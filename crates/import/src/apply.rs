@@ -561,25 +561,41 @@ async fn convert_files(
         .buffer_unordered(PARALLEL);
     let mut pending: Vec<(Item, HealthStatus)> = Vec::new();
     let mut pending_blobs: Vec<(BlobId, Vec<u8>)> = Vec::new();
+    let mut pending_sources = Vec::new();
     while let Some(dir) = converted.next().await {
         done.fetched += dir.fetched;
         done.provider_errors += dir.provider_errors;
         for (path, reason) in dir.skipped {
             done.skip(path, reason);
         }
-        for (item, health, meta) in dir.files {
+        for (item, health, meta, source) in dir.files {
+            pending_sources.push((item.id, source));
             if let Some(b) = item.meta_blob {
                 pending_blobs.push((b, meta));
             }
             pending.push((item, health));
         }
         if pending.len() >= BATCH {
-            write_files(db, &mut pending, &mut pending_blobs, done).await?;
+            write_files(
+                db,
+                &mut pending,
+                &mut pending_blobs,
+                &mut pending_sources,
+                done,
+            )
+            .await?;
             log_files(done, total);
         }
         report(done);
     }
-    write_files(db, &mut pending, &mut pending_blobs, done).await?;
+    write_files(
+        db,
+        &mut pending,
+        &mut pending_blobs,
+        &mut pending_sources,
+        done,
+    )
+    .await?;
     log_files(done, total);
     report(done);
     Ok(())
@@ -705,10 +721,12 @@ async fn write_files(
     db: &Db,
     items: &mut Vec<(Item, HealthStatus)>,
     blobs: &mut Vec<(BlobId, Vec<u8>)>,
+    sources: &mut Vec<(ItemId, String)>,
     done: &mut Imported,
 ) -> Result<(), Error> {
     let refs: Vec<(BlobId, &[u8])> = blobs.iter().map(|(id, b)| (*id, b.as_slice())).collect();
-    db.import_items(items, &refs).await?;
+    db.import_items_with_sources(items, &refs, sources).await?;
+    sources.clear();
     done.files += items.len() as u64;
     items.clear();
     blobs.clear();
@@ -718,7 +736,7 @@ async fn write_files(
 /// One directory's files, converted.
 #[derive(Default)]
 struct Dir {
-    files: Vec<(Item, HealthStatus, Vec<u8>)>,
+    files: Vec<(Item, HealthStatus, Vec<u8>, String)>,
     skipped: Vec<(String, String)>,
     fetched: u64,
     provider_errors: u64,
@@ -740,8 +758,11 @@ async fn convert_dir(
     };
     for row in rows {
         match convert(&row, blobs, &mut sizer).await {
-            Ok((meta, damaged)) => match blob::encode_meta(&meta) {
-                Ok(bytes) => dir.files.push(file_item(row, &meta, damaged, nzbs, bytes)),
+            Ok((meta, damaged, source)) => match blob::encode_meta(&meta) {
+                Ok(bytes) => {
+                    let (item, health, bytes) = file_item(row, &meta, damaged, nzbs, bytes);
+                    dir.files.push((item, health, bytes, source));
+                }
                 Err(error) => dir.skipped.push((row.path, error.to_string())),
             },
             Err(reason) => dir.skipped.push((row.path, reason)),
@@ -828,14 +849,14 @@ async fn convert(
     row: &FileRow,
     blobs: &Path,
     sizer: &mut Sizer<'_>,
-) -> Result<(FileMeta, bool), String> {
+) -> Result<(FileMeta, bool, String), String> {
     let path = row
         .meta
         .as_deref()
         .and_then(|m| blob_path(blobs, m))
         .ok_or("no metadata blob")?;
     let sub_type = row.sub_type;
-    let file = tokio::task::spawn_blocking(move || {
+    let (file, source) = tokio::task::spawn_blocking(move || {
         let bytes = std::fs::read(path).map_err(|e| format!("metadata blob: {e}"))?;
         let file = match sub_type {
             201 => decode(&bytes, csharp::nzb_file).map(CsFile::Nzb),
@@ -843,7 +864,9 @@ async fn convert(
             203 => decode(&bytes, csharp::multipart_file).map(CsFile::Multipart),
             other => return Err(format!("unknown file type {other}")),
         };
-        file.map_err(|e| format!("metadata blob: {e}"))
+        let file = file.map_err(|e| format!("metadata blob: {e}"))?;
+        let source = crate::native::Source::capture(&file, &bytes);
+        Ok::<_, String>((file, source))
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -980,10 +1003,11 @@ async fn convert(
         return Err(format!("size {} differs from C#'s {size}", meta.size()));
     }
     let damaged = damaged || meta.has_placeholders();
-    Ok((meta, damaged))
+    let source = source.finish(row.meta.as_deref().ok_or("missing metadata id")?, &meta)?;
+    Ok((meta, damaged, source))
 }
 
-enum CsFile {
+pub(crate) enum CsFile {
     Nzb(csharp::NzbFile),
     Rar(csharp::RarFile),
     Multipart(csharp::MultipartFile),
@@ -2176,7 +2200,7 @@ mod tests {
             fetched: 0,
             provider_errors: 0,
         };
-        let (meta, _) = rt().block_on(convert(&row, &blobs, &mut sizer)).unwrap();
+        let (meta, _, _) = rt().block_on(convert(&row, &blobs, &mut sizer)).unwrap();
         assert_eq!(meta.size(), 100);
     }
 
@@ -2853,5 +2877,162 @@ mod tests {
             assert_eq!((part.data.start, part.data.end), (45, 100_045));
             assert_eq!(part.segments.size(), 100_053);
         });
+    }
+    #[tokio::test]
+    #[ignore = "requires the real C# native cache writer fixture"]
+    async fn csharp_cache_survives_full_import_and_serves_vfs_without_providers() {
+        use infinidysk_native_cache::legacy::{Folder, Legacy};
+        use infinidysk_native_cache::{Cache, FolderSettings, Key, Settings};
+        use infinidysk_vfs::{Delivery, Node, Origin, Vfs};
+        use sqlx::Connection as _;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let receipt = std::env::var("INFINIDYSK_LEGACY_CACHE_FIXTURE").expect("fixture receipt");
+        let receipts: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
+        let (cs, job) = seed("/content", "/content/job").await;
+        let mut conn = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new().filename(cs.join("db.sqlite")),
+        )
+        .await
+        .unwrap();
+        for row in &receipts {
+            let item = Uuid::parse_str(row["item"].as_str().unwrap()).unwrap();
+            let blob = Uuid::parse_str(row["blob"].as_str().unwrap()).unwrap();
+            let dest = crate::blob_path(&cs.join("blobs"), &blob.to_string()).unwrap();
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::copy(
+                std::path::Path::new(row["metadata_path"].as_str().unwrap()).join("source.blob"),
+                dest,
+            )
+            .unwrap();
+            let name = format!("{}.dat", row["mode"].as_str().unwrap());
+            sqlx::query("INSERT INTO DavItems(Id,ParentId,Name,Path,CreatedAt,Type,SubType,FileSize,FileBlobId) VALUES($1,$2,$3,$4,'2025-01-01',2,$5,$6,$7)")
+                .bind(item.to_string()).bind(job.to_string()).bind(&name).bind(format!("/content/job/{name}"))
+                .bind(if row["multipart"].as_bool().unwrap(){203_i32}else{201_i32})
+                .bind(row["length"].as_i64().unwrap()).bind(blob.to_string()).execute(&mut conn).await.unwrap();
+        }
+        drop(conn);
+        let target = tmp();
+        let db = Db::connect(&format!("sqlite:{}", target.join("db.sqlite").display()))
+            .await
+            .unwrap();
+        let client = Arc::new(Client::new(Vec::<infinidysk_nntp::Provider>::new()));
+        let done = apply(&cs, &db, &client, "/unused").await.unwrap();
+        assert_eq!(done.skipped_count, 0, "{:?}", done.skip_reasons);
+        assert_eq!(done.files, 5);
+        assert_eq!(done.fetched, 0);
+        std::fs::create_dir_all(target.join("cache")).unwrap();
+        let cache = Cache::open(Settings {
+            enabled: true,
+            min_file_mb: 0,
+            metadata_path: target.join("cache-meta").to_str().unwrap().into(),
+            folders: vec![FolderSettings {
+                id: Uuid::new_v4(),
+                path: target.join("cache").to_str().unwrap().into(),
+                min_free_bytes: 0,
+                ..FolderSettings::default()
+            }],
+            ..Settings::default()
+        })
+        .await
+        .unwrap();
+        let vfs = Vfs::new(
+            db.clone(),
+            client,
+            infinidysk_stream::Budget::new(8 * 1024 * 1024),
+            1024 * 1024,
+            "/unused",
+        )
+        .with_native_cache(Some(Arc::clone(&cache)));
+        for row in &receipts {
+            let id = ItemId(Uuid::parse_str(row["item"].as_str().unwrap()).unwrap());
+            let item = db.item(id).await.unwrap().unwrap();
+            let source: crate::native::Source = serde_json::from_str(
+                &db.import_source(id)
+                    .await
+                    .unwrap()
+                    .expect("atomic provenance"),
+            )
+            .unwrap();
+            let key = vfs.cache_key(&item).await.unwrap();
+            assert_eq!(
+                key,
+                Key::from_fingerprint(
+                    id.0,
+                    source.fingerprint.clone().try_into().unwrap(),
+                    source.size
+                )
+            );
+            let dir = std::path::Path::new(row["metadata_path"].as_str().unwrap());
+            let ledger = crate::native::Ledger::open(&dir.join("repair-revisions.db"))
+                .await
+                .unwrap();
+            let generation = source.generation(&ledger).await.unwrap();
+            let legacy = Legacy::open(
+                &dir.join("catalogue.db"),
+                &[Folder {
+                    id: row["folder_id"].as_str().unwrap().into(),
+                    path: row["folder_path"].as_str().unwrap().into(),
+                }],
+            )
+            .await
+            .unwrap();
+            let entry = legacy.entries("", 1).await.unwrap().pop().unwrap();
+            assert!(Legacy::matches(&entry, id.0, &generation, source.size));
+            for block in legacy.blocks(&entry, -1, 64).await.unwrap() {
+                assert!(
+                    legacy
+                        .copy_block(&cache, &entry, &key, block)
+                        .await
+                        .unwrap()
+                );
+            }
+            for delivery in [Delivery::WebDav, Delivery::Fuse] {
+                let mut reader = vfs
+                    .open(
+                        &Node::Item(item.clone()),
+                        Origin {
+                            delivery,
+                            client: "fixture".into(),
+                            player: None,
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                // The partial fixture tests only committed ranges, never gap fillers.
+                let length = if row["mode"] == "partial" {
+                    infinidysk_native_cache::BLOCK_BYTES
+                } else {
+                    usize::try_from(source.size).unwrap()
+                };
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).await.unwrap();
+                assert!(
+                    bytes
+                        .iter()
+                        .enumerate()
+                        .all(|(index, byte)| *byte == u8::try_from(index % 251).unwrap())
+                );
+                reader.seek(std::io::SeekFrom::Start(12345)).await.unwrap();
+                let mut seek = [0; 8192];
+                reader.read_exact(&mut seek).await.unwrap();
+                assert!(
+                    seek.iter()
+                        .enumerate()
+                        .all(|(index, byte)| *byte == u8::try_from((index + 12345) % 251).unwrap())
+                );
+            }
+        }
+        drop(vfs);
+        drop(cache);
+        drop(db);
+        if let Ok(receipt) = std::env::var("INFINIDYSK_KEEP_LEGACY_CONFIG") {
+            std::fs::write(receipt, cs.to_string_lossy().as_bytes()).unwrap();
+        } else {
+            std::fs::remove_dir_all(cs).unwrap();
+        }
+        std::fs::remove_dir_all(target).unwrap();
     }
 }

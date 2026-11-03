@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { api, body, type Schemas } from "../api/client";
@@ -42,6 +42,7 @@ export function NativeCachePanel({value,locked,onChange}:{value:Settings;locked:
       </div>
     </SettingsPanel>
     <NativeCacheBrowser />
+    <LegacyCacheImport />
   </>;
 }
 function NativeCacheBrowser() {
@@ -64,4 +65,51 @@ function NativeCacheBrowser() {
       {selected&&<div className="space-y-1 rounded-lg border p-3"><p className="text-sm font-medium">Verified ranges (end exclusive)</p>{coverage.error&&<Failure error={coverage.error}/>}<p className="break-words font-mono text-xs">{coverage.data?.map(r=>`${r.start}–${r.end}`).join(', ')||'No verified ranges'}</p></div>}
     </>}
   </SettingsPanel></>;
+}
+
+function LegacyCacheImport() {
+  type Request = Schemas["LegacyCacheImport"];
+  const saved = () => {
+    try { return JSON.parse(localStorage.getItem("legacy-cache-import") || "null") as {request:Request;bytes:number;rejected:number;complete:boolean}|null; }
+    catch { return null; }
+  };
+  const [progress,setProgress] = useState(saved);
+  const [path,setPath] = useState(progress?.request.metadata_path || "");
+  const [folders,setFolders] = useState(progress?.request.folders || [{id:"",path:""}]);
+  const [running,setRunning] = useState(false);
+  const [failure,setFailure] = useState<string|null>(null);
+  const active = useRef(false);
+  const queryClient = useQueryClient();
+  useEffect(() => () => { active.current = false; }, []);
+  const run = async () => {
+    if (active.current) return;
+    active.current=true; setRunning(true);setFailure(null);
+    let state = progress || {request:{metadata_path:path,folders,cursor:{after_key:"",offset:-1}},bytes:0,rejected:0,complete:false};
+    try {
+      while(active.current && !state.complete) {
+        const report = await body(api.POST("/api/v1/native-cache/import-legacy",{body:state.request}));
+        state = {...state,request:{...state.request,cursor:report.cursor},bytes:state.bytes+report.processed_bytes,rejected:state.rejected+report.rejected_entries+report.rejected_blocks,complete:report.complete};
+        localStorage.setItem("legacy-cache-import",JSON.stringify(state));setProgress(state);
+        void queryClient.invalidateQueries({queryKey:["native-cache-files"]});
+        if(report.paused) {setFailure("Import paused because cache storage or buffers are unavailable. Free space or wait for playback to finish, then resume.");break;}
+      }
+    } catch(error) {setFailure(error instanceof Error ? error.message : "Legacy cache import failed");}
+    finally {active.current=false;setRunning(false);}
+  };
+  return <SettingsPanel title="Import a 1.x native cache">
+    <p className="text-sm text-muted-foreground">Import the C# installation first. Keep 1.x stopped while copying its cache. Verified blocks are copied into the separate Rust cache; the old cache remains available for rollback. The destination needs enough free space. Source revisions that cannot be proven are skipped.</p>
+    <Field id="legacy-native-metadata" label="1.x native metadata directory"><Input id="legacy-native-metadata" value={path} disabled={running||!!progress} onChange={event=>setPath(event.target.value)} placeholder="/legacy-config/native-cache-metadata" /></Field>
+    {folders.map((folder,index)=><div key={index} className="grid gap-2 sm:grid-cols-2">
+      <Field id={`legacy-folder-${index}-id`} label="1.x folder ID"><Input id={`legacy-folder-${index}-id`} value={folder.id} disabled={running||!!progress} onChange={event=>setFolders(folders.map((value,i)=>i===index?{...value,id:event.target.value}:value))}/></Field>
+      <Field id={`legacy-folder-${index}-path`} label="1.x cache folder path"><Input id={`legacy-folder-${index}-path`} value={folder.path} disabled={running||!!progress} onChange={event=>setFolders(folders.map((value,i)=>i===index?{...value,path:event.target.value}:value))}/></Field>
+    </div>)}
+    {!progress&&<Button type="button" variant="outline" disabled={running||folders.length>=32} onClick={()=>setFolders([...folders,{id:"",path:""}])}>Add source folder</Button>}
+    {progress&&<p className="text-sm" role="status">{progress.complete?"Import complete":"Import progress saved"} · {bytes(progress.bytes)} processed · {progress.rejected} rejected entries or blocks.</p>}
+    {failure&&<p className="text-sm text-destructive" role="alert">{failure}</p>}
+    <div className="flex flex-wrap gap-2">
+      <Button type="button" disabled={running||progress?.complete||!path||folders.some(folder=>!folder.id||!folder.path)} onClick={()=>void run()}>{progress?"Resume import":"Copy verified cache"}</Button>
+      {running&&<Button type="button" variant="outline" onClick={()=>{active.current=false;}}>Pause after this batch</Button>}
+      {progress&&!running&&<Button type="button" variant="outline" onClick={()=>{localStorage.removeItem("legacy-cache-import");setProgress(null);setFailure(null);}}>Start another import</Button>}
+    </div>
+  </SettingsPanel>;
 }

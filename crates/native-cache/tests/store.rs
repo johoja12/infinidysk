@@ -2,6 +2,7 @@
 #![allow(clippy::unwrap_used)] // Fixture setup failures are assertions.
 use bytes::Bytes;
 use infinidysk_native_cache::{BLOCK, BLOCK_BYTES, Cache, FolderSettings, Key, Settings};
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -281,4 +282,30 @@ async fn opening_an_unowned_nonempty_folder_does_not_modify_it() {
         .collect();
     assert_eq!(names, vec![std::ffi::OsString::from("legacy-payload")]);
     assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+}
+
+#[tokio::test]
+async fn complete_copy_verification_rejects_partial_and_corrupt_payloads() {
+    let t = Temp::new();
+    let cache = Cache::open(t.settings()).await.unwrap();
+    let key = key(BLOCK + 17);
+    let lease = cache.lease(key.clone()).unwrap();
+    assert_eq!(cache.verify_complete(&key).await.unwrap(), Some(false));
+    assert!(cache.put(&lease, 0, data(11)).await.unwrap());
+    assert_eq!(cache.verify_complete(&key).await.unwrap(), Some(false));
+    assert!(
+        cache
+            .put(&lease, 1, Bytes::from(vec![12; 17]))
+            .await
+            .unwrap()
+    );
+    assert_eq!(cache.verify_complete(&key).await.unwrap(), Some(true));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(t.payload(&key, 0))
+        .unwrap()
+        .write_all_at(b"damage", 0)
+        .unwrap();
+    assert_eq!(cache.verify_complete(&key).await.unwrap(), Some(false));
+    assert!(cache.coverage(&key).await.unwrap()[0].start > 0);
 }
