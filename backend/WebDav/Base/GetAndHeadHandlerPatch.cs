@@ -146,12 +146,14 @@ public class GetAndHeadHandlerPatch : IRequestHandler
         // Key the shared-stream audit by the decoded store path (the same form
         // /view passes), otherwise overlap between the two entry points on the
         // same file is missed whenever the path needs percent-encoding.
+        var readItemId = entry is BaseStoreItem storeItem && Guid.TryParse(storeItem.UniqueKey, out var itemId)
+            ? itemId : (Guid?)null;
         using var concurrentReadScope = isHeadRequest
             ? null
             : _concurrentReadTracker.BeginRead(
                 Uri.UnescapeDataString(path),
                 range?.Start ?? (range is null ? 0 : null),
-                ResolveReadRegion(range));
+                ResolveReadRegion(range), readItemId);
 
         // ETag might be used for a conditional request
         string? etag = null;

@@ -59,7 +59,8 @@ public sealed class ConcurrentReadTracker(
     public ReadScope BeginRead(
         string path,
         long? startOffset,
-        ConcurrentReadRegion region)
+        ConcurrentReadRegion region,
+        Guid? itemId = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         if (startOffset < 0)
@@ -78,7 +79,7 @@ public sealed class ConcurrentReadTracker(
             }
 
             var overlaps = state.Readers.Count > 0;
-            var reader = new ReaderState(startOffset, overlaps);
+            var reader = new ReaderState(startOffset, overlaps) { ItemId = itemId };
             state.Readers.Add(readerId, reader);
             _readerStarts++;
             _regionStarts[(int)region]++;
@@ -97,6 +98,12 @@ public sealed class ConcurrentReadTracker(
         var context = new ReadContext(path, readerId);
         _currentRead.Value = context;
         return new ReadScope(this, context, previous, startedAt);
+    }
+
+    internal bool HasActiveRead(Guid itemId)
+    {
+        lock (_gate)
+            return _paths.Values.Any(state => state.Readers.Values.Any(reader => reader.ItemId == itemId));
     }
 
     /// <summary>
@@ -495,6 +502,7 @@ public sealed class ConcurrentReadTracker(
 
     private sealed class ReaderState(long? startOffset, bool joinedOverlap)
     {
+        public Guid? ItemId { get; init; }
         public long? StartOffset { get; set; } = startOffset;
         public bool JoinedOverlap { get; } = joinedOverlap;
         public bool DistanceRecorded { get; set; }

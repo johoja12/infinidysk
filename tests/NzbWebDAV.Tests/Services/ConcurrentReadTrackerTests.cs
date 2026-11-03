@@ -10,6 +10,22 @@ namespace NzbWebDAV.Tests.Services;
 public class ConcurrentReadTrackerTests
 {
     [Fact]
+    public void ActiveFileRead_IsScopedAcrossAliasesAndOverlappingReaders()
+    {
+        var tracker = new ConcurrentReadTracker();
+        var itemId = Guid.NewGuid();
+        using var first = tracker.BeginRead("/view/sample.mkv", 0, ConcurrentReadRegion.Full, itemId);
+        using var second = tracker.BeginRead("/.ids/sample", 0, ConcurrentReadRegion.Full, itemId);
+        Assert.True(tracker.HasActiveRead(itemId));
+        Assert.False(tracker.HasActiveRead(Guid.NewGuid()));
+        first.Dispose();
+        Assert.True(tracker.HasActiveRead(itemId));
+        second.Dispose();
+        second.Dispose();
+        Assert.False(tracker.HasActiveRead(itemId));
+    }
+
+    [Fact]
     public void OverlappingRanges_RecordPrivateFallbackAndStartDistance()
     {
         var tracker = new ConcurrentReadTracker();

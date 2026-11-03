@@ -49,6 +49,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
     private static readonly TimeSpan HealthCheckStallDeferral = TimeSpan.FromDays(1);
     internal static readonly TimeSpan PriorityFailureRetry = TimeSpan.FromMinutes(5);
     private readonly ConcurrentDictionary<Guid, DateTimeOffset> _repairRetryNotBefore = new();
+    // Keep read holds separate: a newly confirmed failure may bypass only these retries.
+    private readonly ConcurrentDictionary<Guid, DateTimeOffset> _readHoldRetryNotBefore = new();
+    internal static readonly TimeSpan ActiveReadRepairRetry = TimeSpan.FromSeconds(5);
     // PAR2 repairs still running after the inline wait; their files are not re-picked until they finish.
     private readonly ConcurrentDictionary<Guid, Task<Par2RepairOutcome>> _backgroundPar2Repairs = new();
     private CancellationToken _stoppingToken;
@@ -185,6 +188,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
     private readonly HealthWorkSchedulePolicy? _healthWorkSchedule;
     private readonly HealthCheckConnectionGate _healthCheckConnectionGate;
     private readonly ActiveReadRegistry _activeReads;
+    private readonly ConcurrentReadTracker _concurrentReads;
     private readonly ConcurrentDictionary<Guid, InProgressHealthCheck> _inProgress = new();
     private const int RecentHealthCheckCapacity = 32;
     private readonly ConcurrentQueue<HealthCheckAttemptSnapshot> _recentHealthChecks = new();
@@ -324,7 +328,8 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         ArrInstanceBackoff? arrBackoff = null,
         Regrab.ArrRegrabService? regrabService = null,
         NativeCache.NativeCacheService? nativeCache = null,
-        ActiveReadRegistry? activeReadRegistry = null
+        ActiveReadRegistry? activeReadRegistry = null,
+        ConcurrentReadTracker? concurrentReadTracker = null
     )
     {
         _configManager = configManager;
@@ -342,6 +347,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         _dbContextFactory = dbContextFactory;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _activeReads = activeReadRegistry ?? new ActiveReadRegistry();
+        _concurrentReads = concurrentReadTracker ?? new ConcurrentReadTracker();
         _healthWorkSchedule = healthWorkSchedule;
         _healthCheckConnectionGate = healthCheckConnectionGate;
 
@@ -608,6 +614,13 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             {
                 if (notBefore > currentDateTime) continue;
                 _repairRetryNotBefore.TryRemove(new KeyValuePair<Guid, DateTimeOffset>(item.Id, notBefore));
+            }
+            if (_readHoldRetryNotBefore.TryGetValue(item.Id, out var readHoldUntil))
+            {
+                if (_concurrentReads.HasActiveRead(item.Id)
+                    || (readHoldUntil > currentDateTime && _failureTracker.GetSnapshot(item.Id).Count == 0))
+                    continue;
+                _readHoldRetryNotBefore.TryRemove(new KeyValuePair<Guid, DateTimeOffset>(item.Id, readHoldUntil));
             }
             var isRepair = item.NextHealthCheck == DateTimeOffset.UnixEpoch
                 || item.HealthRepairPending;
@@ -1775,7 +1788,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                 return;
             }
 
-            await Repair(davItem, dbClient, ct, providerGeneration: providerGeneration).ConfigureAwait(false);
+            await Repair(davItem, dbClient, ct, providerGeneration: providerGeneration, confirmedDamage: true).ConfigureAwait(false);
         }
         catch (UsenetUnexpectedResponseException e)
         {
@@ -1941,7 +1954,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             Log.Information(
                 "Health check found {Count} damaged article(s) in {Path} with no damage tolerance applied. Starting repair.",
                 holeIndices.Count, davItem.Path);
-            await Repair(davItem, dbClient, ct, providerGeneration: providerGeneration).ConfigureAwait(false);
+            await Repair(davItem, dbClient, ct, providerGeneration: providerGeneration, confirmedDamage: true).ConfigureAwait(false);
             return;
         }
 
@@ -1975,7 +1988,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             // fails fast pre-import (issue #732), then take today's repair path.
             if (FilenameUtil.IsImportantFileType(davItem.Name))
                 AddMissingSegmentIds(holeSegmentIds, providerGeneration);
-            await Repair(davItem, dbClient, ct, providerGeneration: providerGeneration).ConfigureAwait(false);
+            await Repair(davItem, dbClient, ct, providerGeneration: providerGeneration, confirmedDamage: true).ConfigureAwait(false);
             return;
         }
 
@@ -3726,7 +3739,8 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             ct,
             forceDelete: disposition == UrgentRepairDisposition.ForceDelete,
             forceDeleteIfUnlinked: disposition == UrgentRepairDisposition.ForceDeleteIfUnlinked,
-            streamingFailureCount: failureCount).ConfigureAwait(false);
+            streamingFailureCount: failureCount,
+            confirmedDamage: failureSnapshot.Count > 0).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -3919,11 +3933,17 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
         bool forceDelete = false,
         bool forceDeleteIfUnlinked = false,
         int? streamingFailureCount = null,
-        long? providerGeneration = null)
+        long? providerGeneration = null,
+        bool confirmedDamage = false)
     {
         var readHold = _configManager.GetRepairReadHold();
+        var heldForActiveRead = false;
         DateTimeOffset? GetReadHoldUntil()
         {
+            heldForActiveRead = _concurrentReads.HasActiveRead(davItem.Id);
+            if (heldForActiveRead)
+                return _timeProvider.GetUtcNow() + ActiveReadRepairRetry;
+            if (confirmedDamage) return null;
             if (readHold <= TimeSpan.Zero
                 || _activeReads.GetLastFileReadAt(davItem.Id) is not { } observedReadAt)
                 return null;
@@ -3940,7 +3960,7 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             if (await IsDurablyUrgentAsync(dbClient, davItem.Id, ct).ConfigureAwait(false))
                 davItem.NextHealthCheck = DateTimeOffset.UnixEpoch;
 
-            var retryAt = _repairRetryNotBefore.AddOrUpdate(
+            var retryAt = _readHoldRetryNotBefore.AddOrUpdate(
                 davItem.Id,
                 resumeAt,
                 (_, current) => current >= resumeAt ? current : resumeAt);
@@ -3948,7 +3968,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
             davItem.NextHealthCheck = NextHealthCheckAfterScheduleDeferral(
                 davItem.NextHealthCheck, retryAt);
             Log.Information(
-                "Destructive health repair deferred for DavItem {DavItemId} until {RetryAt}. Reason: recent playback read.",
+                heldForActiveRead
+                    ? "Destructive health repair deferred for DavItem {DavItemId} until {RetryAt}. Reason: active playback read."
+                    : "Destructive health repair deferred for DavItem {DavItemId} until {RetryAt}. Reason: recent playback read.",
                 davItem.Id,
                 retryAt);
             await RecordHealthResult(
@@ -3956,7 +3978,9 @@ public partial class HealthCheckService : BackgroundService, IHealthCheckQuiesce
                 davItem,
                 HealthCheckResult.HealthResult.Unhealthy,
                 HealthCheckResult.RepairAction.ActionNeeded,
-                $"Removal and replacement deferred after a recent playback read. Earliest retry: {retryAt:u}.",
+                heldForActiveRead
+                    ? $"Removal and replacement deferred while a playback read is active. Earliest retry: {retryAt:u}."
+                    : $"Removal and replacement deferred after a recent playback read. Earliest retry: {retryAt:u}.",
                 ct,
                 repairPending: true).ConfigureAwait(false);
         }
