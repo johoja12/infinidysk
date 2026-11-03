@@ -103,7 +103,8 @@ Pinned toolchain: Rust 1.99.1. The three missing-grab integration cases failed o
 unmodified upstream repair code (the requested 60-second grace period exceeded the
 2-second assertion timeout). With the port, all 14 Arr tests passed, including nine
 loopback repair integration cases. Workspace formatting and Clippy with `-D warnings`
-passed. `cargo test --workspace --locked` passed: 296 tests, no failures; one ignored test.
+passed. `cargo test --workspace --locked` passed: 296 tests, no failures; two ignored tests
+(kernel FUSE and local NZB sample tests).
 The optional PostgreSQL test returns without exercising PostgreSQL when its URL is
 unset, as in this local run. No live Arr/provider acceptance, UI production build,
 release image, migration rehearsal or performance qualification is claimed.
