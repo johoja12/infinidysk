@@ -221,10 +221,15 @@ pub async fn import_legacy(
                 report.paused = true;
                 break;
             }
-            Err(error) => {
+            Err(error @ infinidysk_native_cache::Error::Invalid(_)) => {
                 tracing::warn!(reason=%error, "one legacy cache block was rejected");
                 report.rejected_blocks += 1;
                 report.cursor.offset = offset;
+            }
+            Err(error) => {
+                tracing::warn!(reason=%error, "legacy cache storage is unavailable; import paused");
+                report.paused = true;
+                break;
             }
         }
     }

@@ -269,8 +269,13 @@ impl Legacy {
         let reading = tokio::task::spawn_blocking(move || read(&root, &entry, &block, permit));
         let (data, permit) = tokio::time::timeout(std::time::Duration::from_secs(5), reading)
             .await
-            .map_err(|_| Error::Invalid("legacy cache read timed out"))?
-            .map_err(|_| Error::Invalid("legacy cache read task failed"))??;
+            .map_err(|_| {
+                Error::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "legacy cache read timed out",
+                ))
+            })?
+            .map_err(|_| Error::Io(io::Error::other("legacy cache read task failed")))??;
         let copied = cache
             .put_reserved(&lease, start / BLOCK, data, permit)
             .await?;
