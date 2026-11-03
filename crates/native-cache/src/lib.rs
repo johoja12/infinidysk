@@ -384,15 +384,53 @@ impl Cache {
                     .bind(f.id.to_string())
                     .fetch_optional(&db)
                     .await?;
+            // Validate identity before any create/open-for-write, including the lock.
+            if let Some((registered_path, dev, ino, marker)) = &registered {
+                if registered_path != &f.path
+                    || dev != &meta.dev().to_string()
+                    || ino != &meta.ino().to_string()
+                {
+                    return Err(Error::Invalid(
+                        "native cache folder identity differs from its catalogue; restore its mount",
+                    ));
+                }
+                let owner = File::from(openat(
+                    &root,
+                    OWNER,
+                    OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+                    Mode::empty(),
+                )?);
+                if !owner.metadata()?.is_file() || owner.metadata()?.nlink() != 1 {
+                    return Err(Error::Invalid("invalid cache ownership marker"));
+                }
+                let mut contents = String::new();
+                owner.take(100).read_to_string(&mut contents)?;
+                if &contents != marker {
+                    return Err(Error::Invalid("native cache ownership marker changed"));
+                }
+            } else {
+                if f.read_only {
+                    return Err(Error::Invalid(
+                        "read-only cache folders must already be registered",
+                    ));
+                }
+                if std::fs::read_dir(path)?.next().is_some() {
+                    return Err(Error::Invalid(
+                        "new native cache folder must be empty; existing cache data needs its original catalogue",
+                    ));
+                }
+            }
             let lock_flags = if f.read_only {
                 OFlag::O_RDONLY
-            } else {
+            } else if registered.is_none() {
                 OFlag::O_RDWR | OFlag::O_CREAT
+            } else {
+                OFlag::O_RDWR
             };
             let lockfile = File::from(openat(
                 &root,
                 ".lock",
-                lock_flags | OFlag::O_NOFOLLOW,
+                lock_flags | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
                 Mode::S_IRUSR | Mode::S_IWUSR,
             )?);
             let lock = Flock::lock(lockfile, FlockArg::LockExclusiveNonblock)

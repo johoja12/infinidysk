@@ -268,3 +268,17 @@ async fn client_supplied_size_cannot_bypass_an_active_entry_lease() {
     assert_eq!(canonical.size(), BLOCK);
     assert!(!cache.evict(&canonical, "test").await.unwrap());
 }
+
+#[tokio::test]
+async fn opening_an_unowned_nonempty_folder_does_not_modify_it() {
+    let t = Temp::new();
+    let sentinel = t.0.join("data").join("legacy-payload");
+    std::fs::write(&sentinel, b"keep").unwrap();
+    assert!(Cache::open(t.settings()).await.is_err());
+    let names: Vec<_> = std::fs::read_dir(t.0.join("data"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("legacy-payload")]);
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"keep");
+}
