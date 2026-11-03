@@ -652,6 +652,7 @@ async fn carried_over_file_without_a_download_is_replaced_by_search() {
         [
             "GET /api/v3/episodefile/7",
             "GET /api/v3/episode?episodeFileId=7",
+            "GET /api/v3/history?episodeId=5&eventType=3&page=1&pageSize=100&sortKey=date&sortDirection=descending",
             "GET /api/v3/queue/details?episodeIds=5",
             "DELETE /api/v3/episodefile/7",
             "POST /api/v3/command",

@@ -2,6 +2,7 @@
 //! blocklist the release, and get a replacement searched. Sonarr, Radarr, Whisparr
 //! (shaped like one of those) and Lidarr.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use reqwest::Method;
@@ -37,6 +38,8 @@ pub struct Owner {
     /// The Arr's id of the file we recorded it importing, if any.
     recorded_file: Option<i64>,
     current: Option<MediaFile>,
+    /// Verified import provenance, never an inferred migration job id.
+    download_id: Option<String>,
 }
 
 enum Media {
@@ -68,6 +71,12 @@ async fn shape(http: &reqwest::Client, arr: &Arr) -> Result<Option<Shape>, Error
 }
 
 impl Owner {
+    /// The original download proven by import history, when available.
+    #[must_use]
+    pub fn download_id(&self) -> Option<&str> {
+        self.download_id.as_deref()
+    }
+
     /// The Arr has since imported a different file for this media. Compared by file id
     /// where we recorded one, else by the file being added after the import, else by
     /// path; so the same file under a new path (a STRM, a rename) is not a replacement.
@@ -106,8 +115,10 @@ struct QueueRecord {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Page {
     records: Vec<Record>,
+    total_records: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +138,7 @@ struct Record {
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Data {
+    file_id: Option<serde_json::Value>,
     dropped_path: Option<String>,
     imported_path: Option<String>,
 }
@@ -245,6 +257,7 @@ pub async fn owner(
         imported_at,
         recorded_file,
         current,
+        download_id: Some(job.to_owned()),
     }))
 }
 
@@ -273,6 +286,11 @@ pub async fn owner_of_file(
             }
             other => other?,
         };
+    if current.id != file {
+        return Err(Error::Unexpected(
+            "file lookup returned a different file id",
+        ));
+    }
     let media = match shape {
         Shape::Series => {
             let file = file.to_string();
@@ -296,13 +314,107 @@ pub async fn owner_of_file(
                 .ok_or(Error::Unexpected("track file without albumId"))?,
         ),
     };
+    let download_id = original_download(http, arr, &media, &current).await?;
     Ok(Some(Owner {
         media,
+        download_id,
         imported_path: current.path.clone(),
         imported_at: None,
         recorded_file: Some(file),
         current: Some(current),
     }))
+}
+
+/// Recover only an exact file id and path from a complete media-scoped history.
+/// A bounded/inconsistent response is an error, not permission to guess provenance.
+async fn original_download(
+    http: &reqwest::Client,
+    arr: &Arr,
+    media: &Media,
+    file: &MediaFile,
+) -> Result<Option<String>, Error> {
+    const SIZE: usize = 100;
+    const MAX_PAGES: usize = 50;
+    let scopes = match media {
+        Media::Movie(id) => vec![("movieIds", *id)],
+        Media::Episodes(ids) => ids.iter().map(|&id| ("episodeId", id)).collect(),
+        Media::Album(_) => return Ok(None),
+    };
+    let mut candidate: Option<String> = None;
+    for (key, id) in scopes {
+        let mut seen = HashSet::new();
+        let mut total = None;
+        let mut complete = false;
+        for page in 1..=MAX_PAGES {
+            let found: Page = fetch(call(http, arr, Method::GET, "history").query(&[
+                (key, id.to_string()),
+                ("eventType", IMPORTED.to_owned()),
+                ("page", page.to_string()),
+                ("pageSize", SIZE.to_string()),
+                ("sortKey", "date".to_owned()),
+                ("sortDirection", "descending".to_owned()),
+            ]))
+            .await?;
+            if page == 1 {
+                total = found.total_records;
+            } else if total != found.total_records {
+                return Err(Error::Unexpected(
+                    "import history changed during pagination",
+                ));
+            }
+            let count = found.records.len();
+            if count > SIZE || (total.is_some_and(|total| seen.len() + count > total)) {
+                return Err(Error::Unexpected("inconsistent import history page"));
+            }
+            for record in found.records {
+                if !seen.insert(record.id) {
+                    return Err(Error::Unexpected("import history repeated a record"));
+                }
+                let scoped = match media {
+                    Media::Movie(_) => record.movie_id == Some(id),
+                    Media::Episodes(_) => record.episode_id == Some(id),
+                    Media::Album(_) => false,
+                };
+                let file_id = record
+                    .data
+                    .file_id
+                    .as_ref()
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
+                if !scoped
+                    || file_id != Some(file.id)
+                    || record.data.imported_path.as_deref() != Some(file.path.as_str())
+                {
+                    continue;
+                }
+                let Some(download) = record.download_id.filter(|d| !d.trim().is_empty()) else {
+                    continue;
+                };
+                match &candidate {
+                    Some(known) if !known.eq_ignore_ascii_case(&download) => {
+                        return Err(Error::Unexpected("ambiguous original download identity"));
+                    }
+                    None => candidate = Some(download),
+                    Some(_) => {}
+                }
+            }
+            complete = match total {
+                Some(total) => seen.len() == total,
+                None => count < SIZE,
+            };
+            if complete {
+                break;
+            }
+            if count < SIZE {
+                return Err(Error::Unexpected("import history ended before its total"));
+            }
+        }
+        if !complete {
+            return Err(Error::Unexpected(
+                "import history exceeded the recovery limit",
+            ));
+        }
+    }
+    Ok(candidate)
 }
 
 /// What this instance imported from download `job`, as `(dropped, imported)` paths per
@@ -367,10 +479,12 @@ pub async fn all_imports(http: &reqwest::Client, arr: &Arr) -> Result<Vec<Import
 pub async fn replace(
     http: &reqwest::Client,
     arr: &Arr,
-    job: Option<&str>,
+    _job: Option<&str>,
     owner: &Owner,
     wait: Duration,
 ) -> Result<(), Error> {
+    // The caller may hold a legacy/migration id; only import-proven identity is safe.
+    let job = owner.download_id();
     let call = |method, path: String| call(http, arr, method, &path);
     if owner.replaced() || replacing(http, arr, job, owner).await? {
         return Ok(());
@@ -455,6 +569,7 @@ mod tests {
             imported_path: "/movies/a.mkv".to_owned(),
             imported_at: Some("2024-05-01T12:00:00Z".to_owned()),
             recorded_file: None,
+            download_id: None,
             current: Some(MediaFile {
                 id: 2,
                 path: "/movies/renamed.mkv".to_owned(),

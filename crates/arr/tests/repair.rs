@@ -273,7 +273,11 @@ async fn file_owner_without_a_download_deletes_and_searches_without_blocklisting
         .await
         .unwrap();
     let calls = server.calls();
-    assert!(!calls.iter().any(|c| c.contains("/history")));
+    assert!(
+        !calls
+            .iter()
+            .any(|c| c.contains("history/failed") || c.contains("downloadId="))
+    );
     assert_eq!(
         &calls[calls.len() - 2..],
         ["DELETE /api/v3/moviefile/7", "POST /api/v3/command"]
