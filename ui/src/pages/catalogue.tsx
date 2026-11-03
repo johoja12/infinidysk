@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link } from "react-router";
 import { RefreshCw } from "lucide-react";
+import { PlexClassification } from "./library-plex";
 import { toast } from "sonner";
 import { api, body } from "../api/client";
 import { ago, bytes } from "../format";
@@ -47,6 +48,7 @@ export function Catalogue() {
   };
   return <>
     <PageHeader title="Library" description="Video files linked from your configured library folders." />
+    <div className="mb-4"><PlexClassification /></div>
     {roots.isPending ? <Loading /> : roots.isError ? <Failure error={roots.error} /> : !root ?
       <Empty title="No library folders configured"><Link to="/settings/library" className="text-primary underline">Configure library folders</Link> to build the index.</Empty> : <>
         <div className="mb-4 flex flex-wrap items-center gap-2">

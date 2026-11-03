@@ -1,6 +1,6 @@
 use crate::{
-    Account, Connection, HomeUser, Library, Media, Resource, Server, Session, Token, ViewerServer,
-    identity, secret, xml,
+    Account, CatalogueMedia, Connection, HomeUser, Library, Media, Resource, Server, Session,
+    Token, ViewerServer, identity, secret, xml,
 };
 use reqwest::header::{ACCEPT, HeaderValue};
 use reqwest::{Method, Url};
@@ -479,6 +479,42 @@ impl Client {
             .map(media)
             .collect()
     }
+    pub async fn catalogue(
+        &self,
+        server: &Server,
+        library: &Library,
+    ) -> Result<Vec<CatalogueMedia>, Error> {
+        identity(&library.id)?;
+        let path = match library.kind.as_str() {
+            "movie" => format!("/library/sections/{}/all?type=1", library.id),
+            "show" => format!("/library/sections/{}/allLeaves", library.id),
+            _ => return Err(Error::Invalid("unsupported Plex library")),
+        };
+        self.pages(server, &path, "Video", 100_000)
+            .await?
+            .iter()
+            .map(|node| {
+                let mut files = std::collections::BTreeSet::new();
+                for part in node.children("Media").flat_map(|m| m.children("Part")) {
+                    if let Some(path) = part.text("file") {
+                        if !crate::safe_path(path) {
+                            return Err(Error::Invalid("invalid Plex catalogue path"));
+                        }
+                        files.insert(path.to_owned());
+                        if files.len() > 64 {
+                            return Err(Error::Invalid("too many Plex media parts"));
+                        }
+                    }
+                }
+                Ok(CatalogueMedia {
+                    media: media(node)?,
+                    files: files.into_iter().collect(),
+                    year: node.number("year"),
+                })
+            })
+            .collect()
+    }
+
     pub async fn metadata(&self, server: &Server, key: &str) -> Result<Media, Error> {
         identity(key)?;
         let root = self

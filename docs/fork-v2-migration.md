@@ -11,7 +11,7 @@ It groups related changes into capabilities; it is not a promise of complete par
 completed-pointer removal, and a first shared final-media cache implementation are in
 Rust. Cache settings and basic browsing/pinning/eviction are wired into the UI. The
 full fork port is **not complete**. Plex connections and viewer-safe transport are now implemented; Smart Prefetch,
-Plex library metadata matching, PAR2 execution, legacy migration adapters and several repair
+PAR2 execution, legacy migration adapters and several repair
 scheduler behaviors are still pending. A durable warming lane and Plex current/history prediction snapshots now run in Rust.
 The full warming governor and library/source catalogue policies remain open. The draft must not be treated as a cutover.
 
@@ -51,8 +51,8 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | P04 | P1 | Playback-aware warming priority, viewer lead, own-file warm lane, urgent backfills, cooperative yields (`WarmYieldPolicy`, `WarmConnectionGovernor`, `PrefetchWireBudget`) | Depends on P01 and reader tracking. Cached playback must not consume provider allowance; warming cannot starve an uncached seek. | Foreground yields, own-file priority and dedicated warm workload implemented; full governor pending |
 | P05 | P1 | Warming history by source revision/range, fetched bytes, source attribution and repair outcomes (`PrefetchRepairHistory`, `WarmingRateWindow`) | Depends on C01, P01 and R06. Use Rust decimal-byte API/UI conventions. | Port |
 | L01 | P1 | Persisted library link index, additional scan roots, video filter, catalogue/grouped browse (`Services/Library`, `LibraryLinkMaps`) | Rust library conversion/reconciliation exists, but not the fork catalogue and grouping. Preserve exact source-to-link mapping and bounded scans. | Persistent configuration-bound link snapshots, video grouping and browser implemented; durable paged staging for roots above the scan ceiling remains open |
-| L02 | P1 | Plex metadata matching and indexed library classification (`PlexLibraryMetadataService`, `LibraryCatalogService`) | Depends on P02/L01. Keep matching separate from authority to delete or regrab a file. | Port |
-| L03 | P1 | File details: source identity, current cache ranges, health history, active regrab, manual regrab (`GetLibraryFileDetails`, file modal) | Compose new Rust admin APIs over L01/C05/R06; do not assume 1.x API compatibility. | Details now include source revision, cache ranges, indexed paths, active regrab and recent grouped reads; manual outcome controls and Plex metadata remain open |
+| L02 | P1 | Plex metadata matching and indexed library classification (`PlexLibraryMetadataService`, `LibraryCatalogService`) | Depends on P02/L01. Keep matching separate from authority to delete or regrab a file. | Opt-in complete persistent metadata snapshots, exact mapped/indexed paths and ambiguity-guarded display fallback implemented; live Plex acceptance pending |
+| L03 | P1 | File details: source identity, current cache ranges, health history, active regrab, manual regrab (`GetLibraryFileDetails`, file modal) | Compose new Rust admin APIs over L01/C05/R06; do not assume 1.x API compatibility. | Details now include source revision, cache ranges, indexed paths, active regrab and recent grouped reads; Plex classification included; manual outcome controls remain open |
 | L04 | P1 | Live playback rows grouped across bursts, imported file ID, viewer attribution and cache-served reads (`ActiveReadRegistry`, `ActiveReadsBroadcaster`) | Rust `vfs::session` and traces exist; add only missing correlation/attribution and prove cleanup on reader drop. | Source/client/player burst grouping and exact native-cache served bytes implemented; verified Plex viewer correlation remains open |
 | M01 | P0 | Import our actual fork data without losing ownership or repair state (`NzbDavMigration`, fork DB additions) | `crates/import` imports C# data, but fork tables/settings/cache layouts need an explicit compatibility report. Inventory unsupported settings and records; fail or report them rather than silently discard. | Verify / port gaps |
 | M02 | P1 | Legacy NZB catalogue recovery, digest-bound mapped export packages and parallel canary mount (`tools/NzbDavMigration`) | Keep existing tools read-only initially. Decide whether to retain the external tool or add a Rust adapter; preserve package digest, source identity and rollback journal. | Replace / adapter |
@@ -466,3 +466,33 @@ install has no roots, so indexing is inactive until folders are configured. The 
 is read-only and never rewrites library links, adopts cache roots or triggers regrabs.
 
 Validation is recorded in [catalogue validation](validation/rust-v2-catalogue-20261104.md).
+
+
+## Opt-in Plex library classification increment
+
+Library settings now expose default-off metadata matching, with all enabled servers
+or an explicit selection (including none). Complete metadata snapshots persist in a
+separate database table. Paging, transport deadlines, entry/path/byte bounds and a
+single blocking index-build permit prevent unbounded work. Background refresh runs
+daily while imports and playback are idle; explicit administrative sync may run
+while they are active. A failed/incomplete pass retains the previous complete snapshot.
+Configuration changes hide incompatible saved results and reject in-flight publication.
+
+Classification prefers exact configured DAV paths or fresh indexed library paths.
+All Plex media Part paths are considered. Filename fallback is display-only and
+requires agreement across every candidate's type, title, year and episode identity.
+Ambiguity produces a visible warning. Responses cap at 100 matches with total count
+and a warning. Classification never fetches media, authorizes deletion/regrab,
+admits warming or proves a viewer. Restored snapshots are explicitly stale.
+
+Settings, Library and Explorer expose status and classification without per-detail
+Plex or NAS calls. The snapshot stores no credentials or owner watched state. A
+configuration digest scopes results; it does not expose the settings it hashes.
+
+**Upgrade/setup review:** migration 0015 is additive on SQLite and PostgreSQL.
+Back up `/config` before upgrading. Matching is optional and default-off, with
+environment-owned controls locked; it remains advanced-only. There is no new-install
+critical path or setup-wizard version change. 1.x legacy setting import is separate
+work; this increment does not activate old metadata or prefetch settings.
+
+Validation: [Plex classification checkpoint](validation/rust-v2-classification-20261104.md).

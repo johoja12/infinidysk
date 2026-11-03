@@ -37,6 +37,16 @@ pub struct Group {
 }
 
 impl Db {
+    pub async fn plex_classification(&self) -> Result<Option<String>, Error> {
+        Ok(
+            on!(self,pool=>sqlx::query_scalar("SELECT payload FROM plex_classification_snapshot WHERE slot=1").fetch_optional(pool).await?),
+        )
+    }
+    pub async fn save_plex_classification(&self, payload: &str) -> Result<(), Error> {
+        on!(self,pool=>sqlx::query("INSERT INTO plex_classification_snapshot(slot,payload) VALUES(1,$1) ON CONFLICT(slot) DO UPDATE SET payload=excluded.payload").bind(payload).execute(pool).await?.rows_affected());
+        Ok(())
+    }
+
     pub async fn catalogue_roots(&self) -> Result<Vec<Root>, Error> {
         let sql = "SELECT root,scope,scanned_at,requested_at,requested_generation,completed_generation,attempted_generation,attempted_at,error FROM library_catalogue ORDER BY root";
         Ok(on!(self,pool=>sqlx::query_as(sql).fetch_all(pool).await?))

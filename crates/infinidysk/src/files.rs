@@ -386,6 +386,7 @@ pub struct FileDetails {
     library_links: Vec<crate::library::catalogue::FileView>,
     regrab: Option<crate::regrabs::Status>,
     playback: Vec<crate::library::playback::Burst>,
+    plex: crate::library::metadata::Classification,
     entry: FileEntry,
     /// Newest first.
     checks: Vec<HealthCheckView>,
@@ -574,7 +575,7 @@ pub async fn get_file(
         _ => Vec::new(),
     };
     let roots = crate::library::catalogue::roots(&admin).await?;
-    let library_links = db
+    let library_links: Vec<crate::library::catalogue::FileView> = db
         .catalogue_links(None, None, Some(item.id.0), false, "", 200)
         .await?
         .into_iter()
@@ -585,6 +586,10 @@ pub async fn get_file(
                 .map(|r| crate::library::catalogue::FileView::from_link(link, r.stale))
         })
         .collect();
+    let plex = admin
+        .library_metadata
+        .match_file(&item, &library_links)
+        .await;
     let regrab = crate::regrabs::inspect(db, item.id.0).await?;
     let playback = crate::library::playback::grouped(
         admin
@@ -601,6 +606,7 @@ pub async fn get_file(
         cache_available,
         cache_warning,
         library_links,
+        plex,
         regrab,
         playback,
         entry,

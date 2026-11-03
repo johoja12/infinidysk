@@ -684,6 +684,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/library/plex": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["library_plex_status"];
+        put?: never;
+        post: operations["library_plex_sync"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/library/preview": {
         parameters: {
             query?: never;
@@ -2013,6 +2029,7 @@ export interface components {
             links: string[];
             media?: components["schemas"]["MediaView"] | null;
             playback: components["schemas"]["LibraryPlayback"][];
+            plex: components["schemas"]["PlexClassification"];
             regrab?: components["schemas"]["RegrabStatus"] | null;
             segments?: components["schemas"]["SegmentStats"] | null;
             source_revision?: string | null;
@@ -2183,6 +2200,16 @@ export interface components {
              * @default []
              */
             library_dirs: components["schemas"]["LibraryDir"][];
+            /**
+             * @description Read-only Plex classification; no media is fetched.
+             * @default false
+             */
+            plex_matching: boolean;
+            /**
+             * @description None selects all enabled servers; an empty list explicitly selects none.
+             * @default null
+             */
+            plex_server_ids: string[] | null;
             /** @default symlinks */
             strategy: components["schemas"]["ImportStrategy"];
             /**
@@ -3198,6 +3225,42 @@ export interface components {
             numeric_id?: string | null;
             token: components["schemas"]["PlexToken"];
         };
+        PlexClassification: {
+            matches: components["schemas"]["PlexClassificationMatch"][];
+            stale: boolean;
+            /** Format: int32 */
+            total_matches: number;
+            /** Format: int64 */
+            updated_at?: number | null;
+            warning?: string | null;
+        };
+        PlexClassificationMatch: {
+            /** Format: int32 */
+            episode?: number | null;
+            key: string;
+            kind: string;
+            library: string;
+            matched_by: components["schemas"]["PlexMatchBy"];
+            /** Format: int32 */
+            season?: number | null;
+            server: string;
+            show_title?: string | null;
+            title: string;
+            /** Format: int32 */
+            year?: number | null;
+        };
+        PlexClassificationStatus: {
+            enabled: boolean;
+            /** Format: int32 */
+            entries: number;
+            error?: string | null;
+            refreshing: boolean;
+            /** Format: int32 */
+            servers: number;
+            stale: boolean;
+            /** Format: int64 */
+            updated_at?: number | null;
+        };
         PlexConnection: {
             local: boolean;
             relay: boolean;
@@ -3232,6 +3295,8 @@ export interface components {
             expires_at_ms: number;
             state: string;
         };
+        /** @enum {string} */
+        PlexMatchBy: "mapped_path" | "indexed_path" | "filename";
         PlexPathMapping: {
             dav_path?: string | null;
             local_path?: string | null;
@@ -3639,7 +3704,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a31d-0de7-77ce-89ad-f3bb63e70ff7
+             * @default 01a1a350-746b-779d-8358-62b414c5fac6
              */
             id: string;
             /**
@@ -4211,6 +4276,8 @@ export interface components {
             /**
              * @default {
              *       "library_dirs": [],
+             *       "plex_matching": false,
+             *       "plex_server_ids": null,
              *       "strategy": "symlinks",
              *       "strm_dir": "/data/completed-downloads",
              *       "strm_key": ""
@@ -5737,6 +5804,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LibraryPlayback"][];
+                };
+            };
+        };
+    };
+    library_plex_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexClassificationStatus"];
+                };
+            };
+        };
+    };
+    library_plex_sync: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexClassificationStatus"];
                 };
             };
         };

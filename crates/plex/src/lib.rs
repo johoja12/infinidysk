@@ -236,6 +236,14 @@ pub struct Media {
     pub viewed_at: Option<i64>,
     pub user: Option<String>,
 }
+/// Every explicit Part path for a metadata identity, including multiple versions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogueMedia {
+    pub media: Media,
+    pub files: Vec<String>,
+    pub year: Option<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(as=PlexSession)]
 pub struct Session {

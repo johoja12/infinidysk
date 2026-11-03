@@ -61,6 +61,8 @@ import { NativeCachePanel } from "./native-cache";
 import { Providers } from "./providers";
 import { PlexConnections } from "./plex";
 import { PrefetchPanel } from "./prefetch";
+import { PlexClassification } from "./library-plex";
+import { Checkbox } from "@/components/ui/checkbox";
 
 const strategies: { value: Schemas["ImportStrategy"]; title: string; blurb: string }[] = [
   { value: "symlinks", title: "Symlinks", blurb: "Plex, or any media server that sees the mount" },
@@ -806,6 +808,13 @@ export function Settings() {
                       </AlertDescription>
                     </Alert>
                   )}
+                <SettingsPanel title="Plex classification">
+                  <Toggle id="library-plex-matching" label={label("Match Plex metadata", "imports.plex_matching")} hint="Read-only titles and episode details from selected Plex servers. Complete snapshots refresh daily while playback and imports are idle. Save your choices before syncing." checked={draft.imports.plex_matching} disabled={locked("imports.plex_matching")} onChange={(plex_matching) => patch("imports", { plex_matching })} />
+                  <Toggle id="library-plex-all" label={label("All enabled servers", "imports.plex_server_ids")} hint="Turn off to choose individual servers. An empty selection matches none." checked={draft.imports.plex_server_ids == null} disabled={locked("imports.plex_server_ids")} onChange={(all) => patch("imports", { plex_server_ids: all ? null : [] })} />
+                  {draft.imports.plex_server_ids != null && <div className="space-y-2">{draft.plex.servers.map((server) => <label key={server.id} className="flex items-center gap-2 text-sm"><Checkbox aria-label={`Match metadata from ${server.name || server.id}`} disabled={locked("imports.plex_server_ids")} checked={draft.imports.plex_server_ids?.includes(server.id)} onCheckedChange={(checked) => patch("imports", { plex_server_ids: checked ? [...(draft.imports.plex_server_ids ?? []), server.id] : (draft.imports.plex_server_ids ?? []).filter((id) => id !== server.id) })} />{server.name || server.id}{!server.enabled && <span className="text-muted-foreground"> · disabled</span>}</label>)}</div>}
+                  {invalid("imports.plex_server_ids") && <p className="text-destructive text-sm">{invalid("imports.plex_server_ids")}</p>}
+                  <PlexClassification />
+                </SettingsPanel>
                 <SettingsPanel title="Folders">
                   <Field
                     label={label(

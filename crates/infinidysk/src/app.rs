@@ -363,6 +363,7 @@ pub async fn serve(
         move || importing() || streaming()
     };
     if analyzes {
+        let (importing, streaming) = (importing.clone(), streaming.clone());
         health = health.with_analyzer(crate::probe::analyzer(
             Arc::clone(&vfs),
             boot.ffprobe.clone(),
@@ -588,6 +589,18 @@ pub async fn serve(
             .await
             .context("initializing Plex integration")?,
     );
+    let library_metadata = crate::library::metadata::Metadata::load(
+        db.clone(),
+        Arc::clone(&config),
+        plex.client.clone(),
+    )
+    .await
+    .context("loading Plex classification")?;
+    library_metadata.set_busy({
+        let (importing, streaming) = (importing.clone(), streaming.clone());
+        Arc::new(move || importing() || streaming())
+    });
+    let library_metadata_task = tokio::spawn(Arc::clone(&library_metadata).run());
     let prefetch = infinidysk_prefetch::Queue::load(db.clone(), Arc::clone(&vfs))
         .await
         .context("loading warming jobs")?;
@@ -652,6 +665,7 @@ pub async fn serve(
     };
     let admin = Arc::new(Admin {
         predictions,
+        library_metadata,
         prefetch,
         plex,
         config: Arc::clone(&config),
@@ -710,6 +724,7 @@ pub async fn serve(
     health_task.abort();
     prefetch_task.abort();
     predictions_task.abort();
+    library_metadata_task.abort();
     discovery_task.abort();
     cleanup_task.abort();
     library_task.abort();

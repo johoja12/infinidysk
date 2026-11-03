@@ -295,3 +295,57 @@ async fn warming_settings_preserve_live_private_ledger_and_respect_environment_a
     db.close().await;
     let _ = std::fs::remove_file(path);
 }
+
+#[tokio::test]
+async fn plex_classification_settings_preserve_defaults_selection_and_environment_authority() {
+    let path = std::env::temp_dir().join(format!(
+        "infinidysk-classification-config-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("database");
+    let mut store = ConfigStore::load(
+        db.clone(),
+        [("INFINIDYSK__IMPORTS__PLEX_MATCHING".into(), "true".into())],
+    )
+    .await
+    .expect("settings");
+    assert!(store.settings().imports.plex_matching);
+    assert!(store.settings().imports.plex_server_ids.is_none());
+    let mut settings = store.settings().clone();
+    settings.imports.plex_server_ids = Some(vec!["machine".into(), "machine".into()]);
+    store.save(settings).await.expect("selection");
+    assert_eq!(
+        store
+            .settings()
+            .imports
+            .plex_server_ids
+            .as_ref()
+            .expect("selection"),
+        &["machine"]
+    );
+    let mut changed = store.settings().clone();
+    changed.imports.plex_matching = false;
+    assert!(matches!(store.save(changed).await,Err(Error::Locked(p))if p=="imports.plex_matching"));
+    let restored = ConfigStore::load(db.clone(), []).await.expect("reload");
+    assert!(
+        !restored.settings().imports.plex_matching,
+        "env opt-in is never written as a stored default"
+    );
+    assert_eq!(
+        restored
+            .settings()
+            .imports
+            .plex_server_ids
+            .as_ref()
+            .expect("stored selection"),
+        &["machine"]
+    );
+    let mut invalid = restored.settings().clone();
+    invalid.imports.plex_server_ids = Some(vec!["invalid/identity".into()]);
+    assert!(invalid.validate().is_err());
+    db.close().await;
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}

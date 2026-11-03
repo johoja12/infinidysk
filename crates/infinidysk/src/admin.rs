@@ -66,6 +66,7 @@ pub struct Admin {
     pub plex: Arc<crate::plex::Service>,
     pub prefetch: Arc<infinidysk_prefetch::Queue>,
     pub predictions: Arc<crate::predictions::Predictions>,
+    pub library_metadata: Arc<library::metadata::Metadata>,
     /// `Ok` while FUSE is mounted, otherwise why not.
     pub mount: watch::Receiver<Result<infinidysk_vfs::Kernel, String>>,
     pub library: Arc<crate::library::Library>,
@@ -81,6 +82,7 @@ pub struct Admin {
 #[openapi(
     info(title = "infinidysk admin API"),
     paths(
+        library::metadata::status,library::metadata::sync,
         library::playback::status,
         library::catalogue::status,library::catalogue::refresh,library::catalogue::groups,library::catalogue::files,
         crate::native_cache::evictions,crate::native_cache::diagnostics,crate::native_cache::probe,
@@ -360,6 +362,10 @@ pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
         .route(
             "/api/v1/library/catalogue/files",
             get(library::catalogue::files),
+        )
+        .route(
+            "/api/v1/library/plex",
+            get(library::metadata::status).post(library::metadata::sync),
         )
         .route("/api/v1/library/playback", get(library::playback::status))
         .route("/api/v1/library", get(library::get_library))

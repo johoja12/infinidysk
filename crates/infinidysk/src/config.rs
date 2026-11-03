@@ -322,6 +322,10 @@ pub struct Imports {
     pub strm_key: Secret,
     /// Folders holding the Arrs' libraries, walked when pointers change form.
     pub library_dirs: Vec<LibraryDir>,
+    /// Read-only Plex classification; no media is fetched.
+    pub plex_matching: bool,
+    /// None selects all enabled servers; an empty list explicitly selects none.
+    pub plex_server_ids: Option<Vec<String>>,
 }
 
 /// A folder of an Arr's library.
@@ -377,6 +381,8 @@ impl Default for Imports {
             strm_dir: "/data/completed-downloads".to_owned(),
             strm_key: Secret::default(),
             library_dirs: Vec::new(),
+            plex_matching: false,
+            plex_server_ids: None,
         }
     }
 }
@@ -1052,6 +1058,24 @@ impl Settings {
         self.plex
             .validate()
             .map_err(|e| invalid("plex", e.to_string()))?;
+        if let Some(ids) = &mut self.imports.plex_server_ids {
+            if ids.len() > 32
+                || ids.iter().any(|id| {
+                    id.is_empty()
+                        || id.len() > 128
+                        || !id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                })
+            {
+                return Err(invalid(
+                    "imports.plex_server_ids",
+                    "Choose at most 32 valid Plex server identities".to_owned(),
+                ));
+            }
+            ids.sort();
+            ids.dedup();
+        }
         self.native_cache
             .validate()
             .map_err(|e| invalid("native_cache", e.to_string()))?;

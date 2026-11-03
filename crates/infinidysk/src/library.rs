@@ -37,6 +37,7 @@ use crate::handoff::{self, MAX_STRM_BYTES, MAX_SUBTITLE_BYTES};
 use crate::upgrade::{LEGACY_STRM_KEY, LegacyStrm};
 
 pub(crate) mod catalogue;
+pub(crate) mod metadata;
 pub(crate) mod playback;
 
 /// Config key: the [`Confirmed`] form.

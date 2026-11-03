@@ -9,6 +9,24 @@ use infinidysk_db::{
 async fn exercise(db: &Db) {
     fair_rechecks(db).await;
     library_catalogue(db).await;
+    db.save_plex_classification("fixture-snapshot")
+        .await
+        .expect("classification snapshot");
+    assert_eq!(
+        db.plex_classification()
+            .await
+            .expect("classification snapshot")
+            .as_deref(),
+        Some("fixture-snapshot")
+    );
+    assert!(
+        !db.config()
+            .await
+            .expect("settings")
+            .iter()
+            .any(|(key, _)| key == "plex_classification_snapshot")
+    );
+
     // Unreferenced NZBs go at once until the retention section at the end.
     db.set_nzb_retention_days(0);
     let content = db
@@ -1551,9 +1569,19 @@ async fn library_index_survives_database_restart() {
     db.catalogue_replace("/library", "scope", std::slice::from_ref(&link), 100, 0)
         .await
         .expect("publish");
+    db.save_plex_classification("persistent-classification")
+        .await
+        .expect("classification");
     db.close().await;
     drop(db);
     let db = Db::connect(&url).await.expect("reopen");
+    assert_eq!(
+        db.plex_classification()
+            .await
+            .expect("restored classification")
+            .as_deref(),
+        Some("persistent-classification")
+    );
     assert_eq!(
         db.catalogue_links(Some("/library"), None, None, true, "", 10)
             .await

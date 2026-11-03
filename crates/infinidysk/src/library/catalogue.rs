@@ -44,7 +44,12 @@ fn digest(data: &[u8]) -> String {
 fn scope(root: &str, settings: &Settings, known: &Known) -> Result<String, serde_json::Error> {
     serde_json::to_vec(&(
         root,
-        &settings.imports,
+        (
+            &settings.imports.library_dirs,
+            &settings.imports.strm_dir,
+            &settings.imports.strm_key,
+            settings.imports.strategy,
+        ),
         &known.mount_dirs,
         &known.keys,
         known.legacy,
