@@ -294,3 +294,111 @@ async fn overlapping_cached_reads_keep_repair_and_eviction_protection_until_last
     assert!(vfs.sessions().open().is_empty());
     assert!(cache.evict(&key, "test").await.unwrap());
 }
+
+async fn member_cache_case(encrypted: bool) {
+    let t = Temp::new();
+    let (vfs, plain, cache, corpus, server) = fixture(&t, false).await;
+    let Node::Item(plain) = plain else {
+        unreachable!()
+    };
+    let parent = vfs.db().item(plain.parent.unwrap()).await.unwrap().unwrap();
+    let FileMeta::Nzb(source) = blob::decode_meta(
+        &vfs.db()
+            .blob(plain.meta_blob.unwrap())
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    let (range, crypt, expected) = if encrypted {
+        let crypt = infinidysk_core::crypt::Crypt {
+            key: infinidysk_core::crypt::Key::Aes256([9; 32]),
+            iv: [3; 16],
+            size: corpus.data.len() as u64 - 7,
+        };
+        let mut expected = corpus.data.clone();
+        infinidysk_core::crypt::Cipher::new(&crypt.key)
+            .decrypt(&mut crypt.iv.clone(), &mut expected);
+        expected.truncate(expected.len() - 7);
+        (
+            infinidysk_core::ByteRange {
+                start: 0,
+                end: corpus.data.len() as u64,
+            },
+            Some(crypt),
+            expected,
+        )
+    } else {
+        (
+            infinidysk_core::ByteRange {
+                start: 37,
+                end: corpus.data.len() as u64 - 5,
+            },
+            None,
+            corpus.data[37..corpus.data.len() - 5].to_vec(),
+        )
+    };
+    let meta = FileMeta::Multipart(infinidysk_core::MultipartFile {
+        parts: vec![infinidysk_core::FilePart {
+            segments: source.segments,
+            offset: 0,
+            data: range,
+            split_after: false,
+            proof: None,
+        }],
+        crypt,
+    });
+    let mut item = Item::child(&parent, "member.bin", ItemKind::Multipart).unwrap();
+    let id = BlobId::new();
+    item.meta_blob = Some(id);
+    item.size = Some(meta.size());
+    vfs.db()
+        .insert(
+            std::slice::from_ref(&item),
+            &[(id, &blob::encode_meta(&meta).unwrap())],
+        )
+        .await
+        .unwrap();
+    let node = Node::Item(item);
+    let mut reader = vfs
+        .open(&node, origin(Delivery::WebDav))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut actual = Vec::new();
+    reader.read_to_end(&mut actual).await.unwrap();
+    assert_eq!(actual, expected);
+    drop(reader);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cache.stats().await.unwrap().bytes < expected.len() as u64 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let before = server.body_commands();
+    let mut cached = vfs
+        .open(&node, origin(Delivery::Fuse))
+        .await
+        .unwrap()
+        .unwrap();
+    for offset in [17, expected.len() - 512, 0] {
+        cached.seek(SeekFrom::Start(offset as u64)).await.unwrap();
+        let mut bytes = [0; 512];
+        cached.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(bytes, expected[offset..offset + 512]);
+    }
+    assert_eq!(server.body_commands(), before);
+}
+
+#[tokio::test]
+async fn stored_member_ranges_are_cached_as_final_bytes() {
+    member_cache_case(false).await;
+}
+
+#[tokio::test]
+async fn encrypted_members_are_cached_and_seeked_as_plaintext() {
+    member_cache_case(true).await;
+}
