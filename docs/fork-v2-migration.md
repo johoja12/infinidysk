@@ -32,12 +32,12 @@ acceptance gates below pass.
 | --- | --- | --- | --- | --- |
 | R01 | P0 | Replace an exactly identified damaged import even when its original grab is absent (`ArrClient`, `RadarrClient`, `HealthCheckService`; fork PR #230) | `crates/arr/src/repair.rs` already deletes/searches without a grab, but unnecessarily waits for an automatic search it never triggered. Skip that wait and retain replacement/error guards. | First port implemented; validation recorded below |
 | R02 | P0 | Recover the original download from exact file ID + imported path; reject ambiguity and incomplete history (`ArrDownloadIdResolver`, fork PR #234) | `repair.rs::owner_of_file` and Arr owner backfill exist. Add scoped, fully paginated Radarr history using **`movieIds`**, verify current identity, and carry recovered identity into blocklisting. Do not use a migration job ID as original provenance. Sonarr filtering stays profile-specific. | Implemented; exact scoped/paginated recovery with ambiguity guards |
-| R03 | P0 | Protect live/overlapping reads, but bypass recent-read delay for confirmed damage after readers close (`ConcurrentReadTracker`, fork PR #232) | `health::Health::with_in_use` and VFS read handles exist. Prove FUSE/WebDAV/STRM accounting, cancellation cleanup, and no destructive repair while any reader remains. | Reader/eviction overlap verified; last-close repair scheduling still needs a port |
+| R03 | P0 | Protect live/overlapping reads, but bypass recent-read delay for confirmed damage after readers close (`ConcurrentReadTracker`, fork PR #232) | `health::Health::with_in_use` and VFS read handles exist. Prove FUSE/WebDAV/STRM accounting, cancellation cleanup, and no destructive repair while any reader remains. | Implemented reader-held repair persistence and last-close wakeup; regression validation below |
 | R04 | P0 | Keep read/warm-triggered damaged-file repairs urgent through provider circuit outages (`HealthCheckService`, `PrefetchRepairHistory`, `eafe1705`) | `crates/health`, `crates/nntp` circuit handling; persist priority and bounded retry without treating an open circuit as conclusive missing articles. Warming integration depends on P01. | Port |
 | R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Verify / port gaps |
 | R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Port |
 | R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; this baseline has no equivalent recovery executor in health. Port trusted range/slice identity, bounded repair budgets, durable outcomes and separate worker scheduling before declaring repair parity. | Port |
-| C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | First implementation in Rust; legacy cache adoption remains M01 |
+| C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | First implementation in Rust; verified 1.x copy import implemented; broader fork data import remains M01 |
 | C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins implemented; recovery/probe tools pending |
 | C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Source identity and revision cleanup implemented; PAR2 repair-revision integration pending |
 | C04 | P1 | Progressive cold reads, bounded first-byte fill, coalesced fills, source window reuse (`NativeCachedStream`, `NativeSourceCacheStream`; `c6a70ba8`, `0c3c129f`) | Rust segment cache already coalesces in-flight reads. Benchmark FUSE/WebDAV seeks before adding buffering; preserve foreground priority and bounded memory/I/O under NAS stalls. | Progressive read-through and parallel block commits implemented; controlled performance qualification pending |
@@ -174,6 +174,65 @@ encrypted-member plaintext seeks. Workspace Clippy passed after these additions.
 The first cache implementation is not full fork parity: explicit folder probe/scan
 and recovery tooling, legacy cache adoption, persistent traffic/eviction browsing,
 Plex metadata/attribution, cache-aware health policy, background warming/backfill,
-and performance envelopes remain pending. Existing Rust repair also schedules a
-later retry when a live reader blocks it; immediately waking that repair on the last
-close still needs R03. Do not infer complete recovery parity from reader tracking.
+and performance envelopes remain pending. The reader-hold scheduling gap is addressed by the increment below. Other recovery
+parity still needs its own evidence.
+
+## 1.x native cache compatibility increment
+
+The Rust admin API and Performance settings now provide a resumable **copy import**
+from an offline 1.x native cache. This is a format adapter, not shared writable storage.
+It reuses existing verified bytes without NNTP reads, but needs separate destination
+capacity. The 1.x catalogue, payloads, manifests and repair ledger remain unchanged for
+rollback. Pause/resume saves its cursor in the browser. Repeating a batch is idempotent.
+
+Prerequisites and boundaries:
+
+1. Import the C# file records with this branch first. Each converted metadata blob and
+   its original source receipt commit atomically. Receipts include the C# raw blob hash
+   or stable multipart identity, source dependency hashes, and the Rust content identity.
+2. Stop 1.x and expose its original native metadata directory and cache folders to the
+   Rust process. The importer takes the existing 1.x owner lock, checks the volume marker
+   and registered root identity, and opens payload descendants without following links.
+   A live writer, replaced mount, unknown folder or missing repair ledger fails closed.
+3. Configure a separate writable Rust cache, then use **Import a 1.x native cache**.
+   Source folder IDs must match the original catalogue. The importer reconstructs the
+   C# generation from the original repair ledger, checks the catalogue and manifest,
+   reads and SHA-256-verifies each complete integrity block, and publishes it under the
+   independently verified current Rust key. Both sparse and chunked layouts work.
+4. Incomplete, corrupt or stale blocks never become coverage. Original pins are applied
+   before a copied block's lease is released. Insufficient destination capacity pauses
+   the import. Source files not imported, missing provenance, or changed content are
+   reported as rejected; they are not guessed from names or sizes. Earlier trial imports
+   without source receipts need a fresh isolated C# import before cache reuse.
+
+Reproduction is in `scripts/fixtures/legacy-native-cache/README.md`. The real C# writer
+and full Rust file-import/VFS path passed locally for plain, stored and encrypted-member
+metadata, sparse/chunked payloads and partial coverage. No live provider was configured.
+This does not certify every historical 1.x schema or a production snapshot.
+
+## Reader and cache-aware repair increment
+
+Reader-held repairs are now persisted. Closing the last overlapping handle advances
+only that held repair; a concurrent new handle is checked again before repair. A
+startup sweep releases holds left behind by a crash. Unrelated Arr/provider backoffs
+are not accelerated. The session callback runs outside the registry lock.
+
+Before destructive recovery of source article damage, a complete native copy is checked
+from disk. A valid copy is retained as degraded source health; unavailable storage
+postpones replacement. Partial/corrupt copies do not block recovery. A confirmed
+container defect still proceeds to repair, since checksums cannot make bad media valid.
+
+Playback-triggered urgency now has its own persisted marker. Inconclusive provider
+checks retain that priority, wait five minutes before retrying, and remain eligible
+when routine checks are disabled. They do not loop immediately or claim article loss.
+The marker clears on a terminal healthy/degraded/ignored result. Warming integration
+still depends on the pending Smart Prefetch scheduler.
+
+Migrations `0010_fork_import_and_reader_holds` and `0011_urgent_health` are additive on
+SQLite and PostgreSQL. **Back up `/config` before upgrading.** The cache import is an
+explicit advanced maintenance action, so it adds no new-install wizard requirement.
+
+The final checkpoint validation is recorded in
+[`validation/rust-v2-cache-interop-20261103.md`](validation/rust-v2-cache-interop-20261103.md):
+337 workspace tests, PostgreSQL, three real C# interoperability cases, privileged FUSE,
+Chromium and storage-interruption/resume checks. This is not full fork feature parity.

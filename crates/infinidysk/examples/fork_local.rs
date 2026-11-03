@@ -24,6 +24,21 @@ async fn main() -> anyhow::Result<()> {
     let expected_hash = sha2::Sha256::digest(&corpus.data);
     let server = LoopbackServer::start(corpus.articles.clone()).await?;
     let db = Db::connect(&database_url).await?;
+    if let Ok(config) = std::env::var("INFINIDYSK_LEGACY_FIXTURE_CONFIG") {
+        // This explicit opt-in accepts only a generated local fixture, never production.
+        let config = std::path::Path::new(&config);
+        anyhow::ensure!(
+            config.starts_with(std::env::temp_dir())
+                && config
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("infinidysk-import-")),
+            "expected a generated import fixture"
+        );
+        let source = infinidysk_nntp::Client::new(Vec::<infinidysk_nntp::Provider>::new());
+        let imported = infinidysk_import::apply(config, &db, &source, "/unused").await?;
+        anyhow::ensure!(imported.skipped_count == 0, "fixture import skipped files");
+    }
+
     let content = db.item(ItemId::CONTENT).await?.context("content root")?;
     let category = Item::child(&content, "fixture", ItemKind::Directory)?;
     let job = Item::child(&category, "job", ItemKind::Directory)?;
