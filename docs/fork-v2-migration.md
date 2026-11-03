@@ -44,7 +44,7 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins and bounded block/folder probes implemented; offline catalogue reconstruction remains open |
 | C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Source identity and revision cleanup implemented; PAR2 repair-revision integration pending |
 | C04 | P1 | Progressive cold reads, bounded first-byte fill, coalesced fills, source window reuse (`NativeCachedStream`, `NativeSourceCacheStream`; `c6a70ba8`, `0c3c129f`) | Rust segment cache already coalesces in-flight reads. Benchmark FUSE/WebDAV seeks before adding buffering; preserve foreground priority and bounded memory/I/O under NAS stalls. | Progressive read-through and parallel block commits implemented; controlled performance qualification pending |
-| C05 | P1 | Native cache browser, verified ranges, eviction history, buffer/I/O diagnostics (`NativeCacheBrowser*`, cache APIs) | Rust cache statistics exist; final-media file/range APIs and catalogue UI depend on C01–C03. Queries must not warm files or scan NAS payloads. | Settings/browser/ranges/pin/evict and eviction-history/folder-diagnostic APIs implemented; tool UI and detailed traffic diagnostics remain open |
+| C05 | P1 | Native cache browser, verified ranges, eviction history, buffer/I/O diagnostics (`NativeCacheBrowser*`, cache APIs) | Rust cache statistics exist; final-media file/range APIs and catalogue UI depend on C01–C03. Queries must not warm files or scan NAS payloads. | Settings/browser/ranges/pin/evict and eviction-history/folder-diagnostic APIs implemented; probe/history/diagnostic tool UI implemented; detailed traffic diagnostics remain open |
 | P01 | P1 | Durable Smart Prefetch queue, policies, pause/resume/cancel, budgets, bounded lanes (`Services/Prefetch`, `PrefetchJobStore`) | New source-bound durable queue, one strict background lane, manual API/UI and attempted-fill allowance. | Manual and Plex current/history warming implemented; wire budget, catalogue sources and full fork policy parity pending |
 | P02 | P1 | Plex account/PIN/Home-user authentication, server discovery and mapping (`Services/Plex`, Plex API) | New Rust Plex transport, private connection handles, settings and admin UI. | Implemented; loopback transport/service tests and simulated browser acceptance below; live Plex acceptance pending |
 | P03 | P1 | Viewer-scoped next-episode and partially watched predictions; durable snapshots during Plex outages (`PredictionSnapshot*`, `PlexViewerResolver`) | Depends on P02 and the media catalogue. Preserve account identity validation, viewer exclusions and uncertainty states. | Durable complete snapshots and viewer-verified current/history planner implemented; live Plex acceptance pending |
@@ -496,3 +496,18 @@ critical path or setup-wizard version change. 1.x legacy setting import is separ
 work; this increment does not activate old metadata or prefetch settings.
 
 Validation: [Plex classification checkpoint](validation/rust-v2-classification-20261104.md).
+
+
+## Cache inspection UI increment
+
+Settings > Performance now exposes folder diagnostics, stored-block verification and
+eviction history. Storage checks run on request. File verification processes at most
+16 blocks per click, keeps its cursor after storage uncertainty, and resets progress
+when the selected source revision changes. Confirmed corruption invalidates coverage;
+normal verified source reads refill it. History uses bounded stable cursor pages and
+survives reload. No tool triggers source warming, claims catalogue reconstruction or
+adopts an unavailable volume.
+
+This UI-only increment changes no schema, settings or setup wizard. Existing additive
+migrations still require backing up `/config` before an eventual upgrade. Validation
+is in [cache inspection UI validation](validation/rust-v2-cache-ui-20261104.md).

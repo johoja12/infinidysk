@@ -8,6 +8,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 
+import { NativeCacheProbe, NativeCacheTools } from "./native-cache-tools";
+
 type Settings = Schemas["NativeCacheSettings"];
 type Entry = Schemas["NativeCacheEntry"];
 
@@ -57,12 +59,13 @@ function NativeCacheBrowser() {
     {status.data?.reason&&<p className="text-sm text-destructive">{status.data.reason}</p>}
     {!status.data?.available?<p className="text-sm text-muted-foreground">The final-media cache is inactive. Enable it, save settings, and restart to use it.</p>:<>
       <p className="text-sm text-muted-foreground">{status.data.stats?.files??0} files · {bytes(status.data.stats?.bytes??0)} verified bytes. Coverage is a catalogue snapshot; reads verify stored bytes.</p>
+      <NativeCacheTools />
       {entries.error&&<Failure error={entries.error}/>}
       <div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr className="border-b text-left text-muted-foreground"><th className="p-2">File</th><th className="p-2">Coverage</th><th className="p-2">Actions</th></tr></thead><tbody>
         {entries.data?.map(entry=><tr key={`${entry.item}-${entry.revision}`} className="border-b"><td className="p-2 font-mono text-xs">{entry.item.slice(0,8)} · {entry.revision.slice(0,8)}</td><td className="p-2">{bytes(entry.cached_bytes)} / {bytes(entry.size_bytes)}</td><td className="flex gap-1 p-2"><Button type="button" variant="ghost" size="sm" onClick={()=>setSelected(entry)}>Ranges</Button><Button type="button" variant="ghost" size="sm" disabled={action.isPending} onClick={()=>action.mutate({entry,operation:entry.pinned?'unpin':'pin'})}>{entry.pinned?'Unpin':'Pin'}</Button><Button type="button" variant="ghost" size="sm" disabled={entry.pinned||action.isPending} onClick={()=>setEvict(entry)}>Evict</Button></td></tr>)}
       </tbody></table></div>
       <div className="flex gap-2"><Button type="button" variant="outline" size="sm" disabled={offset===0} onClick={()=>setOffset(Math.max(0,offset-50))}>Previous</Button><Button type="button" variant="outline" size="sm" disabled={(entries.data?.length??0)<50} onClick={()=>setOffset(offset+50)}>Next</Button></div>
-      {selected&&<div className="space-y-1 rounded-lg border p-3"><p className="text-sm font-medium">Verified ranges (end exclusive)</p>{coverage.error&&<Failure error={coverage.error}/>}<p className="break-words font-mono text-xs">{coverage.data?.map(r=>`${r.start}–${r.end}`).join(', ')||'No verified ranges'}</p></div>}
+      {selected&&<div className="space-y-1 rounded-lg border p-3"><p className="text-sm font-medium">Verified ranges (end exclusive)</p>{coverage.error&&<Failure error={coverage.error}/>}<p className="break-words font-mono text-xs">{coverage.data?.map(r=>`${r.start}–${r.end}`).join(', ')||'No verified ranges'}</p><NativeCacheProbe key={`${selected.item}-${selected.revision}`} entry={selected}/></div>}
     </>}
   </SettingsPanel></>;
 }
