@@ -907,3 +907,116 @@ async fn a_full_import_holds_a_broken_mp4() {
     let health = Health::new(db.clone(), client(&server), arr, settings).unwrap();
     assert!(!health.step().await.unwrap(), "the confirming check waits");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn last_close_advances_only_a_reader_held_repair() {
+    let (articles, len) = mkv("reader-held");
+    let server = LoopbackServer::start(articles.clone()).await.unwrap();
+    let (db, item, _) = import(&server, &articles, len).await;
+    let (log, arr) = fake_sonarr().await;
+    let (_settings_tx, settings) = watch::channel(Settings::default());
+    let readers = Arc::new(AtomicBool::new(true));
+    let active = Arc::clone(&readers);
+    let health = Health::new(db.clone(), client(&server), arr, settings)
+        .unwrap()
+        .with_in_use(move |_| active.load(Ordering::SeqCst));
+    assert!(health.request_repair(item.id).await.unwrap());
+    assert!(health.step().await.unwrap());
+    assert_eq!(db.reader_held_repairs().await.unwrap(), [item.id]);
+    health.readers_closed(item.id).await.unwrap();
+    assert!(!health.step().await.unwrap());
+    assert!(log.0.lock().unwrap().is_empty());
+    readers.store(false, Ordering::SeqCst);
+    health.readers_closed(item.id).await.unwrap();
+    assert_eq!(
+        db.reader_held_repairs().await.unwrap(),
+        [] as [infinidysk_core::ItemId; 0]
+    );
+    assert!(
+        db.health(item.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .1
+            .next_check
+            .unwrap()
+            <= infinidysk_db::now_ms()
+    );
+    // A second close must not override a later, unrelated provider/Arr backoff.
+    let mut status = db.health(item.id).await.unwrap().unwrap().1;
+    let later = infinidysk_db::now_ms() + 3_600_000;
+    status.next_check = Some(later);
+    db.set_health(item.id, &status, status.recheck)
+        .await
+        .unwrap();
+    health.readers_closed(item.id).await.unwrap();
+    assert_eq!(
+        db.health(item.id).await.unwrap().unwrap().1.next_check,
+        Some(later)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn complete_native_copy_and_storage_uncertainty_both_prevent_replacement() {
+    for available in [Some(true), None] {
+        let (articles, len) = mkv("cached-repair");
+        let server = LoopbackServer::start(articles.clone()).await.unwrap();
+        let (db, item, _) = import(&server, &articles, len).await;
+        let (log, arr) = fake_sonarr().await;
+        let (_settings_tx, settings) = watch::channel(Settings::default());
+        let health = Health::new(db.clone(), client(&server), arr, settings)
+            .unwrap()
+            .with_cached_copy(Arc::new(move |_| Box::pin(async move { available })));
+        assert!(health.request_repair(item.id).await.unwrap());
+        assert!(health.step().await.unwrap());
+        assert!(db.item(item.id).await.unwrap().is_some());
+        assert!(log.0.lock().unwrap().is_empty());
+        let status = db.health(item.id).await.unwrap().unwrap().1;
+        assert_eq!(
+            status.state,
+            if available == Some(true) {
+                HealthState::Degraded
+            } else {
+                HealthState::Repairing
+            }
+        );
+        assert!(status.next_check.unwrap() > infinidysk_db::now_ms());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cached_copy_does_not_hide_a_confirmed_container_defect() {
+    let (articles, len) = mkv("container-copy");
+    let server = LoopbackServer::start(articles.clone()).await.unwrap();
+    let (db, item, _) = import(&server, &articles, len).await;
+    let (log, arr) = fake_sonarr().await;
+    let (_tx, settings) = watch::channel(Settings::default());
+    let consulted = Arc::new(AtomicBool::new(false));
+    let checking = Arc::clone(&consulted);
+    let health = Health::new(db.clone(), client(&server), arr, settings)
+        .unwrap()
+        .with_arr_wait(Duration::ZERO)
+        .with_cached_copy(Arc::new(move |_| {
+            checking.store(true, Ordering::SeqCst);
+            Box::pin(async { Some(true) })
+        }));
+    db.set_structural(
+        item.id,
+        Some(&infinidysk_db::Defect {
+            offset: 0,
+            size: 1_000_000,
+            seen_at: 0,
+            source: 1,
+        }),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(health.request_repair(item.id).await.unwrap());
+    assert!(health.step().await.unwrap());
+    assert!(!consulted.load(Ordering::SeqCst));
+    assert!(
+        !log.0.lock().unwrap().is_empty(),
+        "confirmed container damage still reaches Arr repair"
+    );
+}

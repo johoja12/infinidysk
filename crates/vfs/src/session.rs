@@ -239,12 +239,15 @@ impl Drop for Request {
     }
 }
 
+type LastClose = Arc<dyn Fn(ItemId) + Send + Sync>;
+
 #[derive(Default)]
 pub struct Sessions {
     next: AtomicU64,
     /// Bytes served since start, indexed like [`Delivery::ALL`].
     served: [AtomicU64; 2],
     inner: Mutex<Inner>,
+    on_last_close: Mutex<Option<LastClose>>,
 }
 
 #[derive(Default)]
@@ -258,6 +261,14 @@ struct Inner {
 }
 
 impl Sessions {
+    /// Called outside the session lock when the last overlapping handle closes.
+    pub fn on_last_close(&self, callback: LastClose) {
+        *self
+            .on_last_close
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(callback);
+    }
+
     /// Bytes served since start by `delivery`.
     pub fn served(&self, delivery: Delivery) -> u64 {
         self.served[delivery as usize].load(Ordering::Relaxed)
@@ -385,6 +396,19 @@ impl Drop for Guard {
             }
             inner.finished.push_back(Arc::clone(session));
         }
+        let last = !inner.open.iter().any(|other| other.item == session.item);
+        drop(inner);
+        if last {
+            let callback = self
+                .sessions
+                .on_last_close
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            if let Some(callback) = callback {
+                callback(session.item);
+            }
+        }
     }
 }
 
@@ -502,5 +526,39 @@ impl AsyncSeek for Handle {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_the_last_overlapping_handle_notifies_without_holding_the_session_lock() {
+        let sessions = Arc::new(Sessions::default());
+        let calls = Arc::new(AtomicU64::new(0));
+        let counting = Arc::clone(&calls);
+        let weak = Arc::downgrade(&sessions);
+        sessions.on_last_close(Arc::new(move |item| {
+            assert!(
+                weak.upgrade()
+                    .expect("live registry")
+                    .open()
+                    .iter()
+                    .all(|s| s.item != item)
+            );
+            counting.fetch_add(1, Ordering::SeqCst);
+        }));
+        let item = ItemId::new();
+        let origin = |delivery| Origin {
+            delivery,
+            client: "fixture".into(),
+            player: None,
+        };
+        let first = sessions.start(item, "/fixture".into(), 1, origin(Delivery::Fuse));
+        let second = sessions.start(item, "/fixture".into(), 1, origin(Delivery::WebDav));
+        drop(first);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(second);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

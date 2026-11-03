@@ -361,7 +361,33 @@ pub async fn serve(
             move || importing() || streaming(),
         ));
     }
+    if let Some(cache) = vfs.native_cache().cloned() {
+        let vfs = Arc::clone(&vfs);
+        health = health.with_cached_copy(Arc::new(move |item| {
+            let cache = Arc::clone(&cache);
+            let vfs = Arc::clone(&vfs);
+            Box::pin(async move {
+                let key = vfs.cache_key(&item).await.ok()?;
+                tokio::time::timeout(Duration::from_secs(5), cache.verify_complete(&key))
+                    .await
+                    .ok()?
+                    .ok()?
+            })
+        }));
+    }
     let health = Arc::new(health);
+    let weak_health = Arc::downgrade(&health);
+    vfs.sessions().on_last_close(Arc::new(move |item| {
+        if let Some(health) = weak_health.upgrade()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            runtime.spawn(async move {
+                if let Err(error) = health.readers_closed(item).await {
+                    warn!(reason=%error, "last-reader repair wakeup deferred");
+                }
+            });
+        }
+    }));
     let health_task = {
         let health = Arc::clone(&health);
         tokio::spawn(async move { health.run().await })

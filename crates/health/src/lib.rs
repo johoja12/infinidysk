@@ -123,6 +123,8 @@ pub enum Analysis {
 /// Analyzes one file's media (§5.7).
 pub type Analyzer = Arc<dyn Fn(Item) -> BoxFuture<'static, Analysis> + Send + Sync>;
 
+pub type CachedCopy = Arc<dyn Fn(Item) -> BoxFuture<'static, Option<bool>> + Send + Sync>;
+
 pub struct Health {
     db: Db,
     client: Arc<Client>,
@@ -132,6 +134,7 @@ pub struct Health {
     streaming: Gate,
     in_use: Box<dyn Fn(ItemId) -> bool + Send + Sync>,
     analyzer: Option<Analyzer>,
+    cached_copy: Option<CachedCopy>,
     http: reqwest::Client,
     arr_wait: Duration,
     counters: [AtomicU64; 4],
@@ -192,6 +195,7 @@ impl Health {
             streaming: Box::new(|| false),
             in_use: Box::new(|_| false),
             analyzer: None,
+            cached_copy: None,
             http,
             arr_wait: ARR_WAIT,
             counters: Default::default(),
@@ -217,6 +221,14 @@ impl Health {
     #[must_use]
     pub fn with_in_use(mut self, in_use: impl Fn(ItemId) -> bool + Send + Sync + 'static) -> Self {
         self.in_use = Box::new(in_use);
+        self
+    }
+
+    /// Some(true) means a complete verified final-media copy; None means storage
+    /// uncertainty. Neither authorizes deleting the source. Some(false) permits repair.
+    #[must_use]
+    pub fn with_cached_copy(mut self, check: CachedCopy) -> Self {
+        self.cached_copy = Some(check);
         self
     }
 
@@ -257,6 +269,14 @@ impl Health {
     pub async fn run(&self) {
         tokio::time::sleep(STARTUP_DELAY).await;
         loop {
+            // Persisted holds also recover after a crash, when no handles survive.
+            if let Ok(held) = self.db.reader_held_repairs().await {
+                for item in held {
+                    if let Err(error) = self.readers_closed(item).await {
+                        tracing::warn!(reason=%error, "reader-held repair recovery deferred");
+                    }
+                }
+            }
             match self.step().await {
                 Ok(true) => {}
                 Ok(false) => {
@@ -270,6 +290,15 @@ impl Health {
                 }
             }
         }
+    }
+
+    /// Advance only a repair explicitly held for a reader. Re-check after notification
+    /// because another handle may have opened in the meantime.
+    pub async fn readers_closed(&self, item: ItemId) -> Result<(), Error> {
+        if !(self.in_use)(item) && self.db.release_reader_repair(item).await? {
+            self.wake.notify_one();
+        }
+        Ok(())
     }
 
     async fn housekeep(&self) {
@@ -522,7 +551,13 @@ impl Health {
                 } else {
                     tracing::debug!(path = %item.path, reason = %error, "health check inconclusive");
                 }
-                next.next_check = Some(now + INCONCLUSIVE_RECHECK_MS);
+                next.next_check = Some(
+                    now + if self.db.health_is_urgent(item.id).await? {
+                        5 * MINUTE_MS
+                    } else {
+                        INCONCLUSIVE_RECHECK_MS
+                    },
+                );
             }
             Outcome::Missing(message) => {
                 self.count(UNHEALTHY);
@@ -690,8 +725,51 @@ impl Health {
                 next_check: Some(now + SUSPECT_RECHECK_MS),
                 ..status
             };
+            self.db.hold_repair_for_reader(item.id).await?;
             self.db.set_health(item.id, &next, status.recheck).await?;
+            // Covers last-close racing the persisted hold publication.
+            self.readers_closed(item.id).await?;
             return Ok(());
+        }
+        if let Some(check) = &self.cached_copy
+            && self.db.media_probe(item.id).await?.defect.is_none()
+        {
+            match check(item.clone()).await {
+                Some(false) => {}
+                available => {
+                    let (state, message, delay) = if available == Some(true) {
+                        (
+                            HealthState::Degraded,
+                            "source is damaged; complete verified native copy retained",
+                            DAY_MS,
+                        )
+                    } else {
+                        (
+                            HealthState::Repairing,
+                            "native copy verification is unavailable; destructive repair waits",
+                            HOUR_MS,
+                        )
+                    };
+                    let next = HealthStatus {
+                        state,
+                        next_check: Some(now + delay),
+                        ..status
+                    };
+                    self.db.set_health(item.id, &next, status.recheck).await?;
+                    self.record(
+                        item,
+                        if available == Some(true) {
+                            HealthResult::Degraded
+                        } else {
+                            HealthResult::Inconclusive
+                        },
+                        Repair::None,
+                        message,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
         }
         if self.db.item_remap_pending(item.id).await? {
             let reason = "its Arr is rescanning a converted library file";
