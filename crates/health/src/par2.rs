@@ -37,7 +37,16 @@ pub enum Error {
     #[error("PAR2 provider read failed")]
     Provider(#[from] infinidysk_nntp::Error),
     #[error(transparent)]
-    Recovery(#[from] repair::Error),
+    Recovery(repair::Error),
+}
+
+impl From<repair::Error> for Error {
+    fn from(error: repair::Error) -> Self {
+        match error {
+            repair::Error::Cancelled => Self::Cancelled,
+            other => Self::Recovery(other),
+        }
+    }
 }
 
 /// A whole posted file, not an archive member's inferred byte span. The proof is
@@ -225,12 +234,10 @@ impl Plan {
             .memory
             .checked_sub(overhead)
             .ok_or(Error::Budget)?;
-        // Check the peak before any NNTP work. The actual missing set is discovered later.
-        let k = budget.reconstruction.missing.min(64);
-        let provisional: Vec<_> = (0..k.min(set.locations().len())).collect();
-        if !provisional.is_empty() {
-            Reconstructor::new(set.clone(), &provisional, budget.reconstruction)?;
-        }
+        // A missing-slice policy is a ceiling, not an up-front reservation for
+        // eight damaged slices. Preflight the minimum workable plan here; the
+        // census later checks the actual missing count before recovery reads.
+        Reconstructor::new(set.clone(), &[0], budget.reconstruction)?;
         Ok(Self {
             set,
             sources: bound,
@@ -273,7 +280,7 @@ impl Plan {
                             maximum,
                         }
                     } else {
-                        Error::Recovery(error)
+                        Error::from(error)
                     });
                 }
                 Ok(inspection)

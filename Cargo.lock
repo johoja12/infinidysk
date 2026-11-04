@@ -1287,6 +1287,7 @@ dependencies = [
  "infinidysk-par2",
  "infinidysk-queue",
  "infinidysk-testkit",
+ "md-5",
  "reqwest",
  "serde",
  "serde_json",

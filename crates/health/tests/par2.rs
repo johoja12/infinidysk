@@ -234,3 +234,90 @@ async fn an_intact_source_is_reported_without_fetching_any_recovery_volume() {
     ));
     assert_eq!(server.body_commands(), source_count);
 }
+
+#[test]
+fn large_slices_reserve_for_actual_damage_and_cancel_errors_have_one_public_outcome() {
+    use md5::{Digest as _, Md5};
+    fn packet(set: [u8; 16], kind: &[u8; 16], body: &[u8]) -> Vec<u8> {
+        let mut rest = [set.as_slice(), kind, body].concat();
+        rest.resize(rest.len().next_multiple_of(4), 0);
+        [
+            b"PAR2\0PKT".as_slice(),
+            &(32 + rest.len() as u64).to_le_bytes(),
+            &Md5::digest(&rest),
+            &rest,
+        ]
+        .concat()
+    }
+    let id = [1; 16];
+    let set_id = [42; 16];
+    let size = 32u32 << 20;
+    let length = 8 * u64::from(size);
+    let mut metadata = packet(
+        set_id,
+        b"PAR 2.0\0Main\0\0\0\0",
+        &[
+            u64::from(size).to_le_bytes().as_slice(),
+            &1u32.to_le_bytes(),
+            &id,
+        ]
+        .concat(),
+    );
+    metadata.extend(packet(
+        set_id,
+        b"PAR 2.0\0FileDesc",
+        &[
+            id.as_slice(),
+            &[0; 32],
+            &length.to_le_bytes(),
+            b"fixture.bin",
+        ]
+        .concat(),
+    ));
+    metadata.extend(packet(
+        set_id,
+        b"PAR 2.0\0IFSC\0\0\0\0",
+        &[id.as_slice(), &[0; 8 * 20]].concat(),
+    ));
+    let set = RecoverySet::read(&metadata, None)
+        .expect("bounded synthetic geometry; no payloads allocated");
+    let source = Source {
+        segments: Segments {
+            items: (0..8)
+                .map(|i| Segment {
+                    id: format!("large-{i}@loopback"),
+                    size,
+                    fallbacks: vec![],
+                })
+                .collect(),
+            sizes_trusted: true,
+            ..Segments::default()
+        },
+        proof: Par2Proof {
+            file_id: id,
+            file_md5: [0; 16],
+            md5_16k: [0; 16],
+            file_length: length,
+            slice_size: size,
+            slice_md5: vec![[0; 16]; 8],
+            slice_crc32: vec![0; 8],
+        },
+    };
+    let recovery = Segments {
+        items: vec![Segment {
+            id: "recovery@loopback".into(),
+            size: 1000,
+            fallbacks: vec![],
+        }],
+        sizes_trusted: true,
+        ..Segments::default()
+    };
+    assert!(
+        Plan::new(set, vec![source], vec![recovery], Budget::default()).is_ok(),
+        "one damaged large slice fits; eight is a policy ceiling, not a reservation"
+    );
+    assert!(matches!(
+        Error::from(infinidysk_par2::repair::Error::Cancelled),
+        Error::Cancelled
+    ));
+}
