@@ -535,7 +535,7 @@ impl Predictions {
                 .prefetch
                 .plex
                 .policy
-                .ranges(
+                .warming_ranges(
                     p.size,
                     if source == Source::NextEpisode {
                         0
@@ -543,7 +543,6 @@ impl Predictions {
                         media.view_offset_ms
                     },
                     media.duration_ms,
-                    false,
                 )
                 .into_iter()
                 .map(|(start, len)| Range {

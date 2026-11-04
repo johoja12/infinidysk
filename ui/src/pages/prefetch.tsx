@@ -15,6 +15,7 @@ export function PrefetchPanel() {
   const client = useQueryClient();
   const [item, setItem] = useState("");
   const [budget, setBudget] = useState<string | null>(null);
+  const [wireBudget, setWireBudget] = useState<string | null>(null);
   const status = useQuery({
     queryKey: ["prefetch"],
     queryFn: () => body(api.GET("/api/v1/prefetch")),
@@ -117,6 +118,10 @@ export function PrefetchPanel() {
         >
           Apply allowance
         </Button>
+        <Field id="prefetch-wire-budget" label="Daily provider response allowance (GB)" hint="Reserves credits before reading warming responses, including framing and abandoned drains. Measured after TLS; login and TCP/TLS buffering are excluded. Unused reservations can remain charged after interruption or restart. Cached playback uses no credits.">
+          <Input id="prefetch-wire-budget" type="number" min={0.005} max={100000} step={1} value={wireBudget ?? String(value.daily_wire_bytes / 1000000000)} disabled={locked("prefetch.daily_wire_bytes") || settings.isPending} onChange={e => setWireBudget(e.target.value)} />
+        </Field>
+        <Button type="button" variant="outline" disabled={wireBudget===null || !Number.isFinite(Number(wireBudget)) || Number(wireBudget)<0.005 || Number(wireBudget)>100000 || locked("prefetch.daily_wire_bytes") || settings.isPending} onClick={() => settings.mutate({daily_wire_bytes: Math.round(Number(wireBudget)*1000000000)}, {onSuccess:()=>setWireBudget(null)})}>Apply provider allowance</Button>
         {settings.error && <Failure error={settings.error} />}
         {!view.data.settings.native_cache.enabled && (
           <p className="text-sm text-muted-foreground">
@@ -124,7 +129,18 @@ export function PrefetchPanel() {
           </p>
         )}
       </SettingsPanel>
+      <SettingsPanel title="Finish watched files">
+        <Toggle id="finish-watched" label={<>Finish caching watched files <Locked locked={locked("prefetch.finish_watched.enabled")} /></>} checked={value.finish_watched.enabled} disabled={locked("prefetch.finish_watched.enabled") || settings.isPending} onChange={enabled=>settings.mutate({finish_watched:{...value.finish_watched,enabled}})} />
+        <p className="text-sm text-muted-foreground">Queues a complete current source after foreground playback serves the selected share for at least two minutes and 67 MB. Repeated status polling and seek positions do not count as served bytes. Cached playback counts; fast scans do not qualify.</p>
+        <Field id="finish-watched-percent" label="Minimum served share (%)"><Input id="finish-watched-percent" type="number" min={1} max={100} value={value.finish_watched.percent} disabled={locked("prefetch.finish_watched.percent") || settings.isPending} onChange={e=>{const percent=Number(e.target.value);if(Number.isInteger(percent)&&percent>=1&&percent<=100)settings.mutate({finish_watched:{...value.finish_watched,percent}});}} /></Field>
+      </SettingsPanel>
       <PlexPredictions />
+      <SettingsPanel title="Warming history">
+        <p className="text-sm text-muted-foreground">Last 100 outcomes from up to 2000 saved records. Source and cached byte counts describe final-media bytes verified by that attempt; provider response usage is reported separately.</p>
+        {status.data && !status.data.history_available && <p className="text-sm text-destructive">Warming history is unavailable; retained records were not removed.</p>}
+        {status.data?.history_available && status.data.history.length===0 && <p className="text-sm text-muted-foreground">No warming outcomes recorded.</p>}
+        {status.data?.history.map((row,index)=><div key={`${row.job.id}-${row.recorded_at}-${index}`} className="space-y-1 border-b py-2 text-xs"><p className="break-all font-mono">{row.job.item} · {row.job.revision}</p><p>{row.job.automatic_scope ? row.job.family==="read" ? "Finish watched" : "Plex policy" : "Manual"} · {row.job.state} · stored from source {bytes(row.job.source_bytes)} · cached {bytes(row.job.cached_bytes)}</p><p className="break-words">{row.job.ranges.map(r=>`${r.start}–${r.end}`).join(", ")}</p>{row.job.reason && <p>{row.job.reason}</p>}</div>)}
+      </SettingsPanel>
       <SettingsPanel title="Warm a file">
         <p className="text-muted-foreground text-sm">
           Use the imported file ID from Explore or the cache catalogue. This
@@ -161,6 +177,7 @@ export function PrefetchPanel() {
       </SettingsPanel>
       <SettingsPanel title="Warming queue">
         {status.error && <Failure error={status.error} />}
+        {status.data && !status.data.state_available && <p className="text-sm text-destructive">Queue storage is uncertain. New work waits for durable readback.</p>}
         {status.data && (
           <>
             <div className="flex flex-wrap items-center gap-3">
@@ -177,6 +194,7 @@ export function PrefetchPanel() {
                 {status.data.paused ? "Resume queue" : "Pause queue"}
               </Button>
             </div>
+            <p className="text-xs text-muted-foreground">Provider response reservations: {status.data.reserved_wire_bytes == null ? "storage unavailable" : bytes(status.data.reserved_wire_bytes)} for UTC day {status.data.wire_day ?? "unknown"}. Received since process start: {bytes(status.data.received_wire_bytes)}.{status.data.wire_blocked ? " New provider reads are currently held." : ""}</p>
             <p className="text-xs text-muted-foreground">
               Completed means the requested blocks were verified during this
               job. Later cache eviction can remove them. Retry verifies current

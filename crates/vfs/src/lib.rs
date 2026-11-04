@@ -354,6 +354,16 @@ impl Vfs {
         self
     }
 
+    pub fn warming_budget(&self) -> Option<&Arc<infinidysk_nntp::wire::Budget>> {
+        self.client.warming_budget()
+    }
+    pub fn install_warming_budget(&self, budget: Arc<infinidysk_nntp::wire::Budget>) -> bool {
+        self.client.set_warming_budget(budget)
+    }
+    pub fn foreground_pending(&self) -> bool {
+        self.client.foreground_pending()
+    }
+
     pub fn native_cache(&self) -> Option<&Arc<infinidysk_native_cache::Cache>> {
         self.native_cache.as_ref()
     }

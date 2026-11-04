@@ -377,7 +377,7 @@ async fn cancellation_interrupts_stalled_source_without_publishing_a_partial_blo
 #[tokio::test]
 async fn database_failure_never_acknowledges_a_control_change() {
     let t = Temp::new();
-    let (vfs, item, _, _, _, _) = fixture(&t, false).await;
+    let (vfs, item, _cache, _corpus, _server, _client) = fixture(&t, false).await;
     let q = Queue::load(vfs.db().clone(), Arc::clone(&vfs))
         .await
         .unwrap();
@@ -587,4 +587,107 @@ async fn warming_reports_the_exact_confirmed_missing_slice_for_health_repair() {
         vec![(item.id, 4, infinidysk_stream::Fault::Missing)]
     );
     assert!(vfs.db().health_is_urgent(item.id).await.unwrap());
+}
+
+#[tokio::test]
+async fn wire_quota_is_durable_never_marks_source_damaged_and_does_not_charge_cache_hits() {
+    let t = Temp::new();
+    let (vfs, item, cache, _, server, _) = fixture(&t, false).await;
+    let queue = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
+    let job = enqueue(&queue, &item).await;
+    let mut policy = settings();
+    policy.daily_wire_bytes = BLOCK;
+    assert!(!queue.tick(&policy).await.unwrap());
+    let status = queue.status().await;
+    assert_eq!(status.reserved_wire_bytes, Some(BLOCK));
+    assert_eq!(status.received_wire_bytes, BLOCK);
+    assert!(
+        status.jobs[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("Wire allowance")
+    );
+    assert_eq!(status.jobs[0].state, State::Queued);
+    assert!(
+        cache
+            .coverage(&vfs.cache_key(&item).await.unwrap())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (_, health) = vfs.db().health(item.id).await.unwrap().unwrap();
+    assert_eq!(health.recheck, infinidysk_db::Recheck::None);
+    drop(queue);
+    let restarted = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
+    assert_eq!(restarted.status().await.reserved_wire_bytes, Some(BLOCK));
+    let before = server.body_commands();
+    restarted.control(job.id, Operation::Pause).await.unwrap();
+    restarted.control(job.id, Operation::Resume).await.unwrap();
+    assert!(!restarted.tick(&policy).await.unwrap());
+    assert_eq!(
+        server.body_commands(),
+        before,
+        "spent daily quota cannot admit another BODY after restart"
+    );
+    policy.daily_wire_bytes = 100 * BLOCK;
+    for _ in 0..4 {
+        let _ = restarted.tick(&policy).await.unwrap();
+    }
+    // The operator resume made the retry due; a larger cap admits it without source replacement.
+    restarted.control(job.id, Operation::Pause).await.unwrap();
+    restarted.control(job.id, Operation::Resume).await.unwrap();
+    for _ in 0..4 {
+        let _ = restarted.tick(&policy).await.unwrap();
+    }
+    assert_eq!(restarted.status().await.jobs[0].state, State::Complete);
+    let wire = restarted.status().await.received_wire_bytes;
+    restarted.control(job.id, Operation::Retry).await.unwrap();
+    for _ in 0..4 {
+        let _ = restarted.tick(&policy).await.unwrap();
+    }
+    assert_eq!(restarted.status().await.jobs[0].state, State::Complete);
+    assert_eq!(restarted.status().await.received_wire_bytes, wire);
+}
+
+#[tokio::test]
+async fn warming_history_keeps_prior_attempt_bytes_and_does_not_change_the_block_checkpoint_ledger()
+{
+    let t = Temp::new();
+    let (vfs, item, _cache, _corpus, _server, _client) = fixture(&t, false).await;
+    let db = vfs.db().clone();
+    let queue = Queue::load(db.clone(), vfs.clone()).await.unwrap();
+    let job = enqueue(&queue, &item).await;
+    for _ in 0..4 {
+        let _ = queue.tick(&settings()).await.unwrap();
+    }
+    let status = queue.status().await;
+    assert!(status.history_available);
+    assert_eq!(status.history.len(), 1);
+    assert_eq!(status.history[0].job.source_bytes, 2 * BLOCK);
+    assert_eq!(status.history[0].job.revision, job.revision);
+    queue.control(job.id, Operation::Retry).await.unwrap();
+    for _ in 0..4 {
+        let _ = queue.tick(&settings()).await.unwrap();
+    }
+    let status = queue.status().await;
+    assert_eq!(status.history.len(), 2);
+    let fresh = status.history.iter().find(|h| h.job.run == 1).unwrap();
+    assert_eq!(fresh.job.source_bytes, 0);
+    assert_eq!(fresh.job.cached_bytes, 2 * BLOCK);
+    let ledger = db
+        .config()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|(k, _)| k == "fork_prefetch_v1")
+        .unwrap()
+        .1;
+    assert!(
+        !ledger.contains("recorded_at"),
+        "each block checkpoint must not rewrite outcome history"
+    );
+    drop(queue);
+    let resumed = Queue::load(db, vfs).await.unwrap();
+    assert_eq!(resumed.status().await.history.len(), 2);
 }

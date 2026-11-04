@@ -7,6 +7,10 @@ use utoipa::ToSchema;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 #[schema(as=PlexPredictionPolicy)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent media and range policy switches"
+)]
 pub struct PredictionPolicy {
     pub movies: bool,
     pub television: bool,
@@ -18,6 +22,8 @@ pub struct PredictionPolicy {
     pub viewers: Vec<String>,
     pub excluded_shows: Vec<String>,
     pub full_file: bool,
+    /// Add head/tail retention to partial warming windows.
+    pub minimum_warm: bool,
     pub head_bytes: u64,
     pub tail_bytes: u64,
 }
@@ -33,6 +39,7 @@ impl Default for PredictionPolicy {
             viewers: vec![],
             excluded_shows: vec![],
             full_file: true,
+            minimum_warm: false,
             head_bytes: 16 * 1024 * 1024,
             tail_bytes: 8 * 1024 * 1024,
         }
@@ -137,6 +144,24 @@ impl PredictionPolicy {
         result.sort_by_key(|item| std::cmp::Reverse(item.viewed_at));
         result.truncate(128);
         result
+    }
+    /// Merge playback-window and minimum head/tail policies before admission.
+    pub fn warming_ranges(&self, length: u64, offset_ms: u64, duration_ms: u64) -> Vec<(u64, u64)> {
+        let mut ranges = self.ranges(length, offset_ms, duration_ms, false);
+        if self.minimum_warm && !self.full_file {
+            ranges.extend(self.ranges(length, 0, 0, true));
+        }
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (start, len) in ranges {
+            let end = start.saturating_add(len).min(length);
+            if let Some(last) = merged.last_mut().filter(|last| start <= last.0 + last.1) {
+                last.1 = (last.0 + last.1).max(end) - last.0;
+            } else if start < end {
+                merged.push((start, end - start));
+            }
+        }
+        merged
     }
     /// Ranges are block-aligned for final-byte retention. Time-to-byte is a hint only.
     pub fn ranges(
@@ -381,5 +406,26 @@ mod tests {
         assert!(policy.validate().is_err());
         policy.viewers = vec!["machine:7".into()];
         assert!(policy.validate().is_ok());
+    }
+    #[test]
+    fn minimum_warming_preserves_playback_window_and_merges_overlap() {
+        let mut policy = PredictionPolicy {
+            full_file: false,
+            minimum_warm: true,
+            head_bytes: 16_000_000,
+            tail_bytes: 8_000_000,
+            ..PredictionPolicy::default()
+        };
+        let ranges = policy.warming_ranges(1_000_000_000, 5000, 10000);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].0, 0);
+        assert!(ranges[1].0 < 500_000_000);
+        assert_eq!(ranges[2].0 + ranges[2].1, 1_000_000_000);
+        assert_eq!(policy.warming_ranges(5_000_000, 0, 1000), [(0, 5_000_000)]);
+        policy.full_file = true;
+        assert_eq!(
+            policy.warming_ranges(1_000_000_000, 5000, 10000),
+            [(0, 1_000_000_000)]
+        );
     }
 }

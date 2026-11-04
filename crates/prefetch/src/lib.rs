@@ -1,6 +1,12 @@
 //! One bounded warming lane. Durable progress is a hint: every resumed block is verified
 //! again. Only strict final-media bytes can enter the shared native cache.
-use std::sync::Arc;
+mod watched;
+use sha2::{Digest as _, Sha256};
+use std::fmt::Write as _;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail, ensure};
@@ -15,7 +21,6 @@ use tokio::sync::{Mutex, Notify};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-const STORE: &str = "fork_prefetch_v1";
 const MAX_JOBS: usize = 1000;
 const MAX_RANGES: usize = 64;
 const RETRY_MS: i64 = 5 * 60 * 1000;
@@ -28,20 +33,33 @@ pub struct Settings {
     pub enabled: bool,
     /// Allowance for attempted final-media block fills per UTC day; provider overfetch and wire overhead are excluded.
     pub daily_fill_bytes: u64,
+    /// Reserved NNTP response bytes after TLS; greeting/authentication are excluded.
+    pub daily_wire_bytes: u64,
     pub plex: PlexSettings,
+    pub finish_watched: FinishWatched,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
             daily_fill_bytes: 10_000_000_000,
+            daily_wire_bytes: 10_000_000_000,
             plex: PlexSettings::default(),
+            finish_watched: FinishWatched::default(),
         }
     }
 }
 impl Settings {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.plex.validate()?;
+        ensure!(
+            (1..=100).contains(&self.finish_watched.percent),
+            "finish-watched share must be 1 to 100 percent"
+        );
+        ensure!(
+            (BLOCK..=100_000_000_000_000).contains(&self.daily_wire_bytes),
+            "invalid prefetch daily wire-byte allowance"
+        );
         ensure!(
             (BLOCK..=100_000_000_000_000).contains(&self.daily_fill_bytes),
             "invalid prefetch daily fill-byte allowance"
@@ -96,6 +114,31 @@ impl PlexSettings {
         Ok(())
     }
 }
+/// Foreground serving must last at least two minutes and exceed 67 MB before
+/// the configured share can admit a full-file completion job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+#[schema(as=PrefetchFinishWatched)]
+pub struct FinishWatched {
+    pub enabled: bool,
+    pub percent: u8,
+}
+impl Default for FinishWatched {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            percent: 10,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as=PrefetchFamily)]
+pub enum Family {
+    #[default]
+    Plex,
+    Read,
+}
 /// Internal admission carries the source revision and configuration that authorized it.
 pub struct Automatic<'a> {
     pub item: ItemId,
@@ -136,12 +179,16 @@ pub struct Job {
     pub intent: Uuid,
     #[serde(default)]
     pub automatic_scope: Option<String>,
+    #[serde(default)]
+    pub family: Family,
     pub state: State,
     pub created_at: i64,
     pub updated_at: i64,
     pub expires_at: i64,
     pub next_attempt: i64,
     pub attempts: u32,
+    #[serde(default)]
+    pub run: u32,
     pub verified_bytes: u64,
     pub source_bytes: u64,
     pub cached_bytes: u64,
@@ -156,13 +203,31 @@ struct Ledger {
     charged: u64,
     jobs: Vec<Job>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[schema(as=PrefetchHistory)]
+pub struct History {
+    pub job: Job,
+    pub recorded_at: i64,
+}
 #[derive(Serialize, ToSchema)]
 #[schema(as=PrefetchStatus)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent queue, wire and storage availability observations"
+)]
 pub struct Status {
     pub paused: bool,
     pub day: i64,
     pub charged_fill_bytes: u64,
+    /// Observed NNTP bytes since process start, including abandoned drains.
+    pub received_wire_bytes: u64,
+    pub reserved_wire_bytes: Option<u64>,
+    pub wire_day: Option<i64>,
+    pub wire_blocked: bool,
     pub jobs: Vec<Job>,
+    pub history: Vec<History>,
+    pub history_available: bool,
+    pub state_available: bool,
 }
 #[derive(Clone, Copy, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -181,18 +246,21 @@ pub struct Queue {
     /// A step holds this across its I/O. Controls use the ledger only and stay responsive.
     step: Mutex<()>,
     changed: Notify,
+    wire: Arc<infinidysk_nntp::wire::Budget>,
+    watched: Mutex<watched::Tracker>,
+    uncertain: AtomicBool,
 }
 impl Queue {
     pub async fn load(db: Db, vfs: Arc<Vfs>) -> anyhow::Result<Arc<Self>> {
-        let mut ledger = db
-            .config()
-            .await?
-            .into_iter()
-            .find(|(k, _)| k == STORE)
-            .map_or_else(
-                || Ok(Ledger::default()),
-                |(_, v)| serde_json::from_str::<Ledger>(&v),
-            )?;
+        {
+            let _writing = db.write_permit().await;
+            db.ensure_prefetch(&serde_json::to_string(&Ledger::default())?)
+                .await?;
+        }
+        let mut ledger: Ledger = {
+            let _writing = db.write_permit().await;
+            serde_json::from_str(&db.read_prefetch().await?)?
+        };
         ensure!(
             ledger.jobs.len() <= MAX_JOBS,
             "prefetch ledger exceeds job limit"
@@ -213,36 +281,126 @@ impl Queue {
                 job.verified_bytes = 0;
             }
         }
+        let wire = if let Some(budget) = vfs.warming_budget() {
+            budget.clone()
+        } else {
+            let db = db.clone();
+            let budget = infinidysk_nntp::wire::Budget::new(Arc::new(move |day, bytes, limit| {
+                let db = db.clone();
+                Box::pin(async move {
+                    let _writing = db.write_permit().await;
+                    let row = db
+                        .reserve_warming_wire(day, bytes, limit)
+                        .await
+                        .map_err(|_| infinidysk_nntp::wire::Denied)?
+                        .ok_or(infinidysk_nntp::wire::Denied)?;
+                    u64::try_from(row.granted).map_err(|_| infinidysk_nntp::wire::Denied)
+                })
+            }));
+            ensure!(
+                vfs.install_warming_budget(budget.clone()),
+                "warming wire admission already installed"
+            );
+            budget
+        };
+        wire.pause(ledger.paused);
         Ok(Arc::new(Self {
             db,
             vfs,
             ledger: Mutex::new(ledger),
             step: Mutex::new(()),
             changed: Notify::new(),
+            wire,
+            watched: Mutex::default(),
+            uncertain: AtomicBool::new(false),
         }))
+    }
+    async fn lock_ledger(&self) -> anyhow::Result<tokio::sync::MutexGuard<'_, Ledger>> {
+        let mut current = self.ledger.lock().await;
+        if self.uncertain.load(Ordering::Acquire) {
+            let _writing = self.db.write_permit().await;
+            let restored: Ledger = serde_json::from_str(&self.db.read_prefetch().await?)?;
+            ensure!(
+                restored.jobs.len() <= MAX_JOBS
+                    && restored.jobs.iter().all(
+                        |j| normalize(&j.ranges, j.size).is_ok_and(|ranges| ranges == j.ranges)
+                    ),
+                "saved warming state is invalid"
+            );
+            *current = restored;
+            self.wire.pause(current.paused);
+            self.uncertain.store(false, Ordering::Release);
+        }
+        Ok(current)
     }
     // Write before replacing memory. A storage failure never acknowledges a state change.
     async fn save(&self, current: &mut Ledger, next: Ledger) -> anyhow::Result<()> {
-        let value = serde_json::to_string(&next)?;
-        self.db.write_config(&[(STORE, &value)], &[]).await?;
+        let mut events = Vec::new();
+        for job in &next.jobs {
+            if !matches!(job.state, State::Queued | State::Paused)
+                && current
+                    .jobs
+                    .iter()
+                    .any(|old| old.id == job.id && old.state != job.state)
+            {
+                let history = History {
+                    job: job.clone(),
+                    recorded_at: now_ms(),
+                };
+                let digest = Sha256::digest(serde_json::to_vec(&(job.id, job.run, job.state))?);
+                let mut bytes = [0; 16];
+                bytes.copy_from_slice(&digest[..16]);
+                events.push((
+                    Uuid::from_bytes(bytes),
+                    history.recorded_at,
+                    serde_json::to_string(&history)?,
+                ));
+            }
+        }
+        let raw = serde_json::to_string(&next)?;
+        let _writing = self.db.write_permit().await;
+        self.uncertain.store(true, Ordering::Release);
+        self.db.save_prefetch(&raw, &events).await?;
         *current = next;
+        self.uncertain.store(false, Ordering::Release);
         self.changed.notify_waiters();
         Ok(())
     }
     pub async fn status(&self) -> Status {
-        let ledger = self.ledger.lock().await;
+        let wire = self.db.warming_wire_usage().await.ok();
+        let history = self.db.prefetch_history(100).await.ok().and_then(|rows| {
+            rows.into_iter()
+                .map(|raw| serde_json::from_str::<History>(&raw))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        });
+        let history_available = history.is_some();
+        let ledger = match self.lock_ledger().await {
+            Ok(ledger) => ledger,
+            Err(_) => self.ledger.lock().await,
+        };
         Status {
             paused: ledger.paused,
             day: ledger.day,
             charged_fill_bytes: ledger.charged,
+            received_wire_bytes: self.wire.received(),
+            reserved_wire_bytes: wire.as_ref().and_then(|w| u64::try_from(w.charged).ok()),
+            wire_day: wire.map(|w| w.day),
+            wire_blocked: self.wire.blocked(),
             jobs: ledger.jobs.clone(),
+            history: history.unwrap_or_default(),
+            history_available,
+            state_available: !self.uncertain.load(Ordering::Acquire),
         }
     }
     pub async fn pause(&self, paused: bool) -> anyhow::Result<()> {
-        let mut current = self.ledger.lock().await;
+        let mut current = self.lock_ledger().await?;
         let mut next = current.clone();
         next.paused = paused;
         let result = self.save(&mut current, next).await;
+        if result.is_ok() {
+            self.wire.pause(paused);
+        }
         drop(current);
         result
     }
@@ -262,7 +420,7 @@ impl Queue {
                 request.ranges,
                 request.priority,
                 request.intent,
-                Some((request.scope, request.revision)),
+                Some((request.scope, request.revision, Family::Plex)),
             )
             .await?;
         if job.state == State::Complete {
@@ -305,11 +463,20 @@ impl Queue {
         scope: Option<&str>,
         wanted: Option<&std::collections::HashSet<Uuid>>,
     ) -> anyhow::Result<()> {
-        let mut current = self.ledger.lock().await;
+        self.reconcile_family(Family::Plex, scope, wanted).await
+    }
+    async fn reconcile_family(
+        &self,
+        family: Family,
+        scope: Option<&str>,
+        wanted: Option<&std::collections::HashSet<Uuid>>,
+    ) -> anyhow::Result<()> {
+        let mut current = self.lock_ledger().await?;
         let mut next = current.clone();
         let mut changed = false;
         for job in &mut next.jobs {
             if let Some(owner) = &job.automatic_scope
+                && job.family == family
                 && matches!(job.state, State::Queued | State::Paused)
                 && (scope != Some(owner.as_str())
                     || wanted.is_some_and(|ids| !ids.contains(&job.intent)))
@@ -332,7 +499,7 @@ impl Queue {
         ranges: &[Range],
         priority: u8,
         intent: Uuid,
-        automatic: Option<(&str, &str)>,
+        automatic: Option<(&str, &str, Family)>,
     ) -> anyhow::Result<Job> {
         ensure!(priority <= 100, "invalid prefetch priority");
         let item = self
@@ -341,7 +508,7 @@ impl Queue {
             .await?
             .context("prefetch source no longer exists")?;
         let key = self.vfs.cache_key(&item).await?;
-        if let Some((scope, revision)) = automatic {
+        if let Some((scope, revision, _)) = automatic {
             ensure!(
                 scope.len() == 64 && scope.bytes().all(|b| b.is_ascii_hexdigit()),
                 "invalid automatic policy scope"
@@ -356,7 +523,7 @@ impl Queue {
             self.vfs.native_cache().is_some(),
             "native cache must be available before warming"
         );
-        let mut current = self.ledger.lock().await;
+        let mut current = self.lock_ledger().await?;
         if let Some(existing) = current.jobs.iter().find(|j| {
             j.item == key.item()
                 && j.revision == key.revision()
@@ -389,13 +556,15 @@ impl Queue {
             range: 0,
             priority,
             intent,
-            automatic_scope: automatic.map(|(scope, _)| scope.to_owned()),
+            automatic_scope: automatic.map(|(scope, _, _)| scope.to_owned()),
+            family: automatic.map_or(Family::Plex, |(_, _, family)| family),
             state: State::Queued,
             created_at: now,
             updated_at: now,
             expires_at: now + EXPIRY_MS,
             next_attempt: now,
             attempts: 0,
+            run: 0,
             verified_bytes: 0,
             source_bytes: 0,
             cached_bytes: 0,
@@ -407,7 +576,7 @@ impl Queue {
         Ok(job)
     }
     pub async fn control(&self, id: Uuid, operation: Operation) -> anyhow::Result<()> {
-        let mut current = self.ledger.lock().await;
+        let mut current = self.lock_ledger().await?;
         let mut next = current.clone();
         let job = next
             .jobs
@@ -426,9 +595,15 @@ impl Queue {
                 if matches!(job.state, State::Failed | State::Expired | State::Complete) =>
             {
                 job.state = State::Queued;
+                job.run = job
+                    .run
+                    .checked_add(1)
+                    .context("warming attempt counter exhausted")?;
                 job.range = 0;
                 job.offset = job.ranges[0].start;
                 job.verified_bytes = 0;
+                job.source_bytes = 0;
+                job.cached_bytes = 0;
                 job.attempts = 0;
                 job.reason = None;
                 job.expires_at = now_ms() + EXPIRY_MS;
@@ -441,28 +616,104 @@ impl Queue {
         drop(current);
         result
     }
+    /// Source-bound completion requests from observed playback. No provider I/O
+    /// occurs here; the ordinary durable queue executes and verifies them.
+    pub async fn observe_reads(&self, settings: &Settings) -> anyhow::Result<()> {
+        let scope = if settings.enabled && settings.finish_watched.enabled {
+            Some(
+                Sha256::digest(serde_json::to_vec(&settings.finish_watched)?)
+                    .iter()
+                    .fold(String::with_capacity(64), |mut out, b| {
+                        write!(out, "{b:02x}").expect("String formatting is infallible");
+                        out
+                    }),
+            )
+        } else {
+            None
+        };
+        self.reconcile_family(Family::Read, scope.as_deref(), None)
+            .await?;
+        let Some(scope) = scope else {
+            *self.watched.lock().await = watched::Tracker::default();
+            return Ok(());
+        };
+        let candidates = self
+            .watched
+            .lock()
+            .await
+            .observe(self.vfs.sessions().playback(), now_ms());
+        for (id, served) in candidates {
+            let Some(item) = self.db.item(id).await? else {
+                continue;
+            };
+            if item.health_state == infinidysk_db::HealthState::Hidden {
+                continue;
+            }
+            let key = self.vfs.cache_key(&item).await?;
+            if key.size() == 0
+                || u128::from(served) * 100
+                    < u128::from(key.size()) * u128::from(settings.finish_watched.percent)
+            {
+                continue;
+            }
+            let mut hash = Sha256::new();
+            hash.update(b"finish-watched-v1");
+            hash.update(id.0.as_bytes());
+            hash.update(key.revision().as_bytes());
+            hash.update(scope.as_bytes());
+            let digest = hash.finalize();
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(&digest[..16]);
+            let job = self
+                .admit(
+                    id,
+                    &[Range {
+                        start: 0,
+                        end: key.size(),
+                    }],
+                    40,
+                    Uuid::from_bytes(bytes),
+                    Some((&scope, key.revision(), Family::Read)),
+                )
+                .await?;
+            if job.state == State::Complete {
+                let Some(cache) = self.vfs.native_cache() else {
+                    continue;
+                };
+                let coverage = cache.coverage(&key).await?;
+                if !coverage.iter().any(|r| r.start == 0 && r.end >= key.size()) {
+                    self.control(job.id, Operation::Retry).await?;
+                }
+            }
+        }
+        Ok(())
+    }
     pub async fn changed(&self) {
         self.changed.notified().await;
     }
     fn foreground(&self) -> bool {
-        self.vfs
-            .sessions()
-            .open()
-            .iter()
-            .any(|s| s.waiting().is_some_and(|d| d >= Duration::from_millis(25)))
+        self.vfs.foreground_pending()
+            || self
+                .vfs
+                .sessions()
+                .open()
+                .iter()
+                .any(|s| s.waiting().is_some_and(|d| d >= Duration::from_millis(25)))
     }
     /// One block at most. The caller owns process cancellation and current settings.
     pub async fn tick(&self, settings: &Settings) -> anyhow::Result<bool> {
         let Ok(_step) = self.step.try_lock() else {
             return Ok(false);
         };
+        self.wire
+            .configure(settings.enabled, settings.daily_wire_bytes);
         if !settings.enabled || self.foreground() {
             return Ok(false);
         }
         settings.validate()?;
         let now = now_ms();
         let selected = {
-            let mut current = self.ledger.lock().await;
+            let mut current = self.lock_ledger().await?;
             if current.paused {
                 return Ok(false);
             }
@@ -521,6 +772,9 @@ impl Queue {
             self.checkpoint(&job, bytes.len() as u64, false).await?;
             return Ok(true);
         }
+        if self.wire.clone().ready().await.is_err() {
+            return self.defer_wire(&job).await;
+        }
         let length = BLOCK.min(job.size - job.offset);
         let Some(permit) = cache.try_buffer() else {
             return Ok(false);
@@ -528,7 +782,7 @@ impl Queue {
         // Reserve committed source-byte allowance durably before a source attempt. Failed,
         // interrupted and declined writes remain charged: retries cannot bypass the cap.
         {
-            let mut current = self.ledger.lock().await;
+            let mut current = self.lock_ledger().await?;
             if current.paused
                 || !current
                     .jobs
@@ -576,6 +830,9 @@ impl Queue {
             return Ok(false);
         };
         if !matches!(transferred, Ok(Ok(()))) {
+            if self.wire.blocked() {
+                return self.defer_wire(&job).await;
+            }
             // An inconclusive/circuit failure is urgent work, never proof of permanent damage.
             self.db
                 .request_recheck(ItemId(job.item), Recheck::Playback)
@@ -614,7 +871,7 @@ impl Queue {
             self.checkpoint(&job, length, true).await?;
             Ok(true)
         } else {
-            let mut current = self.ledger.lock().await;
+            let mut current = self.lock_ledger().await?;
             let mut next = current.clone();
             if let Some(j) = next
                 .jobs
@@ -633,8 +890,24 @@ impl Queue {
             Ok(false)
         }
     }
+    async fn defer_wire(&self, job: &Job) -> anyhow::Result<bool> {
+        let mut current = self.lock_ledger().await?;
+        let mut next = current.clone();
+        if let Some(j) = next
+            .jobs
+            .iter_mut()
+            .find(|j| j.id == job.id && j.state == State::Queued)
+        {
+            j.next_attempt = now_ms() + 60_000;
+            j.updated_at = now_ms();
+            j.reason = Some("Wire allowance unavailable or exhausted; source unchanged".into());
+        }
+        self.save(&mut current, next).await?;
+        drop(current);
+        Ok(false)
+    }
     async fn checkpoint(&self, original: &Job, bytes: u64, source: bool) -> anyhow::Result<()> {
-        let mut current = self.ledger.lock().await;
+        let mut current = self.lock_ledger().await?;
         let mut next = current.clone();
         let Some(job) = next.jobs.iter_mut().find(|j| {
             j.id == original.id
@@ -667,7 +940,7 @@ impl Queue {
         result
     }
     async fn retry(&self, original: &Job) -> anyhow::Result<()> {
-        let mut current = self.ledger.lock().await;
+        let mut current = self.lock_ledger().await?;
         let mut next = current.clone();
         if let Some(j) = next
             .jobs
@@ -688,7 +961,7 @@ impl Queue {
         result
     }
     async fn finish(&self, id: Uuid, state: State, reason: &str) -> anyhow::Result<()> {
-        let mut current = self.ledger.lock().await;
+        let mut current = self.lock_ledger().await?;
         let mut next = current.clone();
         if let Some(j) = next
             .jobs
@@ -732,4 +1005,159 @@ fn normalize(ranges: &[Range], size: u64) -> anyhow::Result<Vec<Range>> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+    #[tokio::test]
+    async fn uncertain_control_reads_the_accepted_database_state_before_admitting_more_work() {
+        let path = std::env::temp_dir().join(format!(
+            "infinidysk-warm-readback-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Db::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .expect("database");
+        let client = Arc::new(infinidysk_nntp::Client::new([]));
+        let vfs = Arc::new(Vfs::new(
+            db.clone(),
+            client,
+            infinidysk_stream::Budget::new(1_000_000),
+            0,
+            "/unused",
+        ));
+        let queue = Queue::load(db.clone(), vfs).await.expect("queue");
+        assert!(!queue.status().await.paused);
+        let accepted = Ledger {
+            paused: true,
+            ..Ledger::default()
+        };
+        db.save_prefetch(&serde_json::to_string(&accepted).expect("ledger"), &[])
+            .await
+            .expect("commit whose acknowledgement was lost");
+        queue.uncertain.store(true, Ordering::Release);
+        let status = queue.status().await;
+        assert!(status.state_available);
+        assert!(status.paused);
+        queue
+            .reconcile_automatic(None, None)
+            .await
+            .expect("reconcile cannot overwrite the observed pause");
+        assert!(
+            serde_json::from_str::<Ledger>(&db.read_prefetch().await.expect("fenced readback"))
+                .expect("ledger")
+                .paused
+        );
+        queue
+            .pause(false)
+            .await
+            .expect("explicit resume after readback");
+        assert!(!queue.status().await.paused);
+        drop(queue);
+        db.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+    #[tokio::test]
+    async fn disabling_plex_and_finish_policies_cancels_only_their_own_jobs() {
+        let path = std::env::temp_dir().join(format!(
+            "infinidysk-warm-families-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let db = Db::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .expect("database");
+        let make = |family: Family, automatic: bool| Job {
+            id: Uuid::new_v4(),
+            item: Uuid::new_v4(),
+            revision: "a".repeat(64),
+            size: 1,
+            ranges: vec![Range { start: 0, end: 1 }],
+            priority: 40,
+            intent: Uuid::new_v4(),
+            automatic_scope: automatic.then(|| "b".repeat(64)),
+            family,
+            state: State::Queued,
+            created_at: 1,
+            updated_at: 1,
+            expires_at: i64::MAX,
+            next_attempt: 1,
+            attempts: 0,
+            run: 0,
+            verified_bytes: 0,
+            source_bytes: 0,
+            cached_bytes: 0,
+            reason: None,
+            range: 0,
+            offset: 0,
+        };
+        let plex = make(Family::Plex, true);
+        let read = make(Family::Read, true);
+        let manual = make(Family::Plex, false);
+        let ledger = Ledger {
+            jobs: vec![plex.clone(), read.clone(), manual.clone()],
+            ..Ledger::default()
+        };
+        db.save_prefetch(&serde_json::to_string(&ledger).expect("ledger"), &[])
+            .await
+            .expect("seed");
+        let vfs = Arc::new(Vfs::new(
+            db.clone(),
+            Arc::new(infinidysk_nntp::Client::new([])),
+            infinidysk_stream::Budget::new(1_000_000),
+            0,
+            "/unused",
+        ));
+        let queue = Queue::load(db.clone(), vfs).await.expect("queue");
+        queue
+            .reconcile_automatic(None, None)
+            .await
+            .expect("disable Plex");
+        let state = queue.status().await;
+        assert_eq!(
+            state
+                .jobs
+                .iter()
+                .find(|j| j.id == plex.id)
+                .expect("plex")
+                .state,
+            State::Cancelled
+        );
+        assert_eq!(
+            state
+                .jobs
+                .iter()
+                .find(|j| j.id == read.id)
+                .expect("read")
+                .state,
+            State::Queued
+        );
+        queue
+            .observe_reads(&Settings::default())
+            .await
+            .expect("disable finish-watched");
+        let state = queue.status().await;
+        assert_eq!(
+            state
+                .jobs
+                .iter()
+                .find(|j| j.id == read.id)
+                .expect("read")
+                .state,
+            State::Cancelled
+        );
+        assert_eq!(
+            state
+                .jobs
+                .iter()
+                .find(|j| j.id == manual.id)
+                .expect("manual")
+                .state,
+            State::Queued
+        );
+        assert_eq!(state.history.len(), 2);
+        drop(queue);
+        db.close().await;
+        let _ = std::fs::remove_file(path);
+    }
 }

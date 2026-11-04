@@ -150,6 +150,7 @@ export function PlexPredictions() {
           ["movies", "Include movies"],
           ["television", "Include television"],
           ["full_file", "Warm complete files"],
+          ["minimum_warm", "Keep minimum head and tail coverage for partial warming"],
         ] as const
       ).map(([key, label]) => (
         <Toggle
@@ -160,11 +161,14 @@ export function PlexPredictions() {
               {label} <Locked locked={locked(`prefetch.plex.policy.${key}`)} />
             </>
           }
-          checked={policy[key] ?? true}
+          checked={policy[key] ?? (key !== "minimum_warm")}
           disabled={change.isPending || locked(`prefetch.plex.policy.${key}`)}
           onChange={(checked) => change.mutate({ policy: { [key]: checked } })}
         />
       ))}
+      <div className="grid gap-3 sm:grid-cols-2">
+        {([['head_bytes','Minimum head (MB)'],['tail_bytes','Minimum tail (MB)']] as const).map(([key,label])=><ApplyNumber key={key} id={`prediction-${key}`} label={label} value={policy[key]/1000000} min={0} max={1000} disabled={change.isPending || locked(`prefetch.plex.policy.${key}`)} apply={n=>change.mutateAsync({policy:{[key]:n*1000000}})} />)}
+      </div>
       <ApplyList
         id="prediction-viewers"
         label="Viewer identities"

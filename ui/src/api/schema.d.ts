@@ -3513,6 +3513,11 @@ export interface components {
              * @default 2
              */
             min_distinct_episodes: number;
+            /**
+             * @description Add head/tail retention to partial warming windows.
+             * @default false
+             */
+            minimum_warm: boolean;
             /** @default true */
             movies: boolean;
             /**
@@ -3566,6 +3571,7 @@ export interface components {
              *       "head_bytes": 16777216,
              *       "lookback_days": 7,
              *       "min_distinct_episodes": 2,
+             *       "minimum_warm": false,
              *       "movies": true,
              *       "partial_movie_lookback_days": 7,
              *       "tail_bytes": 8388608,
@@ -3674,6 +3680,26 @@ export interface components {
         PrefetchControl: {
             operation: components["schemas"]["PrefetchOperation"];
         };
+        /** @enum {string} */
+        PrefetchFamily: "plex" | "read";
+        /**
+         * @description Foreground serving must last at least two minutes and exceed 67 MB before
+         *     the configured share can admit a full-file completion job.
+         */
+        PrefetchFinishWatched: {
+            /** @default false */
+            enabled: boolean;
+            /**
+             * Format: int32
+             * @default 10
+             */
+            percent: number;
+        };
+        PrefetchHistory: {
+            job: components["schemas"]["PrefetchJob"];
+            /** Format: int64 */
+            recorded_at: number;
+        };
         PrefetchJob: {
             /** Format: int32 */
             attempts: number;
@@ -3684,6 +3710,7 @@ export interface components {
             created_at: number;
             /** Format: int64 */
             expires_at: number;
+            family?: components["schemas"]["PrefetchFamily"];
             /** Format: uuid */
             id: string;
             /**
@@ -3703,6 +3730,8 @@ export interface components {
             ranges: components["schemas"]["PrefetchRange"][];
             reason?: string | null;
             revision: string;
+            /** Format: int32 */
+            run?: number;
             /** Format: int64 */
             size: number;
             /** Format: int64 */
@@ -3740,8 +3769,21 @@ export interface components {
              * @default 10000000000
              */
             daily_fill_bytes: number;
+            /**
+             * Format: int64
+             * @description Reserved NNTP response bytes after TLS; greeting/authentication are excluded.
+             * @default 10000000000
+             */
+            daily_wire_bytes: number;
             /** @default false */
             enabled: boolean;
+            /**
+             * @default {
+             *       "enabled": false,
+             *       "percent": 10
+             *     }
+             */
+            finish_watched: components["schemas"]["PrefetchFinishWatched"];
             /**
              * @default {
              *       "enabled": false,
@@ -3755,6 +3797,7 @@ export interface components {
              *         "head_bytes": 16777216,
              *         "lookback_days": 7,
              *         "min_distinct_episodes": 2,
+             *         "minimum_warm": false,
              *         "movies": true,
              *         "partial_movie_lookback_days": 7,
              *         "tail_bytes": 8388608,
@@ -3774,8 +3817,21 @@ export interface components {
             charged_fill_bytes: number;
             /** Format: int64 */
             day: number;
+            history: components["schemas"]["PrefetchHistory"][];
+            history_available: boolean;
             jobs: components["schemas"]["PrefetchJob"][];
             paused: boolean;
+            /**
+             * Format: int64
+             * @description Observed NNTP bytes since process start, including abandoned drains.
+             */
+            received_wire_bytes: number;
+            /** Format: int64 */
+            reserved_wire_bytes?: number | null;
+            state_available: boolean;
+            wire_blocked: boolean;
+            /** Format: int64 */
+            wire_day?: number | null;
         };
         /** @enum {string} */
         Preset: "balanced" | "max_playback" | "low_resources";
@@ -3874,7 +3930,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a636-764b-7135-8fb0-f5d013ea86b5
+             * @default 01a1a68c-ee34-709a-9b1b-2e83fc48db4e
              */
             id: string;
             /**
@@ -4562,7 +4618,12 @@ export interface components {
             /**
              * @default {
              *       "daily_fill_bytes": 10000000000,
+             *       "daily_wire_bytes": 10000000000,
              *       "enabled": false,
+             *       "finish_watched": {
+             *         "enabled": false,
+             *         "percent": 10
+             *       },
              *       "plex": {
              *         "enabled": false,
              *         "history": false,
@@ -4575,6 +4636,7 @@ export interface components {
              *           "head_bytes": 16777216,
              *           "lookback_days": 7,
              *           "min_distinct_episodes": 2,
+             *           "minimum_warm": false,
              *           "movies": true,
              *           "partial_movie_lookback_days": 7,
              *           "tail_bytes": 8388608,

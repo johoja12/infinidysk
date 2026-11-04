@@ -12,18 +12,19 @@ publish.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 infinidysk-core.workspace = true
+infinidysk-nntp.workspace = true
 infinidysk-plex.workspace = true
 infinidysk-db.workspace = true
 infinidysk-native-cache.workspace = true
 infinidysk-vfs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 utoipa.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-infinidysk-nntp.workspace = true
 infinidysk-stream.workspace = true
 infinidysk-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }

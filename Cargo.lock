@@ -1411,6 +1411,7 @@ dependencies = [
  "infinidysk-vfs",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tokio",
  "utoipa",
  "uuid",

@@ -759,6 +759,9 @@ pub async fn serve(
                         warn!(reason=%error,"automatic warming cleanup deferred");
                         continue;
                     }
+                    if let Err(error) = prefetch.observe_reads(&config.settings().prefetch).await {
+                        warn!(reason=%error,"finish-watched admission deferred");
+                    }
                     config.settings().prefetch.clone()
                 };
                 tokio::select! {
@@ -987,6 +990,12 @@ pub struct Live {
 
 impl Live {
     pub async fn apply(&self, settings: &Settings) -> anyhow::Result<()> {
+        if let Some(budget) = self.dav.vfs.warming_budget() {
+            budget.configure(
+                settings.prefetch.enabled,
+                settings.prefetch.daily_wire_bytes,
+            );
+        }
         self.quotas.configure(&settings.providers);
         self.bandwidth.set_limit(download_limit(settings));
         {

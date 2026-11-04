@@ -484,3 +484,49 @@ async fn par2_limits_are_validated_and_environment_authority_is_preserved() {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
 }
+
+#[tokio::test]
+async fn provider_response_allowance_and_finish_share_are_validated_and_managed() {
+    let path = std::env::temp_dir().join(format!(
+        "infinidysk-wire-settings-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("db");
+    let mut store = ConfigStore::load(
+        db.clone(),
+        [(
+            "INFINIDYSK__PREFETCH__DAILY_WIRE_BYTES".into(),
+            "9000000".into(),
+        )],
+    )
+    .await
+    .expect("config");
+    assert_eq!(store.settings().prefetch.daily_wire_bytes, 9_000_000);
+    let mut changed = store.settings().clone();
+    changed.prefetch.daily_wire_bytes = 10_000_000;
+    assert!(
+        matches!(store.save(changed).await,Err(Error::Locked(key)) if key=="prefetch.daily_wire_bytes")
+    );
+    for percent in [0, 101] {
+        let mut changed = store.settings().clone();
+        changed.prefetch.finish_watched.percent = percent;
+        assert!(store.save(changed).await.is_err());
+    }
+    let mut changed = store.settings().clone();
+    changed.prefetch.finish_watched.enabled = true;
+    changed.prefetch.finish_watched.percent = 25;
+    store.save(changed).await.expect("advanced policy");
+    let reloaded = ConfigStore::load(db.clone(), []).await.expect("reload");
+    assert_eq!(
+        reloaded.settings().prefetch.daily_wire_bytes,
+        10_000_000_000,
+        "environment value is not persisted"
+    );
+    assert_eq!(reloaded.settings().prefetch.finish_watched.percent, 25);
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
