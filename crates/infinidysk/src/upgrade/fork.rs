@@ -27,6 +27,11 @@ fn warming(raw: &str, settings: &mut Settings, notes: &mut Vec<String>) -> Resul
         }
     }
     let mut next = settings.prefetch.clone();
+    take(
+        &mut values,
+        "connectionsperjob",
+        &mut next.connections_per_job,
+    )?;
     let policy = &mut next.plex.policy;
     take(&mut values, "movieenabled", &mut policy.movies)?;
     take(&mut values, "tvenabled", &mut policy.television)?;
@@ -165,11 +170,12 @@ mod tests {
     fn typed_policy_preserves_bytes_without_enabling_background_work() {
         let mut settings = Settings::default();
         let mut notes = vec![];
-        warming(r#"{"Enabled":true,"HistoryEnabled":true,"FinishWatchedEnabled":true,"FinishWatchedPercent":25,"MinimumHeadMb":32,"ConfidenceThreshold":0.501,"DailyByteBudget":20000000000,"Users":["legacy-profile"]}"#,&mut settings,&mut notes).unwrap();
+        warming(r#"{"Enabled":true,"HistoryEnabled":true,"FinishWatchedEnabled":true,"FinishWatchedPercent":25,"MinimumHeadMb":32,"ConnectionsPerJob":3,"ConfidenceThreshold":0.501,"DailyByteBudget":20000000000,"Users":["legacy-profile"]}"#,&mut settings,&mut notes).unwrap();
         assert!(!settings.prefetch.enabled);
         assert!(!settings.prefetch.plex.enabled);
         assert!(settings.prefetch.finish_watched.enabled);
         assert_eq!(settings.prefetch.finish_watched.percent, 25);
+        assert_eq!(settings.prefetch.connections_per_job, 3);
         assert_eq!(settings.prefetch.plex.policy.head_bytes, 32 * 1_048_576);
         assert_eq!(settings.prefetch.plex.policy.confidence_percent, 51);
         assert_eq!(settings.prefetch.daily_wire_bytes, 20_000_000_000);
@@ -182,6 +188,7 @@ mod tests {
         for raw in [
             r#"{"Enabled":true,"enabled":false}"#,
             r#"{"ConfidenceThreshold":1.1}"#,
+            r#"{"ConnectionsPerJob":9}"#,
             r#"{"MinimumHeadMb":18446744073709551615}"#,
             r#"{"FinishWatchedPercent":"25"}"#,
         ] {

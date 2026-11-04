@@ -331,6 +331,7 @@ pub struct SegmentReader {
     /// Background-priority reads that fail instead of filling, padding or cutting.
     strict: bool,
     background: Workload,
+    warm_floor: usize,
     budget: Option<Budget>,
     cache: Option<Arc<Cache>>,
     /// Segments from here on are fetched only when read: the caller's range ends before.
@@ -384,6 +385,7 @@ impl SegmentReader {
             prewarm: true,
             strict: false,
             background: Workload::Health,
+            warm_floor: 2,
             budget: None,
             cache: None,
             end,
@@ -429,12 +431,19 @@ impl SegmentReader {
 
     /// Strict background warming, accounted separately from health and playback.
     #[must_use]
-    pub const fn with_warming(mut self) -> Self {
+    pub const fn with_warming(self) -> Self {
+        self.with_warming_floor(2)
+    }
+
+    /// Warming starts at the selected floor and borrows unused provider capacity.
+    #[must_use]
+    pub const fn with_warming_floor(mut self, floor: usize) -> Self {
         self.strict = true;
         self.prewarm = false;
         self.background = Workload::Warm;
-        self.prefetch = 1;
-        self.initial = 1;
+        self.prefetch = 24;
+        self.initial = 2;
+        self.warm_floor = floor;
         self
     }
 
@@ -608,6 +617,9 @@ impl SegmentReader {
     /// Segments to keep in flight ahead of the reader. Large articles grow the window by
     /// the opening size per segment read, so an open does not queue the whole prefetch.
     fn ahead(&self) -> usize {
+        if self.background == Workload::Warm {
+            return self.client.warming_window(self.warm_floor);
+        }
         if self.bounded {
             return self.prefetch;
         }

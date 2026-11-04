@@ -777,3 +777,68 @@ fn setup_on(corpus: &Corpus, servers: &[&LoopbackServer]) -> (Arc<Client>, Arc<L
     }));
     (Arc::new(client), Arc::new(layout))
 }
+
+#[tokio::test]
+async fn warming_borrows_spare_capacity_but_leaves_a_connection_for_foreground() {
+    let corpus = Corpus::generate(1025, 8, ARTICLE_SIZE);
+    let (server, mut gates) = LoopbackServer::start_gated_many(corpus.articles.clone(), 4)
+        .await
+        .unwrap();
+    let (client, layout) = setup(&corpus, &server);
+    assert_eq!(client.warming_window(1), 3);
+    let warm = tokio::spawn({
+        let client = client.clone();
+        async move {
+            let mut reader = SegmentReader::new(client, layout, 1).with_warming_floor(1);
+            reader.set_end(3 * ARTICLE_SIZE as u64);
+            let mut data = vec![0; 3 * ARTICLE_SIZE];
+            reader.read_exact(&mut data).await.unwrap();
+            data
+        }
+    });
+    for gate in gates.iter_mut().take(3) {
+        tokio::time::timeout(Duration::from_secs(2), gate.blocked())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        server.body_commands(),
+        3,
+        "the reserved fourth connection remains free"
+    );
+    let foreground = tokio::spawn({
+        let client = client.clone();
+        let id = corpus.articles[5].message_id.clone();
+        async move {
+            client
+                .body(&id, infinidysk_nntp::Workload::Stream, None)
+                .await
+                .unwrap()
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), gates[3].blocked())
+        .await
+        .unwrap();
+    assert_eq!(
+        client.warming_window(1),
+        1,
+        "foreground pressure shrinks new warming admissions"
+    );
+    for gate in &gates {
+        gate.release();
+    }
+    let data = tokio::time::timeout(Duration::from_secs(2), warm)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(data, corpus.data[..3 * ARTICLE_SIZE]);
+    assert_eq!(
+        foreground.await.unwrap().data,
+        corpus.data[5 * ARTICLE_SIZE..6 * ARTICLE_SIZE]
+    );
+    assert_eq!(
+        server.body_commands(),
+        4,
+        "the warming range did not fetch beyond its end"
+    );
+}

@@ -203,17 +203,17 @@ impl Reader {
         }
     }
 
-    /// Strict one-article window, using the provider warming class.
-    pub(crate) fn into_warming(self) -> Self {
+    /// Strict bounded adaptive window, using the provider warming class.
+    pub(crate) fn into_warming(self, floor: usize) -> Self {
         match self {
             Self::Memory(_) | Self::Native(_) | Self::Revision(_) => self,
-            Self::Segments(r) => Self::Segments(r.with_warming()),
+            Self::Segments(r) => Self::Segments(r.with_warming_floor(floor)),
             Self::Parts(mut r) => {
-                r.inner = r.inner.with_warming();
+                r.inner = r.inner.with_warming_floor(floor);
                 Self::Parts(r)
             }
             Self::Crypt(mut r) => {
-                r.inner.inner = r.inner.inner.with_warming();
+                r.inner.inner = r.inner.inner.with_warming_floor(floor);
                 Self::Crypt(r)
             }
         }

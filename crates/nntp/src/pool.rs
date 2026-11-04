@@ -61,6 +61,7 @@ pub struct Pool {
     downloads: Arc<Downloads>,
     /// Requests holding a ticket.
     busy: Arc<AtomicUsize>,
+    warm_busy: Arc<AtomicUsize>,
     /// Connection tasks running.
     live: Arc<AtomicUsize>,
     state: Arc<Mutex<State>>,
@@ -234,6 +235,7 @@ struct Ticket {
     _download: Permit,
     _load: Load,
     _busy: Load,
+    _warm: Option<Load>,
 }
 
 pub(crate) struct Load(Arc<AtomicUsize>, Option<Arc<Notify>>);
@@ -275,6 +277,7 @@ impl Pool {
             config,
             downloads,
             busy: Arc::default(),
+            warm_busy: Arc::default(),
             live: Arc::default(),
             state: Arc::default(),
             changed: Arc::default(),
@@ -295,6 +298,20 @@ impl Pool {
     pub const fn with_weight_large(mut self, on: bool) -> Self {
         self.weight_large = on;
         self
+    }
+
+    /// Effective connection capacity, occupied request slots and physical warming
+    /// requests. Tickets keep abandoned drains counted until transport completion.
+    pub(crate) fn warming_capacity(&self) -> (usize, usize, usize, bool) {
+        let state = self.lock();
+        let limit = self.limit(&state);
+        drop(state);
+        (
+            limit,
+            self.busy.load(Ordering::Relaxed),
+            self.warm_busy.load(Ordering::Relaxed),
+            self.downloads.pressured(),
+        )
     }
 
     /// Fetches and decodes one body (message-id without angle brackets).
@@ -508,6 +525,7 @@ impl Pool {
                 _download: download,
                 _load: load,
                 _busy: Load::acquire(&self.busy),
+                _warm: (tag.workload == Workload::Warm).then(|| Load::acquire(&self.warm_busy)),
             };
             let request = Request {
                 command,
@@ -901,6 +919,8 @@ async fn run(
                 }),
             Command::Stat => conn.read_stat().await.map(|()| None),
         };
+        // No unfinished response-credit refill may survive into idle/keepalive.
+        conn.set_wire_budget(None);
         let result = match (result, request.tag.expected_hash) {
             (Ok(Some(body)), Some(expected)) => {
                 let data = body.data.clone();

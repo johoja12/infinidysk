@@ -60,6 +60,11 @@ impl AsyncRead for Metered {
         let mut credit = if let Some(budget) = self.budget.clone() {
             loop {
                 if let Some(credit) = budget.take(buf.remaining()) {
+                    // Another reader may return credits while our refill is pending.
+                    // Retire that future before using them: it may hold the global
+                    // refill lock, which an idle connection must never retain.
+                    self.grant = None;
+                    self.granting.store(false, Ordering::Relaxed);
                     break Some(credit);
                 }
                 self.granting.store(true, Ordering::Relaxed);
@@ -805,4 +810,75 @@ fn parse_ypart(line: &[u8]) -> Option<(u64, usize)> {
     let end = field::<u64>(line, b"end")?;
     let len = end.checked_sub(begin)?.checked_add(1)?;
     Some((begin.checked_sub(1)?, usize::try_from(len).ok()?))
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use std::future::{pending, poll_fn};
+    use std::sync::atomic::AtomicUsize;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn refunded_credits_retire_an_unfinished_refill_before_connection_goes_idle() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let budget = crate::wire::Budget::new(Arc::new({
+            let calls = Arc::clone(&calls);
+            move |_, _, _| {
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                Box::pin(async move { if first { Ok(8) } else { pending().await } })
+            }
+        }));
+        budget.configure(true, 100);
+        budget.clone().ready().await.unwrap();
+        let held = budget.take(8).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        let mut reader = Metered {
+            inner: Either::Left(socket),
+            usage: None,
+            unpaid: 0,
+            link: Arc::new(Link::new()),
+            budget: Some(budget.clone()),
+            granting: Arc::default(),
+            grant: None,
+        };
+        let mut data = [0; 8];
+        poll_fn(|cx| {
+            assert!(
+                Pin::new(&mut reader)
+                    .poll_read(cx, &mut ReadBuf::new(&mut data))
+                    .is_pending()
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "second refill holds the shared lock"
+        );
+        drop(held);
+        poll_fn(|cx| {
+            assert!(
+                Pin::new(&mut reader)
+                    .poll_read(cx, &mut ReadBuf::new(&mut data))
+                    .is_pending()
+            );
+            Poll::Ready(())
+        })
+        .await;
+        assert!(
+            reader.grant.is_none(),
+            "available credit cancels the stale refill"
+        );
+        assert!(!reader.granting.load(Ordering::Relaxed));
+        tokio::time::timeout(Duration::from_millis(100), budget.ready())
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }

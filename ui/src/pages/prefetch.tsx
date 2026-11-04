@@ -122,6 +122,9 @@ export function PrefetchPanel() {
           <Input id="prefetch-wire-budget" type="number" min={0.005} max={100000} step={1} value={wireBudget ?? String(value.daily_wire_bytes / 1000000000)} disabled={locked("prefetch.daily_wire_bytes") || settings.isPending} onChange={e => setWireBudget(e.target.value)} />
         </Field>
         <Button type="button" variant="outline" disabled={wireBudget===null || !Number.isFinite(Number(wireBudget)) || Number(wireBudget)<0.005 || Number(wireBudget)>100000 || locked("prefetch.daily_wire_bytes") || settings.isPending} onClick={() => settings.mutate({daily_wire_bytes: Math.round(Number(wireBudget)*1000000000)}, {onSuccess:()=>setWireBudget(null)})}>Apply provider allowance</Button>
+        <Field id="prefetch-connections" label="Warming connection floor" hint="1 to 8 articles under transfer pressure. When capacity is free, the bounded window can grow to 24 with a target reserve of 25% of provider capacity. The floor can exceed that reserve on small pools. New scheduling shrinks under pressure; replies already sent may finish. Foreground seeks still interrupt warming.">
+          <Input id="prefetch-connections" type="number" min={1} max={8} value={value.connections_per_job} disabled={locked("prefetch.connections_per_job") || settings.isPending} onChange={e=>{const connections_per_job=Number(e.target.value);if(Number.isInteger(connections_per_job)&&connections_per_job>=1&&connections_per_job<=8)settings.mutate({connections_per_job});}} />
+        </Field>
         {settings.error && <Failure error={settings.error} />}
         {!view.data.settings.native_cache.enabled && (
           <p className="text-sm text-muted-foreground">

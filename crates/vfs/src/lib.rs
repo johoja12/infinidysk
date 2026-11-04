@@ -760,8 +760,9 @@ impl Vfs {
         ))
     }
 
-    /// Background warming has no playback session, filler, hedges or segment read-ahead.
-    pub async fn open_warming(&self, item: &Item) -> Result<Reader, Error> {
+    /// Background warming has no playback session, filler or hedges. Its bounded
+    /// article window follows spare provider capacity and stops at the requested end.
+    pub async fn open_warming(&self, item: &Item, floor: usize) -> Result<Reader, Error> {
         let report = self.report.as_ref().map(|report| {
             let (report, id) = (Arc::clone(report), item.id);
             Arc::new(move |index, fault| report(id, index, fault)) as Report
@@ -777,7 +778,7 @@ impl Vfs {
             None,
             report.as_ref(),
         )?
-        .into_warming();
+        .into_warming(floor);
         Ok(revision::RevisionReader::wrap(
             reader,
             meta,

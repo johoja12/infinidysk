@@ -32,6 +32,8 @@ const EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 #[schema(as=PrefetchSettings)]
 pub struct Settings {
     pub enabled: bool,
+    /// Minimum article window under transfer pressure; spare capacity may grow it to 24.
+    pub connections_per_job: u8,
     /// Allowance for attempted final-media block fills per UTC day; provider overfetch and wire overhead are excluded.
     pub daily_fill_bytes: u64,
     /// Reserved NNTP response bytes after TLS; greeting/authentication are excluded.
@@ -43,6 +45,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            connections_per_job: 2,
             daily_fill_bytes: 10_000_000_000,
             daily_wire_bytes: 10_000_000_000,
             plex: PlexSettings::default(),
@@ -53,6 +56,10 @@ impl Default for Settings {
 impl Settings {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.plex.validate()?;
+        ensure!(
+            (1..=8).contains(&self.connections_per_job),
+            "warming connection floor must be 1 to 8"
+        );
         ensure!(
             (1..=100).contains(&self.finish_watched.percent),
             "finish-watched share must be 1 to 100 percent"
@@ -832,7 +839,10 @@ impl Queue {
             self.save(&mut current, next).await?;
             drop(current);
         }
-        let mut reader = self.vfs.open_warming(&source).await?;
+        let mut reader = self
+            .vfs
+            .open_warming(&source, usize::from(settings.connections_per_job))
+            .await?;
         reader.set_end(job.offset + length);
         let mut bytes = vec![0; usize::try_from(length)?];
         let transfer = async {

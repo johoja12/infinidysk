@@ -96,6 +96,16 @@ pub struct Client {
     warm_lane: Lane,
 }
 
+fn warm_target(floor: usize, held: usize, total: usize, free: usize, pressure: bool) -> usize {
+    let floor = floor.clamp(1, 8);
+    if pressure {
+        return floor;
+    }
+    held.saturating_add(free)
+        .saturating_sub(total.div_ceil(4))
+        .clamp(floor, 24)
+}
+
 /// Exclusive use of the providers for a diagnostic: background requests wait at
 /// admission until it drops, and playback cancels [`token`](Self::token).
 pub struct Lease {
@@ -376,6 +386,36 @@ impl Client {
             .filter(|e| Some(e.provider.priority) == level)
             .map(|e| e.provider.pool.max_connections())
             .sum()
+    }
+
+    /// Bounded warming window from the first available provider level. Keeps a
+    /// quarter of effective connection capacity for other transfers. Pressure
+    /// reduces new scheduling to the floor; existing replies drain normally.
+    #[must_use]
+    pub fn warming_window(&self, floor: usize) -> usize {
+        let providers = self.snapshot();
+        let available = |e: &&Entry| !e.provider.pool.exhausted() && !e.breaker.is_open();
+        let level = providers
+            .iter()
+            .filter(available)
+            .map(|e| e.provider.priority)
+            .min();
+        let mut total = 0usize;
+        let mut free = 0usize;
+        let mut held = 0usize;
+        let mut pressure = self.foreground_pending();
+        for entry in providers
+            .iter()
+            .filter(available)
+            .filter(|e| Some(e.provider.priority) == level)
+        {
+            let (limit, busy, warm, waiting) = entry.provider.pool.warming_capacity();
+            total = total.saturating_add(limit);
+            free = free.saturating_add(limit.saturating_sub(busy));
+            held = held.saturating_add(warm);
+            pressure |= waiting;
+        }
+        warm_target(floor, held, total, free, pressure)
     }
 
     fn snapshot(&self) -> Arc<[Entry]> {
@@ -887,6 +927,18 @@ mod tests {
     use super::*;
     use crate::{Downloads, Endpoint, PoolConfig, TlsMode};
     use infinidysk_testkit::{Corpus, LoopbackServer};
+
+    #[test]
+    fn warm_capacity_keeps_a_quarter_reserve_and_shrinks_without_revoking_held_replies() {
+        assert_eq!(warm_target(2, 4, 40, 30, false), 24);
+        assert_eq!(warm_target(2, 4, 40, 10, false), 4);
+        assert_eq!(warm_target(2, 12, 40, 28, true), 2);
+        assert_eq!(warm_target(3, 0, 8, 0, false), 3);
+        assert_eq!(warm_target(3, 0, 0, 0, false), 3);
+        assert_eq!(warm_target(2, 0, 400, 400, false), 24);
+        assert_eq!(warm_target(2, 0, 4, 4, false), 3);
+        assert_eq!(warm_target(99, 0, 0, 0, true), 8);
+    }
 
     #[allow(clippy::unwrap_used)] // Test helper; panics are the assertions.
     fn provider(server: &LoopbackServer, downloads: &Arc<Downloads>) -> Provider {

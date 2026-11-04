@@ -3880,6 +3880,12 @@ export interface components {
         };
         PrefetchSettings: {
             /**
+             * Format: int32
+             * @description Minimum article window under transfer pressure; spare capacity may grow it to 24.
+             * @default 2
+             */
+            connections_per_job: number;
+            /**
              * Format: int64
              * @description Allowance for attempted final-media block fills per UTC day; provider overfetch and wire overhead are excluded.
              * @default 10000000000
@@ -4049,7 +4055,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a72d-05b9-72b8-a898-6065e082b479
+             * @default 01a1a74d-e58b-76b0-a945-727187b91b00
              */
             id: string;
             /**
@@ -4737,6 +4743,7 @@ export interface components {
             plex: components["schemas"]["PlexSettings"];
             /**
              * @default {
+             *       "connections_per_job": 2,
              *       "daily_fill_bytes": 10000000000,
              *       "daily_wire_bytes": 10000000000,
              *       "enabled": false,

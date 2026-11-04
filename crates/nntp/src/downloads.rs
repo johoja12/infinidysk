@@ -52,6 +52,16 @@ impl Downloads {
         self.lock().free
     }
 
+    /// Live transfers waiting for global admission; abandoned waiters do not count.
+    pub(crate) fn pressured(&self) -> bool {
+        let lanes = self.lock();
+        lanes
+            .urgent
+            .iter()
+            .chain(&lanes.background)
+            .any(|(_, tx)| !tx.is_closed())
+    }
+
     /// Whether [`Self::acquire`] would admit this request right now. A snapshot, not a
     /// reservation.
     pub(crate) fn can_acquire(&self, urgent: bool, weight: usize) -> bool {
