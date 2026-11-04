@@ -47,10 +47,10 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | R04 | P0 | Keep read/warm-triggered damaged-file repairs urgent through provider circuit outages (`HealthCheckService`, `PrefetchRepairHistory`, `eafe1705`) | Persisted urgent health state and bounded inconclusive retry; strict warming failures request the same priority. | Implemented for playback and the shared warming executor, including admitted current/history predictions; other source policies remain open |
 | R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Durable sampled-content snapshot, cursor, pause/resume, category and run limits implemented; fair maintenance slots and revision-safe fault publication included |
 | R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Durable source-bound journal, detached observation, revision-checked controls and current Arr-root authority implemented; read-only scan-root guards at admission and every mutation checkpoint included |
-| R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; a bounded GF16 reconstruction core is now implemented and tested against real par2cmdline recovery packets. Health now has an explicitly bound, provider-facing execution API, not yet connected to automatic repair. Bounded execution budgets are implemented. Complete, bounded article assembly is also implemented. Automatic source discovery, source/reader-gated publication, durable outcomes and separate worker scheduling are still required before declaring repair parity. | Port |
+| R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | Separate bounded GF16 reconstruction lane with exact original-post proof binding, complete-article assembly, shared-reader/source publication admission and durable intent/outcome recovery. Provider outages defer work without proving permanent damage. | Automatic opt-in worker, durable journal/readback, original-post discovery, shared-reader publication admission and fresh-check completion implemented; runtime qualification below |
 | C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | First implementation in Rust; verified 1.x copy import implemented; broader fork data import remains M01 |
-| C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins and bounded block/folder probes implemented; offline catalogue reconstruction remains open |
-| C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Durable article ledger, admission stamps, decoded-cache namespaces, final-media keys and dependent-reader guards implemented; startup/lineage checks, later cache attachment guards and retained-hash fallback implemented; automatic PAR2 publication remains open |
+| C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins, durable retained-copy health protection and bounded block/folder probes implemented; offline catalogue reconstruction remains open |
+| C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Durable article ledger, admission stamps, decoded-cache namespaces, final-media keys and dependent-reader guards implemented; startup/lineage checks, later cache attachment guards and retained-hash fallback implemented; automatic PAR2 publication is connected through the opt-in durable worker |
 | C04 | P1 | Progressive cold reads, bounded first-byte fill, coalesced fills, source window reuse (`NativeCachedStream`, `NativeSourceCacheStream`; `c6a70ba8`, `0c3c129f`) | Rust segment cache already coalesces in-flight reads. Benchmark FUSE/WebDAV seeks before adding buffering; preserve foreground priority and bounded memory/I/O under NAS stalls. | Progressive read-through and parallel block commits implemented; controlled performance qualification pending |
 | C05 | P1 | Native cache browser, verified ranges, eviction history, buffer/I/O diagnostics (`NativeCacheBrowser*`, cache APIs) | Rust cache statistics exist; final-media file/range APIs and catalogue UI depend on C01–C03. Queries must not warm files or scan NAS payloads. | Settings/browser/ranges/pin/evict and eviction-history/folder-diagnostic APIs implemented; probe/history/diagnostic tool UI implemented; detailed traffic diagnostics remain open |
 | P01 | P1 | Durable Smart Prefetch queue, policies, pause/resume/cancel, budgets, bounded lanes (`Services/Prefetch`, `PrefetchJobStore`) | New source-bound durable queue, one strict background lane, manual API/UI and attempted-fill allowance. | Manual and Plex current/history warming implemented; wire budget, catalogue sources and full fork policy parity pending |
@@ -997,3 +997,61 @@ frames even for tiny payloads. Existing unbounded APIs and stored formats remain
 unchanged. Sixteen core tests and seven SQLite/PostgreSQL database tests pass;
 workspace all-target Clippy passed for the bounded-input increment before subsequent
 worker wiring began. These are resource guards, not an automatic-repair activation.
+
+### Automatic local PAR2 worker and runtime controls
+
+R07 now connects original-post discovery, bounded reconstruction and article publication
+through a separate durable background worker. Health admits or observes attempts without
+performing provider work inline. Playback and warming urgency survives provider outages.
+Target readers defer work before provider reads; publication also reserves shared article
+IDs so another imported file cannot keep reading a superseded article generation. Last
+reader close wakes deferred attempts. Four urgent attempts admit one due routine attempt.
+
+The worker records a source-bound publication manifest before any authoritative write.
+Uncertain publication is read back before new discovery. Startup recovers running attempts
+but retains publishing intents. Successful publication and an urgent fresh health check
+commit in the same main-database transaction. A journal acknowledgement never itself
+marks the file healthy. A resource or binding limit falls through to the existing
+confirmed-damage replacement policy during its cooldown; provider uncertainty retains
+pending work and never proves permanent damage.
+
+Advanced Health settings expose opt-in repair, missing slices, working-buffer allowance
+and failure cooldown. Fresh installations default to disabled. Enabling on an installation
+without a repair ledger requires restart; existing repaired articles remain authoritative
+when new attempts are disabled. The stable `repair-v2` directory must be backed up with
+the database and restored together. The status API and Health page show bounded attempt
+history without exposing provider article IDs or verification manifests.
+
+Setup-wizard impact: advanced-only. These controls are not required to configure providers,
+a mount or an Arr client. The wizard version and required strategy bundles do not change.
+Environment-owned values retain the existing server-enforced settings authority. The
+working-buffer setting uses decimal MB and does not claim to cap all process memory.
+The additive main-database journal migration requires a config backup before upgrading.
+
+Eight SQLite/loopback integration tests passed, covering actual GF16 repair,
+shared cached playback and seeks after providers are removed, last-reader admission,
+provider outages, a no-patch healthy outcome, and uncertain-publication recovery without
+provider replay. Source-change admission, cooldown/no-replay, foreground yielding and authenticated runtime/API checks also pass. The workspace checkpoint passed 543 tests with zero failures, and all-target warnings-denied Clippy passed. Browser acceptance against the rebuilt embedded UI passed settings persistence, first-enable restart notice, empty repair history and 390px mobile layout.
+This is local generated-provider evidence, not a production deployment or live provider
+acceptance result. The remaining Smart Prefetch, catalogue and migration inventory rows
+are still tracked separately.
+
+### Last-reader maintenance admission and cache protection
+
+A deterministic regression reproduced a last-reader/maintenance deadlock: the admitted
+health step waited for a second write permit behind a pending exclusive maintenance
+pause, while the pause waited for that same health step. Internal last-reader reconciliation
+now reuses the caller's admission. The external close callback still obtains its own permit.
+The regression fails before the change and passes afterward.
+
+Complete native copies retained for a damaged source now gain durable health protection
+before storage verification. A storage outage or canceled verification keeps protection;
+conclusively incomplete/corrupt coverage releases automatic protection. Manual pins are
+never released by maintenance. Source removal or revision change releases only automatic
+protection before ordinary eviction. Explicit user unpinning permits eviction, as the cache
+browser explains. Pin changes hold a generation lease through the durable update so eviction
+cannot race between admission and SQLite persistence. Two new storage tests cover restart,
+manual-pin preservation, partial coverage, mount loss and checksum corruption. No new
+setting or setup-wizard branch is introduced.
+
+Final qualification of automatic repair and retained-copy protection: **546 workspace tests passed, zero failed**, full warnings-denied Clippy, three original C# writer tests and two actual kernel FUSE tests. The rebuilt embedded UI passed Chromium settings/history/mobile checks. See [automatic repair validation](validation/rust-v2-automatic-repair-20261104.md).
