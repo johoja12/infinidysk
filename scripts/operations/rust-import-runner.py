@@ -262,8 +262,8 @@ class Client:
         self.url, self.key = url.rstrip('/'), key
         self.opener = urllib.request.build_opener(NoRedirect)
 
-    def call(self, path, body=None, options=None):
-        headers = {'X-Api-Key':self.key, 'Content-Type':'application/x-nzb', 'Accept':'application/json'}
+    def call(self, path, body=None, options=None, content_type='application/x-nzb'):
+        headers = {'X-Api-Key':self.key, 'Content-Type':content_type, 'Accept':'application/json'}
         if options is not None:
             headers['X-Migration-Options'] = base64.b64encode(canonical(options)).decode('ascii')
         request = urllib.request.Request(self.url + path, data=body, headers=headers)
@@ -276,6 +276,10 @@ class Client:
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             # HTTP exception strings can include private URLs and response data.
             raise RuntimeError('Migration request failed; read back its intent before retry') from None
+
+
+    def json(self,path,value):
+        return self.call(path,canonical(value),content_type='application/json')
 
 
 class Journal:
