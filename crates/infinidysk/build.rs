@@ -28,5 +28,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err(format!("INFINIDYSK_COMMIT must be a full commit hash, not {commit:?}").into());
     }
+    println!("cargo::rerun-if-env-changed=INFINIDYSK_SOURCE_REPOSITORY");
+    if let Ok(repository) = env::var("INFINIDYSK_SOURCE_REPOSITORY")
+        && !repository.is_empty()
+        && !(repository.split('/').count() == 2
+            && repository.split('/').all(|part| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            }))
+    {
+        return Err("INFINIDYSK_SOURCE_REPOSITORY must be an owner/repository identity".into());
+    }
     Ok(())
 }

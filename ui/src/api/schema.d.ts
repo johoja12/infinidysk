@@ -3957,7 +3957,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a69e-5f8d-7674-88ad-ba9026599d59
+             * @default 01a1a6ac-2f5d-73fa-82ee-f3d01b281700
              */
             id: string;
             /**
@@ -4747,6 +4747,7 @@ export interface components {
             commit?: string | null;
             disk_cache?: components["schemas"]["DiskCacheStatus"] | null;
             mount: components["schemas"]["MountStatus"];
+            source_repository: string;
             /**
              * Format: int64
              * @description Unix milliseconds this process started; changes after a restart.

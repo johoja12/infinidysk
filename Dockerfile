@@ -31,10 +31,15 @@ COPY . .
 COPY --from=ui /ui/dist ui/dist
 # The full commit hash, so the server can tell when `main` has moved on.
 ARG COMMIT=""
-RUN INFINIDYSK_COMMIT="$COMMIT" cargo build --release --locked -p infinidysk \
+ARG SOURCE_REPOSITORY="johoja12/infinidysk"
+RUN INFINIDYSK_COMMIT="$COMMIT" INFINIDYSK_SOURCE_REPOSITORY="$SOURCE_REPOSITORY" cargo build --release --locked -p infinidysk \
     && cp target/release/infinidysk /usr/local/bin/infinidysk
 
 FROM ubuntu:26.04
+ARG COMMIT=""
+ARG SOURCE_REPOSITORY="johoja12/infinidysk"
+LABEL org.opencontainers.image.revision="$COMMIT" \
+      org.opencontainers.image.source="https://github.com/$SOURCE_REPOSITORY"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg fuse3 \
     && rm -rf /var/lib/apt/lists/*

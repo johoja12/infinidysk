@@ -94,6 +94,7 @@ function Version({ status }: { status: Schemas["Status"] }) {
       <div className="flex flex-wrap items-baseline gap-x-3">
         <span className="font-medium">infinidysk {status.version}</span>
         {status.commit && <span className="text-muted-foreground font-mono text-xs">{status.commit.slice(0, 7)}</span>}
+        <span className="text-muted-foreground text-xs">{status.source_repository}</span>
       </div>
       <div className="mt-0.5 flex flex-wrap items-center gap-x-4">
         {status.update && (

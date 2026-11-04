@@ -19,6 +19,7 @@ env:
 
 jobs:
   release-please:
+    if: github.repository == 'infinidysk/infinidysk'
     runs-on: ubuntu-latest
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
@@ -60,7 +61,9 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          build-args: COMMIT=${{ github.sha }}
+          build-args: |
+            COMMIT=${{ github.sha }}
+            SOURCE_REPOSITORY=${{ github.repository }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,scope=${{ matrix.platform }},mode=max

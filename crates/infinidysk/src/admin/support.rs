@@ -406,6 +406,7 @@ fn system(admin: &Admin) -> Value {
     json!({
         "version": VERSION,
         "commit": COMMIT,
+        "source_repository": crate::update::SOURCE_REPOSITORY,
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "cpus": std::thread::available_parallelism().map_or(0, std::num::NonZero::get),
@@ -443,6 +444,7 @@ fn write(
         "generated_at": stamp.rfc3339(),
         "version": VERSION,
         "commit": COMMIT,
+        "source_repository": crate::update::SOURCE_REPOSITORY,
         "include_traces": include_traces,
         "entries": names,
         "failed": pack.failed,

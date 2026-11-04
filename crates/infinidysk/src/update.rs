@@ -16,6 +16,11 @@ pub const COMMIT: Option<&str> = match option_env!("INFINIDYSK_COMMIT") {
     Some(commit) if !commit.is_empty() => Some(commit),
     _ => None,
 };
+/// Source identity is independent of the upstream product version.
+pub const SOURCE_REPOSITORY: &str = match option_env!("INFINIDYSK_SOURCE_REPOSITORY") {
+    Some(repository) if !repository.is_empty() => repository,
+    _ => "johoja12/infinidysk",
+};
 const CHECK_EVERY: Duration = Duration::from_hours(1);
 const REGISTRY: &str = "https://ghcr.io";
 const IMAGE: &str = "infinidysk/infinidysk-next";
@@ -45,6 +50,10 @@ impl Updates {
 
     /// Checks at once and then hourly until `cancel`; does nothing for a build without a commit.
     pub async fn run(&self, cancel: CancellationToken) {
+        // Fork deployments must not be offered upstream images that omit fork state.
+        if SOURCE_REPOSITORY != "infinidysk/infinidysk" {
+            return;
+        }
         let Some(commit) = COMMIT else {
             return;
         };

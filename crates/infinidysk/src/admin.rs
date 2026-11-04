@@ -1349,6 +1349,7 @@ async fn get_events(
 #[derive(Serialize, ToSchema)]
 struct Status {
     version: &'static str,
+    source_repository: &'static str,
     /// The full commit this build came from, when known.
     commit: Option<&'static str>,
     /// The entry script of the UI this server serves; tabs running another one are stale.
@@ -1536,6 +1537,7 @@ async fn get_status(State(admin): State<Arc<Admin>>) -> Json<Status> {
     };
     Json(Status {
         version: crate::update::VERSION,
+        source_repository: crate::update::SOURCE_REPOSITORY,
         commit: crate::update::COMMIT,
         ui_entry: crate::ui::entry(),
         update: admin.updates.get(),
