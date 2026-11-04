@@ -324,18 +324,34 @@ impl Predictions {
                     // candidate rather than silently warming its replacement revision.
                     if self
                         .queue
-                        .enqueue_automatic(Automatic {
-                            item: ItemId(item),
-                            ranges: &p.ranges,
-                            priority: match p.source {
-                                Source::Playback => 90,
-                                Source::NextEpisode | Source::PartialMovie => 50,
-                                _ => 30,
+                        .enqueue_automatic_origin(
+                            Automatic {
+                                item: ItemId(item),
+                                ranges: &p.ranges,
+                                priority: match p.source {
+                                    Source::Playback => 90,
+                                    Source::NextEpisode | Source::PartialMovie => 50,
+                                    _ => 30,
+                                },
+                                intent: p.id,
+                                revision,
+                                scope: &owner,
                             },
-                            intent: p.id,
-                            revision,
-                            scope: &owner,
-                        })
+                            infinidysk_prefetch::PolicyOrigin {
+                                source: match p.source {
+                                    Source::Playback => "playback",
+                                    Source::NextEpisode => "next_episode",
+                                    Source::PartialMovie => "partial_movie",
+                                    Source::Hub => "hub",
+                                    Source::Collection => "collection",
+                                    Source::Library => "library",
+                                }
+                                .into(),
+                                server: p.server.clone(),
+                                viewer: p.viewer.clone(),
+                                observed_at: saved.updated_at,
+                            },
+                        )
                         .await
                         .is_err()
                     {
@@ -699,6 +715,62 @@ impl Predictions {
         p.id = Uuid::from_bytes(bytes);
         Ok(p)
     }
+}
+pub(crate) fn backfill_context(
+    snapshot: &Snapshot,
+    settings: &Settings,
+) -> Vec<infinidysk_prefetch::BackfillAttribution> {
+    let now = now_ms();
+    if snapshot.scope != scope(settings)
+        || snapshot.stale
+        || snapshot
+            .updated_at
+            .is_none_or(|at| now < at || now - at > 120_000)
+    {
+        return Vec::new();
+    }
+    let mut grouped =
+        std::collections::BTreeMap::<(Uuid, String), infinidysk_prefetch::Attribution>::new();
+    for p in snapshot
+        .predictions
+        .iter()
+        .filter(|p| p.source == Source::Playback)
+    {
+        let Some((item, revision)) = p.item.zip(p.revision.as_ref()) else {
+            continue;
+        };
+        if !grouped.contains_key(&(item, revision.clone())) && grouped.len() >= 32 {
+            continue;
+        }
+        let attribution = grouped.entry((item, revision.clone())).or_default();
+        for c in &p.playback {
+            let viewer = infinidysk_prefetch::ReportedViewer {
+                server: p.server.clone(),
+                viewer: p.viewer.clone(),
+                viewer_name: c.viewer_name.clone(),
+                player: c.player.clone(),
+                duration_ms: c.duration_ms,
+                observed_at: snapshot.updated_at.unwrap_or(0),
+            };
+            if !attribution.playback.contains(&viewer) {
+                if attribution.playback.len() < 8 {
+                    attribution.playback.push(viewer);
+                } else {
+                    attribution.truncated = true;
+                }
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .map(
+            |((item, revision), attribution)| infinidysk_prefetch::BackfillAttribution {
+                item,
+                revision,
+                attribution,
+            },
+        )
+        .collect()
 }
 fn valid_saved(saved: &Saved) -> bool {
     saved.version == 1
@@ -1358,7 +1430,18 @@ mod tests {
             infinidysk_prefetch::State::Cancelled
         );
         let options = f.config.read().await.settings().prefetch.clone();
-        assert!(f.queue.tick(&options).await.unwrap());
+        let progressed = f.queue.tick(&options).await.unwrap();
+        assert!(
+            progressed,
+            "warming did not progress: {:?}",
+            f.queue
+                .status()
+                .await
+                .jobs
+                .iter()
+                .map(|j| (&j.state, &j.reason, j.next_attempt))
+                .collect::<Vec<_>>()
+        );
         let completed = f
             .queue
             .status()
@@ -1533,6 +1616,35 @@ mod tests {
             .unwrap();
         assert!(live.item.is_some());
         assert_eq!(live.playback.len(), 2);
+        let jobs = f.queue.status().await.jobs;
+        for candidate in snapshot
+            .predictions
+            .iter()
+            .filter(|p| p.item.is_some() && !p.ranges.is_empty())
+        {
+            let job = jobs.iter().find(|j| j.intent == candidate.id).unwrap();
+            let origin = job.attribution.policy.as_ref().unwrap();
+            assert_eq!(
+                (&origin.server, &origin.viewer),
+                (&candidate.server, &candidate.viewer)
+            );
+            assert!(origin.observed_at > 0);
+        }
+        let settings = f.config.read().await.settings().clone();
+        let contexts = backfill_context(&snapshot, &settings);
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].attribution.playback.len(), 2);
+        let mut unavailable = snapshot.clone();
+        unavailable.stale = true;
+        assert_eq!(backfill_context(&unavailable, &settings).len(), 0);
+        let mut changed = settings;
+        changed.prefetch.plex.policy.restrict_viewers = true;
+        changed.prefetch.plex.policy.viewers.clear();
+        assert_eq!(
+            backfill_context(&snapshot, &changed).len(),
+            0,
+            "a newer viewer selection cannot inherit the old scope's labels"
+        );
         assert_eq!(live.playback[0].session, "session");
         assert_eq!(live.playback[1].session, "session-b");
         assert_eq!(

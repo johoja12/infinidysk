@@ -742,6 +742,7 @@ pub async fn serve(
     };
     let prefetch_task = {
         let prefetch = Arc::clone(&prefetch);
+        let predictions = Arc::clone(&predictions);
         let config = Arc::clone(&config);
         let stop = cancel.clone();
         tokio::spawn(async move {
@@ -749,6 +750,11 @@ pub async fn serve(
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! { ()=stop.cancelled()=>break, _=interval.tick()=>{} }
+                let snapshot = if prefetch.pending_backfills() > 0 {
+                    Some(predictions.snapshot().await)
+                } else {
+                    None
+                };
                 let settings = {
                     let config = config.read().await;
                     if let Err(error) = prefetch
@@ -761,8 +767,12 @@ pub async fn serve(
                         warn!(reason=%error,"automatic warming cleanup deferred");
                         continue;
                     }
+                    let contexts = snapshot
+                        .as_ref()
+                        .map(|s| crate::predictions::backfill_context(s, config.settings()))
+                        .unwrap_or_default();
                     if let Err(error) = prefetch
-                        .observe_backfills(&config.settings().prefetch)
+                        .observe_backfills_attributed(&config.settings().prefetch, &contexts)
                         .await
                     {
                         warn!(reason=%error,"playback backfill admission deferred");
@@ -783,6 +793,7 @@ pub async fn serve(
         predictions,
         library_metadata,
         prefetch,
+        prefetch_followups: crate::prefetch::Followups::default(),
         plex,
         config: Arc::clone(&config),
         queue: Arc::clone(&queue),

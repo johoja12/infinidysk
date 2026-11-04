@@ -1,7 +1,11 @@
 //! One bounded warming lane. Durable progress is a hint: every resumed block is verified
 //! again. Only strict final-media bytes can enter the shared native cache.
+mod attribution;
+pub use attribution::{Attribution, BackfillAttribution, PolicyOrigin, ReportedViewer};
 mod backfill;
 mod lead;
+mod rates;
+pub use rates::Rate;
 mod watched;
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
@@ -201,6 +205,8 @@ pub struct Job {
     #[serde(default)]
     pub automatic_scope: Option<String>,
     #[serde(default)]
+    pub attribution: Attribution,
+    #[serde(default)]
     pub family: Family,
     pub state: State,
     pub created_at: i64,
@@ -240,6 +246,8 @@ pub struct Status {
     pub paused: bool,
     pub recovery_mode: bool,
     pub pending_backfills: usize,
+    pub rates: Vec<Rate>,
+    pub recent_wire_bytes_per_second: Option<f64>,
     pub dropped_backfills: u64,
     pub day: i64,
     pub charged_fill_bytes: u64,
@@ -274,6 +282,7 @@ pub struct Queue {
     watched: Mutex<watched::Tracker>,
     lead: Mutex<lead::Lead>,
     uncertain: AtomicBool,
+    rates: rates::Window,
 }
 impl Queue {
     pub async fn load(db: Db, vfs: Arc<Vfs>) -> anyhow::Result<Arc<Self>> {
@@ -291,6 +300,10 @@ impl Queue {
             "prefetch ledger exceeds job limit"
         );
         for job in &mut ledger.jobs {
+            ensure!(
+                job.attribution.valid(),
+                "invalid persisted warming attribution"
+            );
             ensure!(
                 job.ranges == normalize(&job.ranges, job.size)?,
                 "invalid persisted prefetch ranges"
@@ -329,7 +342,7 @@ impl Queue {
             budget
         };
         wire.pause(ledger.paused);
-        Ok(Arc::new(Self {
+        let queue = Arc::new(Self {
             db,
             vfs,
             ledger: Mutex::new(ledger),
@@ -339,7 +352,26 @@ impl Queue {
             watched: Mutex::default(),
             lead: Mutex::default(),
             uncertain: AtomicBool::new(false),
-        }))
+            rates: rates::Window::default(),
+        });
+        queue
+            .rates
+            .observe_wire(std::time::Instant::now(), now_ms(), queue.wire.received());
+        let weak = Arc::downgrade(&queue);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(queue) = weak.upgrade() else {
+                    break;
+                };
+                queue.rates.observe_wire(
+                    std::time::Instant::now(),
+                    now_ms(),
+                    queue.wire.received(),
+                );
+            }
+        });
+        Ok(queue)
     }
     async fn lock_ledger(&self) -> anyhow::Result<tokio::sync::MutexGuard<'_, Ledger>> {
         let mut current = self.ledger.lock().await;
@@ -405,7 +437,19 @@ impl Queue {
             Ok(ledger) => ledger,
             Err(_) => self.ledger.lock().await,
         };
+        let (mut rates, recent_wire_bytes_per_second) =
+            self.rates
+                .snapshot(std::time::Instant::now(), now_ms(), self.wire.received());
+        rates.retain(|r| {
+            !ledger.paused
+                && ledger
+                    .jobs
+                    .iter()
+                    .any(|j| j.id == r.job && j.run == r.run && j.state == State::Queued)
+        });
         Status {
+            rates,
+            recent_wire_bytes_per_second,
             paused: ledger.paused,
             pending_backfills: self.vfs.backfills().stats().0,
             dropped_backfills: self.vfs.backfills().stats().1,
@@ -432,6 +476,7 @@ impl Queue {
         let result = self.save(&mut current, next).await;
         if result.is_ok() {
             self.wire.pause(paused);
+            self.rates.forget(None);
         }
         drop(current);
         result
@@ -446,13 +491,22 @@ impl Queue {
         self.admit(item, ranges, priority, intent, None).await
     }
     pub async fn enqueue_automatic(&self, request: Automatic<'_>) -> anyhow::Result<Job> {
+        self.enqueue_automatic_attributed(request, &Attribution::default())
+            .await
+    }
+    async fn enqueue_automatic_attributed(
+        &self,
+        request: Automatic<'_>,
+        attribution: &Attribution,
+    ) -> anyhow::Result<Job> {
         let job = self
-            .admit(
+            .admit_attributed(
                 request.item,
                 request.ranges,
                 request.priority,
                 request.intent,
                 Some((request.scope, request.revision, Family::Plex)),
+                attribution,
             )
             .await?;
         if job.state == State::Complete {
@@ -487,6 +541,24 @@ impl Queue {
             }
         }
         Ok(job)
+    }
+    pub async fn enqueue_automatic_origin(
+        &self,
+        request: Automatic<'_>,
+        origin: PolicyOrigin,
+    ) -> anyhow::Result<Job> {
+        self.enqueue_automatic_attributed(
+            request,
+            &Attribution {
+                policy: Some(origin),
+                ..Attribution::default()
+            },
+        )
+        .await
+    }
+    #[must_use]
+    pub fn pending_backfills(&self) -> usize {
+        self.vfs.backfills().stats().0
     }
     /// Scope changes cancel only automatic jobs. A complete new pass can additionally
     /// retire intents no longer predicted; an incomplete pass must never do so.
@@ -533,6 +605,26 @@ impl Queue {
         intent: Uuid,
         automatic: Option<(&str, &str, Family)>,
     ) -> anyhow::Result<Job> {
+        self.admit_attributed(
+            item,
+            ranges,
+            priority,
+            intent,
+            automatic,
+            &Attribution::default(),
+        )
+        .await
+    }
+    async fn admit_attributed(
+        &self,
+        item: ItemId,
+        ranges: &[Range],
+        priority: u8,
+        intent: Uuid,
+        automatic: Option<(&str, &str, Family)>,
+        attribution: &Attribution,
+    ) -> anyhow::Result<Job> {
+        ensure!(attribution.valid(), "invalid warming attribution");
         ensure!(priority <= 100, "invalid prefetch priority");
         let item = self
             .db
@@ -589,6 +681,7 @@ impl Queue {
             priority,
             intent,
             automatic_scope: automatic.map(|(scope, _, _)| scope.to_owned()),
+            attribution: attribution.clone(),
             family: automatic.map_or(Family::Plex, |(_, _, family)| family),
             state: State::Queued,
             created_at: now,
@@ -608,6 +701,18 @@ impl Queue {
         Ok(job)
     }
     pub async fn control(&self, id: Uuid, operation: Operation) -> anyhow::Result<()> {
+        self.control_attributed(id, operation, None).await
+    }
+    async fn control_attributed(
+        &self,
+        id: Uuid,
+        operation: Operation,
+        attribution: Option<&Attribution>,
+    ) -> anyhow::Result<()> {
+        ensure!(
+            attribution.is_none_or(Attribution::valid),
+            "invalid warming attribution"
+        );
         let mut current = self.lock_ledger().await?;
         let mut next = current.clone();
         let job = next
@@ -627,6 +732,9 @@ impl Queue {
                 if matches!(job.state, State::Failed | State::Expired | State::Complete) =>
             {
                 job.state = State::Queued;
+                if let Some(attribution) = attribution {
+                    job.attribution = attribution.clone();
+                }
                 job.run = job
                     .run
                     .checked_add(1)
@@ -646,6 +754,9 @@ impl Queue {
         job.next_attempt = now_ms();
         let result = self.save(&mut current, next).await;
         drop(current);
+        if result.is_ok() {
+            self.rates.forget(Some(id));
+        }
         result
     }
     /// Source-bound completion requests from observed playback. No provider I/O
@@ -798,6 +909,9 @@ impl Queue {
         let Some(job) = selected else {
             return Ok(false);
         };
+        let _rate = self
+            .rates
+            .begin(job.id, job.run, std::time::Instant::now(), now_ms());
         let source = self.db.item(ItemId(job.item)).await?;
         let key = match source.as_ref() {
             Some(i) => Some(self.vfs.cache_key(i).await?),
@@ -987,6 +1101,15 @@ impl Queue {
         }
         let result = self.save(&mut current, next).await;
         drop(current);
+        if result.is_ok() {
+            self.rates.record(
+                original.id,
+                original.run,
+                if source { bytes } else { 0 },
+                std::time::Instant::now(),
+                now_ms(),
+            );
+        }
         result
     }
     async fn retry(&self, original: &Job) -> anyhow::Result<()> {
@@ -1126,6 +1249,7 @@ mod durability_tests {
             priority: 40,
             intent: Uuid::new_v4(),
             automatic_scope: automatic.then(|| "b".repeat(64)),
+            attribution: Attribution::default(),
             family,
             state: State::Queued,
             created_at: 1,
@@ -1209,5 +1333,77 @@ mod durability_tests {
         drop(queue);
         db.close().await;
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod attribution_history_tests {
+    use super::*;
+    #[tokio::test]
+    async fn automatic_retry_records_new_context_without_rewriting_the_prior_outcome() {
+        let root = std::env::temp_dir().join(format!("infinidysk-attribution-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let db = Db::connect(&format!("sqlite:{}", root.join("data.sqlite").display()))
+            .await
+            .unwrap();
+        let vfs = Arc::new(Vfs::new(
+            db.clone(),
+            Arc::new(infinidysk_nntp::Client::new([])),
+            infinidysk_stream::Budget::new(1_000_000),
+            0,
+            "/unused",
+        ));
+        let queue = Queue::load(db.clone(), vfs).await.unwrap();
+        let id = Uuid::new_v4();
+        let first = Attribution {
+            playback: vec![ReportedViewer {
+                server: "fixture-server".into(),
+                viewer: "fixture-a".into(),
+                viewer_name: None,
+                player: None,
+                duration_ms: 100,
+                observed_at: 1,
+            }],
+            ..Attribution::default()
+        };
+        let job:Job=serde_json::from_value(serde_json::json!({"id":id,"item":Uuid::new_v4(),"revision":"a".repeat(64),"size":100,"ranges":[{"start":0,"end":100}],"priority":100,"intent":Uuid::new_v4(),"automatic_scope":"b".repeat(64),"family":"backfill","attribution":first,"state":"queued","created_at":1,"updated_at":2,"expires_at":1000,"next_attempt":0,"attempts":0,"verified_bytes":100,"source_bytes":100,"cached_bytes":0,"reason":null,"range":1,"offset":100})).unwrap();
+        {
+            let mut current = queue.lock_ledger().await.unwrap();
+            let mut next = current.clone();
+            next.jobs.push(job);
+            queue.save(&mut current, next).await.unwrap();
+            drop(current);
+        }
+        queue
+            .finish(id, State::Complete, "fixture completion")
+            .await
+            .unwrap();
+        let mut next_context = first.clone();
+        next_context.playback[0].viewer = "fixture-b".into();
+        next_context.playback[0].observed_at = 3;
+        queue
+            .control_attributed(id, Operation::Retry, Some(&next_context))
+            .await
+            .unwrap();
+        queue
+            .finish(id, State::Failed, "fixture failure")
+            .await
+            .unwrap();
+        let status = queue.status().await;
+        let old = status
+            .history
+            .iter()
+            .find(|h| h.job.id == id && h.job.run == 0)
+            .unwrap();
+        assert_eq!(old.job.attribution, first);
+        let new = status
+            .history
+            .iter()
+            .find(|h| h.job.id == id && h.job.run == 1)
+            .unwrap();
+        assert_eq!(new.job.attribution, next_context);
+        drop(queue);
+        db.close().await;
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

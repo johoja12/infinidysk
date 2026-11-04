@@ -3819,6 +3819,14 @@ export interface components {
             /** Format: int64 */
             warm: number;
         };
+        PrefetchAttribution: {
+            /** @default [] */
+            playback: components["schemas"]["PrefetchReportedViewer"][];
+            /** @default null */
+            policy: components["schemas"]["PrefetchPolicyOrigin"] | null;
+            /** @default false */
+            truncated: boolean;
+        };
         PrefetchControl: {
             operation: components["schemas"]["PrefetchOperation"];
         };
@@ -3845,6 +3853,7 @@ export interface components {
         PrefetchJob: {
             /** Format: int32 */
             attempts: number;
+            attribution?: components["schemas"]["PrefetchAttribution"];
             automatic_scope?: string | null;
             /** Format: int64 */
             cached_bytes: number;
@@ -3889,11 +3898,60 @@ export interface components {
         PrefetchPause: {
             paused: boolean;
         };
+        PrefetchPolicyOrigin: {
+            /** Format: int64 */
+            observed_at: number;
+            server: string;
+            source: string;
+            viewer: string;
+        };
         PrefetchRange: {
             /** Format: int64 */
             end: number;
             /** Format: int64 */
             start: number;
+        };
+        PrefetchRate: {
+            active: boolean;
+            /** Format: uuid */
+            job: string;
+            /** Format: int64 */
+            last_progress_at: number;
+            /** Format: double */
+            recent_fill_bytes_per_second?: number | null;
+            /** Format: int32 */
+            run: number;
+            stalled: boolean;
+        };
+        PrefetchRepairFollowup: {
+            /** Format: uuid */
+            item: string;
+            regrab: components["schemas"]["RegrabStatus"];
+            /** Format: uuid */
+            replacement_item?: string | null;
+            replacement_revision?: string | null;
+            status: string;
+            /** Format: int64 */
+            warmed_at?: number | null;
+        };
+        PrefetchRepairSnapshot: {
+            available: boolean;
+            entries: components["schemas"]["PrefetchRepairFollowup"][];
+            error?: string | null;
+            refreshing: boolean;
+            stale: boolean;
+            /** Format: int64 */
+            updated_at?: number | null;
+        };
+        PrefetchReportedViewer: {
+            /** Format: int64 */
+            duration_ms: number;
+            /** Format: int64 */
+            observed_at: number;
+            player?: string | null;
+            server: string;
+            viewer: string;
+            viewer_name?: string | null;
         };
         PrefetchRequest: {
             /** Format: uuid */
@@ -3974,11 +4032,14 @@ export interface components {
             jobs: components["schemas"]["PrefetchJob"][];
             paused: boolean;
             pending_backfills: number;
+            rates: components["schemas"]["PrefetchRate"][];
             /**
              * Format: int64
              * @description Observed NNTP bytes since process start, including abandoned drains.
              */
             received_wire_bytes: number;
+            /** Format: double */
+            recent_wire_bytes_per_second?: number | null;
             recovery_mode: boolean;
             /** Format: int64 */
             reserved_wire_bytes?: number | null;
@@ -3986,6 +4047,9 @@ export interface components {
             wire_blocked: boolean;
             /** Format: int64 */
             wire_day?: number | null;
+        };
+        PrefetchView: components["schemas"]["PrefetchStatus"] & {
+            followup: components["schemas"]["PrefetchRepairSnapshot"];
         };
         /** @enum {string} */
         Preset: "balanced" | "max_playback" | "low_resources";
@@ -7141,7 +7205,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PrefetchStatus"];
+                    "application/json": components["schemas"]["PrefetchView"];
                 };
             };
         };

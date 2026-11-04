@@ -937,7 +937,28 @@ async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without
         .unwrap();
     assert!(queue.status().await.jobs.is_empty());
     let full = enqueue(&queue, &item).await;
-    queue.observe_backfills(&settings()).await.unwrap();
+    let context = infinidysk_prefetch::Attribution {
+        playback: vec![infinidysk_prefetch::ReportedViewer {
+            server: "fixture-server".into(),
+            viewer: "fixture-viewer".into(),
+            viewer_name: Some("Fixture viewer".into()),
+            player: Some("Fixture player".into()),
+            duration_ms: 60000,
+            observed_at: infinidysk_db::now_ms(),
+        }],
+        ..Default::default()
+    };
+    queue
+        .observe_backfills_attributed(
+            &settings(),
+            &[infinidysk_prefetch::BackfillAttribution {
+                item: item.id.0,
+                revision: vfs.cache_key(&item).await.unwrap().revision().into(),
+                attribution: context.clone(),
+            }],
+        )
+        .await
+        .unwrap();
     let status = queue.status().await;
     let backfill = status
         .jobs
@@ -945,6 +966,7 @@ async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without
         .find(|j| j.family == Family::Backfill)
         .unwrap();
     let id = backfill.id;
+    assert_eq!(backfill.attribution, context);
     assert_eq!(
         backfill.ranges,
         vec![Range {
@@ -956,6 +978,17 @@ async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without
     assert_eq!(status.pending_backfills, 0);
     drop(queue);
     let queue = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
+    assert_eq!(
+        queue
+            .status()
+            .await
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .unwrap()
+            .attribution,
+        context
+    );
     queue.reconcile_automatic(None, None).await.unwrap();
     queue.observe_reads(&settings()).await.unwrap();
     assert!(queue.tick(&settings()).await.unwrap());

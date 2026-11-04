@@ -142,7 +142,15 @@ export function PrefetchPanel() {
         <p className="text-sm text-muted-foreground">Last 100 outcomes from up to 2000 saved records. Source and cached byte counts describe final-media bytes verified by that attempt; provider response usage is reported separately.</p>
         {status.data && !status.data.history_available && <p className="text-sm text-destructive">Warming history is unavailable; retained records were not removed.</p>}
         {status.data?.history_available && status.data.history.length===0 && <p className="text-sm text-muted-foreground">No warming outcomes recorded.</p>}
-        {status.data?.history.map((row,index)=><div key={`${row.job.id}-${row.recorded_at}-${index}`} className="space-y-1 border-b py-2 text-xs"><p className="break-all font-mono">{row.job.item} · {row.job.revision}</p><p>{row.job.automatic_scope ? row.job.family==="read" ? "Finish watched" : "Plex policy" : "Manual"} · {row.job.state} · stored from source {bytes(row.job.source_bytes)} · cached {bytes(row.job.cached_bytes)}</p><p className="break-words">{row.job.ranges.map(r=>`${r.start}–${r.end}`).join(", ")}</p>{row.job.reason && <p>{row.job.reason}</p>}</div>)}
+        {status.data?.history.map((row,index)=><div key={`${row.job.id}-${row.recorded_at}-${index}`} className="space-y-1 border-b py-2 text-xs"><p className="break-all font-mono">{row.job.item} · {row.job.revision}</p><p>{originLabel(row.job)} · {row.job.state} · stored from source {bytes(row.job.source_bytes)} · cached {bytes(row.job.cached_bytes)}</p><p className="break-words">{row.job.ranges.map(r=>`${r.start}–${r.end}`).join(", ")}</p>{row.job.reason && <p>{row.job.reason}</p>}<AttributionView attribution={row.job.attribution} /></div>)}
+      </SettingsPanel>
+      <SettingsPanel title="Current repair follow-up">
+        <p className="text-muted-foreground text-sm">Last inspection of up to 32 recent warming sources. Replacement checks run in the background and never change a warming attempt's saved outcome. A warmed replacement means a complete current revision finished warming after its regrab request; later eviction may remove its bytes.</p>
+        {status.data?.followup.refreshing && <p className="text-muted-foreground text-xs">Refreshing repair follow-up…</p>}
+        {status.data?.followup.stale && <p className="text-muted-foreground text-xs">Repair follow-up needs a fresh inspection.</p>}
+        {status.data?.followup.error && <p className="text-destructive text-xs">{status.data.followup.error}</p>}
+        {status.data?.followup.entries.map(row=><div key={row.item} className="border-b py-2 text-xs"><p className="break-all font-mono">{row.item}</p><p>{row.status.replaceAll("_"," ")} · journal {row.regrab.stage.replaceAll("_"," ")}</p>{row.replacement_item && <p className="break-all">Current replacement: {row.replacement_item} · revision {row.replacement_revision?.slice(0,8)}</p>}{row.warmed_at && <p>Full warm completed {new Date(row.warmed_at).toLocaleString()}</p>}</div>)}
+        {status.data?.followup.available && !status.data.followup.stale && status.data.followup.entries.length===0 && <p className="text-muted-foreground text-sm">No regrab journal for the inspected warming sources.</p>}
       </SettingsPanel>
       <SettingsPanel title="Warm a file">
         <p className="text-muted-foreground text-sm">
@@ -203,6 +211,7 @@ export function PrefetchPanel() {
               job. Later cache eviction can remove them. Retry verifies current
               coverage again.
             </p>
+            <p className="text-xs text-muted-foreground">Recent provider response rate: {status.data.recent_wire_bytes_per_second == null ? "collecting" : bytes(status.data.recent_wire_bytes_per_second)+"/s"}. Uses the recent 20 seconds and includes abandoned warming responses. Native fills are measured separately.</p>
             <p className="text-xs text-muted-foreground">Playback backfills waiting for durable admission: {status.data.pending_backfills}. Hints dropped at the memory limit: {status.data.dropped_backfills}. Actual uncached ranges qualify after a handle serves 17 MB. Short probes do not qualify. Saved jobs survive restart.</p>
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm">
@@ -224,6 +233,8 @@ export function PrefetchPanel() {
                           {job.item.slice(0, 8)}
                           <br />
                           {job.revision.slice(0, 8)}
+                          <p className="font-sans">{originLabel(job)}</p>
+                          <AttributionView attribution={job.attribution} />
                         </td>
                         <td className="p-2">
                           {job.state}
@@ -242,6 +253,7 @@ export function PrefetchPanel() {
                           <p className="text-muted-foreground text-xs">
                             Stored from source: {bytes(job.source_bytes)}
                           </p>
+                          <RateView rate={status.data.rates.find(r=>r.job===job.id && r.run===job.run)} />
                         </td>
                         <td className="p-2">
                           <div className="flex flex-wrap gap-1">
@@ -290,4 +302,20 @@ export function PrefetchPanel() {
       </SettingsPanel>
     </div>
   );
+}
+
+function RateView({rate}:{rate?:Schemas["PrefetchRate"]}) {
+  if(!rate)return null;
+  return <p className={rate.stalled?"text-destructive text-xs":"text-muted-foreground text-xs"}>{rate.active?"Running":"Recent"} native fill: {rate.recent_fill_bytes_per_second == null ? "collecting" : bytes(rate.recent_fill_bytes_per_second)+"/s"}. Last progress {new Date(rate.last_progress_at).toLocaleTimeString()}.{rate.stalled?" No progress for at least 60 seconds.":""}</p>;
+}
+
+function originLabel(job:Schemas["PrefetchJob"]) {
+  if(!job.automatic_scope)return "Manual";
+  if(job.family==="read")return "Finish watched";
+  if(job.family==="backfill")return "Playback backfill";
+  return job.attribution?.policy?.source.replaceAll("_"," ") || "Plex policy";
+}
+function AttributionView({attribution}:{attribution?:Schemas["PrefetchAttribution"]}) {
+  if(!attribution)return null;
+  return <div className="text-muted-foreground text-xs break-all">{attribution.policy && <p>Prediction owner {attribution.policy.server}:{attribution.policy.viewer} · recorded {new Date(attribution.policy.observed_at).toLocaleString()}</p>}{attribution.playback.length>0 && <><p>Plex reported for this source at admission:</p>{attribution.playback.map((p,i)=><p key={i}>{p.viewer_name || p.viewer}{p.player && <> on {p.player}</>} · {new Date(p.observed_at).toLocaleString()}</p>)}{attribution.truncated && <p>Additional source sessions were omitted at the history limit.</p>}</>}</div>;
 }

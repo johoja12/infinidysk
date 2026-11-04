@@ -6,7 +6,9 @@ use axum::{
 };
 use infinidysk_core::ItemId;
 use infinidysk_prefetch::{Job, Operation, Range, Status};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+mod followups;
+pub use followups::Followups;
 use std::sync::Arc;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -26,9 +28,27 @@ pub struct Request {
     pub priority: u8,
     pub intent: Uuid,
 }
-#[utoipa::path(get,operation_id="prefetch_status",path="/api/v1/prefetch",responses((status=200,body=Status)))]
-pub async fn status(State(admin): State<Arc<Admin>>) -> Json<Status> {
-    Json(admin.prefetch.status().await)
+#[derive(Serialize, ToSchema)]
+#[schema(as=PrefetchView)]
+pub struct View {
+    #[serde(flatten)]
+    pub queue: Status,
+    pub followup: followups::Snapshot,
+}
+#[utoipa::path(get,operation_id="prefetch_status",path="/api/v1/prefetch",responses((status=200,body=View)))]
+pub async fn status(State(admin): State<Arc<Admin>>) -> Json<View> {
+    let queue = admin.prefetch.status().await;
+    let jobs = queue
+        .jobs
+        .iter()
+        .cloned()
+        .chain(queue.history.iter().map(|h| h.job.clone()))
+        .collect();
+    let followup = admin
+        .prefetch_followups
+        .snapshot(Arc::clone(&admin), jobs)
+        .await;
+    Json(View { queue, followup })
 }
 #[utoipa::path(post,operation_id="prefetch_enqueue",path="/api/v1/prefetch",request_body=Request,responses((status=200,body=Job)))]
 pub async fn enqueue(

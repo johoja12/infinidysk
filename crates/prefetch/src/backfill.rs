@@ -3,6 +3,17 @@
 use super::*;
 impl Queue {
     pub async fn observe_backfills(&self, settings: &Settings) -> anyhow::Result<()> {
+        self.observe_backfills_attributed(settings, &[]).await
+    }
+    pub async fn observe_backfills_attributed(
+        &self,
+        settings: &Settings,
+        contexts: &[BackfillAttribution],
+    ) -> anyhow::Result<()> {
+        ensure!(
+            contexts.len() <= 32,
+            "too many backfill attribution sources"
+        );
         let scope = settings
             .enabled
             .then_some("a56f8f03b8bd3d3866df663eaa504efe3f08e0c7c9b1992e91b6b130e17d82fa");
@@ -42,17 +53,32 @@ impl Queue {
                 hash.update(hint.end.to_le_bytes());
                 let mut bytes = [0; 16];
                 bytes.copy_from_slice(&hash.finalize()[..16]);
+                let now = now_ms();
+                let attribution = contexts
+                    .iter()
+                    .find(|c| c.item == hint.item.0 && c.revision == hint.revision)
+                    .map(|c| &c.attribution)
+                    .filter(|a| {
+                        a.valid()
+                            && a.playback
+                                .iter()
+                                .all(|p| now >= p.observed_at && now - p.observed_at <= 120_000)
+                    })
+                    .cloned()
+                    .unwrap_or_default();
                 let job = self
-                    .admit(
+                    .admit_attributed(
                         item.id,
                         &ranges,
                         100,
                         Uuid::from_bytes(bytes),
                         Some((scope, key.revision(), Family::Backfill)),
+                        &attribution,
                     )
                     .await?;
                 if matches!(job.state, State::Complete | State::Expired) {
-                    self.control(job.id, Operation::Retry).await?;
+                    self.control_attributed(job.id, Operation::Retry, Some(&attribution))
+                        .await?;
                 }
             }
             // If coalescing replaced the event during database I/O, its newer nonce

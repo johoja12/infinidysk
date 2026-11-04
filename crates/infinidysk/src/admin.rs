@@ -65,6 +65,7 @@ pub struct Admin {
     pub tests: provider_test::Tests,
     pub plex: Arc<crate::plex::Service>,
     pub prefetch: Arc<infinidysk_prefetch::Queue>,
+    pub prefetch_followups: crate::prefetch::Followups,
     pub predictions: Arc<crate::predictions::Predictions>,
     pub library_metadata: Arc<library::metadata::Metadata>,
     /// `Ok` while FUSE is mounted, otherwise why not.

@@ -603,6 +603,20 @@ impl Library {
 
     /// Read-only prediction lookup. Bound abandoned NAS operations even after timeout.
     pub(crate) async fn prediction_pointer(&self, path: String) -> Result<Option<ItemId>, ()> {
+        self.pointer_checked(path, None).await
+    }
+    pub(crate) async fn replacement_pointer(
+        &self,
+        path: String,
+        root: String,
+    ) -> Result<Option<ItemId>, ()> {
+        self.pointer_checked(path, Some(root)).await
+    }
+    async fn pointer_checked(
+        &self,
+        path: String,
+        root: Option<String>,
+    ) -> Result<Option<ItemId>, ()> {
         let permit = Arc::clone(&self.pointer_reads)
             .try_acquire_owned()
             .map_err(|_| ())?;
@@ -619,9 +633,12 @@ impl Library {
         };
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let path = Path::new(&path);
+            let path = scoped_pointer_path(Path::new(&path), root.as_deref()).map_err(|_| ())?;
+            let path = path.as_path();
             match fs::symlink_metadata(path) {
-                Ok(meta) => Ok(classify(path, &meta, &known).map(|found| found.item)),
+                Ok(meta) => classify_checked(path, &meta, &known)
+                    .map(|found| found.map(|found| found.item))
+                    .map_err(|_| ()),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
                 Err(_) => Err(()),
             }
@@ -2094,6 +2111,39 @@ fn taken(path: &Path, item: ItemId) -> bool {
         .is_ok_and(|meta| classify(path, &meta, &Known::any()).is_none_or(|f| f.item != item))
 }
 
+fn scoped_pointer_path(path: &Path, root: Option<&str>) -> io::Result<PathBuf> {
+    let Some(root) = root else {
+        return Ok(path.to_owned());
+    };
+    if !path.is_absolute()
+        || !Path::new(root).is_absolute()
+        || path
+            .components()
+            .chain(Path::new(root).components())
+            .any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid pointer inspection path",
+        ));
+    }
+    let root = fs::canonicalize(root)?;
+    let parent = fs::canonicalize(
+        path.parent()
+            .ok_or_else(|| io::Error::other("missing pointer parent"))?,
+    )?;
+    if !parent.starts_with(&root) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "pointer parent is outside its library root",
+        ));
+    }
+    Ok(parent.join(
+        path.file_name()
+            .ok_or_else(|| io::Error::other("missing pointer name"))?,
+    ))
+}
+
 /// The local path of the Arr-side `path`, inside a library folder.
 pub(crate) fn local(dirs: &[config::LibraryDir], path: &str) -> Option<PathBuf> {
     dirs.iter().find_map(|d| {
@@ -2763,5 +2813,31 @@ mod tests {
             panic!("{action:?}")
         };
         assert_eq!(path, PathBuf::from("/lib/Show/Episode"));
+    }
+}
+
+#[cfg(test)]
+mod followup_root_tests {
+    use super::*;
+    #[test]
+    fn replacement_pointer_parent_cannot_escape_and_the_pointer_target_is_not_followed() {
+        let root = std::env::temp_dir().join(format!("infinidysk-followup-root-{}", ItemId::new()));
+        fs::create_dir_all(root.join("library")).unwrap();
+        fs::create_dir(root.join("outside")).unwrap();
+        std::os::unix::fs::symlink(root.join("outside"), root.join("library/escape")).unwrap();
+        let library = root.join("library");
+        assert!(
+            scoped_pointer_path(&library.join("escape/fixture.mkv"), library.to_str()).is_err()
+        );
+        assert!(
+            scoped_pointer_path(&library.join("../outside/fixture.mkv"), library.to_str()).is_err()
+        );
+        std::os::unix::fs::symlink("/unused-mount/.ids/fixture", library.join("fixture.mkv"))
+            .unwrap();
+        assert_eq!(
+            scoped_pointer_path(&library.join("fixture.mkv"), library.to_str()).unwrap(),
+            fs::canonicalize(&library).unwrap().join("fixture.mkv")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

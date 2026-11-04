@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Serialize, ToSchema)]
 #[schema(as=RegrabStatus)]
 pub struct Status {
     pub item: Uuid,
@@ -48,7 +48,7 @@ pub(crate) async fn inspect(db: &infinidysk_db::Db, id: Uuid) -> Result<Option<S
     };
     Ok(Some(from_row(id, &row)))
 }
-fn from_row(id: Uuid, row: &infinidysk_db::RegrabIntent) -> Status {
+pub(crate) fn from_row(id: Uuid, row: &infinidysk_db::RegrabIntent) -> Status {
     match serde_json::from_str::<Saved>(&row.payload) {
         Ok(saved) => Status {
             item: id,
@@ -86,6 +86,12 @@ fn from_row(id: Uuid, row: &infinidysk_db::RegrabIntent) -> Status {
             observation: Some("Journal unreadable; original retained for recovery".into()),
         },
     }
+}
+
+pub(crate) fn replacement_path(row: &infinidysk_db::RegrabIntent) -> Option<String> {
+    let saved: Saved = serde_json::from_str(&row.payload).ok()?;
+    (row.terminal && saved.progress.version == 1 && saved.progress.terminal())
+        .then(|| saved.progress.owner.file_path().to_owned())
 }
 
 #[derive(Deserialize, ToSchema)]
