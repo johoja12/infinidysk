@@ -722,6 +722,7 @@ impl Client {
 
         let mut last_error = None;
         let mut skipped = false;
+        let mut unreachable = false;
         // The first provider that missed or failed, for rescue counts.
         let mut first_miss: Option<(u16, trace::Outcome)> = None;
         // Backbones whose stored copy is missing or corrupt.
@@ -809,6 +810,7 @@ impl Client {
                     ) => (Outcome::Fatal, Some(error)),
                     Err(Failure::Request(error)) => (Outcome::Failure, Some(error)),
                 };
+                unreachable |= matches!(outcome, Outcome::Failure | Outcome::Fatal);
                 if matches!(outcome, Outcome::Miss) {
                     missed.extend(backbone);
                     if error.is_none() {
@@ -834,9 +836,9 @@ impl Client {
         // ponytail: a request that never reached a provider (all skipped) is not
         // counted; give the client its own counter if quota cut-offs need showing.
         Err(match last_error {
-            // A skipped provider may hold an intact copy.
+            // A skipped or failed provider may still hold an intact copy.
             Some((Error::CrcMismatch { .. } | Error::Yenc(_) | Error::TooLarge, stats))
-                if skipped =>
+                if skipped || unreachable =>
             {
                 stats.failed(workload);
                 Error::Unavailable
@@ -964,6 +966,38 @@ mod tests {
             result.err()
         );
         assert_eq!(bad.body_commands(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_copy_is_not_final_after_another_provider_connection_failed() {
+        let corpus = Corpus::generate(1025, 1, 1024);
+        let mut corrupt = corpus.articles[0].clone();
+        let at = corrupt
+            .wire
+            .windows(7)
+            .position(|w| w == b"pcrc32=")
+            .expect("CRC field")
+            + 7;
+        corrupt.wire[at] = if corrupt.wire[at] == b'0' { b'1' } else { b'0' };
+        let bad = LoopbackServer::start([corrupt])
+            .await
+            .expect("bad provider");
+        let failed = LoopbackServer::start_dropping(corpus.articles.clone(), 0)
+            .await
+            .expect("failed provider");
+        let downloads = Downloads::new(4);
+        let first = provider(&failed, &downloads);
+        let mut second = provider(&bad, &downloads);
+        second.priority = 1;
+        let client = Client::new([first, second]);
+        assert!(matches!(
+            client
+                .body(&corpus.articles[0].message_id, Workload::Health, None)
+                .await,
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(bad.body_commands(), 1);
+        assert_eq!(downloads.available_permits(), 4);
     }
 
     #[tokio::test]
