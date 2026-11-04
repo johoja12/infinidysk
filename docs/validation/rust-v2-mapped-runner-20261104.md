@@ -35,3 +35,20 @@ client across journal restart. These are Python fixture results. Rust queue/data
 and actual HTTP behavior are qualified separately in
 [migration admission](rust-v2-migration-admission-20261104.md). No live Plex/provider,
 production filesystem mutation, merge, publication or deployment is claimed.
+
+## Native CLI rehearsal
+
+Qualified aggregate source: `8438e25f`. The clean-source native example was copied to
+an immutable path before execution. Binary SHA256:
+`497dc89cc917771c64a95f92f318455ff5be6620595163241b8f8b2279b77e55`.
+The actual Python CLI submitted a paused generated NZB through the native API,
+preserved an explicit legacy job name, restarted the backend behind a stable local
+fixture origin, and read back the same job. Removing that job left one durable
+acceptance receipt with unknown history. Subsequent CLI passes created no new job.
+The runner correctly refused a changed server origin in an earlier rehearsal.
+
+This is actual native API/SQLite/restart evidence using a generated mapped-package
+fixture. It proves submission recovery, not original C# export generation, member
+correlation, payload/provider acceptance or library-link promotion. The runner
+continued to report `acknowledged: false`. Private receipt:
+`/tmp/infinidysk-rust-browser/migration-admission-validation.json`.
