@@ -195,3 +195,62 @@ async fn cold_start_requests_wait_for_their_own_connection_rather_than_queue() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn cancelled_stalled_body_releases_its_permit_and_connection_before_next_read() {
+    let corpus = Corpus::generate(1025, 2, ARTICLE_SIZE);
+    let (server, mut gate) = LoopbackServer::start_gated(corpus.articles.clone())
+        .await
+        .unwrap();
+    let downloads = Downloads::new(1);
+    let endpoint = Endpoint::new(
+        "127.0.0.1",
+        server.addr().port(),
+        TlsMode::Plain,
+        None,
+        Duration::from_millis(200),
+    )
+    .unwrap();
+    let pool = Arc::new(
+        Pool::new(
+            endpoint,
+            PoolConfig {
+                max_connections: 1,
+                pipeline_depth: 1,
+                idle_timeout: Duration::from_secs(5),
+                min_connections: 0,
+            },
+            Arc::clone(&downloads),
+        )
+        .unwrap(),
+    );
+    let first = tokio::spawn({
+        let pool = Arc::clone(&pool);
+        let id = corpus.articles[0].message_id.clone();
+        async move { pool.body(&id).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), gate.blocked())
+        .await
+        .unwrap()
+        .unwrap();
+    first.abort();
+    let _ = first.await;
+    // Do not release the server gate: cleanup has to replace the timed-out socket.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while downloads.available_permits() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let second = tokio::time::timeout(
+        Duration::from_secs(5),
+        pool.body(&corpus.articles[1].message_id),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(second.data, corpus.data[ARTICLE_SIZE..]);
+    assert_eq!(downloads.available_permits(), 1);
+    gate.release();
+}

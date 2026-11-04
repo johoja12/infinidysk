@@ -1300,3 +1300,45 @@ async fn migration_does_not_acknowledge_a_separate_sab_job_under_another_categor
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].category, "first-fixture");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_stored_media_inside_rar_and_sevenzip_fails_before_handoff() {
+    let invalid = vec![0x55; 40_000];
+    let rar = import_rar(&rar5_set("fixture.mkv", &invalid, 3)).await;
+    assert_eq!(rar.status, JobStatus::Failed, "{:?}", rar.fail_message);
+    assert!(rar.fail_message.unwrap().contains("Not a valid mkv file"));
+    let zip = sevenzip(&[("fixture.mkv", &invalid)]);
+    let (_, db, result) = import_one("fixture.7z", &zip).await;
+    assert_eq!(
+        result.status,
+        JobStatus::Failed,
+        "{:?}",
+        result.fail_message
+    );
+    assert!(
+        result
+            .fail_message
+            .unwrap()
+            .contains("Not a valid mkv file")
+    );
+    assert!(meta(&db, "/content/tv/job/fixture.mkv").await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn first_rar_volume_uses_header_order_when_last_volume_is_listed_first() {
+    let valid = mkv(40_000, 0x55);
+    let set = rar5_set("fixture.mkv", &valid, 3);
+    // Names sort opposite to the actual volume order. The signature is in volume 0.
+    let result = import_files(&[
+        ("a.random".into(), set[2].clone()),
+        ("m.random".into(), set[1].clone()),
+        ("z.random".into(), set[0].clone()),
+    ])
+    .await;
+    assert_eq!(
+        result.status,
+        JobStatus::Completed,
+        "{:?}",
+        result.fail_message
+    );
+}
