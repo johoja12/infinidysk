@@ -164,7 +164,12 @@ async fn main() -> anyhow::Result<()> {
         settings.plex.servers.clear();
         settings.arr_instances.clear();
         settings.imports.library_dirs.clear();
-        settings.imports.scan_dirs.clear();
+        settings.imports.scan_dirs.retain(|dir| {
+            std::path::Path::new(&dir.path).starts_with(&root)
+                && !std::path::Path::new(&dir.path)
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+        });
     } else {
         settings.native_cache = NativeSettings {
             enabled: true,
