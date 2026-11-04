@@ -903,6 +903,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/migration/submissions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["migration_submit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/migration/submissions/{intent}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["migration_submission"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/native-cache": {
         parameters: {
             query?: never;
@@ -3305,6 +3337,11 @@ export interface components {
             /** Format: int64 */
             misses: number;
             /** Format: int64 */
+            read_timeouts: number;
+            /** Format: int64 */
+            recency_dropped: number;
+            recency_pending: number;
+            /** Format: int64 */
             skipped: number;
         };
         NativeCacheStatus: {
@@ -4409,6 +4446,19 @@ export interface components {
              */
             stalls: number;
             traced: boolean;
+        };
+        Receipt: {
+            /** Format: int64 */
+            accepted_at: number;
+            /** Format: uuid */
+            download_dir?: string | null;
+            intent: string;
+            /** Format: uuid */
+            job_id: string;
+            payload_sha256: string;
+            scope: string;
+            /** @description Missing history remains unknown; it does not authorize replay. */
+            state: string;
         };
         RecentRead: {
             client: string;
@@ -6752,6 +6802,60 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    migration_submit: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Base64 JSON with package_digest, source_release_id, file_name, optional job_name, category, priority and post_processing. Kept out of URL/access logs. */
+                "x-migration-options": string;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/x-nzb": string;
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Receipt"];
+                };
+            };
+            /** @description Intent/content conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    migration_submission: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                intent: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Receipt"] | null;
                 };
             };
         };

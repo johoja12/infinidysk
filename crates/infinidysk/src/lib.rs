@@ -16,6 +16,7 @@ mod library;
 pub mod logs;
 mod maintenance;
 pub mod metrics;
+mod migration;
 mod plex;
 mod predictions;
 mod prefetch;

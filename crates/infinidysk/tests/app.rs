@@ -1017,3 +1017,64 @@ async fn par2_runtime_starts_with_an_exclusive_ledger_and_keeps_inspection_authe
         Exit::Stopped
     );
 }
+
+#[tokio::test]
+async fn migration_submission_readback_survives_a_lost_http_response() {
+    use base64::Engine as _;
+    let (addr, cancel, server, url) = start().await;
+    let package = "a".repeat(64);
+    let options = json!({"package_digest":package,"source_release_id":"fixture-release","file_name":"fixture.nzb","job_name":"fixture","category":"migration-fixture","priority":-2,"post_processing":0});
+    let request = |options: &Value| {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(options).unwrap());
+        admin_request("POST", "/api/v1/migration/submissions", NZB).replace(
+            "Content-Type:",
+            &format!("X-Migration-Options: {encoded}\r\nContent-Type:"),
+        )
+    };
+    let intent = infinidysk_queue::service::migration_intent(&package, "fixture-release").unwrap();
+    let mut connection = TcpStream::connect(addr).await.unwrap();
+    connection
+        .write_all(request(&options).as_bytes())
+        .await
+        .unwrap();
+    // Drop the response deliberately. Read back the stable key before any retry.
+    let read = format!("/api/v1/migration/submissions/{intent}");
+    let mut receipt = Value::Null;
+    for _ in 0..100 {
+        let (code, body) = send(addr, &admin_request("GET", &read, "")).await;
+        assert_eq!(code, "HTTP/1.1 200 OK");
+        receipt = serde_json::from_str(&body).unwrap();
+        if !receipt.is_null() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    drop(connection);
+    assert_eq!(receipt["state"], "queued");
+    let (code, body) = send(addr, &request(&options)).await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), receipt);
+    let mut changed = options.clone();
+    changed["category"] = json!("other-fixture");
+    assert_eq!(
+        status(addr, &request(&changed)).await,
+        "HTTP/1.1 409 Conflict"
+    );
+    let db = infinidysk_db::Db::connect(&url).await.unwrap();
+    let jobs = db.queue().await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    db.remove_job(jobs[0].id).await.unwrap();
+    let (code, body) = send(addr, &admin_request("GET", &read, "")).await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    let missing: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(missing["state"], "accepted_history_unavailable");
+    assert_eq!(missing["job_id"], receipt["job_id"]);
+    let (code, body) = send(addr, &request(&options)).await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), missing);
+    assert_eq!(db.queue().await.unwrap().len(), 0);
+    db.close().await;
+    cancel.cancel();
+    assert_eq!(server.await.unwrap().unwrap(), Exit::Stopped);
+}

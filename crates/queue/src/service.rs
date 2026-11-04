@@ -61,6 +61,60 @@ pub enum Error {
     /// Handing a finished job off failed; the job retries with the transient backoff.
     #[error("Could not write the files for the Arr: {0}")]
     Handoff(String),
+    #[error("migration submission refused: {0}")]
+    Migration(&'static str),
+}
+
+/// Stable migration key. Package digests and release identities are length-bound;
+/// neither changed XML nor changed options can reuse this accepted intent.
+pub fn migration_intent(package: &str, release: &str) -> Result<String, Error> {
+    if package.len() != 64
+        || !package
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || release.is_empty()
+        || release.len() > 512
+        || release.chars().any(char::is_control)
+    {
+        return Err(Error::Migration(
+            "package digest or source release identity is invalid",
+        ));
+    }
+    Ok(migration_digest(&["migration-intent-v1", package, release]))
+}
+fn migration_digest(parts: &[&str]) -> String {
+    use sha2::{Digest as _, Sha256};
+    let mut digest = Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    migration_hex(&digest.finalize())
+}
+fn migration_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut output, b| {
+            write!(output, "{b:02x}").expect("formatting into String cannot fail");
+            output
+        })
+}
+fn migration_bytes_digest(raw: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    migration_hex(&Sha256::digest(raw))
+}
+fn matching_submission(
+    receipt: infinidysk_db::MigrationSubmission,
+    scope: &str,
+    payload: &str,
+) -> Result<infinidysk_db::MigrationSubmission, Error> {
+    if receipt.scope != scope || receipt.payload_sha256 != payload {
+        return Err(Error::Migration(
+            "this intent was accepted with different source bytes or submission options",
+        ));
+    }
+    Ok(receipt)
 }
 
 /// A job's submission parameters.
@@ -397,6 +451,117 @@ impl Queue {
         self.db.enqueue(&entry, &encoded).await?;
         self.wake.notify_one();
         Ok(entry.id)
+    }
+
+    /// Durable migration admission. A stable package/release key binds the exact
+    /// decompressed XML and submission options. Ambiguous existing SAB jobs are
+    /// refused rather than acknowledged under the migration's category/identity.
+    pub async fn enqueue_migration(
+        &self,
+        job: &Submission<'_>,
+        package: &str,
+        release: &str,
+        raw: &[u8],
+    ) -> Result<infinidysk_db::MigrationSubmission, Error> {
+        self.enqueue_migration_named(job, package, release, None, raw)
+            .await
+    }
+    /// Preserves an export's explicit legacy job name without granting path authority.
+    pub async fn enqueue_migration_named(
+        &self,
+        job: &Submission<'_>,
+        package: &str,
+        release: &str,
+        legacy_job_name: Option<&str>,
+        raw: &[u8],
+    ) -> Result<infinidysk_db::MigrationSubmission, Error> {
+        let job_name =
+            legacy_job_name.map_or_else(|| names::job_name(job.file_name), str::to_owned);
+        if job_name.is_empty()
+            || job_name.len() > 1024
+            || matches!(job_name.as_str(), "." | "..")
+            || job_name.contains(['/', '\\'])
+            || job_name.chars().any(char::is_control)
+        {
+            return Err(Error::Migration(
+                "legacy job name is not a valid bounded path component",
+            ));
+        }
+        let intent = migration_intent(package, release)?;
+        if job.file_name.is_empty()
+            || job.file_name.len() > 1024
+            || job.file_name.chars().any(char::is_control)
+            || job.category.len() > 256
+            || job.category.chars().any(char::is_control)
+        {
+            return Err(Error::Migration("submission fields exceed their bounds"));
+        }
+        let scope = migration_digest(&[
+            "migration-options-v1",
+            job.file_name,
+            &job_name,
+            job.category,
+            &job.priority.to_string(),
+            &job.post_processing.to_string(),
+        ]);
+        let raw = raw.to_vec();
+        let (xml, parsed, content_hash, payload_sha256) =
+            blocking(move || -> Result<_, nzb::Error> {
+                let xml = nzb::decompress(&raw)?.into_owned();
+                let parsed = nzb::parse(&xml)?;
+                let content = parsed.content_hash();
+                let digest = migration_bytes_digest(&xml);
+                Ok((xml, parsed, content, digest))
+            })
+            .await?;
+        let _submit = self.submit.lock().await;
+        if let Some(receipt) = self.db.migration_submission(&intent).await? {
+            return matching_submission(receipt, &scope, &payload_sha256);
+        }
+        if self.db.job_with_content(&content_hash).await?.is_some() {
+            return Err(Error::Migration(
+                "this content already has a separate queued job; inspect it before migrating",
+            ));
+        }
+        if self.rejected(&job_name, &parsed).await? {
+            return Err(Error::Migration(
+                "health rejected this source; choose a different release",
+            ));
+        }
+        let paused = job.priority == PAUSED_PRIORITY;
+        let entry = QueueEntry {
+            id: JobId::new(),
+            created_at: now_ms(),
+            file_name: job.file_name.to_owned(),
+            job_name,
+            category: job.category.to_owned(),
+            priority: if paused { 0 } else { job.priority },
+            post_processing: job.post_processing,
+            nzb_blob: BlobId::new(),
+            nzb_size: xml.len() as u64,
+            total_bytes: parsed.files.iter().map(nzb::File::bytes).sum(),
+            paused,
+            retry_at: None,
+            attempts: 0,
+            stuck_count: 0,
+            last_error: None,
+            content_hash: Some(content_hash),
+        };
+        let receipt = infinidysk_db::MigrationSubmission {
+            intent,
+            scope: scope.clone(),
+            payload_sha256: payload_sha256.clone(),
+            job_id: entry.id.0,
+            created_at: entry.created_at,
+        };
+        let encoded = blocking(move || blob::encode_nzb(&xml)).await?;
+        let accepted = self
+            .db
+            .enqueue_migration(&entry, &encoded, &receipt)
+            .await?;
+        let accepted = matching_submission(accepted, &scope, &payload_sha256)?;
+        self.wake.notify_one();
+        Ok(accepted)
     }
 
     /// Records a submission that never queues as a failed job, without its NZB.

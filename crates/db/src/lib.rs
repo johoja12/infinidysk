@@ -30,6 +30,15 @@ pub const SEARCH_WINDOW_MS: i64 = 30 * 60 * 1000;
 /// How long a SQLite write waits for another connection's lock before it fails.
 pub const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Atomically accepted migration submission, independent of job/history retention.
+#[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+pub struct MigrationSubmission {
+    pub intent: String,
+    pub scope: String,
+    pub payload_sha256: String,
+    pub job_id: Uuid,
+    pub created_at: i64,
+}
 /// Durable repair state, retained independently from the source's lifetime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegrabIntent {
@@ -1600,8 +1609,50 @@ impl Db {
     /// Queues the job with its NZB blob. A stored blob with the job's `nzb_blob` id is
     /// reused (and kept from expiring), so pass an existing id only for identical content.
     pub async fn enqueue(&self, job: &QueueEntry, nzb: &[u8]) -> Result<(), Error> {
+        self.enqueue_bound(job, nzb, None).await?;
+        Ok(())
+    }
+    /// Creates the acceptance receipt and queue/blob rows in one transaction.
+    /// A repeated intent returns its original receipt without creating a job.
+    pub async fn enqueue_migration(
+        &self,
+        job: &QueueEntry,
+        nzb: &[u8],
+        receipt: &MigrationSubmission,
+    ) -> Result<MigrationSubmission, Error> {
+        if receipt.job_id != job.id.0 {
+            return Err(Error::Corrupt("migration receipt job identity differs"));
+        }
+        self.enqueue_bound(job, nzb, Some(receipt))
+            .await?
+            .ok_or(Error::Corrupt("migration receipt missing after admission"))
+    }
+    /// Readback is authoritative even when its queue/history rows have expired.
+    pub async fn migration_submission(
+        &self,
+        intent: &str,
+    ) -> Result<Option<MigrationSubmission>, Error> {
+        Ok(
+            on!(self, pool => sqlx::query_as("SELECT intent,scope,payload_sha256,job_id,created_at FROM migration_submissions WHERE intent=$1").bind(intent).fetch_optional(pool).await?),
+        )
+    }
+    async fn enqueue_bound(
+        &self,
+        job: &QueueEntry,
+        nzb: &[u8],
+        receipt: Option<&MigrationSubmission>,
+    ) -> Result<Option<MigrationSubmission>, Error> {
         on!(self, pool => {
             let mut tx = pool.begin().await?;
+            if let Some(receipt) = receipt {
+                let inserted=sqlx::query("INSERT INTO migration_submissions(intent,scope,payload_sha256,job_id,created_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(intent) DO NOTHING")
+                    .bind(&receipt.intent).bind(&receipt.scope).bind(&receipt.payload_sha256).bind(receipt.job_id).bind(receipt.created_at).execute(&mut *tx).await?.rows_affected();
+                if inserted == 0 {
+                    let existing=sqlx::query_as("SELECT intent,scope,payload_sha256,job_id,created_at FROM migration_submissions WHERE intent=$1").bind(&receipt.intent).fetch_one(&mut *tx).await?;
+                    tx.commit().await?;
+                    return Ok(Some(existing));
+                }
+            }
             let reused = sqlx::query("UPDATE blobs SET unreferenced_at = NULL WHERE id = $1")
                 .bind(job.nzb_blob.0)
                 .execute(&mut *tx)
@@ -1642,9 +1693,14 @@ impl Db {
             tx.commit().await?;
         });
         self.notify(Change::Queue);
-        Ok(())
+        Ok(receipt.cloned())
     }
 
+    pub async fn queue_contains(&self, id: JobId) -> Result<bool, Error> {
+        Ok(
+            on!(self,pool=>sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM queue WHERE id=$1)").bind(id.0).fetch_one(pool).await?),
+        )
+    }
     /// The oldest queued job with this content hash.
     pub async fn job_with_content(&self, hash: &str) -> Result<Option<JobId>, Error> {
         let id: Option<Uuid> = on!(self, pool => sqlx::query_scalar(

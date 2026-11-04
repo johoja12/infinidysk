@@ -37,6 +37,7 @@ async fn exercise(db: &Db) {
 
     // Unreferenced NZBs go at once until the retention section at the end.
     db.set_nzb_retention_days(0);
+    migration_admission(db).await;
     let content = db
         .item_by_path("/content")
         .await
@@ -2748,4 +2749,82 @@ async fn staged_library_progress_survives_database_restart_and_source_identity_c
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
+}
+
+async fn migration_admission(db: &Db) {
+    let job = QueueEntry {
+        id: JobId::new(),
+        created_at: 1,
+        file_name: "fixture.nzb".into(),
+        job_name: "fixture".into(),
+        category: "migration-fixture".into(),
+        priority: 0,
+        post_processing: 0,
+        nzb_blob: BlobId::new(),
+        nzb_size: 7,
+        total_bytes: 7,
+        paused: false,
+        retry_at: None,
+        attempts: 0,
+        stuck_count: 0,
+        last_error: None,
+        content_hash: None,
+    };
+    let receipt = infinidysk_db::MigrationSubmission {
+        intent: "fixture-intent".into(),
+        scope: "fixture-options".into(),
+        payload_sha256: "fixture-digest".into(),
+        job_id: job.id.0,
+        created_at: 1,
+    };
+    assert_eq!(
+        db.enqueue_migration(&job, b"fixture", &receipt)
+            .await
+            .expect("atomic admission"),
+        receipt
+    );
+    let replay = QueueEntry {
+        id: JobId::new(),
+        nzb_blob: BlobId::new(),
+        ..job.clone()
+    };
+    let candidate = infinidysk_db::MigrationSubmission {
+        job_id: replay.id.0,
+        ..receipt.clone()
+    };
+    assert_eq!(
+        db.enqueue_migration(&replay, b"fixture", &candidate)
+            .await
+            .expect("readback"),
+        receipt
+    );
+    assert!(!db.queue_contains(replay.id).await.expect("queue readback"));
+    assert!(
+        db.blob(replay.nzb_blob)
+            .await
+            .expect("blob readback")
+            .is_none()
+    );
+    let failed = infinidysk_db::MigrationSubmission {
+        intent: "failed-fixture-intent".into(),
+        ..receipt.clone()
+    };
+    assert!(
+        db.enqueue_migration(&job, b"fixture", &failed)
+            .await
+            .is_err()
+    );
+    assert!(
+        db.migration_submission(&failed.intent)
+            .await
+            .expect("rolled back receipt")
+            .is_none()
+    );
+    db.remove_job(job.id).await.expect("remove fixture");
+    assert_eq!(
+        db.migration_submission(&receipt.intent)
+            .await
+            .expect("independent receipt"),
+        Some(receipt)
+    );
 }

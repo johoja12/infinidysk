@@ -1168,3 +1168,135 @@ async fn the_same_nzb_queues_once_and_invalid_ones_fail_at_once() {
         .count();
     assert_eq!(failed, 1, "the invalid NZB is in history");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_intents_bind_exact_bytes_options_and_survive_completion_restart_and_pruning() {
+    let c = post("migration-fixture", "fixture.mkv", &mkv(4000, 1), 1000);
+    let xml = nzb(&[("fixture.mkv", &c, 4000, 1000)]);
+    let server = LoopbackServer::start(c).await.unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "infinidysk-migration-intent-{}.sqlite",
+        ItemId::new()
+    ));
+    let queue = queue_at(&[&server], &path).await;
+    let submission = Submission {
+        file_name: "fixture.nzb",
+        category: "migration-fixture",
+        priority: 0,
+        post_processing: 0,
+    };
+    let package = "a".repeat(64);
+    let (a, b) = tokio::join!(
+        queue.enqueue_migration(&submission, &package, "fixture-release", &xml),
+        queue.enqueue_migration(&submission, &package, "fixture-release", &xml)
+    );
+    let receipt = a.unwrap();
+    assert_eq!(receipt, b.unwrap());
+    assert_eq!(queue.db().queue().await.unwrap().len(), 1);
+    let changed = Submission {
+        category: "other-fixture",
+        ..submission.clone()
+    };
+    assert!(
+        queue
+            .enqueue_migration(&changed, &package, "fixture-release", &xml)
+            .await
+            .is_err()
+    );
+    let mut different = xml.clone();
+    different.extend_from_slice(b" ");
+    assert!(
+        queue
+            .enqueue_migration(&submission, &package, "fixture-release", &different)
+            .await
+            .is_err()
+    );
+    assert!(queue.process_next().await);
+    let db = queue.db().clone();
+    let history = db
+        .history_entry(infinidysk_core::JobId(receipt.job_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(history.status, JobStatus::Completed);
+    assert_eq!(
+        queue
+            .enqueue_migration(&submission, &package, "fixture-release", &xml)
+            .await
+            .unwrap(),
+        receipt
+    );
+    db.delete_history(&[infinidysk_core::JobId(receipt.job_id)])
+        .await
+        .unwrap();
+    drop(queue);
+    db.close().await;
+    let queue = queue_at(&[&server], &path).await;
+    assert_eq!(
+        queue
+            .enqueue_migration(&submission, &package, "fixture-release", &xml)
+            .await
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(queue.db().queue().await.unwrap().len(), 0);
+    assert!(
+        queue
+            .db()
+            .history_entry(infinidysk_core::JobId(receipt.job_id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        queue
+            .enqueue_migration(&submission, &package, "invalid-release", b"<nzb/>")
+            .await
+            .is_err()
+    );
+    let invalid = infinidysk_queue::service::migration_intent(&package, "invalid-release").unwrap();
+    assert!(
+        queue
+            .db()
+            .migration_submission(&invalid)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    queue.db().close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_does_not_acknowledge_a_separate_sab_job_under_another_category() {
+    let c = post(
+        "migration-other-fixture",
+        "fixture.mkv",
+        &mkv(4000, 1),
+        1000,
+    );
+    let xml = nzb(&[("fixture.mkv", &c, 4000, 1000)]);
+    let (_server, queue) = setup(c).await;
+    let original = Submission {
+        file_name: "fixture.nzb",
+        category: "first-fixture",
+        priority: 0,
+        post_processing: 0,
+    };
+    queue.enqueue(&original, &xml).await.unwrap();
+    let migrated = Submission {
+        category: "second-fixture",
+        ..original
+    };
+    assert!(
+        queue
+            .enqueue_migration(&migrated, &"a".repeat(64), "fixture-release", &xml)
+            .await
+            .is_err()
+    );
+    let jobs = queue.db().queue().await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].category, "first-fixture");
+}

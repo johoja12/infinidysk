@@ -109,6 +109,7 @@ pub struct Admin {
         provider_test::delete_provider_tests,
         quota::get_provider_usage,
         quota::post_reset_usage,
+        crate::migration::submit, crate::migration::status,
         get_queue,
         post_queue,
         get_queue_paused,
@@ -207,6 +208,15 @@ impl Modify for Security {
 
 pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
     Router::new()
+        .route(
+            "/api/v1/migration/submissions",
+            post(crate::migration::submit)
+                .layer(DefaultBodyLimit::max(infinidysk_queue::nzb::MAX_UPLOAD)),
+        )
+        .route(
+            "/api/v1/migration/submissions/{intent}",
+            get(crate::migration::status),
+        )
         .route(
             "/api/v1/prefetch/predictions",
             get(crate::predictions::status).post(crate::predictions::refresh),
