@@ -483,3 +483,377 @@ async fn changed_healthy_bytes_in_a_mixed_article_cannot_be_published() {
     );
     assert_eq!(downloads.available_permits(), 8);
 }
+
+struct DiscoveryFixture {
+    posts: Vec<infinidysk_health::par2::Posted>,
+    anchors: Vec<infinidysk_health::par2::Anchor>,
+    articles: Vec<Article>,
+}
+fn discovery_fixture(missing: &[usize]) -> DiscoveryFixture {
+    use infinidysk_health::par2::{Anchor, Posted};
+    let set = RecoverySet::read(&fixture("set.par2"), None).expect("set");
+    let mut posts = Vec::new();
+    let mut anchors = Vec::new();
+    let mut served = Vec::new();
+    for (i, file) in set.files().iter().enumerate() {
+        let bytes = data(usize::try_from(file.length).expect("length"));
+        let articles = post(&format!("discovered-{i}"), "fixture.bin", &bytes, 3000);
+        let ids: Vec<_> = articles.iter().map(|a| a.message_id.clone()).collect();
+        if i == 0 {
+            anchors.push(Anchor {
+                ids: ids[3..5].to_vec(),
+                proof: Par2Proof {
+                    file_length: file.length,
+                    file_md5: file.hash,
+                    md5_16k: file.hash_16k,
+                    file_id: file.id,
+                    slice_size: u32::try_from(set.slice_size()).expect("slice size"),
+                    slice_md5: file.slices.iter().map(|s| s.md5).collect(),
+                    slice_crc32: file.slices.iter().map(|s| s.crc32).collect(),
+                },
+            });
+        }
+        posts.push(Posted {
+            ids,
+            recovery_hint: false,
+        });
+        served.extend(
+            articles
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| i != 0 || !missing.contains(index))
+                .map(|(_, a)| a),
+        );
+    }
+    let recovery = post(
+        "discovered-recovery",
+        "fixture.bin",
+        &fixture("set.vol0+3.par2"),
+        113,
+    );
+    posts.push(Posted {
+        ids: recovery.iter().map(|a| a.message_id.clone()).collect(),
+        recovery_hint: false,
+    });
+    served.extend(recovery);
+    DiscoveryFixture {
+        posts,
+        anchors,
+        articles: served,
+    }
+}
+#[tokio::test]
+async fn discovery_binds_partial_imported_id_spans_and_infers_only_exact_single_holes() {
+    use infinidysk_health::par2::{ArticleOutcome, DiscoveryBudget, discover};
+    let fixture = discovery_fixture(&[1]);
+    let server = LoopbackServer::start(fixture.articles)
+        .await
+        .expect("server");
+    let (client, downloads) = provider_client(&server);
+    let plan = discover(
+        client.clone(),
+        fixture.posts,
+        fixture.anchors,
+        DiscoveryBudget::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("source binding");
+    let ArticleOutcome::Repaired(articles) = plan
+        .execute_articles(client, CancellationToken::new())
+        .await
+        .expect("verified repair")
+    else {
+        panic!("repair expected");
+    };
+    assert_eq!(articles.len(), 3);
+    for article in articles {
+        let (_, body, _) = article.into_parts();
+        let expected = data(usize::try_from(body.file_size).expect("size"));
+        let at = usize::try_from(body.offset).expect("offset");
+        assert_eq!(body.data.as_ref(), &expected[at..at + body.data.len()]);
+    }
+    assert_eq!(downloads.available_permits(), 8);
+}
+#[tokio::test]
+async fn discovery_refuses_consecutive_unknown_ranges_instead_of_dividing_them() {
+    use infinidysk_health::par2::{DiscoveryBudget, discover};
+    let fixture = discovery_fixture(&[1, 2]);
+    let server = LoopbackServer::start(fixture.articles)
+        .await
+        .expect("server");
+    let (client, _) = provider_client(&server);
+    assert!(matches!(
+        discover(
+            client,
+            fixture.posts,
+            fixture.anchors,
+            DiscoveryBudget::default(),
+            CancellationToken::new()
+        )
+        .await,
+        Err(Error::Binding)
+    ));
+}
+#[tokio::test]
+async fn discovery_cannot_use_a_forged_imported_id_span_or_exceed_preflight_memory() {
+    use infinidysk_health::par2::{DiscoveryBudget, discover};
+    let mut fixture = discovery_fixture(&[1]);
+    fixture.anchors[0].ids = vec!["not-in-the-original-nzb@fixture".into()];
+    let server = LoopbackServer::start(fixture.articles)
+        .await
+        .expect("server");
+    let (client, _) = provider_client(&server);
+    assert!(matches!(
+        discover(
+            client.clone(),
+            fixture.posts,
+            fixture.anchors,
+            DiscoveryBudget::default(),
+            CancellationToken::new()
+        )
+        .await,
+        Err(Error::Binding)
+    ));
+    let fixture = discovery_fixture(&[1]);
+    let mut budget = DiscoveryBudget::default();
+    budget.execution.reconstruction.memory = 64 << 20;
+    assert!(matches!(
+        discover(
+            client,
+            fixture.posts,
+            fixture.anchors,
+            budget,
+            CancellationToken::new()
+        )
+        .await,
+        Err(Error::Budget)
+    ));
+    assert_eq!(
+        server.body_commands(),
+        0,
+        "invalid bindings and impossible RAM limits are rejected before provider work"
+    );
+}
+#[tokio::test]
+async fn discovery_outages_and_cancellation_do_not_prove_permanent_damage() {
+    use infinidysk_health::par2::{DiscoveryBudget, discover};
+    let fixture = discovery_fixture(&[1]);
+    assert!(matches!(
+        discover(
+            Arc::new(Client::new([])),
+            fixture.posts,
+            fixture.anchors,
+            DiscoveryBudget::default(),
+            CancellationToken::new()
+        )
+        .await,
+        Err(Error::Provider(infinidysk_nntp::Error::Unavailable))
+    ));
+    let fixture = discovery_fixture(&[1]);
+    let (server, mut gate) = LoopbackServer::start_gated(fixture.articles)
+        .await
+        .expect("server");
+    let (client, downloads) = provider_client(&server);
+    let cancel = CancellationToken::new();
+    let token = cancel.clone();
+    let task = tokio::spawn(async move {
+        discover(
+            client,
+            fixture.posts,
+            fixture.anchors,
+            DiscoveryBudget::default(),
+            token,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), gate.blocked())
+        .await
+        .expect("admitted");
+    cancel.cancel();
+    assert!(matches!(task.await.expect("worker"), Err(Error::Cancelled)));
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while downloads.available_permits() != 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all permits returned");
+}
+#[tokio::test]
+async fn discovery_charges_completed_responses_and_preserves_the_remaining_execution_allowance() {
+    use infinidysk_health::par2::{DiscoveryBudget, discover};
+    let fixture = discovery_fixture(&[1]);
+    let server = LoopbackServer::start(fixture.articles)
+        .await
+        .expect("server");
+    let (client, _) = provider_client(&server);
+    let budget = DiscoveryBudget {
+        requests: 1,
+        ..DiscoveryBudget::default()
+    };
+    assert!(matches!(
+        discover(
+            client,
+            fixture.posts,
+            fixture.anchors,
+            budget,
+            CancellationToken::new()
+        )
+        .await,
+        Err(Error::Budget)
+    ));
+    assert_eq!(server.body_commands(), 1);
+}
+
+#[tokio::test]
+async fn discovery_and_reconstruction_recover_an_article_with_bad_crc_on_every_provider() {
+    use infinidysk_health::par2::{ArticleOutcome, DiscoveryBudget, discover};
+    let mut fixture = discovery_fixture(&[]);
+    let bad = fixture
+        .articles
+        .iter_mut()
+        .find(|article| article.message_id == "discovered-0-1@loopback")
+        .expect("source");
+    let at = bad
+        .wire
+        .windows(7)
+        .position(|w| w == b"pcrc32=")
+        .expect("CRC")
+        + 7;
+    bad.wire[at] = if bad.wire[at] == b'0' { b'1' } else { b'0' };
+    let server = LoopbackServer::start(fixture.articles)
+        .await
+        .expect("server");
+    let (client, downloads) = provider_client(&server);
+    let plan = discover(
+        client.clone(),
+        fixture.posts,
+        fixture.anchors,
+        DiscoveryBudget::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("trusted missing range");
+    let ArticleOutcome::Repaired(articles) = plan
+        .execute_articles(client, CancellationToken::new())
+        .await
+        .expect("verified reconstruction")
+    else {
+        panic!("repair expected");
+    };
+    assert_eq!(articles.len(), 3);
+    for article in articles {
+        let (_, body, _) = article.into_parts();
+        let expected = data(usize::try_from(body.file_size).expect("size"));
+        let at = usize::try_from(body.offset).expect("offset");
+        assert_eq!(body.data.as_ref(), &expected[at..at + body.data.len()]);
+    }
+    assert_eq!(downloads.available_permits(), 8);
+}
+
+#[tokio::test]
+async fn discovery_preserves_nonuniform_article_ranges_instead_of_assuming_a_chunk_size() {
+    use infinidysk_health::par2::{ArticleOutcome, DiscoveryBudget, discover};
+    let mut fixture = discovery_fixture(&[]);
+    fixture
+        .articles
+        .retain(|article| !article.message_id.starts_with("discovered-0-"));
+    let bytes = data(100_000);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for size in [1500usize, 4700, 2300, 5000].into_iter().cycle() {
+        if start == bytes.len() {
+            break;
+        }
+        let end = (start + size).min(bytes.len());
+        ranges.push(start..end);
+        start = end;
+    }
+    fixture.posts[0].ids = (0..ranges.len())
+        .map(|i| format!("discovered-0-{i}@loopback"))
+        .collect();
+    for (index, range) in ranges.iter().enumerate() {
+        if index == 1 {
+            continue;
+        }
+        let source = post(
+            "temporary",
+            "fixture.bin",
+            &bytes[range.clone()],
+            range.len(),
+        )
+        .remove(0);
+        let first = source
+            .wire
+            .windows(2)
+            .position(|v| v == b"\r\n")
+            .expect("begin")
+            + 2;
+        let payload = first
+            + source.wire[first..]
+                .windows(2)
+                .position(|v| v == b"\r\n")
+                .expect("part")
+            + 2;
+        let end = source
+            .wire
+            .windows(7)
+            .position(|v| v == b"\r\n=yend")
+            .expect("end");
+        let crc = source
+            .wire
+            .windows(7)
+            .position(|v| v == b"pcrc32=")
+            .expect("CRC")
+            + 7;
+        let crc = std::str::from_utf8(&source.wire[crc..crc + 8]).expect("hex");
+        let mut wire=format!("=ybegin part={} total={} line=128 size={} name=fixture.bin\r\n=ypart begin={} end={}\r\n",index+1,ranges.len(),bytes.len(),range.start+1,range.end).into_bytes();
+        wire.extend_from_slice(&source.wire[payload..end]);
+        wire.extend_from_slice(
+            format!(
+                "\r\n=yend size={} part={} pcrc32={crc}\r\n.\r\n",
+                range.len(),
+                index + 1
+            )
+            .as_bytes(),
+        );
+        fixture.articles.push(Article {
+            message_id: fixture.posts[0].ids[index].clone(),
+            wire,
+        });
+    }
+    let server = LoopbackServer::start(fixture.articles)
+        .await
+        .expect("server");
+    let (client, _) = provider_client(&server);
+    let plan = discover(
+        client.clone(),
+        fixture.posts,
+        fixture.anchors,
+        DiscoveryBudget::default(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("nonuniform exact bindings");
+    let ArticleOutcome::Repaired(articles) = plan
+        .execute_articles(client, CancellationToken::new())
+        .await
+        .expect("repair")
+    else {
+        panic!("repair expected");
+    };
+    let mut restored_missing = false;
+    for article in articles {
+        let (id, body, _) = article.into_parts();
+        let at = usize::try_from(body.offset).expect("offset");
+        assert_eq!(body.data.as_ref(), &bytes[at..at + body.data.len()]);
+        if id == "discovered-0-1@loopback" {
+            assert_eq!(body.offset, 1500);
+            assert_eq!(body.data.len(), 4700);
+            restored_missing = true;
+        }
+    }
+    assert!(restored_missing);
+}

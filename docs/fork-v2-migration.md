@@ -900,3 +900,36 @@ migration 0018 is additive and its receipts are deleted with their item. Back up
 config directory and external cache metadata before upgrading. No setting, API
 shape or setup-wizard control is introduced. Automatic PAR2 discovery, durable
 attempt scheduling/outcomes and the worker still remain open.
+
+### Original-post discovery for automatic PAR2 planning
+
+`health::par2::discover` now probes original NZB article IDs and constructs complete
+source/volume ranges for the verified executor. Names are only probe hints. Damaged
+sources require an imported PAR2 proof and an exact contiguous ID span. Additional
+healthy sources require matching length, whole MD5 and first-16-KB MD5. All descriptor
+fields and IFSC entries must match the imported anchors. Conflicting same-set core
+metadata is rejected; display-name differences do not establish source identity.
+
+A single missing or conclusively corrupt article can receive an exact range from
+validated neighboring boundaries (or the proven whole-file extent for one article).
+Consecutive unknown ranges are not divided or guessed. Nonuniform part sizes are
+preserved. Every recoverable file must bind before a plan is returned. Corrupt copies
+remain inconclusive if any provider was skipped or failed to connect.
+
+Discovery uses its own NNTP lane and CPU workers, a two-minute timeout, cancellation,
+source-geometry/RAM preflight, 100,000 logical request ceiling and bounded decoded
+read reservations. Unknown responses reserve the 32 MB-scale decoder ceiling until
+a complete response proves the actual length. Uncertain/discarded responses retain
+the reservation. Remaining request/read allowances pass into execution; this is not
+wire-byte accounting. Current input ceilings are 512 original posted files and 64
+imported proof anchors; the preflight reserves 112 MB-scale fixed parsing/response
+headroom plus input/geometry storage. Limits and unbound ranges are uncertain, not
+proof that Arr should replace a source.
+
+Focused qualification: sixteen executor/discovery tests, twelve NNTP unit tests and
+thirteen health unit tests pass. Health/NNTP all-target warnings-denied Clippy passes.
+New cases exercise partial imported ID spans, complete verified repair, variable
+article lengths, consecutive unknown ranges, forged anchors, low-memory rejection
+before provider work, request limits, outages, cancellation/permit return and actual
+bad-CRC recovery. Durable attempts, scheduling, source/reader-gated publication and
+the application worker/settings are still open. No production provider was used.

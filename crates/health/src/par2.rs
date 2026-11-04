@@ -2,7 +2,9 @@
 //! separate: only complete, imported range bindings are accepted here, and this
 //! executor returns a whole-file proof without modifying source/cache state.
 mod articles;
+mod discovery;
 pub use articles::{ArticleOutcome, ArticleProof, VerifiedArticle};
+pub use discovery::{Anchor, DiscoveryBudget, Posted, discover};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -34,6 +36,8 @@ pub enum Error {
     MissingLimit { observed: usize, maximum: usize },
     #[error("PAR2 source changed or remained unavailable after reconstruction")]
     Changed,
+    #[error("PAR2 source discovery exceeded its time allowance")]
+    DiscoveryTimeout,
     #[error("PAR2 execution cancelled")]
     Cancelled,
     #[error("PAR2 CPU worker failed")]
@@ -471,7 +475,11 @@ impl Reads {
         };
         let bytes = match body {
             Ok(body) => Some(body.data),
-            Err(infinidysk_nntp::Error::NotFound) => None,
+            Err(
+                infinidysk_nntp::Error::NotFound
+                | infinidysk_nntp::Error::CrcMismatch { .. }
+                | infinidysk_nntp::Error::Yenc(_),
+            ) => None,
             Err(error) => return Err(Error::Provider(error)),
         };
         self.last = Some(Remembered {
