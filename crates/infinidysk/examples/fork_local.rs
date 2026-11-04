@@ -19,9 +19,10 @@ async fn main() -> anyhow::Result<()> {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
     let resuming = arguments.first().is_some_and(|a| a == "--resume");
     let large = arguments.as_slice() == ["--large"];
+    let retirement = arguments.as_slice() == ["--retirement-poc"];
     anyhow::ensure!(
-        arguments.is_empty() || large || resuming && arguments.len() == 2,
-        "usage: fork_local [--large | --resume GENERATED_ROOT]"
+        arguments.is_empty() || large || retirement || resuming && arguments.len() == 2,
+        "usage: fork_local [--large | --retirement-poc | --resume GENERATED_ROOT]"
     );
     let root = if resuming {
         let root = std::fs::canonicalize(&arguments[1])?;
@@ -198,6 +199,98 @@ async fn main() -> anyhow::Result<()> {
             ..NativeSettings::default()
         };
     }
+    let retirement_receipt = if retirement {
+        use axum::{
+            Json, Router,
+            extract::{Request, State},
+            http::StatusCode,
+            response::{IntoResponse as _, Response},
+        };
+        use infinidysk::config::{ArrInstance, ArrProfile};
+        use infinidysk_db::{HealthState, HealthStatus};
+        use std::sync::Arc;
+        async fn remote(State(root): State<Arc<std::path::PathBuf>>, request: Request) -> Response {
+            if request.method() != axum::http::Method::GET {
+                let _ = std::fs::write(root.join("unexpected-arr-write"), b"blocked");
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            let replaced = root.join("replacement-observed").exists();
+            Json(match request.uri().path(){
+            "/api/v3/system/status"=>serde_json::json!({"appName":"Radarr","version":"6.0.0"}),
+            "/api/v3/rootfolder"=>serde_json::json!([{"path":"/fixture"}]),
+            "/api/v3/moviefile/7"=>serde_json::json!({"id":7,"movieId":3,"path":"/fixture/legacy.bin"}),
+            "/api/v3/movie/3"=>serde_json::json!({"movieFile":{"id":if replaced{8}else{7},"path":if replaced{"/fixture/replacement.bin"}else{"/fixture/legacy.bin"}}}),
+            "/api/v3/queue/details"|"/api/v3/downloadclient"=>serde_json::json!([]),
+            "/api/v3/history"=>serde_json::json!({"records":[],"totalRecords":0}),
+            _=>return StatusCode::NOT_FOUND.into_response(),
+        }).into_response()
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let arr = ArrInstance {
+            id: uuid::Uuid::now_v7(),
+            name: "generated-loopback".into(),
+            profile: ArrProfile::Radarr,
+            url: format!("http://{}", listener.local_addr()?),
+            api_key: Secret("fixture".into()),
+            enabled: true,
+        };
+        let router = Router::new()
+            .fallback(remote)
+            .with_state(Arc::new(root.clone()));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let parent = db
+            .item(file.parent.context("fixture parent")?)
+            .await?
+            .context("fixture parent")?;
+        let mut legacy = Item::child(&parent, "legacy.bin", ItemKind::NzbFile)?;
+        let meta_id = BlobId::new();
+        legacy.meta_blob = Some(meta_id);
+        legacy.size = file.size;
+        legacy.health_state = HealthState::ActionNeeded;
+        let raw = db
+            .blob(file.meta_blob.context("fixture metadata")?)
+            .await?
+            .context("fixture metadata")?;
+        let meta = blob::decode_meta(&raw)?;
+        let provenance = serde_json::to_string(&infinidysk_import::native::Source {
+            version: 1,
+            base_generation: "generated-poc".into(),
+            dependencies: vec![],
+            fingerprint: sha2::Sha256::digest(meta.content_identity()?).to_vec(),
+            size: meta.size(),
+            mapped_identity: None,
+        })?;
+        db.import_items_with_sources(
+            &[(
+                legacy.clone(),
+                HealthStatus {
+                    state: HealthState::ActionNeeded,
+                    next_check: Some(infinidysk_db::now_ms() + 86_400_000),
+                    ..HealthStatus::default()
+                },
+            )],
+            &[(meta_id, &raw)],
+            &[(legacy.id, provenance)],
+        )
+        .await?;
+        let request=serde_json::json!({"Id":uuid::Uuid::now_v7(),"Status":"requested","ArrHost":arr.url,"ArrMediaKind":"movie","ArrFileId":7,"ArrMediaIds":"3","LibraryPath":"/fixture/legacy.bin","DavItemId":legacy.id.0.to_string()}).to_string();
+        db.retain_legacy_repair_request(
+            "generated-poc-request",
+            Some(legacy.id),
+            "arr-request",
+            &request,
+            None,
+        )
+        .await?;
+        settings.arr_instances = vec![arr];
+        settings.health.enabled = true;
+        settings.health.auto_repair = true;
+        Some(serde_json::json!({"item":legacy.id.0,"evidence":"generated-poc-request"}))
+    } else {
+        None
+    };
     ConfigStore::load(db.clone(), std::iter::empty())
         .await?
         .save(settings)
@@ -216,7 +309,7 @@ async fn main() -> anyhow::Result<()> {
             ]
         })
         .collect();
-    let receipt = serde_json::json!({"url":format!("http://{address}"),"root":root,"item":file.id.0,"source_path":file.path,"size":file.size,"sha256":digest});
+    let receipt = serde_json::json!({"url":format!("http://{address}"),"root":root,"item":file.id.0,"source_path":file.path,"size":file.size,"sha256":digest,"legacy_retirement":retirement_receipt});
     let receipt_path = root.join("receipt.json");
     std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)?;
     std::fs::set_permissions(&receipt_path, std::fs::Permissions::from_mode(0o600))?;
