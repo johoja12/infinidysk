@@ -52,5 +52,5 @@ member-mismatch classification lets discovery distinguish a definitive different
 candidate from unavailable source evidence. Scheduler tests cover restart, sparse
 priority order, two-slot admission, import progress during validation, explicit
 terminal dispositions and changed plans. These Python phases use generated data
-and simulated child/API results; native end-to-end pipeline qualification is a
-separate gate.
+and simulated child/API results; native end-to-end pipeline qualification is recorded in
+[native canary validation](rust-v2-native-migration-canary-20261105.md).
