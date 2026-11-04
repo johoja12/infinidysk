@@ -1372,6 +1372,19 @@ async fn reimport_proof_binds_exact_offline_member_to_completed_accepted_job() {
         status(addr, &admin_request("POST", path, &request.to_string())).await,
         "HTTP/1.1 409 Conflict"
     );
+    request["source"]["identity_digest"] = json!(identity);
+    let mut changed = metadata.clone();
+    let FileMeta::Nzb(member) = &mut changed else {
+        panic!("direct fixture");
+    };
+    member.segments.items[0].id = "different@loopback".into();
+    db.update_blob(meta, &blob::encode_meta(&changed).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        status(addr, &admin_request("POST", path, &request.to_string())).await,
+        "HTTP/1.1 409 Conflict"
+    );
     assert!(
         db.import_source(file.id).await.unwrap().is_none(),
         "new IDs cannot adopt legacy cache provenance"

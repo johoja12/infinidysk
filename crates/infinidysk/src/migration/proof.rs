@@ -320,8 +320,11 @@ async fn prove_reimport(admin: &Admin, request: ReimportRequest) -> Result<Reimp
         id,
     )
     .await
-    .map_err(|_| {
-        Fail::Unavailable("Offline source cannot prove this exact reimported member".into())
+    .map_err(|error| match error {
+        infinidysk_import::Error::MemberMismatch => {
+            Fail::Conflict("Current candidate differs from the exact legacy member".into())
+        }
+        _ => Fail::Unavailable("Offline source cannot prove this exact reimported member".into()),
     })?;
     let evidence = expected.evidence;
     if evidence.version != 1

@@ -1318,9 +1318,7 @@ pub async fn capture_reimport_identity(
         || item.size != Some(expected.size)
         || metadata.size() != expected.size
     {
-        return Err(Error::Mapping(
-            "reimported member differs from the exact legacy source",
-        ));
+        return Err(Error::MemberMismatch);
     }
     if !db.metadata_is_current(current, blob_id, &raw).await? {
         return Err(Error::Mapping("reimported metadata changed during proof"));

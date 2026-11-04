@@ -45,6 +45,8 @@ const LOG_EVERY: u32 = 30;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("reimported member differs from the exact legacy source")]
+    MemberMismatch,
     #[error("legacy source mapping: {0}")]
     Mapping(&'static str),
     #[error("no C# database at {0}")]
