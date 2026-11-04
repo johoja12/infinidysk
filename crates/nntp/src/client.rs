@@ -91,6 +91,7 @@ pub struct Client {
     preempt: Arc<Mutex<Option<CancellationToken>>>,
     /// Requests admitted and not yet finished.
     admitted: Arc<AtomicUsize>,
+    foreground: Arc<AtomicUsize>,
 }
 
 /// Exclusive use of the providers for a diagnostic: background requests wait at
@@ -156,6 +157,7 @@ impl Client {
             gate: Arc::default(),
             preempt: Arc::default(),
             admitted: Arc::default(),
+            foreground: Arc::default(),
         };
         client.replace(providers);
         client
@@ -343,6 +345,14 @@ impl Client {
             })
             .min_by_key(|entry| entry.preference())
             .is_some_and(|entry| entry.provider.pool.can_hedge(size))
+    }
+
+    /// Uncached foreground callers waiting for providers. Local repaired bodies
+    /// and decoded/native cache hits do not consume this signal. Cancelled callers
+    /// stop counting even while an abandoned reply drains in the background.
+    #[must_use]
+    pub fn foreground_pending(&self) -> bool {
+        self.foreground.load(Ordering::Acquire) > 0
     }
 
     /// Connection limit of the first priority level.
@@ -712,6 +722,7 @@ impl Client {
         }
         validate_message_id(message_id)?;
         let workload = base.workload;
+        let _foreground = (workload == Workload::Stream).then(|| Load::acquire(&self.foreground));
         let _admitted = self.admit(workload).await;
         let providers = self.snapshot();
         if providers.is_empty() {
@@ -998,6 +1009,42 @@ mod tests {
         ));
         assert_eq!(bad.body_commands(), 1);
         assert_eq!(downloads.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn foreground_demand_excludes_background_work_and_cancelled_callers() {
+        for workload in [Workload::Stream, Workload::Health] {
+            let corpus = Corpus::generate(1025, 1, 1024);
+            let id = corpus.articles[0].message_id.clone();
+            let (server, mut gate) = LoopbackServer::start_gated(corpus.articles)
+                .await
+                .expect("server");
+            let downloads = Downloads::new(4);
+            let client = Arc::new(Client::new([provider(&server, &downloads)]));
+            assert!(!client.foreground_pending());
+            let task = {
+                let client = client.clone();
+                tokio::spawn(async move { client.body(&id, workload, None).await })
+            };
+            tokio::time::timeout(Duration::from_secs(5), gate.blocked())
+                .await
+                .expect("admitted");
+            assert_eq!(client.foreground_pending(), workload == Workload::Stream);
+            task.abort();
+            assert!(task.await.expect_err("caller cancelled").is_cancelled());
+            assert!(
+                !client.foreground_pending(),
+                "the still-draining old response is not new playback demand"
+            );
+            gate.release();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while downloads.available_permits() != 4 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("drain releases permits");
+        }
     }
 
     #[tokio::test]
