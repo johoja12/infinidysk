@@ -194,7 +194,7 @@ export function PrefetchPanel() {
                 {status.data.paused ? "Resume queue" : "Pause queue"}
               </Button>
             </div>
-            <p className="text-xs text-muted-foreground">Provider response reservations: {status.data.reserved_wire_bytes == null ? "storage unavailable" : bytes(status.data.reserved_wire_bytes)} for UTC day {status.data.wire_day ?? "unknown"}. Received since process start: {bytes(status.data.received_wire_bytes)}.{status.data.wire_blocked ? " New provider reads are currently held." : ""}</p>
+            <p className="text-xs text-muted-foreground">Provider response reservations: {status.data.reserved_wire_bytes == null ? "storage unavailable" : bytes(status.data.reserved_wire_bytes)} for {status.data.wire_day == null ? "an unknown UTC date" : status.data.wire_day === 0 ? "a day with no reservations yet" : new Date(status.data.wire_day * 86400000).toISOString().slice(0, 10) + " UTC"}. Received since process start: {bytes(status.data.received_wire_bytes)}.{status.data.wire_blocked ? " New provider reads are currently held." : ""}</p>
             <p className="text-xs text-muted-foreground">
               Completed means the requested blocks were verified during this
               job. Later cache eviction can remove them. Retry verifies current
