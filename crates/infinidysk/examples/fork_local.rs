@@ -18,9 +18,10 @@ use tokio_util::sync::CancellationToken;
 async fn main() -> anyhow::Result<()> {
     let arguments: Vec<_> = std::env::args().skip(1).collect();
     let resuming = arguments.first().is_some_and(|a| a == "--resume");
+    let large = arguments.as_slice() == ["--large"];
     anyhow::ensure!(
-        arguments.is_empty() || resuming && arguments.len() == 2,
-        "usage: fork_local [--resume GENERATED_ROOT]"
+        arguments.is_empty() || large || resuming && arguments.len() == 2,
+        "usage: fork_local [--large | --resume GENERATED_ROOT]"
     );
     let root = if resuming {
         let root = std::fs::canonicalize(&arguments[1])?;
@@ -43,7 +44,20 @@ async fn main() -> anyhow::Result<()> {
         root
     };
     let database_url = format!("sqlite:{}", root.join("infinidysk.sqlite").display());
-    let corpus = Corpus::generate(1025, 32, 256 * 1024);
+    let articles = if resuming {
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("receipt.json"))?)?;
+        match receipt["size"].as_u64() {
+            Some(8_388_608) => 32,
+            Some(25_165_824) => 96,
+            _ => anyhow::bail!("unexpected generated fixture size"),
+        }
+    } else if large {
+        96
+    } else {
+        32
+    };
+    let corpus = Corpus::generate(1025, articles, 256 * 1024);
     let expected_hash = sha2::Sha256::digest(&corpus.data);
     let server = LoopbackServer::start(corpus.articles.clone()).await?;
     let db = Db::connect(&database_url).await?;
