@@ -979,3 +979,21 @@ CAS refusal, interrupted-running recovery, preserved publishing payloads, priori
 and capacity release. Database all-target warnings-denied Clippy passes. Migration
 0019 is additive: back up the config directory and external cache metadata before
 upgrading. No setting or setup-wizard control is introduced by the journal.
+
+### Settled repair-ledger snapshots and bounded metadata
+
+A controlled WAL transaction reproduced a readback race: reconciliation could
+activate the preceding snapshot while an earlier dispatched writer was unresolved.
+Startup and reconciliation now acquire a SQLite write barrier and read epoch,
+quotas and records through one transaction/connection. They release SQL before
+waiting for the health mutation barrier, preserving shared-catalogue lock order.
+Fourteen repair-store tests pass, including the reproduction after the fix and a
+matching startup case; native-cache all-target warnings-denied Clippy passes.
+
+Repair workflows also have bounded compressed-blob reads at the database and bounded
+NZB/metadata expansion in the core decoder. Output bytes and zstd history windows
+are limited; an 8 MB-scale history floor accepts the existing streaming writer's
+frames even for tiny payloads. Existing unbounded APIs and stored formats remain
+unchanged. Sixteen core tests and seven SQLite/PostgreSQL database tests pass;
+workspace all-target Clippy passed for the bounded-input increment before subsequent
+worker wiring began. These are resource guards, not an automatic-repair activation.
