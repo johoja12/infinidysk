@@ -59,7 +59,7 @@ class Schedule:
         value=result.manifest
         if value.get('masterManifestDigest')!=self.value['masterManifestDigest'] \
                 or value.get('batchIndex')!=index or value.get('batchCount')!=self.value['batchCount'] \
-                or len(value['releases'])>1000:
+                or len(value['releases'])>1000 or not 1<=len(value['selectedLinks'])<=1000:
             result.close();raise ValueError('Sealed batch differs from frozen master/slot bound')
         return result
 
