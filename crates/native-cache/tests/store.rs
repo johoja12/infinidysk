@@ -478,3 +478,48 @@ async fn unavailable_cache_storage_keeps_health_protection_and_corruption_releas
     assert!(!cache.entries(0, 10).await.unwrap()[0].pinned);
     assert!(cache.coverage(&k).await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn verified_playback_does_not_wait_for_a_catalogue_recency_writer() {
+    use sqlx::{ConnectOptions as _, Connection as _};
+    let temp = Temp::new();
+    let mut settings = temp.settings();
+    // Functional lock-contention test; physical I/O timing is tested separately.
+    settings.io_timeout_ms = 10_000;
+    let cache = Cache::open(settings).await.unwrap();
+    let key = Key::new(Uuid::new_v4(), b"recency-fixture", BLOCK);
+    let lease = cache.lease(key).unwrap();
+    assert!(cache.put(&lease, 0, data(7)).await.unwrap());
+    let mut blocker = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(temp.0.join("metadata/catalogue.sqlite"))
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("UPDATE entries SET used=1")
+        .execute(&mut blocker)
+        .await
+        .unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut blocker)
+        .await
+        .unwrap();
+    let found = cache.get(&lease, 0).await;
+    sqlx::query("ROLLBACK").execute(&mut blocker).await.unwrap();
+    assert!(
+        found.is_some(),
+        "a verified payload must not depend on a best-effort recency write"
+    );
+    assert_eq!(found.unwrap(), data(7));
+    for _ in 0..200 {
+        let used: i64 = sqlx::query_scalar("SELECT used FROM entries")
+            .fetch_one(&mut blocker)
+            .await
+            .unwrap();
+        if used > 1 {
+            blocker.close().await.unwrap();
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("queued recency was not persisted after the writer released");
+}

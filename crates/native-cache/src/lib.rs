@@ -2,6 +2,7 @@
 //! The catalogue stays on local storage; browsing never scans payload volumes.
 mod diagnostics;
 mod manifest;
+mod recency;
 pub use manifest::{
     Candidate as RecoveryCandidate, Page as RecoveryPage, Report as RecoveryReport,
 };
@@ -299,6 +300,8 @@ impl Drop for Lease {
 pub struct Cache {
     settings: Settings,
     db: SqlitePool,
+    recency: recency::Updates,
+    read_timeouts: AtomicU64,
     folders: Vec<Arc<Folder>>,
     live: Arc<Mutex<Live>>,
     entries: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
@@ -331,6 +334,9 @@ pub struct Stats {
     pub skipped: u64,
     pub failed: u64,
     pub io: IoStats,
+    pub read_timeouts: u64,
+    pub recency_pending: usize,
+    pub recency_dropped: u64,
 }
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[schema(as = NativeCacheCoverage)]
@@ -537,7 +543,10 @@ impl Cache {
             folders.push(Arc::new(folder));
         }
         folders.sort_by_key(|f| std::cmp::Reverse(f.settings.priority));
+        let recency = recency::Updates::start(db.clone());
         Ok(Arc::new(Self {
+            recency,
+            read_timeouts: AtomicU64::new(0),
             slots: Arc::new(Semaphore::new(
                 (u64::from(settings.buffer_mb) * MB / BLOCK).max(1) as usize,
             )),
@@ -618,9 +627,14 @@ impl Cache {
         lock
     }
     pub async fn get(&self, lease: &Lease, block: u64) -> Option<Bytes> {
-        let result = tokio::time::timeout(self.deadline(), self.read(lease, block))
-            .await
-            .unwrap_or(Ok(None));
+        let result = if let Ok(result) =
+            tokio::time::timeout(self.deadline(), self.read(lease, block)).await
+        {
+            result
+        } else {
+            self.read_timeouts.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        };
         match result {
             Ok(Some(data)) => {
                 self.hits.fetch_add(1, Ordering::Relaxed);
@@ -687,11 +701,7 @@ impl Cache {
         });
         match tokio::time::timeout(self.deadline(), job).await {
             Ok(Ok(Ok(data))) => {
-                sqlx::query("UPDATE entries SET used=$2 WHERE key=$1")
-                    .bind(key.id())
-                    .bind(now())
-                    .execute(&self.db)
-                    .await?;
+                self.recency.touch(key.id(), now());
                 Ok(Some(data))
             }
             Ok(Ok(Err(error))) => {
@@ -1058,6 +1068,9 @@ impl Cache {
             skipped: self.skipped.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
             io: self.io.snapshot(self.slots.available_permits()),
+            read_timeouts: self.read_timeouts.load(Ordering::Relaxed),
+            recency_pending: self.recency.pending(),
+            recency_dropped: self.recency.dropped(),
         })
     }
     pub async fn pin(&self, key: &Key, pinned: bool) -> Result<bool, Error> {

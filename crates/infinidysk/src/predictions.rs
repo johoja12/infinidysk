@@ -1518,7 +1518,12 @@ mod tests {
         let mut b = [0; 64];
         reader.read_exact(&mut b).await.unwrap();
         assert_eq!(b, expected[expected.len() - 128..expected.len() - 64]);
-        assert_eq!(f.server.body_commands(), 0);
+        assert_eq!(
+            f.server.body_commands(),
+            0,
+            "cache diagnostics: {:?}",
+            f.vfs.native_cache().unwrap().stats().await.unwrap()
+        );
     }
     #[tokio::test]
     async fn mismatched_playing_media_version_is_not_guessed_from_metadata() {
