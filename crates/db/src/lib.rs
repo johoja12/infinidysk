@@ -3648,3 +3648,12 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
+
+impl Db {
+    /// One bounded recursive statement proves membership in a recorded import,
+    /// independently of names, sizes and current filesystem paths.
+    pub async fn item_descends_from(&self, item: ItemId, root: ItemId) -> Result<bool, Error> {
+        let sql = "WITH RECURSIVE chain(id,parent_id,depth) AS (SELECT id,parent_id,0 FROM items WHERE id=$1 UNION ALL SELECT i.id,i.parent_id,c.depth+1 FROM items i JOIN chain c ON i.id=c.parent_id WHERE c.depth<64) SELECT EXISTS(SELECT 1 FROM chain WHERE id=$2)";
+        Ok(on!(self,pool=>sqlx::query_scalar(sql).bind(item.0).bind(root.0).fetch_one(pool).await?))
+    }
+}

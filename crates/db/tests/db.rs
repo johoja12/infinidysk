@@ -66,6 +66,16 @@ async fn exercise(db: &Db) {
     .await
     .expect("insert");
 
+    assert!(
+        db.item_descends_from(file.id, dir.id)
+            .await
+            .expect("import subtree")
+    );
+    assert!(
+        !db.item_descends_from(file.id, other.id)
+            .await
+            .expect("unrelated subtree")
+    );
     let intent = db
         .prepare_regrab(file.id, "scope", "prepared")
         .await

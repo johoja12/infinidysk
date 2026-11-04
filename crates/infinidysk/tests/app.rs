@@ -1231,3 +1231,153 @@ async fn migration_mount_challenge_matches_actual_webdav_bytes_without_a_media_r
     cancel.cancel();
     assert_eq!(server.await.unwrap().unwrap(), Exit::Stopped);
 }
+
+#[tokio::test]
+async fn reimport_proof_binds_exact_offline_member_to_completed_accepted_job() {
+    fn object(fields: &[Vec<u8>]) -> Vec<u8> {
+        let mut out = vec![u8::try_from(fields.len()).unwrap()];
+        out.extend(fields.iter().map(|v| u8::try_from(v.len()).unwrap()));
+        out.extend(fields.iter().flatten());
+        out
+    }
+    use base64::Engine as _;
+    use infinidysk_core::{BlobId, FileMeta, NzbFile, Segment, Segments, blob};
+    use infinidysk_db::HealthState;
+    use sqlx::{ConnectOptions as _, Connection as _};
+    let (addr, cancel, server, url) = start().await;
+    assert_eq!(
+        status(addr, &admin_request("GET", "/api/v1/status", "")).await,
+        "HTTP/1.1 200 OK"
+    );
+    let db = infinidysk_db::Db::connect(&url).await.unwrap();
+    let package = "a".repeat(64);
+    let options = json!({"package_digest":package,"source_release_id":"fixture-release","file_name":"fixture.nzb","category":"migration-fixture","priority":0,"post_processing":0});
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&options).unwrap());
+    let submitted = admin_request("POST", "/api/v1/migration/submissions", NZB).replace(
+        "Content-Type:",
+        &format!("X-Migration-Options: {encoded}\r\nContent-Type:"),
+    );
+    let (code, body) = send(addr, &submitted).await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    let receipt: Value = serde_json::from_str(&body).unwrap();
+    let job = JobId(receipt["job_id"].as_str().unwrap().parse().unwrap());
+    db.remove_job(job).await.unwrap();
+    let root = db.item(ItemId::CONTENT).await.unwrap().unwrap();
+    let dir = Item::child(&root, "proof-import", ItemKind::Directory).unwrap();
+    let mut file = Item::child(&dir, "fixture.bin", ItemKind::NzbFile).unwrap();
+    let meta = BlobId::new();
+    file.meta_blob = Some(meta);
+    file.size = Some(100);
+    file.health_state = HealthState::Ignored;
+    let metadata = FileMeta::Nzb(NzbFile {
+        segments: Segments {
+            items: vec![Segment {
+                id: "a@b".into(),
+                size: 100,
+                fallbacks: vec![],
+            }],
+            sizes_trusted: true,
+            ..Default::default()
+        },
+        proof: None,
+    });
+    // Completion and metadata are generated fixtures, not a real NNTP import.
+    db.add_history(
+        &HistoryEntry {
+            id: job,
+            created_at: 1,
+            file_name: "fixture.nzb".into(),
+            job_name: "fixture".into(),
+            category: "migration-fixture".into(),
+            status: JobStatus::Completed,
+            total_bytes: 100,
+            download_seconds: 1,
+            fail_message: None,
+            download_dir: Some(dir.id),
+            nzb_blob: None,
+            storage: None,
+        },
+        &[dir, file.clone()],
+        &[(meta, &blob::encode_meta(&metadata).unwrap())],
+    )
+    .await
+    .unwrap();
+    let source = std::env::temp_dir().join(format!("id-reimport-proof-{}", ItemId::new()));
+    std::fs::create_dir(&source).unwrap();
+    let legacy = ItemId::new();
+    let old_meta = uuid::Uuid::new_v4();
+    let old_nzb = uuid::Uuid::new_v4();
+    let mut cs = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(source.join("db.sqlite"))
+        .create_if_missing(true)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::raw_sql("CREATE TABLE DavItems(Id TEXT,ParentId TEXT,Name TEXT,Path TEXT,SubType INTEGER,FileSize INTEGER,FileBlobId TEXT,NzbBlobId TEXT,CreatedAt TEXT,ReleaseDate INTEGER,LastHealthCheck INTEGER,NextHealthCheck INTEGER,HealthRepairPending INTEGER)").execute(&mut cs).await.unwrap();
+    sqlx::query("INSERT INTO DavItems VALUES($1,NULL,'fixture.bin','/content/fixture.bin',201,100,$2,$3,'2025-01-01',NULL,NULL,NULL,0)").bind(legacy.0.to_string()).bind(old_meta.to_string()).bind(old_nzb.to_string()).execute(&mut cs).await.unwrap();
+    cs.close().await.unwrap();
+    let mut ids = 1i32.to_le_bytes().to_vec();
+    ids.extend([(!3i32).to_le_bytes(), 3i32.to_le_bytes()].concat());
+    ids.extend(b"a@b");
+    let mut ranges = 1i32.to_le_bytes().to_vec();
+    ranges.extend(object(&[
+        0i64.to_le_bytes().to_vec(),
+        100i64.to_le_bytes().to_vec(),
+    ]));
+    let memorypack = object(&[old_meta.to_bytes_le().to_vec(), ids, ranges]);
+    for (id, raw) in [
+        (
+            old_meta,
+            zstd::encode_all(memorypack.as_slice(), 1).unwrap(),
+        ),
+        (old_nzb, NZB.as_bytes().to_vec()),
+    ] {
+        let hex = id.simple().to_string();
+        let path = source
+            .join("blobs")
+            .join(&hex[..2])
+            .join(&hex[2..4])
+            .join(id.to_string());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, raw).unwrap();
+    }
+    let identity = infinidysk_import::article_identity::parse(NZB.as_bytes())
+        .unwrap()
+        .direct(&["a@b".into()])
+        .unwrap();
+    let mut request = json!({"source":{"source_config":source,"package_digest":package,"legacy_item":legacy.0,"identity_kind":"direct-articles-v1","identity_digest":identity,"payload_sha256":receipt["payload_sha256"],"size":100},"current_item":file.id.0,"submission_intent":receipt["intent"],"source_release_id":"fixture-release"});
+    let path = "/api/v1/migration/reimport-proof";
+    let (code, body) = send(addr, &admin_request("POST", path, &request.to_string())).await;
+    assert_eq!(code, "HTTP/1.1 200 OK", "{body}");
+    let proof: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(proof["current_item"], json!(file.id.0));
+    assert_eq!(proof["legacy_item"], json!(legacy.0));
+    assert_eq!(proof["job_id"], receipt["job_id"]);
+    assert_eq!(proof["payload_validated"], false);
+    request["source_release_id"] = json!("another-fixture");
+    assert_eq!(
+        status(addr, &admin_request("POST", path, &request.to_string())).await,
+        "HTTP/1.1 400 Bad Request"
+    );
+    request["source_release_id"] = json!("fixture-release");
+    request["current_item"] = json!(ItemId::CONTENT.0);
+    assert_eq!(
+        status(addr, &admin_request("POST", path, &request.to_string())).await,
+        "HTTP/1.1 409 Conflict"
+    );
+    request["current_item"] = json!(file.id.0);
+    request["source"]["identity_digest"] = json!("b".repeat(64));
+    assert_eq!(
+        status(addr, &admin_request("POST", path, &request.to_string())).await,
+        "HTTP/1.1 409 Conflict"
+    );
+    assert!(
+        db.import_source(file.id).await.unwrap().is_none(),
+        "new IDs cannot adopt legacy cache provenance"
+    );
+    db.close().await;
+    cancel.cancel();
+    assert_eq!(server.await.unwrap().unwrap(), Exit::Stopped);
+    std::fs::remove_dir_all(source).unwrap();
+}

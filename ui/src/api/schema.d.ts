@@ -935,6 +935,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/migration/reimport-proof": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["migration_reimport_proof"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/migration/submissions": {
         parameters: {
             query?: never;
@@ -4599,6 +4615,20 @@ export interface components {
             /** Format: int64 */
             updated_at: number;
         };
+        ReimportProof: components["schemas"]["Proof"] & {
+            /** Format: uuid */
+            download_dir: string;
+            /** Format: uuid */
+            job_id: string;
+            submission_intent: string;
+        };
+        ReimportRequest: {
+            /** Format: uuid */
+            current_item: string;
+            source: components["schemas"]["Request"];
+            source_release_id: string;
+            submission_intent: string;
+        };
         /**
          * @description A release health asked an Arr to replace. NZBs with its name or any of its articles
          *     fail to import until it expires.
@@ -6931,6 +6961,36 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["MountProof"];
                 };
+            };
+        };
+    };
+    migration_reimport_proof: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReimportRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReimportProof"];
+                };
+            };
+            /** @description Import or exact member identity differs */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

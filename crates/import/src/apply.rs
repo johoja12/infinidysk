@@ -1210,44 +1210,8 @@ pub async fn capture_mapped_source(
         }
         return Ok(evidence);
     }
-    let mut cs = open(config).await?;
-    let rows:Vec<FileRow>=sqlx::query_as(concat!(
-        "SELECT Id AS id,ParentId AS parent,Name AS name,Path AS path,SubType AS sub_type,FileSize AS size,FileBlobId AS meta,NzbBlobId AS nzb,",
-        ms!("CreatedAt")," AS created,ReleaseDate AS release_date,LastHealthCheck AS last_check,NextHealthCheck AS next_check,HealthRepairPending <> 0 AS repair_pending FROM DavItems WHERE Id=$1 OR Id=$2 OR Id=$3 OR Id=$4 LIMIT 2"
-    )).bind(id.0.to_string()).bind(id.0.to_string().to_uppercase()).bind(id.0.simple().to_string()).bind(id.0.simple().to_string().to_uppercase()).fetch_all(&mut cs).await?;
-    if rows.len() != 1 {
-        return Err(Error::Mapping(
-            "original legacy source is missing or ambiguous",
-        ));
-    }
-    let row = &rows[0];
-    let client = Client::new([]);
-    let part = match &current {
-        FileMeta::Nzb(file) => file.segments.items.first(),
-        FileMeta::Multipart(file) => file.parts.first().and_then(|p| p.segments.items.first()),
-    }
-    .map(|s| u64::from(s.size));
-    let volumes = match &current {
-        FileMeta::Nzb(_) => vec![],
-        FileMeta::Multipart(file) => file
-            .parts
-            .iter()
-            .filter_map(|p| p.proof.as_ref().map(|proof| proof.file_length))
-            .collect(),
-    };
-    let mut sizer = Sizer {
-        client: &client,
-        part,
-        volumes,
-        fetched: 0,
-        provider_errors: 0,
-    };
-    let (_, _, converted) = convert_with_mapping(row, &config.join("blobs"), &mut sizer, true)
-        .await
-        .map_err(|_| {
-            Error::Mapping("offline source conversion could not prove the current member")
-        })?;
-    let source: crate::native::Source = serde_json::from_str(&converted)
+    let source = offline_mapped_source(config, id, &current).await?;
+    let converted = serde_json::to_string(&source)
         .map_err(|_| Error::Mapping("converted provenance is invalid"))?;
     if source.base_generation != original.base_generation
         || source.fingerprint != fingerprint
@@ -1267,6 +1231,106 @@ pub async fn capture_mapped_source(
         return Err(Error::Mapping("source changed during mapping capture"));
     }
     Ok(evidence)
+}
+
+async fn offline_mapped_source(
+    config: &Path,
+    id: ItemId,
+    current: &FileMeta,
+) -> Result<crate::native::Source, Error> {
+    let mut cs = open(config).await?;
+    let rows:Vec<FileRow>=sqlx::query_as(concat!(
+        "SELECT Id AS id,ParentId AS parent,Name AS name,Path AS path,SubType AS sub_type,FileSize AS size,FileBlobId AS meta,NzbBlobId AS nzb,",
+        ms!("CreatedAt")," AS created,ReleaseDate AS release_date,LastHealthCheck AS last_check,NextHealthCheck AS next_check,HealthRepairPending <> 0 AS repair_pending FROM DavItems WHERE Id=$1 OR Id=$2 OR Id=$3 OR Id=$4 LIMIT 2"
+    )).bind(id.0.to_string()).bind(id.0.to_string().to_uppercase()).bind(id.0.simple().to_string()).bind(id.0.simple().to_string().to_uppercase()).fetch_all(&mut cs).await?;
+    if rows.len() != 1 {
+        return Err(Error::Mapping(
+            "original legacy source is missing or ambiguous",
+        ));
+    }
+    let row = &rows[0];
+    let client = Client::new([]);
+    let part = match current {
+        FileMeta::Nzb(file) => file.segments.items.first(),
+        FileMeta::Multipart(file) => file.parts.first().and_then(|p| p.segments.items.first()),
+    }
+    .map(|s| u64::from(s.size));
+    let volumes = match current {
+        FileMeta::Nzb(_) => vec![],
+        FileMeta::Multipart(file) => file
+            .parts
+            .iter()
+            .filter_map(|p| p.proof.as_ref().map(|proof| proof.file_length))
+            .collect(),
+    };
+    let mut sizer = Sizer {
+        client: &client,
+        part,
+        volumes,
+        fetched: 0,
+        provider_errors: 0,
+    };
+    let (_, _, converted) = convert_with_mapping(row, &config.join("blobs"), &mut sizer, true)
+        .await
+        .map_err(|_| {
+            Error::Mapping("offline source conversion could not prove the current member")
+        })?;
+    serde_json::from_str(&converted).map_err(|_| Error::Mapping("converted provenance is invalid"))
+}
+
+/// Exact offline identity for a newly allocated Rust ID. This proves metadata
+/// equivalence, not healthy payload bytes or membership in an accepted job.
+pub struct ReimportIdentity {
+    pub evidence: crate::article_identity::Evidence,
+    pub fingerprint: Vec<u8>,
+}
+pub async fn capture_reimport_identity(
+    config: &Path,
+    db: &Db,
+    legacy: ItemId,
+    current: ItemId,
+) -> Result<ReimportIdentity, Error> {
+    use sha2::{Digest as _, Sha256};
+    let item = db
+        .item(current)
+        .await?
+        .ok_or(Error::Mapping("reimported member is missing"))?;
+    if item.health_state == HealthState::Hidden {
+        return Err(Error::Mapping("reimported member is being replaced"));
+    }
+    let blob_id = item
+        .meta_blob
+        .ok_or(Error::Mapping("reimported metadata is missing"))?;
+    let raw = db
+        .blob_limited(blob_id, MAX_NZB_BLOB_BYTES)
+        .await?
+        .ok_or(Error::Mapping(
+            "reimported metadata is missing or exceeds bound",
+        ))?;
+    let (metadata, raw, fingerprint) = tokio::task::spawn_blocking(move || -> Result<_, Error> {
+        let metadata = blob::decode_meta(&raw)?;
+        let fingerprint = Sha256::digest(metadata.content_identity()?).to_vec();
+        Ok((metadata, raw, fingerprint))
+    })
+    .await??;
+    let expected = offline_mapped_source(config, legacy, &metadata).await?;
+    if expected.fingerprint != fingerprint
+        || item.size != Some(expected.size)
+        || metadata.size() != expected.size
+    {
+        return Err(Error::Mapping(
+            "reimported member differs from the exact legacy source",
+        ));
+    }
+    if !db.metadata_is_current(current, blob_id, &raw).await? {
+        return Err(Error::Mapping("reimported metadata changed during proof"));
+    }
+    Ok(ReimportIdentity {
+        evidence: expected
+            .mapped_identity
+            .ok_or(Error::Mapping("original identity is unavailable"))?,
+        fingerprint,
+    })
 }
 
 pub(crate) enum CsFile {
@@ -3516,11 +3580,20 @@ mod tests {
             let captured=db.import_source(id).await.unwrap().unwrap();assert_ne!(captured,old);
             assert_eq!(capture_mapped_source(Path::new("/nonexistent-legacy-fixture"),&db,id).await.unwrap(),evidence);
             let item=db.item(id).await.unwrap().unwrap();let meta_id=item.meta_blob.unwrap();
+            let mut reimported=item.clone();reimported.id=ItemId::new();reimported.name="reimported.bin".into();reimported.path="/content/job/reimported.bin".into();
+            let copied=BlobId::new();reimported.meta_blob=Some(copied);
+            db.insert(std::slice::from_ref(&reimported),&[(copied,&db.blob(meta_id).await.unwrap().unwrap())]).await.unwrap();
+            let proof=capture_reimport_identity(&config,&db,id,reimported.id).await.unwrap();
+            assert_eq!(proof.evidence,evidence);assert!(db.import_source(reimported.id).await.unwrap().is_none());
+
             let mut changed=blob::decode_meta(&db.blob(meta_id).await.unwrap().unwrap()).unwrap();
             let FileMeta::Multipart(member)=&mut changed else{panic!("multipart fixture");};
             member.parts[0].segments.items[0].id="changed@loopback".into();
             db.update_blob(meta_id,&blob::encode_meta(&changed).unwrap()).await.unwrap();
             assert!(capture_mapped_source(&config,&db,id).await.is_err());
+            assert!(capture_reimport_identity(&config,&db,id,reimported.id).await.is_ok());
+            db.update_blob(copied,&blob::encode_meta(&changed).unwrap()).await.unwrap();
+            assert!(capture_reimport_identity(&config,&db,id,reimported.id).await.is_err());
             assert_eq!(db.import_source(id).await.unwrap().unwrap(),captured);
             db.close().await;std::fs::remove_dir_all(config).unwrap();
         });

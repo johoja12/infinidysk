@@ -1176,6 +1176,7 @@ dependencies = [
  "utoipa",
  "uuid",
  "zip",
+ "zstd",
 ]
 
 [[package]]

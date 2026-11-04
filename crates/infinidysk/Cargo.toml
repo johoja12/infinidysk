@@ -51,6 +51,7 @@ zip.workspace = true
 infinidysk-fuse.workspace = true
 
 [dev-dependencies]
+zstd.workspace = true
 sqlx.workspace = true
 infinidysk-par2.workspace = true
 infinidysk-plex = { workspace = true, features = ["test-support"] }

@@ -28,8 +28,8 @@ use sqlx::sqlite::SqliteConnectOptions;
 use uuid::Uuid;
 
 pub use crate::apply::{
-    Imported, Progress, Stage, apply, apply_with_progress, capture_mapped_source,
-    restore_nzb_downloads, retry_files, stamp_download_ids,
+    Imported, Progress, ReimportIdentity, Stage, apply, apply_with_progress, capture_mapped_source,
+    capture_reimport_identity, restore_nzb_downloads, retry_files, stamp_download_ids,
 };
 use crate::csharp::{LongRange, decode};
 pub use crate::password::{is_legacy, legacy_hash, verify_legacy};

@@ -110,7 +110,7 @@ pub struct Admin {
         quota::get_provider_usage,
         quota::post_reset_usage,
         crate::migration::mount_probe,
-        crate::migration::proof::capture,
+        crate::migration::proof::capture,crate::migration::proof::capture_reimport,
         crate::migration::submit, crate::migration::status,
         get_queue,
         post_queue,
@@ -213,6 +213,10 @@ pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
         .route(
             "/api/v1/migration/mount-probe",
             post(crate::migration::mount_probe),
+        )
+        .route(
+            "/api/v1/migration/reimport-proof",
+            post(crate::migration::proof::capture_reimport),
         )
         .route(
             "/api/v1/migration/legacy-proof",
