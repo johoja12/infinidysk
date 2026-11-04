@@ -640,3 +640,25 @@ This is a reconstruction foundation, not completed R07 or C03. Provider discover
 source/range binding, streaming packet collection, whole-file verification,
 durable worker scheduling and revision-safe publication remain required. No live
 repair, production deployment or cutover was performed.
+
+### Streamed PAR2 packets and final verification
+
+Recovery framing now accepts arbitrary transport chunks, retains at most one
+packet window and emits one checksum-valid recovery row at a time. The caller
+stops the volume as soon as enough independent equations have been accepted.
+Metadata collection has its own ceiling. Scan bytes and hash work are bounded;
+EOF resynchronization finds valid packets behind truncated false headers.
+Cancellation or budget failure poisons the reader.
+
+`Verification` performs a separate ordered read pass using the recovered slices
+and current source slices. Only completion of every recoverable file's whole-file
+MD5 check constructs `VerifiedRepair`. Changed input, inconsistent descriptors,
+missing final input and poisoned verification cannot produce a publication proof.
+This remains a pure sans-I/O component, not a health-worker or cache publication
+implementation. Release-wide I/O budgets and source bindings belong to that worker.
+
+Focused validation now passes 13 PAR2 tests and warnings-denied all-target Clippy.
+New checks cover one-byte and packet-boundary chunking, early row completion,
+truncated false headers, reader cancellation/budgets, whole-file/IFSC disagreement,
+changed sources and full 32-bit recovery exponents. Existing par2cmdline fixtures
+remain the independent recovery-byte oracle.

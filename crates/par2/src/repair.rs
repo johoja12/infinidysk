@@ -1,6 +1,11 @@
 //! Bounded, incremental PAR2 reconstruction. Filesystem/provider I/O and publication
 //! belong to the caller. Packet IDs are opaque; packet hashes and slice checksums
 //! establish integrity, as required by the PAR 2.0 specification.
+mod reader;
+mod verify;
+pub use reader::{MetadataReader, RecoveryReader};
+pub use verify::{Verification, VerifiedRepair};
+
 use super::{FILE_DESC, File, HEADER, IFSC, Id, Index, MAGIC, MAIN, Packet, RECOVERY, build};
 use md5::{Digest as _, Md5};
 use std::collections::{BTreeMap, BTreeSet};
