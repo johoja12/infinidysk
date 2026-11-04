@@ -18,8 +18,8 @@ use nix::sys::stat::Mode;
 use nix::unistd::{UnlinkatFlags, unlinkat};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::{SqliteConnection, SqlitePool};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -274,9 +274,12 @@ impl Store {
         ] {
             sqlx::query(sql).execute(&db).await?;
         }
+        // Fence any SQL command that outlived a cancelled/dropped prior owner.
+        // Epoch, quotas and records must describe one settled snapshot.
+        let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
         let saved: Option<(i64, String, i64)> =
             sqlx::query_as("SELECT version,id,epoch FROM repair_state WHERE singleton=1")
-                .fetch_optional(&db)
+                .fetch_optional(&mut *tx)
                 .await?;
         let (id, epoch) = if let Some((version, id, epoch)) = saved {
             if version != 1 || epoch < 0 {
@@ -296,12 +299,13 @@ impl Store {
             let id = Uuid::new_v4();
             sqlx::query("INSERT INTO repair_state VALUES(1,1,$1,0)")
                 .bind(id.to_string())
-                .execute(&db)
+                .execute(&mut *tx)
                 .await?;
             (id, 0)
         };
         check_anchor(anchor.as_ref(), id, epoch)?;
-        let index = load(&db).await?;
+        let index = load(&mut tx).await?;
+        tx.commit().await?;
         let stamping = Arc::clone(&root);
         tokio::task::spawn_blocking(move || stamping.write_anchor(id, epoch))
             .await
@@ -570,9 +574,13 @@ impl Store {
     /// Reconciles uncertain writes by reading durable state, not replaying patches.
     pub async fn reconcile(&self) -> Result<(), Error> {
         let writer = Arc::clone(&self.writer).lock_owned().await;
+        self.root.validate()?;
+        // A cancelled commit may still be running on SQLite's worker. WAL reads
+        // alone can observe the preceding state and incorrectly clear Pending.
+        let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
         let (version, id, epoch): (i64, String, i64) =
             sqlx::query_as("SELECT version,id,epoch FROM repair_state WHERE singleton=1")
-                .fetch_one(&self.db)
+                .fetch_one(&mut *tx)
                 .await?;
         if version != 1
             || id != self.id.to_string()
@@ -582,7 +590,10 @@ impl Store {
             return Err(Error::Invalid("repair ledger identity or epoch regressed"));
         }
         check_anchor(self.root.anchor()?.as_ref(), self.id, epoch.cast_unsigned())?;
-        let index = load(&self.db).await?;
+        let index = load(&mut tx).await?;
+        // Release SQL before waiting for health's mutation barrier: health may
+        // need the shared catalogue while holding its read side of that barrier.
+        tx.commit().await?;
         let _publication = self.publication_guard().await;
         let (root, id) = (Arc::clone(&self.root), self.id);
         let (_writer, anchored) = tokio::task::spawn_blocking(move || {
@@ -691,14 +702,14 @@ fn prepare(patch: &Patch) -> Result<Info, Error> {
     })
 }
 type Row = (String, Vec<u8>, Vec<u8>, String, String, i64, Option<i64>);
-async fn load(db: &SqlitePool) -> Result<BTreeMap<String, Entry>, Error> {
+async fn load(db: &mut SqliteConnection) -> Result<BTreeMap<String, Entry>, Error> {
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM article_repairs")
-        .fetch_one(db)
+        .fetch_one(&mut *db)
         .await?;
     if count < 0 || count.cast_unsigned() > MAX_ENTRIES as u64 {
         return Err(Error::Budget);
     }
-    let (payload_bytes, id_bytes, record_bytes, invalid): (i64, i64, i64, i64) = sqlx::query_as("SELECT COALESCE(SUM(LENGTH(payload)),0),COALESCE(SUM(LENGTH(CAST(message_id AS BLOB))),0),COALESCE(SUM(LENGTH(geometry)+LENGTH(proof)),0),COALESCE(SUM(CASE WHEN LENGTH(CAST(message_id AS BLOB))>4096 OR LENGTH(geometry)>1024 OR LENGTH(proof)>2048 OR LENGTH(revision)!=32 OR LENGTH(hash)!=32 THEN 1 ELSE 0 END),0) FROM article_repairs").fetch_one(db).await?;
+    let (payload_bytes, id_bytes, record_bytes, invalid): (i64, i64, i64, i64) = sqlx::query_as("SELECT COALESCE(SUM(LENGTH(payload)),0),COALESCE(SUM(LENGTH(CAST(message_id AS BLOB))),0),COALESCE(SUM(LENGTH(geometry)+LENGTH(proof)),0),COALESCE(SUM(CASE WHEN LENGTH(CAST(message_id AS BLOB))>4096 OR LENGTH(geometry)>1024 OR LENGTH(proof)>2048 OR LENGTH(revision)!=32 OR LENGTH(hash)!=32 THEN 1 ELSE 0 END),0) FROM article_repairs").fetch_one(&mut *db).await?;
     if payload_bytes < 0
         || payload_bytes.cast_unsigned() > MAX_PAYLOAD
         || id_bytes < 0
@@ -709,7 +720,7 @@ async fn load(db: &SqlitePool) -> Result<BTreeMap<String, Entry>, Error> {
     {
         return Err(Error::Budget);
     }
-    let rows: Vec<Row> = sqlx::query_as("SELECT message_id,revision,hash,geometry,proof,length,LENGTH(payload) FROM article_repairs LIMIT 100001").fetch_all(db).await?;
+    let rows: Vec<Row> = sqlx::query_as("SELECT message_id,revision,hash,geometry,proof,length,LENGTH(payload) FROM article_repairs LIMIT 100001").fetch_all(&mut *db).await?;
     let mut index = BTreeMap::new();
     for (id, revision, hash, geometry, proof, length, payload) in rows {
         if id.is_empty()

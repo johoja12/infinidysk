@@ -611,3 +611,143 @@ async fn cancelled_source_validation_has_no_ambiguous_publication_to_replay() {
     drop(store);
     std::fs::remove_dir_all(path).expect("cleanup");
 }
+
+#[tokio::test]
+async fn reconciliation_waits_for_unresolved_database_writes_before_activating_a_snapshot() {
+    use sha2::{Digest as _, Sha256};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    let fail = Arc::new(AtomicBool::new(true));
+    assert!(store.set_witness(Arc::new({
+        let fail = fail.clone();
+        move |_, _| {
+            let fail = fail.clone();
+            Box::pin(async move {
+                if fail.load(Ordering::Acquire) {
+                    Err(Error::Witness)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    })));
+    assert!(matches!(
+        store
+            .publish(vec![patch("in-flight@fixture", b"restored")])
+            .await,
+        Err(Error::Witness)
+    ));
+    assert!(store.is_pending());
+    fail.store(false, Ordering::Release);
+    // Models an already-dispatched SQLite write whose result the caller lost.
+    // WAL readers can still see the preceding epoch while this writer is active.
+    let db = database(&path).await;
+    let mut tx = db
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("in-flight transaction");
+    let newer = patch("in-flight@fixture", b"newbytes");
+    let expected = newer.expected_revision().expect("revision");
+    let hash: [u8; 32] = Sha256::digest(&newer.data).into();
+    sqlx::query("UPDATE article_repairs SET revision=$1,hash=$2,payload=$3 WHERE message_id=$4")
+        .bind(expected.as_slice())
+        .bind(hash.as_slice())
+        .bind(newer.data.as_ref())
+        .bind(&newer.message_id)
+        .execute(&mut *tx)
+        .await
+        .expect("pending body");
+    sqlx::query("UPDATE repair_state SET epoch=2 WHERE singleton=1")
+        .execute(&mut *tx)
+        .await
+        .expect("pending epoch");
+    let mut readback = {
+        let store = store.clone();
+        tokio::spawn(async move { store.reconcile().await })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut readback)
+            .await
+            .is_err(),
+        "readback must wait for the unresolved writer, not activate an earlier WAL snapshot"
+    );
+    assert!(store.is_pending());
+    tx.commit().await.expect("write completed");
+    readback.await.expect("readback worker").expect("reconcile");
+    assert_eq!(store.epoch(), 2);
+    assert_eq!(revision(&store, "in-flight@fixture"), expected);
+    assert_eq!(
+        store
+            .get("in-flight@fixture", expected)
+            .await
+            .expect("current bytes")
+            .data
+            .as_ref(),
+        b"newbytes"
+    );
+    db.close().await;
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+
+#[tokio::test]
+async fn startup_waits_for_an_older_owners_unresolved_database_write() {
+    use sha2::{Digest as _, Sha256};
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    store
+        .publish(vec![patch("startup-in-flight@fixture", b"restored")])
+        .await
+        .expect("first revision");
+    drop(store);
+    let db = database(&path).await;
+    let mut tx = db
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("unresolved writer");
+    let newer = patch("startup-in-flight@fixture", b"newbytes");
+    let expected = newer.expected_revision().expect("revision");
+    let hash: [u8; 32] = Sha256::digest(&newer.data).into();
+    sqlx::query("UPDATE article_repairs SET revision=$1,hash=$2,payload=$3 WHERE message_id=$4")
+        .bind(expected.as_slice())
+        .bind(hash.as_slice())
+        .bind(newer.data.as_ref())
+        .bind(&newer.message_id)
+        .execute(&mut *tx)
+        .await
+        .expect("pending body");
+    sqlx::query("UPDATE repair_state SET epoch=2 WHERE singleton=1")
+        .execute(&mut *tx)
+        .await
+        .expect("pending epoch");
+    let mut opening = {
+        let path = path.clone();
+        tokio::spawn(async move { Store::open(&path).await })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut opening)
+            .await
+            .is_err(),
+        "startup cannot activate an older snapshot while a prior SQL writer is unresolved"
+    );
+    tx.commit().await.expect("settled writer");
+    let store = opening.await.expect("startup worker").expect("open");
+    assert_eq!(store.epoch(), 2);
+    assert_eq!(revision(&store, "startup-in-flight@fixture"), expected);
+    assert_eq!(
+        store
+            .get("startup-in-flight@fixture", expected)
+            .await
+            .expect("current bytes")
+            .data
+            .as_ref(),
+        b"newbytes"
+    );
+    db.close().await;
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
