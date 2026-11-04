@@ -3,6 +3,7 @@
 //! through the Arr that imported them.
 
 mod check;
+pub mod par2;
 mod regrab;
 pub use regrab::Control as RegrabControl;
 mod structure;

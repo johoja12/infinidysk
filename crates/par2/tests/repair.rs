@@ -460,3 +460,46 @@ fn recovery_exponents_use_the_full_wire_value_modulo_the_field_order() {
         assert_eq!(slice.data, original[slice.index]);
     }
 }
+
+#[test]
+fn inspection_requires_whole_file_proof_for_healthy_results_and_bounds_damage() {
+    use infinidysk_par2::repair::Inspection;
+    let good = set();
+    let original = sources(&good);
+    let mut inspection = Inspection::new(good.clone(), 2).expect("census");
+    for (i, data) in original.iter().enumerate() {
+        inspection
+            .slice(i, (i != 0 && i != 24).then_some(data.as_slice()), || false)
+            .expect("slice");
+    }
+    assert_eq!(inspection.finish(|| false).expect("damage"), [0, 24]);
+    let mut inspection = Inspection::new(good.clone(), 1).expect("census");
+    inspection.slice(0, None, || false).expect("first missing");
+    assert_eq!(inspection.slice(1, None, || false), Err(Error::Budget));
+    assert_eq!(inspection.missing_count(), 2);
+    assert!(matches!(
+        inspection.finish(|| false),
+        Err(Error::Invalid(_))
+    ));
+    let changed = rewrite(
+        &fixture("set.par2"),
+        |kind, body| {
+            let mut body = body.to_vec();
+            if kind == b"PAR 2.0\0FileDesc" {
+                body[16] ^= 1;
+            }
+            body
+        },
+        good.id(),
+    );
+    let changed = RecoverySet::read(&changed, None).expect("valid packets");
+    let mut inspection = Inspection::new(changed, 1).expect("census");
+    let mut rejected = false;
+    for (i, data) in original.iter().enumerate() {
+        if inspection.slice(i, Some(data), || false).is_err() {
+            rejected = true;
+            break;
+        }
+    }
+    assert!(rejected || matches!(inspection.finish(|| false), Err(Error::Verification)));
+}

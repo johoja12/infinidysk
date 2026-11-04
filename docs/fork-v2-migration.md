@@ -46,7 +46,7 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | R04 | P0 | Keep read/warm-triggered damaged-file repairs urgent through provider circuit outages (`HealthCheckService`, `PrefetchRepairHistory`, `eafe1705`) | Persisted urgent health state and bounded inconclusive retry; strict warming failures request the same priority. | Implemented for playback and the shared warming executor, including admitted current/history predictions; other source policies remain open |
 | R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Durable sampled-content snapshot, cursor, pause/resume, category and run limits implemented; fair maintenance slots and revision-safe fault publication included |
 | R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Durable source-bound journal, detached observation, revision-checked controls and current Arr-root authority implemented; read-only scan-root guards at admission and every mutation checkpoint included |
-| R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; a bounded GF16 reconstruction core is now implemented and tested against real par2cmdline recovery packets. Health still has no recovery executor. Port trusted range/slice identity, bounded repair budgets, durable outcomes and separate worker scheduling before declaring repair parity. | Port |
+| R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; a bounded GF16 reconstruction core is now implemented and tested against real par2cmdline recovery packets. Health now has an explicitly bound, provider-facing execution API, not yet connected to automatic repair. Port durable source discovery/publication, bounded repair budgets, durable outcomes and separate worker scheduling before declaring repair parity. | Port |
 | C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | First implementation in Rust; verified 1.x copy import implemented; broader fork data import remains M01 |
 | C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins and bounded block/folder probes implemented; offline catalogue reconstruction remains open |
 | C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Source identity and revision cleanup implemented; PAR2 repair-revision integration pending |
@@ -662,3 +662,37 @@ New checks cover one-byte and packet-boundary chunking, early row completion,
 truncated false headers, reader cancellation/budgets, whole-file/IFSC disagreement,
 changed sources and full 32-bit recovery exponents. Existing par2cmdline fixtures
 remain the independent recovery-byte oracle.
+
+
+### Provider-facing PAR2 execution API
+
+`health::par2::Plan` now executes the three source passes against NNTP: damage
+inspection, recovery reduction and final verification. Every source binding must
+supply a whole-file imported PAR2 proof and complete trusted decoded article ranges.
+Names, partial archive-member spans and estimated article sizes cannot establish
+those bindings. The exact descriptor, IFSC, first-16-KB hash, file length and whole
+MD5 must agree before provider work starts. Sources follow main-packet input order.
+
+The execution API uses a separate NNTP lane, ordered geometry-checked BODY reads,
+a one-article reuse window and blocking workers for hashing/reconstruction. Default
+ceilings are eight damaged slices, a 16 GB-scale release, 512 MB-scale recovery
+volumes, 100,000 BODY admissions and 256 MB-scale total RAM. Internally the byte
+ceilings use powers of two. Source geometry, retained descriptor copies, current
+article buffers and packet windows are included in the RAM preflight. Decoded-read
+reservations are conservative, are charged before dispatch and survive cancellation;
+they are explicitly not a provider wire-byte measurement.
+
+An intact outcome also requires whole-file MD5 proof. Provider outages return a
+provider error, not a confirmed missing-slice outcome. Exceeding the missing-slice
+policy has its own result, distinct from read/memory allowance exhaustion. An
+incomplete, changed or unbound source cannot return a repair proof. The API does
+not publish article patches, change cache revisions, schedule work or mutate Arr.
+Automatic repair still needs durable discovery, worker/outcome scheduling and C03
+publication. R07 remains open until that path is connected and qualified.
+
+Focused validation: five loopback NNTP executor tests pass, alongside 14 pure PAR2
+tests and warnings-denied all-target Clippy for health, NNTP and PAR2. Tests cover
+an article missing across two slice boundaries, complete reconstructed bytes,
+healthy files without recovery reads, early missing/read-budget cutoffs, untrusted
+bindings, provider outages, cancellation and all download permits returning.
+No real provider, production data or deployed service was used.

@@ -15,12 +15,14 @@ infinidysk-arr.workspace = true
 infinidysk-core.workspace = true
 infinidysk-db.workspace = true
 infinidysk-nntp.workspace = true
+infinidysk-par2.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 utoipa.workspace = true

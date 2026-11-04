@@ -399,6 +399,28 @@ impl Client {
         .await
     }
 
+    /// A checked maintenance BODY in one isolated operation lane. Geometry is
+    /// validated before the caller or abandoned-body cache sink sees any bytes.
+    pub async fn body_checked_in_lane(
+        &self,
+        message_id: &str,
+        lane: Lane,
+        workload: Workload,
+        expected: crate::BodyExpectation,
+    ) -> Result<Body, Error> {
+        self.body_tagged(
+            message_id,
+            Tag {
+                lane: Some(lane),
+                workload,
+                begin: expected.offset,
+                expected: Some(expected),
+                ..Tag::UNTRACKED
+            },
+        )
+        .await
+    }
+
     /// A BODY belonging to one independently scheduled operation. Requests from the
     /// same lane retain normal pipelining and the global provider/permit limits.
     pub async fn body_in_lane(

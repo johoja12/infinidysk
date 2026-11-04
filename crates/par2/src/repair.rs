@@ -1,6 +1,8 @@
 //! Bounded, incremental PAR2 reconstruction. Filesystem/provider I/O and publication
 //! belong to the caller. Packet IDs are opaque; packet hashes and slice checksums
 //! establish integrity, as required by the PAR 2.0 specification.
+mod inspect;
+pub use inspect::Inspection;
 mod reader;
 mod verify;
 pub use reader::{MetadataReader, RecoveryReader};
@@ -155,6 +157,11 @@ impl RecoverySet {
             locations,
             heap,
         })
+    }
+    /// Heap retained by the parsed recovery descriptors and source-slice locations.
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.heap
     }
     #[must_use]
     pub const fn id(&self) -> Id {
