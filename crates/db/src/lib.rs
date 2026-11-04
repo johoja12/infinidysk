@@ -172,6 +172,7 @@ macro_rules! on {
 }
 
 pub mod catalogue;
+pub mod repair;
 pub mod sweep;
 
 /// A file or directory in the virtual tree.

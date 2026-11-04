@@ -786,3 +786,28 @@ with six ignored; all three original C# writer checks and both privileged FUSE
 checks pass separately. The original C# full-import test uses the new repair layer.
 See [repair revision validation](validation/rust-v2-repair-revisions-20261104.md)
 for exact source and the remaining runtime-bootstrap/publication boundaries.
+
+### Publication lineage witnesses
+
+A repair ledger can now require durable witnesses before activating a committed
+batch. The main database (additive migration 0017, SQLite and PostgreSQL), native
+cache catalogue and external decoded-cache directory each retain its identity and
+monotonic epoch. Late completion cannot replace the ledger identity or reduce the
+epoch. The decoded cache also checks lineage before a changed runtime cache path
+becomes readable; conflicting paths remain disabled with a diagnostic failure.
+
+A witness error leaves affected articles pending. Readback reconciliation repeats
+only the idempotent witness checks and then activates already committed patches;
+it never reconstructs or republishes the batch. Marker writes use checksums,
+exclusive ownership, atomic replacement and fsync outside async executor threads.
+Owned guards cover blocking work even if its caller is cancelled.
+
+Focused validation passes ten ledger tests, sixteen decoded-cache unit tests and
+seven main-database tests, including actual PostgreSQL. New cases prove post-commit
+witness failure/readback, older/different ledger refusal, persistent external-cache
+markers and runtime path rejection without rewriting the conflicting marker.
+Warnings-denied all-target Clippy passes for these three crates. Application startup
+and the background worker still need to install and use these witnesses.
+
+No setup-wizard setting is introduced by these internal contracts. Migration 0017
+is additive: **back up `/config` and any external cache metadata before upgrading**.

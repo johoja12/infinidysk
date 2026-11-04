@@ -23,6 +23,7 @@ utoipa.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+infinidysk-db.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

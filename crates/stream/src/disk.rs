@@ -1,6 +1,8 @@
 //! Disk tier of the segment cache: one checksummed file per article under the cache
 //! directory, written behind the reader and evicted least recently used first.
 
+mod lineage;
+
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -47,6 +49,7 @@ pub(crate) struct Disk {
     max_age_secs: AtomicU64,
     index: Mutex<Index>,
     writes: mpsc::Sender<(Arc<str>, Bytes)>,
+    lineage: Arc<tokio::sync::Mutex<()>>,
     /// Ends this run's unfinished writes, which the scan running alongside must keep.
     tmp_suffix: String,
     indexing: AtomicBool,
@@ -143,6 +146,7 @@ impl Disk {
                 max_age_secs: AtomicU64::new(max_age_secs),
                 index: Mutex::default(),
                 writes,
+                lineage: Arc::new(tokio::sync::Mutex::new(())),
                 tmp_suffix,
                 indexing: AtomicBool::new(true),
                 written: AtomicU64::new(0),
@@ -165,6 +169,17 @@ impl Disk {
         tokio::spawn(write_behind(Arc::downgrade(&disk), queue));
         tokio::spawn(sweep(Arc::downgrade(&disk)));
         Ok(disk)
+    }
+
+    pub(crate) async fn bind_repair_lineage(&self, id: [u8; 16], epoch: u64) -> io::Result<()> {
+        let guard = Arc::clone(&self.lineage).lock_owned().await;
+        let (path, suffix) = (self.dir.clone(), self.tmp_suffix.clone());
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            lineage::bind(&path, &suffix, id, epoch)
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     pub(crate) fn dir(&self) -> &Path {

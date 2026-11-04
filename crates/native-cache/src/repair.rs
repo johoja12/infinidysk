@@ -3,11 +3,13 @@
 //! fails closed instead of reverting repaired articles to an unversioned source.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -41,6 +43,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("{0}")]
     Invalid(&'static str),
+    #[error("repair publication witness failed; readback is required")]
+    Witness,
     #[error("repair publication requires reconciliation before another attempt")]
     Pending,
     #[error("article repair revision changed during the read")]
@@ -164,6 +168,11 @@ impl Root {
     }
 }
 
+/// Persists main-database/external-cache lineage before index activation. It must
+/// never call back into this ledger's publication/reconciliation methods.
+pub type Witness =
+    Arc<dyn Fn(Uuid, u64) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> + Send + Sync>;
+
 pub struct Store {
     db: SqlitePool,
     root: Arc<Root>,
@@ -173,6 +182,7 @@ pub struct Store {
     pending: AtomicBool,
     index: RwLock<BTreeMap<String, Entry>>,
     writer: Arc<Mutex<()>>,
+    witness: OnceLock<Witness>,
 }
 impl Store {
     /// Opens the same local metadata directory used by the final-media cache. This
@@ -295,7 +305,22 @@ impl Store {
             pending: AtomicBool::new(false),
             index: RwLock::new(index),
             writer: Arc::new(Mutex::new(())),
+            witness: OnceLock::new(),
         }))
+    }
+    /// Install during application bootstrap before attaching the article source.
+    pub fn set_witness(&self, witness: Witness) -> bool {
+        self.witness.set(witness).is_ok()
+    }
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
+    }
+    async fn witness(&self, epoch: u64) -> Result<(), Error> {
+        if let Some(witness) = self.witness.get() {
+            witness(self.id, epoch).await?;
+        }
+        Ok(())
     }
     #[must_use]
     pub const fn id(&self) -> Uuid {
@@ -494,6 +519,7 @@ impl Store {
         .await
         .map_err(|_| Error::Invalid("repair anchor worker failed"))?;
         anchored?;
+        self.witness(next.cast_unsigned()).await?;
         {
             let mut index = self.index.write().unwrap_or_else(PoisonError::into_inner);
             for (patch, info) in prepared {
@@ -529,6 +555,7 @@ impl Store {
         .await
         .map_err(|_| Error::Invalid("repair anchor worker failed"))?;
         anchored?;
+        self.witness(epoch.cast_unsigned()).await?;
         {
             let mut current = self.index.write().unwrap_or_else(PoisonError::into_inner);
             *current = index;

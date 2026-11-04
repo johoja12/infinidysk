@@ -265,3 +265,60 @@ async fn versioned_disk_keys_survive_reopen_and_never_fall_back_to_old_base_byte
     drop(store);
     std::fs::remove_dir_all(path).expect("cleanup");
 }
+
+#[tokio::test]
+async fn external_disk_lineage_rejects_forgotten_repairs_and_checks_runtime_path_changes() {
+    let path = directory();
+    let id = [17; 16];
+    let config = |dir: &str| CacheConfig {
+        memory_enabled: true,
+        memory_bytes: 1 << 20,
+        disk: Some(DiskConfig {
+            dir: path.join(dir),
+            max_bytes: 1 << 30,
+            max_age: Duration::from_secs(3600),
+        }),
+    };
+    let first = Arc::new(Cache::new(true, 1 << 20));
+    first.configure(&config("first")).await;
+    first
+        .bind_repair_lineage(id, 0)
+        .await
+        .expect("initial binding");
+    first
+        .bind_repair_lineage(id, 3)
+        .await
+        .expect("forward witness");
+    assert!(first.bind_repair_lineage(id, 2).await.is_err());
+    assert!(first.bind_repair_lineage([18; 16], 4).await.is_err());
+    let fresh = Cache::new(true, 1 << 20);
+    fresh.configure(&config("first")).await;
+    assert!(
+        fresh.bind_repair_lineage(id, 0).await.is_err(),
+        "a fresh process cannot forget previous repair epochs"
+    );
+    fresh
+        .bind_repair_lineage(id, 3)
+        .await
+        .expect("matching restart");
+    let foreign = Cache::new(true, 1 << 20);
+    foreign.configure(&config("foreign")).await;
+    foreign
+        .bind_repair_lineage([19; 16], 1)
+        .await
+        .expect("other ledger");
+    let before = std::fs::read(path.join("foreign/.repair-lineage")).expect("foreign witness");
+    first.configure(&config("foreign")).await;
+    assert!(first.stats().disk.is_none());
+    assert!(first.stats().disk_failure.is_some());
+    assert_eq!(
+        std::fs::read(path.join("foreign/.repair-lineage")).expect("unchanged witness"),
+        before
+    );
+    first.configure(&config("first")).await;
+    assert!(first.stats().disk.is_some());
+    drop(first);
+    drop(fresh);
+    drop(foreign);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}

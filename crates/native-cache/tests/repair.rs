@@ -424,3 +424,92 @@ async fn the_actual_ledger_serves_body_and_stat_without_providers_and_checks_geo
     drop(store);
     std::fs::remove_dir_all(path).expect("cleanup");
 }
+
+#[tokio::test]
+async fn monotonic_external_witnesses_complete_before_activation_and_readback_does_not_republish() {
+    use infinidysk_db::{Db, repair::Lineage};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let path = directory();
+    let store = Store::open(&path.join("repair")).await.expect("ledger");
+    let cache = Cache::open(Settings {
+        metadata_path: path.join("native").to_str().expect("path").into(),
+        ..Settings::default()
+    })
+    .await
+    .expect("cache");
+    let db = Db::connect(&format!("sqlite:{}", path.join("main.sqlite").display()))
+        .await
+        .expect("main database");
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(store.set_witness(Arc::new({
+        let db = db.clone();
+        let cache = cache.clone();
+        let calls = calls.clone();
+        move |id, epoch| {
+            let db = db.clone();
+            let cache = cache.clone();
+            let calls = calls.clone();
+            Box::pin(async move {
+                if !db
+                    .bind_repair_lineage(id, epoch)
+                    .await
+                    .map_err(|_| Error::Witness)?
+                {
+                    return Err(Error::Witness);
+                }
+                cache
+                    .bind_repair_lineage(id, epoch)
+                    .await
+                    .map_err(|_| Error::Witness)?;
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(Error::Witness);
+                }
+                Ok(())
+            })
+        }
+    })));
+    assert!(matches!(
+        store.publish(vec![patch("a@fixture", b"restored")]).await,
+        Err(Error::Witness)
+    ));
+    assert!(store.is_pending());
+    assert_eq!(store.revision("a@fixture"), Revision::Pending);
+    assert_eq!(
+        db.repair_lineage().await.expect("witness"),
+        Some(Lineage {
+            id: store.id(),
+            epoch: 1
+        })
+    );
+    store
+        .reconcile()
+        .await
+        .expect("complete witness by readback");
+    assert_eq!(store.epoch(), 1);
+    assert!(!store.is_pending());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let rev = revision(&store, "a@fixture");
+    assert_eq!(
+        store
+            .get("a@fixture", rev)
+            .await
+            .expect("bytes")
+            .data
+            .as_ref(),
+        b"restored"
+    );
+    assert!(
+        !db.bind_repair_lineage(store.id(), 0)
+            .await
+            .expect("late main write")
+    );
+    assert!(cache.bind_repair_lineage(store.id(), 0).await.is_err());
+    assert!(cache.bind_repair_lineage(Uuid::new_v4(), 2).await.is_err());
+    drop(store);
+    drop(cache);
+    drop(db);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}

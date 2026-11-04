@@ -89,6 +89,7 @@ pub struct Cache {
     /// The directory and reason the configured disk tier did not start.
     disk_failure: Mutex<Option<(PathBuf, String)>>,
     inflight: Mutex<Inflight>,
+    lineage: tokio::sync::Mutex<Option<([u8; 16], u64)>>,
     memory_hits: AtomicU64,
     disk_hits: AtomicU64,
     joined: AtomicU64,
@@ -168,6 +169,7 @@ impl Cache {
             disk: RwLock::default(),
             disk_failure: Mutex::default(),
             inflight: Mutex::default(),
+            lineage: tokio::sync::Mutex::new(None),
             memory_hits: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             joined: AtomicU64::new(0),
@@ -180,6 +182,7 @@ impl Cache {
     /// in memory. A new disk directory starts empty; one that cannot be written leaves
     /// the disk tier off with a warning.
     pub async fn configure(&self, config: &CacheConfig) {
+        let lineage = self.lineage.lock().await;
         self.enabled.store(config.memory_enabled, Ordering::Relaxed);
         self.memory.set_capacity(config.memory_bytes);
         if !config.memory_enabled {
@@ -187,7 +190,7 @@ impl Cache {
         }
         let current = self.disk();
         let mut failure = None;
-        let next = match (&config.disk, current) {
+        let mut next = match (&config.disk, current) {
             (None, _) => None,
             (Some(want), Some(disk)) if disk.dir() == want.dir => {
                 disk.set_limits(want.max_bytes, want.max_age.as_secs());
@@ -218,11 +221,38 @@ impl Cache {
                 }
             }
         };
+        if let (Some((id, epoch)), Some(disk)) = (*lineage, next.as_ref())
+            && let Err(error) = disk.bind_repair_lineage(id, epoch).await
+        {
+            failure = Some((disk.dir().to_path_buf(), error.to_string()));
+            next = None;
+        }
         *self.disk.write().unwrap_or_else(PoisonError::into_inner) = next;
         *self
             .disk_failure
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = failure;
+        drop(lineage); // Publish a configured disk only after its lineage check.
+    }
+
+    /// Must succeed before attaching a repair source or activating newer repairs.
+    /// Settings changes bind any replacement disk before it can serve bytes.
+    pub async fn bind_repair_lineage(&self, id: [u8; 16], epoch: u64) -> std::io::Result<()> {
+        let mut lineage = self.lineage.lock().await;
+        if id == [0; 16]
+            || lineage.is_some_and(|(old_id, old_epoch)| old_id != id || old_epoch > epoch)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decoded cache repair lineage changed or regressed",
+            ));
+        }
+        if let Some(disk) = self.disk() {
+            disk.bind_repair_lineage(id, epoch).await?;
+        }
+        *lineage = Some((id, epoch));
+        drop(lineage);
+        Ok(())
     }
 
     fn disk(&self) -> Option<Arc<Disk>> {

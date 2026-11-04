@@ -365,6 +365,7 @@ impl Cache {
             "CREATE TABLE IF NOT EXISTS blocks(key TEXT NOT NULL REFERENCES entries(key) ON DELETE CASCADE,block BIGINT NOT NULL,len BIGINT NOT NULL,hash TEXT NOT NULL,valid INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(key,block))",
             "CREATE INDEX IF NOT EXISTS cache_entries_eviction ON entries(folder,pinned,used)",
             "CREATE TABLE IF NOT EXISTS evictions(item TEXT NOT NULL,revision TEXT NOT NULL,bytes BIGINT NOT NULL,at BIGINT NOT NULL,reason TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS repair_lineage(slot INTEGER PRIMARY KEY CHECK(slot=1),ledger_id TEXT NOT NULL,epoch BIGINT NOT NULL CHECK(epoch>=0))",
             "PRAGMA user_version=1",
         ] {
             sqlx::query(sql).execute(&db).await?;
@@ -518,6 +519,23 @@ impl Cache {
             failed: AtomicU64::new(0),
         }))
     }
+    /// Witnesses repair state before its new revisions become readable. Refuses
+    /// replacement and rollback even when cache payload retention was disabled.
+    pub async fn bind_repair_lineage(&self, id: Uuid, epoch: u64) -> Result<(), Error> {
+        let epoch = i64::try_from(epoch).map_err(|_| Error::Invalid("invalid repair epoch"))?;
+        if id.is_nil() {
+            return Err(Error::Invalid("invalid repair ledger identity"));
+        }
+        let changed = sqlx::query("INSERT INTO repair_lineage(slot,ledger_id,epoch) VALUES(1,$1,$2) ON CONFLICT(slot) DO UPDATE SET epoch=excluded.epoch WHERE repair_lineage.ledger_id=excluded.ledger_id AND repair_lineage.epoch<=excluded.epoch")
+            .bind(id.to_string()).bind(epoch).execute(&self.db).await?.rows_affected();
+        if changed != 1 {
+            return Err(Error::Invalid(
+                "native cache belongs to a different or newer repair ledger; restore matching metadata",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn lease(&self, key: Key) -> Option<Arc<Lease>> {
         if key.size < u64::from(self.settings.min_file_mb) * MB
             || key.size > i64::MAX.cast_unsigned()

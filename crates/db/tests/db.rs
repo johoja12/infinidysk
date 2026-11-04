@@ -7,6 +7,7 @@ use infinidysk_db::{
 
 /// Exercises the tree, blob and config paths that must behave the same on both backends.
 async fn exercise(db: &Db) {
+    repair_lineage(db).await;
     content_sweep(db).await;
     fair_rechecks(db).await;
     library_catalogue(db).await;
@@ -1903,4 +1904,49 @@ async fn content_sweep(db: &Db) {
             .expect("stale")
     );
     db.delete_item(dir.id).await.expect("cleanup");
+}
+
+async fn repair_lineage(db: &Db) {
+    use infinidysk_db::repair::Lineage;
+    let id = uuid::Uuid::new_v4();
+    assert_eq!(db.repair_lineage().await.expect("unbound"), None);
+    assert!(
+        !db.bind_repair_lineage(uuid::Uuid::nil(), 0)
+            .await
+            .expect("nil rejected")
+    );
+    assert!(
+        db.bind_repair_lineage(id, 0)
+            .await
+            .expect("initial binding")
+    );
+    assert!(
+        db.bind_repair_lineage(id, 3)
+            .await
+            .expect("forward witness")
+    );
+    assert!(
+        db.bind_repair_lineage(id, 3)
+            .await
+            .expect("idempotent readback")
+    );
+    assert!(
+        !db.bind_repair_lineage(id, 2)
+            .await
+            .expect("late older write rejected")
+    );
+    assert!(
+        !db.bind_repair_lineage(uuid::Uuid::new_v4(), 4)
+            .await
+            .expect("different ledger rejected")
+    );
+    assert!(
+        !db.bind_repair_lineage(id, u64::MAX)
+            .await
+            .expect("overflow rejected")
+    );
+    assert_eq!(
+        db.repair_lineage().await.expect("retained"),
+        Some(Lineage { id, epoch: 3 })
+    );
 }
