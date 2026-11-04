@@ -20,6 +20,8 @@ pub struct PredictionPolicy {
     pub confidence_percent: u8,
     /// Exact `server:viewer` identities; names do not authorize or select profiles.
     pub viewers: Vec<String>,
+    /// An explicitly empty selection permits no viewers.
+    pub restrict_viewers: bool,
     pub excluded_shows: Vec<String>,
     pub full_file: bool,
     /// Add head/tail retention to partial warming windows.
@@ -37,6 +39,7 @@ impl Default for PredictionPolicy {
             min_distinct_episodes: 2,
             confidence_percent: 50,
             viewers: vec![],
+            restrict_viewers: false,
             excluded_shows: vec![],
             full_file: true,
             minimum_warm: false,
@@ -70,6 +73,10 @@ impl PredictionPolicy {
         }
         Ok(())
     }
+    pub fn allows_viewer(&self, server: &str, viewer: &str) -> bool {
+        (!self.restrict_viewers && self.viewers.is_empty())
+            || self.viewers.contains(&format!("{server}:{viewer}"))
+    }
     pub fn eligible(&self, item: &Media) -> bool {
         match item.kind.as_str() {
             "movie" => self.movies,
@@ -101,10 +108,10 @@ impl PredictionPolicy {
                     && item
                         .viewed_at
                         .is_some_and(|at| at >= threshold && at <= now_seconds)
-                    && item.user.as_ref().is_some_and(|user| {
-                        self.viewers.is_empty()
-                            || self.viewers.contains(&format!("{server}:{user}"))
-                    })
+                    && item
+                        .user
+                        .as_ref()
+                        .is_some_and(|user| self.allows_viewer(server, user))
             })
             .collect();
         selected.sort_by_key(|item| std::cmp::Reverse(item.viewed_at));
@@ -427,5 +434,15 @@ mod tests {
             policy.warming_ranges(1_000_000_000, 5000, 10000),
             [(0, 1_000_000_000)]
         );
+    }
+    #[test]
+    fn explicit_empty_viewer_selection_never_broadens_to_all_viewers() {
+        let mut policy = PredictionPolicy::default();
+        assert!(policy.allows_viewer("machine", "7"));
+        policy.restrict_viewers = true;
+        assert!(!policy.allows_viewer("machine", "7"));
+        policy.viewers.push("machine:7".into());
+        assert!(policy.allows_viewer("machine", "7"));
+        assert!(!policy.allows_viewer("other-machine", "7"));
     }
 }

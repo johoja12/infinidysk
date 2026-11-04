@@ -1,5 +1,7 @@
 //! Settings carried over from a C# install; deleted together with the importer.
 
+mod fork;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::future::IntoFuture as _;
@@ -174,6 +176,11 @@ fn basic(headers: &HeaderMap) -> Option<(String, String)> {
 
 /// C# settings with a counterpart or their own note here.
 const MAPPED: &[&str] = &[
+    "smart-prefetch.settings",
+    "media.library-scan-dirs",
+    "media.library-plex-server-ids",
+    "cache.native.folders",
+    "cache.native.metadata-path",
     "plex.accounts",
     "plex.servers",
     "api.key",
@@ -370,6 +377,7 @@ pub fn settings(cs: &Config) -> Upgrade {
         _ => notes.push("Plex connections were not carried over: invalid legacy settings; reconnect from Plex settings".into()),
     }
     keep_valid(&mut s, &mut notes);
+    fork::apply(cs, &mut s, &mut notes);
     let dropped: Vec<&str> = cs.keys().filter(|k| !MAPPED.contains(k)).collect();
     if !dropped.is_empty() {
         notes.push(format!(

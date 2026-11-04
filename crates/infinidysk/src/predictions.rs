@@ -342,12 +342,7 @@ impl Predictions {
                     .into_iter()
                     .filter(|s| matches!(s.state.as_str(), "playing" | "paused"))
                 {
-                    if options.policy.viewers.is_empty()
-                        || options
-                            .policy
-                            .viewers
-                            .contains(&format!("{}:{}", server.id, session.user))
-                    {
+                    if options.policy.allows_viewer(&server.id, &session.user) {
                         let mut media = session.media;
                         media.user = Some(session.user);
                         inputs.push((media, true));
@@ -481,12 +476,7 @@ impl Predictions {
                 .iter()
                 .filter(|s| s.enabled && s.server == server.id)
             {
-                if !options.policy.viewers.is_empty()
-                    && !options
-                        .policy
-                        .viewers
-                        .contains(&format!("{}:{}", server.id, selection.viewer))
-                {
+                if !options.policy.allows_viewer(&server.id, &selection.viewer) {
                     continue;
                 }
                 let viewer = self
@@ -1436,5 +1426,18 @@ mod tests {
             failed.predictions.iter().map(|p| p.id).collect::<Vec<_>>(),
             before.predictions.iter().map(|p| p.id).collect::<Vec<_>>()
         );
+    }
+    #[tokio::test]
+    async fn explicitly_empty_viewer_selection_cannot_admit_any_prediction() {
+        let f = fixture().await;
+        let mut config = f.config.write().await;
+        let mut settings = config.settings().clone();
+        settings.prefetch.plex.policy.restrict_viewers = true;
+        settings.prefetch.plex.policy.viewers.clear();
+        config.save(settings).await.unwrap();
+        drop(config);
+        f.service.tick(true).await.unwrap();
+        assert_eq!(f.service.snapshot().await.predictions.len(), 0);
+        assert_eq!(f.queue.status().await.jobs.len(), 0);
     }
 }

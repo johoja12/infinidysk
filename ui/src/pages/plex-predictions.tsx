@@ -171,10 +171,11 @@ export function PlexPredictions() {
         {([['head_bytes','Minimum head (MB)'],['tail_bytes','Minimum tail (MB)']] as const).map(([key,label])=><ApplyNumber key={key} id={`prediction-${key}`} label={label} value={policy[key]/1000000} min={0} max={1000} disabled={change.isPending || locked(`prefetch.plex.policy.${key}`)} apply={n=>change.mutateAsync({policy:{[key]:n*1000000}})} />)}
       </div>
       <PlexPrefetchSources value={value.sources} servers={view.data.settings.plex.servers} disabled={change.isPending || locked("prefetch.plex.sources")} apply={sources=>change.mutateAsync({options:{sources}})} />
+      <Toggle id="prediction-restrict-viewers" label={<>Limit predictions to selected viewers <Locked locked={locked("prefetch.plex.policy.restrict_viewers")} /></>} hint="When enabled, an empty viewer list permits no predictions. Review this selection after migrating legacy profiles." checked={policy.restrict_viewers} disabled={change.isPending || locked("prefetch.plex.policy.restrict_viewers")} onChange={checked=>change.mutate({policy:{restrict_viewers:checked}})} />
       <ApplyList
         id="prediction-viewers"
         label="Viewer identities"
-        hint="Comma-separated server:viewer IDs. Empty includes profiles that can be verified. Display names do not identify profiles."
+        hint="Comma-separated server:viewer IDs. An empty list includes verified profiles only when the selection limit is off. Display names do not identify profiles."
         value={policy.viewers ?? []}
         disabled={change.isPending || locked("prefetch.plex.policy.viewers")}
         apply={(ids) => change.mutateAsync({ policy: { viewers: ids } })}

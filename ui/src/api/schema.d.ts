@@ -3551,6 +3551,11 @@ export interface components {
              */
             partial_movie_lookback_days: number;
             /**
+             * @description An explicitly empty selection permits no viewers.
+             * @default false
+             */
+            restrict_viewers: boolean;
+            /**
              * Format: int64
              * @default 8388608
              */
@@ -3599,6 +3604,7 @@ export interface components {
              *       "minimum_warm": false,
              *       "movies": true,
              *       "partial_movie_lookback_days": 7,
+             *       "restrict_viewers": false,
              *       "tail_bytes": 8388608,
              *       "television": true,
              *       "viewers": []
@@ -3851,6 +3857,7 @@ export interface components {
              *         "minimum_warm": false,
              *         "movies": true,
              *         "partial_movie_lookback_days": 7,
+             *         "restrict_viewers": false,
              *         "tail_bytes": 8388608,
              *         "television": true,
              *         "viewers": []
@@ -3982,7 +3989,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a6ac-2f5d-73fa-82ee-f3d01b281700
+             * @default 01a1a6be-7a64-7071-b739-511b67467065
              */
             id: string;
             /**
@@ -4691,6 +4698,7 @@ export interface components {
              *           "minimum_warm": false,
              *           "movies": true,
              *           "partial_movie_lookback_days": 7,
+             *           "restrict_viewers": false,
              *           "tail_bytes": 8388608,
              *           "television": true,
              *           "viewers": []
