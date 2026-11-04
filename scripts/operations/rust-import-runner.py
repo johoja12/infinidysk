@@ -249,6 +249,12 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         raise ValueError('Migration API redirect refused')
 
 
+class HttpFailure(RuntimeError):
+    def __init__(self,status):
+        self.status=status
+        super().__init__('Migration request returned HTTP '+str(status)+'; no replay is authorized')
+
+
 class Client:
     def __init__(self, url, key):
         if not key or len(key)>4096 or any(ord(c)<33 or ord(c)>126 for c in key):
@@ -273,6 +279,8 @@ class Client:
                 if len(raw) > MAX_JSON:
                     raise ValueError('Migration response exceeds bound')
                 return unique_json(raw)
+        except urllib.error.HTTPError as error:
+            raise HttpFailure(error.code) from None
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             # HTTP exception strings can include private URLs and response data.
             raise RuntimeError('Migration request failed; read back its intent before retry') from None
@@ -402,7 +410,14 @@ def main():
             # or an uncertain dispatch into a new NZB. Validation is a separate lane.
             with concurrent.futures.ThreadPoolExecutor(max_workers=args.import_slots) as pool:
                 results = list(pool.map(lambda release:submit_one(package,release,client,journal,args.category,args.priority), active[:args.import_slots]))
+            counts={}
+            for release in releases:
+                state=journal.latest.get(intent(package.digest,release['sourceReleaseId']),{}).get('state','pending')
+                counts[state]=counts.get(state,0)+1
+            completed=bool(releases) and set(counts)=={'completed'}
+            terminal=bool(releases) and set(counts)<=set(('completed','failed','accepted_history_unavailable','completed_source_missing'))
             print(json.dumps({'manifestDigest':package.digest,'observed':len(results),'states':[r['state'] for r in results],
+                              'releaseCount':len(releases),'releaseStates':counts,'allCompleted':completed,'allTerminal':terminal,
                               'acknowledged':False,'next':'Verify exact imported member identities before any link promotion'}))
         finally:
             journal.close()
