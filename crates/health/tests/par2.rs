@@ -68,8 +68,7 @@ fn setup(budget: Budget, remove: bool) -> (Plan, Vec<Article>, RecoverySet) {
         set,
     )
 }
-fn provider_client(server: &LoopbackServer) -> (Arc<Client>, Arc<Downloads>) {
-    let downloads = Downloads::new(8);
+fn provider(server: &LoopbackServer, downloads: &Arc<Downloads>) -> Provider {
     let pool = Pool::new(
         Endpoint::new(
             "127.0.0.1",
@@ -85,17 +84,21 @@ fn provider_client(server: &LoopbackServer) -> (Arc<Client>, Arc<Downloads>) {
             pipeline_depth: 2,
             idle_timeout: Duration::from_secs(5),
         },
-        Arc::clone(&downloads),
+        downloads.clone(),
     )
     .expect("pool");
+    Provider {
+        pool,
+        key: "fixture".into(),
+        name: "fixture".into(),
+        priority: 0,
+        backbone: None,
+    }
+}
+fn provider_client(server: &LoopbackServer) -> (Arc<Client>, Arc<Downloads>) {
+    let downloads = Downloads::new(8);
     (
-        Arc::new(Client::new([Provider {
-            pool,
-            key: "fixture".into(),
-            name: "fixture".into(),
-            priority: 0,
-            backbone: None,
-        }])),
+        Arc::new(Client::new([provider(server, &downloads)])),
         downloads,
     )
 }
@@ -320,4 +323,163 @@ fn large_slices_reserve_for_actual_damage_and_cancel_errors_have_one_public_outc
         Error::from(infinidysk_par2::repair::Error::Cancelled),
         Error::Cancelled
     ));
+}
+
+#[tokio::test]
+async fn complete_articles_roundtrip_through_the_durable_store_after_whole_file_proof() {
+    use infinidysk_health::par2::ArticleOutcome;
+    use infinidysk_native_cache::repair::{Geometry, Patch, Proof, Store};
+    use infinidysk_nntp::Workload;
+    let (plan, articles, set) = setup(Budget::default(), true);
+    let server = LoopbackServer::start(articles).await.expect("server");
+    let (client, downloads) = provider_client(&server);
+    let ArticleOutcome::Repaired(articles) = plan
+        .execute_articles(client, CancellationToken::new())
+        .await
+        .expect("whole articles")
+    else {
+        panic!("repair expected");
+    };
+    assert_eq!(
+        articles.len(),
+        3,
+        "all articles crossing the two restored slices are complete"
+    );
+    let path =
+        std::env::temp_dir().join(format!("infinidysk-par2-articles-{}", uuid::Uuid::new_v4()));
+    let store = Store::open(&path).await.expect("store");
+    let patches: Vec<_> = articles
+        .into_iter()
+        .map(|article| {
+            let (message_id, body, proof) = article.into_parts();
+            assert_eq!(proof.set(), set.id());
+            assert_eq!(proof.file(), set.files()[0].id);
+            assert_eq!(proof.md5(), set.files()[0].hash);
+            assert_eq!(body.file_size, set.files()[0].length);
+            let expected = data(usize::try_from(body.file_size).expect("file size"));
+            assert_eq!(
+                body.data.as_ref(),
+                &expected[usize::try_from(body.offset).expect("offset")
+                    ..usize::try_from(body.offset).expect("offset") + body.data.len()]
+            );
+            Patch {
+                message_id,
+                geometry: Geometry {
+                    offset: body.offset,
+                    file_size: body.file_size,
+                    part: body.part,
+                    total: body.total,
+                },
+                proof: Proof {
+                    set: proof.set(),
+                    file: proof.file(),
+                    file_md5: proof.md5(),
+                    file_length: body.file_size,
+                },
+                data: body.data,
+            }
+        })
+        .collect();
+    let expected: Vec<_> = patches
+        .iter()
+        .map(|p| (p.message_id.clone(), p.data.clone()))
+        .collect();
+    store
+        .publish(patches)
+        .await
+        .expect("atomic verified publication");
+    let reader = Client::new([]);
+    assert!(reader.set_repairs(store.clone()));
+    for (id, bytes) in expected {
+        assert_eq!(
+            reader
+                .body(&id, Workload::Health, None)
+                .await
+                .expect("provider-free repaired body")
+                .data,
+            bytes
+        );
+    }
+    assert_eq!(downloads.available_permits(), 8);
+    drop(reader);
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+
+async fn proof_request_count() -> usize {
+    let (plan, articles, _) = setup(Budget::default(), true);
+    let server = LoopbackServer::start(articles).await.expect("server");
+    let (client, _) = provider_client(&server);
+    assert!(matches!(
+        plan.execute(client, CancellationToken::new())
+            .await
+            .expect("proof"),
+        Outcome::Repaired(_)
+    ));
+    server.body_commands()
+}
+#[tokio::test]
+async fn article_assembly_cannot_reset_the_request_allowance_after_verification() {
+    let requests = proof_request_count().await;
+    let (plan, articles, _) = setup(
+        Budget {
+            requests,
+            ..Budget::default()
+        },
+        true,
+    );
+    let server = LoopbackServer::start(articles).await.expect("server");
+    let (client, downloads) = provider_client(&server);
+    assert!(matches!(
+        plan.execute_articles(client, CancellationToken::new())
+            .await,
+        Err(Error::Budget)
+    ));
+    assert_eq!(
+        server.body_commands(),
+        requests,
+        "no extra admission after the original allowance"
+    );
+    assert_eq!(downloads.available_permits(), 8);
+}
+#[tokio::test]
+async fn changed_healthy_bytes_in_a_mixed_article_cannot_be_published() {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let requests = proof_request_count().await;
+    let (plan, articles, set) = setup(Budget::default(), true);
+    assert!(set.files()[0].length > 12_288);
+    let server = LoopbackServer::start(articles).await.expect("server");
+    let mut changed = data(usize::try_from(set.files()[0].length).expect("file size"));
+    changed[8192] ^= 1;
+    let changed_server = LoopbackServer::start(post("source-0", "fixture.bin", &changed, 3000))
+        .await
+        .expect("changed server");
+    let (client, downloads) = provider_client(&server);
+    let next = Mutex::new(Some(provider(&changed_server, &downloads)));
+    let weak = Arc::downgrade(&client);
+    let completed = AtomicUsize::new(0);
+    client.set_sink(Box::new(move |_, _, _, _, _| {
+        // One BODY was a missing article. Switch after the final successful BODY
+        // of the original verification, before mixed-article assembly reads.
+        if completed.fetch_add(1, Ordering::SeqCst) + 1 == requests - 1 {
+            weak.upgrade().expect("client alive").replace([next
+                .lock()
+                .expect("provider")
+                .take()
+                .expect("one switch")]);
+        }
+    }));
+    assert!(matches!(
+        plan.execute_articles(client, CancellationToken::new())
+            .await,
+        Err(Error::Changed)
+    ));
+    assert!(
+        changed_server.body_commands() > 0,
+        "changed source was read during article assembly"
+    );
+    assert_eq!(downloads.available_permits(), 8);
 }

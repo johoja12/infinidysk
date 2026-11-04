@@ -1,6 +1,9 @@
 //! Bounded provider-facing PAR2 execution. Discovery and durable publication remain
 //! separate: only complete, imported range bindings are accepted here, and this
 //! executor returns a whole-file proof without modifying source/cache state.
+mod articles;
+pub use articles::{ArticleOutcome, ArticleProof, VerifiedArticle};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -17,6 +20,7 @@ const MAX_ARTICLES: usize = 100_000;
 const MAX_RELEASE: u64 = 16 << 30;
 const MAX_RECOVERY: usize = 512 << 20;
 const MAX_ARTICLE: usize = 32 * 1024 * 1024;
+const MAX_PATCH: usize = 256 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -60,7 +64,8 @@ pub struct Source {
 pub struct Budget {
     pub reconstruction: Limits,
     pub requests: usize,
-    /// Returned decoded bytes, across inspection, reduction and final verification.
+    /// Returned decoded bytes across inspection, reduction, final verification
+    /// and bounded complete-article assembly.
     /// This is an execution allowance, not a provider wire-byte counter.
     pub read_bytes: u64,
 }
@@ -69,7 +74,7 @@ impl Default for Budget {
         Self {
             reconstruction: Limits::default(),
             requests: MAX_ARTICLES,
-            read_bytes: 3 * MAX_RELEASE + MAX_RECOVERY as u64,
+            read_bytes: 3 * MAX_RELEASE + MAX_RECOVERY as u64 + MAX_PATCH as u64,
         }
     }
 }
@@ -250,6 +255,15 @@ impl Plan {
         client: Arc<Client>,
         cancel: CancellationToken,
     ) -> Result<Outcome, Error> {
+        self.execute_with_reads(client, cancel)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+    async fn execute_with_reads(
+        &self,
+        client: Arc<Client>,
+        cancel: CancellationToken,
+    ) -> Result<(Outcome, Reads), Error> {
         let mut reads = Reads {
             client,
             cancel: cancel.clone(),
@@ -294,7 +308,7 @@ impl Plan {
                 .await
                 .map_err(|_| Error::Worker)??;
         if missing.is_empty() {
-            return Ok(Outcome::Healthy);
+            return Ok((Outcome::Healthy, reads));
         }
         let mut recon = Reconstructor::new(self.set.clone(), &missing, self.budget.reconstruction)?;
         reads.last = None;
@@ -395,11 +409,11 @@ impl Plan {
             .await
             .map_err(|_| Error::Worker)??;
         }
-        tokio::task::spawn_blocking(move || verification.finish(|| cancel.is_cancelled()))
-            .await
-            .map_err(|_| Error::Worker)?
-            .map(Outcome::Repaired)
-            .map_err(Error::from)
+        let proof =
+            tokio::task::spawn_blocking(move || verification.finish(|| cancel.is_cancelled()))
+                .await
+                .map_err(|_| Error::Worker)??;
+        Ok((Outcome::Repaired(proof), reads))
     }
 }
 struct Reads {

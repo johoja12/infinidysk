@@ -849,3 +849,26 @@ later cannot introduce a foreign repair-history marker when no authoritative led
 is active; that disk tier stays disabled and its marker is left intact. Six startup
 tests and workspace all-target Clippy pass for this follow-up. This closes the case
 where an external cache was unavailable during startup and became available later.
+
+### Complete verified repair articles
+
+`Plan::execute_articles` now converts the whole-file verification result into
+complete articles for durable publication. It includes every article intersecting
+recovered slices. Healthy portions of mixed articles are read again and checked
+against the original IFSC before copying. Changed, missing or unbound bytes cannot
+produce a partial publication batch. Reconstructed bytes retain exact whole-file
+identity and decoded geometry; unknown yEnc part/total fields are not invented.
+
+Assembly shares the original execution request/read allowance. Its default decoded
+allowance includes a bounded additional patch batch; this is not a wire-byte budget.
+Before article allocation, it bounds the batch at 1,024 articles and 256 MB-scale
+payloads and accounts for retained recovered slices, patch buffers and per-article
+metadata against the remaining RAM allowance. Cancellation is checked during reads,
+checksums and copying. No storage mutation occurs inside this executor.
+
+Nine provider-facing executor tests and warnings-denied health all-target Clippy
+pass. New cases round-trip all complete articles through the real repair store and
+provider-free NNTP reads, exhaust the original request allowance at assembly, and
+switch providers after whole-file verification to prove that changed healthy bytes
+in a mixed article are rejected. Automatic discovery, durable scheduling/outcomes,
+source/reader-gated publication and the separate worker remain open.
