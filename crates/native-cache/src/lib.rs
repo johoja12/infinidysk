@@ -2,6 +2,7 @@
 //! The catalogue stays on local storage; browsing never scans payload volumes.
 mod diagnostics;
 pub mod legacy;
+pub mod repair;
 pub use diagnostics::{Eviction, FolderDiagnostic, Probe};
 
 use std::collections::{HashMap, HashSet};

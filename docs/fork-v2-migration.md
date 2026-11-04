@@ -702,3 +702,37 @@ The corrected PAR2 checkpoint is qualified by the full workspace run: **479 pass
 0 failed, 6 ignored**, plus the three original C# writer checks and two privileged
 kernel FUSE checks run separately. See [PAR2 execution validation](validation/rust-v2-par2-execution-20261104.md)
 for exact source, limits, qualification and remaining automatic-repair gaps.
+
+### Durable article repair ledger
+
+C03 now has an independently tested storage primitive in
+`native_cache::repair::Store`. It shares the local final-media catalogue and works
+without final-media payload folders. A repair record binds message ID, complete
+article geometry, source PAR2 proof, payload hash and a deterministic content revision.
+Evicting patch bytes retains the revision and proof; a missing patch cannot silently
+become an unversioned provider/cache lookup.
+
+Publication is atomic across a bounded batch. Affected IDs become pending before
+mutation. Ambiguous commit or anchor-sync results remain pending until explicit
+readback reconciliation. Reconciliation observes the database; it does not replay
+patches. A separately fsynced identity/epoch anchor rejects rollback below published
+repair state. Only one ledger writer owns the directory. Root/anchor identity,
+symlink guards, payload hashes and persisted descriptor/revision consistency are
+checked. Hashing and anchor sync run outside async executor threads; owned writer
+guards also cover blocking work after caller cancellation.
+
+The storage ceiling is 4 GB-scale patch payloads, 100,000 retained revision records,
+256 MB-scale batches, 32 MB-scale articles and bounded ID/record text. Internal byte
+ceilings use powers of two. The storage API trusts its publishing caller's whole-file
+proof; it does not establish source identity itself. Eight focused ledger tests and
+all-target native-cache Clippy pass, including payload eviction/restart, changed
+revisions, atomic batch rejection, committed-but-unacknowledged anchor failure,
+readback recovery, stale/lost metadata, corrupt payload/geometry, directory swaps,
+symlinked anchors and sharing metadata with the existing native cache.
+
+This is not yet attached to playback or automatic repair. Admission-time article
+stamps, decoded-cache flights/sinks, final-media keys, dependent-reader changes,
+external cache lineage and guarded publication still need integration. C03 remains
+open. The new local tables are additive; **back up `/config`, including the native
+cache metadata and repair anchor, before upgrading**. No persisted user setting or
+setup-wizard branch is introduced by this primitive.
