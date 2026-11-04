@@ -7,6 +7,7 @@ use infinidysk_db::{
 
 /// Exercises the tree, blob and config paths that must behave the same on both backends.
 async fn exercise(db: &Db) {
+    content_sweep(db).await;
     fair_rechecks(db).await;
     library_catalogue(db).await;
     db.save_plex_classification("fixture-snapshot")
@@ -1815,4 +1816,91 @@ async fn library_index_survives_database_restart() {
     db.close().await;
     drop(db);
     let _ = std::fs::remove_file(path);
+}
+
+async fn content_sweep(db: &Db) {
+    let root = db
+        .item(ItemId::CONTENT)
+        .await
+        .expect("query")
+        .expect("root");
+    let dir = Item::child(&root, "sweep%", ItemKind::Directory).expect("directory");
+    let mut first = Item::child(&dir, "a.mkv", ItemKind::NzbFile).expect("file");
+    let a = BlobId::new();
+    first.meta_blob = Some(a);
+    let mut second = Item::child(&dir, "b.mkv", ItemKind::NzbFile).expect("file");
+    let b = BlobId::new();
+    second.meta_blob = Some(b);
+    db.insert(
+        &[dir.clone(), first.clone(), second.clone()],
+        &[(a, b"old"), (b, b"other")],
+    )
+    .await
+    .expect("insert");
+    assert!(
+        db.update_metadata_if_current(first.id, a, b"old", b"new")
+            .await
+            .expect("CAS")
+    );
+    assert!(
+        !db.update_metadata_if_current(first.id, a, b"old", b"stale")
+            .await
+            .expect("stale CAS")
+    );
+    assert!(
+        !db.update_metadata_if_current(second.id, a, b"new", b"wrong-item")
+            .await
+            .expect("scope")
+    );
+    assert!(
+        db.metadata_is_current(first.id, a, b"new")
+            .await
+            .expect("current")
+    );
+    assert!(
+        !db.metadata_is_current(first.id, a, b"old")
+            .await
+            .expect("old")
+    );
+    let original = db.content_sweep().await.expect("state");
+    assert!(
+        db.start_content_sweep(original.revision, "snapshot", Some("sweep%"))
+            .await
+            .expect("start")
+    );
+    let view = db.content_sweep().await.expect("state");
+    assert_eq!(view.total, 2);
+    assert_eq!(view.payload, "snapshot");
+    assert!(
+        !db.start_content_sweep(original.revision, "stale", None)
+            .await
+            .expect("stale start")
+    );
+    let initial = db
+        .next_sweep_item(None)
+        .await
+        .expect("cursor")
+        .expect("first");
+    db.delete_item(initial).await.expect("delete");
+    assert_eq!(
+        db.content_sweep().await.expect("snapshot persists").total,
+        2
+    );
+    assert!(
+        db.next_sweep_item(Some(initial))
+            .await
+            .expect("cursor")
+            .is_some()
+    );
+    assert!(
+        db.checkpoint_content_sweep(view.revision, "paused")
+            .await
+            .expect("checkpoint")
+    );
+    assert!(
+        !db.checkpoint_content_sweep(view.revision, "stale")
+            .await
+            .expect("stale")
+    );
+    db.delete_item(dir.id).await.expect("cleanup");
 }

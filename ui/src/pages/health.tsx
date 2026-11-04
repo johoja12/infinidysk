@@ -5,6 +5,7 @@ import { Search, Stethoscope, TriangleAlert, Wrench } from "lucide-react";
 import { toast } from "sonner";
 import { api, body, type Schemas } from "../api/client";
 import { Regrabs } from "./regrabs";
+import { ContentSweep } from "./content-sweep";
 import { ago, stamp } from "../format";
 import { useSettings } from "../settings";
 import { cn } from "@/lib/utils";
@@ -386,6 +387,7 @@ export function Health() {
       <Attention />
       <Schedule />
       <Rejected />
+      <ContentSweep />
       <Regrabs />
       <h2 className="mb-3 font-medium">History</h2>
       <div className="mb-3 flex flex-wrap items-center gap-2">

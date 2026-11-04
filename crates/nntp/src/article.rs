@@ -19,6 +19,71 @@ pub struct Body {
     pub total: Option<u32>,
 }
 
+/// Geometry independently known from the imported source. Checked before a body
+/// can reach a caller or the abandoned-body cache sink.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BodyExpectation {
+    pub part: Option<u32>,
+    pub total: Option<u32>,
+    pub file_size: Option<u64>,
+    pub offset: Option<u64>,
+    pub decoded_len: Option<u64>,
+}
+impl BodyExpectation {
+    pub(crate) fn validate(self, body: &Body) -> Result<(), crate::Error> {
+        let regular = match body.part {
+            Some(1) if body.offset == 0 => Some(body.data.len() as u64),
+            Some(part)
+                if part > 1
+                    && body.offset > 0
+                    && body.offset.is_multiple_of(u64::from(part - 1)) =>
+            {
+                Some(body.offset / u64::from(part - 1))
+            }
+            _ => None,
+        };
+        let obfuscated_total = self.part == body.part
+            && regular.is_some_and(|size| {
+                size > 0
+                    && body.data.len() as u64 <= size
+                    && body
+                        .total
+                        .is_some_and(|total| body.file_size.div_ceil(size) != u64::from(total))
+            });
+        let impossible_range = self.part.is_some()
+            && body.part.is_some()
+            && self.offset.is_none()
+            && match self.part {
+                Some(1) => body.offset != 0,
+                Some(_) => {
+                    body.offset == 0
+                        || (body.file_size > 0
+                            && body.offset.saturating_add(body.data.len() as u64) > body.file_size)
+                }
+                None => false,
+            };
+        if self
+            .part
+            .is_some_and(|v| body.part.is_some_and(|actual| actual != v))
+            || impossible_range
+            || (!obfuscated_total
+                && self
+                    .total
+                    .is_some_and(|v| body.total.is_some_and(|actual| actual != v)))
+            || self.file_size.is_some_and(|v| body.file_size != v)
+            || self.offset.is_some_and(|v| body.offset != v)
+            || self
+                .decoded_len
+                .is_some_and(|v| body.data.len() as u64 != v)
+        {
+            return Err(crate::Error::Yenc(
+                "article does not match imported geometry",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Value of `key=` in a `=y…` header line. Stops at `name=`, which is always last and
 /// may contain spaces.
 fn raw_field<'a>(line: &'a [u8], key: &[u8]) -> Option<&'a str> {

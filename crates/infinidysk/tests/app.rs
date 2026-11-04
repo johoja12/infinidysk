@@ -281,6 +281,27 @@ async fn serves_every_api_on_one_port_and_applies_settings_live() {
         json!({"entries":[],"next":null})
     );
 
+    let sweep = "/api/v1/health/content-sweep";
+    assert!(spec["paths"][sweep]["get"].is_object());
+    assert!(spec["paths"][sweep]["post"].is_object());
+    let anonymous = format!("GET {sweep} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    assert_eq!(status(addr, &anonymous).await, "HTTP/1.1 401 Unauthorized");
+    let request = admin_request(
+        "POST",
+        sweep,
+        r#"{"revision":-1,"operation":"start","category":null,"limit":null}"#,
+    );
+    assert_eq!(status(addr, &request).await, "HTTP/1.1 409 Conflict");
+    assert_eq!(
+        status(addr, &request.replace("X-Api-Key: adminkey\r\n", "")).await,
+        "HTTP/1.1 401 Unauthorized"
+    );
+    let (code, body) = send(addr, &admin_request("GET", sweep, "")).await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    let state: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(state["state"]["status"], "idle");
+    assert_eq!(state["revision"], 0);
+
     let anonymous = "GET /api/v1/settings HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
     assert_eq!(status(addr, anonymous).await, "HTTP/1.1 401 Unauthorized");
 

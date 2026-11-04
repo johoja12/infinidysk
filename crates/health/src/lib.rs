@@ -6,6 +6,7 @@ mod check;
 mod regrab;
 pub use regrab::Control as RegrabControl;
 mod structure;
+pub mod sweep;
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -148,6 +149,12 @@ pub struct Health {
     counters: [AtomicU64; 4],
     inconclusive: Mutex<HashMap<ItemId, u32>>,
     wake: Notify,
+    sweep_gate: tokio::sync::Mutex<()>,
+    publication_gate: tokio::sync::Mutex<()>,
+    sweep_cancel: watch::Sender<u64>,
+    priority_cancel: watch::Sender<u64>,
+    priority_streak: AtomicU64,
+    maintenance_turn: AtomicU64,
 }
 
 /// Checks since start, by result.
@@ -211,6 +218,12 @@ impl Health {
             counters: Default::default(),
             inconclusive: Mutex::default(),
             wake: Notify::new(),
+            sweep_gate: tokio::sync::Mutex::new(()),
+            publication_gate: tokio::sync::Mutex::new(()),
+            sweep_cancel: watch::channel(0).0,
+            priority_cancel: watch::channel(0).0,
+            priority_streak: AtomicU64::new(0),
+            maintenance_turn: AtomicU64::new(0),
         })
     }
 
@@ -316,6 +329,8 @@ impl Health {
     /// because another handle may have opened in the meantime.
     pub async fn readers_closed(&self, item: ItemId) -> Result<(), Error> {
         if !(self.in_use)(item) && self.db.release_reader_repair(item).await? {
+            self.priority_cancel
+                .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
             self.wake.notify_one();
         }
         Ok(())
@@ -342,22 +357,62 @@ impl Health {
             return Ok(false);
         }
         let _writing = self.db.write_permit().await;
-        if let Some(analyzer) = &self.analyzer
-            && !(self.streaming)()
-            && let Some((item, requested)) = self.db.next_media_probe().await?
-        {
-            self.analyze(analyzer, item, requested).await?;
-            return Ok(true);
-        }
         let settings = *self.settings.borrow();
-        let Some((item, status)) = self
+        let primary = self
             .db
             .due_health_work(now_ms(), settings.enabled, 1)
             .await?
-            .pop()
-        else {
+            .pop();
+        let urgent = primary.as_ref().is_some_and(|(_, status)| {
+            status.recheck != Recheck::None
+                || matches!(status.state, HealthState::Repairing | HealthState::Hidden)
+        });
+        let maintenance =
+            primary.is_none() || !urgent || self.priority_streak.load(Ordering::Relaxed) >= 4;
+        let mut chosen = None;
+        if maintenance {
+            let turn = self.maintenance_turn.fetch_add(1, Ordering::Relaxed) % 3;
+            for offset in 0..3 {
+                match (turn + offset) % 3 {
+                    0 => match self.sweep_step().await {
+                        Ok(true) => {
+                            self.priority_streak.store(0, Ordering::Relaxed);
+                            return Ok(true);
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(reason=%error,"content sweep could not advance; other health work continues");
+                        }
+                    },
+                    1 => {
+                        if !(self.streaming)()
+                            && let Some(analyzer) = &self.analyzer
+                            && let Some((item, requested)) = self.db.next_media_probe().await?
+                        {
+                            self.analyze(analyzer, item, requested).await?;
+                            self.priority_streak.store(0, Ordering::Relaxed);
+                            return Ok(true);
+                        }
+                    }
+                    _ => {
+                        chosen = self
+                            .db
+                            .due_routine_health(now_ms(), settings.enabled)
+                            .await?;
+                        if chosen.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+            self.priority_streak.store(0, Ordering::Relaxed);
+        }
+        let Some((item, status)) = chosen.or(primary) else {
             return Ok(false);
         };
+        if urgent && !maintenance {
+            self.priority_streak.fetch_add(1, Ordering::Relaxed);
+        }
         let work = async {
             match status.state {
                 HealthState::Repairing => self.repair(&item, status, &settings).await,
@@ -398,7 +453,8 @@ impl Health {
         Ok(true)
     }
 
-    /// The next `limit` files with health work, in the order [`Self::step`] takes them.
+    /// Due file work in priority order. Sample sweeps and media analysis receive
+    /// separate bounded maintenance slots and are not listed here.
     pub async fn schedule(
         &self,
         limit: i64,
@@ -419,6 +475,8 @@ impl Health {
             self.db.set_health(id, &status, Recheck::None).await?;
         }
         self.db.request_recheck(id, Recheck::User).await?;
+        self.priority_cancel
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         self.wake.notify_one();
         Ok(true)
     }
@@ -433,6 +491,8 @@ impl Health {
             status.state = HealthState::Repairing;
             status.next_check = Some(now_ms());
             self.db.set_health(id, &status, Recheck::None).await?;
+            self.priority_cancel
+                .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
             self.wake.notify_one();
         }
         Ok(true)
@@ -450,7 +510,8 @@ impl Health {
 
     async fn analyze(&self, analyzer: &Analyzer, item: Item, requested: i64) -> Result<(), Error> {
         let (id, path) = (item.id, item.path.clone());
-        let (outcome, reason, info) = match analyzer(item).await {
+        let analysis = tokio::select! {result=analyzer(item)=>result,()=self.wake.notified()=>Analysis::Preempted};
+        let (outcome, reason, info) = match analysis {
             Analysis::Preempted => {
                 tracing::debug!(path = %path, "media analysis yielded to foreground work");
                 return Ok(());
@@ -478,23 +539,29 @@ impl Health {
 
     /// Records segments playback found `missing` or `corrupt` (flat indices across parts)
     /// as the first confirmed miss of `id`, and checks it next.
-    // ponytail: a check of `id` running meanwhile may overwrite these holes; the next
-    // playback reports them again.
     pub async fn report(
         &self,
         id: ItemId,
         missing: &[usize],
         corrupt: &[usize],
     ) -> Result<(), Error> {
+        self.report_source(id, None, missing, corrupt)
+            .await
+            .map(|_| ())
+    }
+    async fn report_source(
+        &self,
+        id: ItemId,
+        identity: Option<&[u8]>,
+        missing: &[usize],
+        corrupt: &[usize],
+    ) -> Result<bool, Error> {
+        let _publication = self.publication_gate.lock().await;
         let Some((item, mut status)) = self.db.health(id).await? else {
-            return Ok(());
+            return Ok(false);
         };
-        if let Some((blob_id, mut meta)) = self.meta(&item).await?
-            && check::mark(&mut meta, missing, corrupt)
-        {
-            self.db
-                .update_blob(blob_id, &blob::encode_meta(&meta)?)
-                .await?;
+        if !self.mark_current(&item, identity, missing, corrupt).await? {
+            return Ok(false);
         }
         if matches!(
             status.state,
@@ -515,9 +582,11 @@ impl Health {
                 self.db.set_health(id, &status, Recheck::None).await?;
             }
             self.db.request_recheck(id, Recheck::Playback).await?;
+            self.priority_cancel
+                .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
             self.wake.notify_one();
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn check(
@@ -526,7 +595,7 @@ impl Health {
         status: HealthStatus,
         settings: &Settings,
     ) -> Result<(), Error> {
-        let Some((blob_id, mut meta)) = self.meta(item).await? else {
+        let Some((blob_id, raw, mut meta)) = self.meta_snapshot(item).await? else {
             tracing::warn!(item = %item.id, path = %item.path, reason = "its stored metadata is gone", "cannot check a file; retrying tomorrow");
             self.db
                 .postpone_health(item.id, now_ms() + DAY_MS, status.recheck_generation)
@@ -545,10 +614,32 @@ impl Health {
         };
         let client = check::Direct(&self.client);
         let (outcome, changed, head) = check::run(&client, &mut meta, &item.name, &opts).await;
-        if changed {
+        let found = if matches!(outcome, Outcome::Healthy | Outcome::Degraded(_)) {
+            Some(structure::walk(&client, &meta, &item.name, head).await)
+        } else {
+            None
+        };
+        let _publication = self.publication_gate.lock().await;
+        if self
+            .db
+            .health(item.id)
+            .await?
+            .is_none_or(|(_, current)| current.recheck_generation != status.recheck_generation)
+        {
+            return Ok(());
+        }
+        let current = if changed {
             self.db
-                .update_blob(blob_id, &blob::encode_meta(&meta)?)
+                .update_metadata_if_current(item.id, blob_id, &raw, &blob::encode_meta(&meta)?)
+                .await?
+        } else {
+            self.db.metadata_is_current(item.id, blob_id, &raw).await?
+        };
+        if !current {
+            self.db
+                .postpone_health(item.id, now_ms() + MINUTE_MS, status.recheck_generation)
                 .await?;
+            return Ok(());
         }
         let probe = self.db.media_probe(item.id).await?;
         let now = now_ms();
@@ -627,7 +718,9 @@ impl Health {
                 }
             }
             Outcome::Healthy | Outcome::Degraded(_) => {
-                let found = structure::walk(&client, &meta, &item.name, head).await;
+                let Some(found) = found else {
+                    return Err(Error::Regrab("missing structural check result"));
+                };
                 let source = structure::source(&meta);
                 let verdict =
                     structure::judge(probe.defect, &found, source, now, SUSPECT_RECHECK_MS);
@@ -1169,15 +1262,57 @@ impl Health {
         Ok(())
     }
 
-    async fn meta(&self, item: &Item) -> Result<Option<(BlobId, FileMeta)>, Error> {
+    async fn meta_snapshot(
+        &self,
+        item: &Item,
+    ) -> Result<Option<(BlobId, Vec<u8>, FileMeta)>, Error> {
         let Some(id) = item.meta_blob else {
             return Ok(None);
         };
-        // `None` when deleted between the query and the read.
         let Some(bytes) = self.db.blob(id).await? else {
             return Ok(None);
         };
-        Ok(Some((id, blob::decode_meta(&bytes)?)))
+        let meta = blob::decode_meta(&bytes)?;
+        Ok(Some((id, bytes, meta)))
+    }
+    async fn meta(&self, item: &Item) -> Result<Option<(BlobId, FileMeta)>, Error> {
+        Ok(self
+            .meta_snapshot(item)
+            .await?
+            .map(|(id, _, meta)| (id, meta)))
+    }
+    /// Merge faults without overwriting another reader's additions or a newer source.
+    async fn mark_current(
+        &self,
+        item: &Item,
+        identity: Option<&[u8]>,
+        missing: &[usize],
+        corrupt: &[usize],
+    ) -> Result<bool, Error> {
+        for _ in 0..4 {
+            let Some((id, raw, mut meta)) = self.meta_snapshot(item).await? else {
+                return Ok(false);
+            };
+            if let Some(identity) = identity
+                && meta.content_identity()? != identity
+            {
+                return Ok(false);
+            }
+            if !check::mark(&mut meta, missing, corrupt) {
+                if self.db.metadata_is_current(item.id, id, &raw).await? {
+                    return Ok(true);
+                }
+            } else if self
+                .db
+                .update_metadata_if_current(item.id, id, &raw, &blob::encode_meta(&meta)?)
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        Err(Error::Regrab(
+            "metadata changed repeatedly; retry the report",
+        ))
     }
 
     async fn record(

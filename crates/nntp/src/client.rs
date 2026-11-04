@@ -362,6 +362,26 @@ impl Client {
         self.body_tagged(message_id, tag).await
     }
 
+    /// A complete verified BODY for maintenance probes. No streaming callback can
+    /// observe bytes before their imported geometry has been checked.
+    pub async fn body_checked(
+        &self,
+        message_id: &str,
+        workload: Workload,
+        expected: crate::BodyExpectation,
+    ) -> Result<Body, Error> {
+        self.body_tagged(
+            message_id,
+            Tag {
+                workload,
+                begin: expected.offset,
+                expected: Some(expected),
+                ..Tag::UNTRACKED
+            },
+        )
+        .await
+    }
+
     /// A playback body racing a slow fetch of the same article: waits for an idle
     /// connection rather than pipeline behind another request.
     pub async fn hedge(

@@ -19,7 +19,7 @@ use std::pin::Pin;
 
 use bytes::Bytes;
 
-pub use article::Body;
+pub use article::{Body, BodyExpectation};
 pub use bandwidth::Bandwidth;
 pub use client::{BodySink, Client, Lease, Provider};
 pub use connection::{Connection, ConnectionStats, Endpoint, Phase, Progress, Timing, TlsMode};

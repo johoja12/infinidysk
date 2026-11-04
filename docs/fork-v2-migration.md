@@ -44,7 +44,7 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | R02 | P0 | Recover the original download from exact file ID + imported path; reject ambiguity and incomplete history (`ArrDownloadIdResolver`, fork PR #234) | `repair.rs::owner_of_file` and Arr owner backfill exist. Add scoped, fully paginated Radarr history using **`movieIds`**, verify current identity, and carry recovered identity into blocklisting. Do not use a migration job ID as original provenance. Sonarr filtering stays profile-specific. | Implemented; exact scoped/paginated recovery with ambiguity guards |
 | R03 | P0 | Protect live/overlapping reads, but bypass recent-read delay for confirmed damage after readers close (`ConcurrentReadTracker`, fork PR #232) | `health::Health::with_in_use` and VFS read handles exist. Prove FUSE/WebDAV/STRM accounting, cancellation cleanup, and no destructive repair while any reader remains. | Implemented persisted reader holds, last-close wakeup and atomic reader/repair admission; regression validation below |
 | R04 | P0 | Keep read/warm-triggered damaged-file repairs urgent through provider circuit outages (`HealthCheckService`, `PrefetchRepairHistory`, `eafe1705`) | Persisted urgent health state and bounded inconclusive retry; strict warming failures request the same priority. | Implemented for playback and the shared warming executor, including admitted current/history predictions; other source policies remain open |
-| R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Request generations and explicit-request scheduling implemented; resumable full-content sweep remains open |
+| R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Durable sampled-content snapshot, cursor, pause/resume, category and run limits implemented; fair maintenance slots and revision-safe fault publication included |
 | R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Durable source-bound journal, detached observation, revision-checked controls and current Arr-root authority implemented; read-only local scan-root policy remains with library parity |
 | R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; this baseline has no equivalent recovery executor in health. Port trusted range/slice identity, bounded repair budgets, durable outcomes and separate worker scheduling before declaring repair parity. | Port |
 | C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | First implementation in Rust; verified 1.x copy import implemented; broader fork data import remains M01 |
@@ -550,3 +550,42 @@ exact managed-file deletion to Arr instead of unlinking a local library pointer.
 
 No schema or setting change is added. Validation and the distinction from the C# local
 symlink-removal guard are in [regrab control validation](validation/rust-v2-regrab-controls-20261104.md).
+
+## Resumable sampled-content sweep and fair health maintenance
+
+The Health page now starts, pauses and resumes an imported-content sweep. SQLite and
+PostgreSQL persist a transactional candidate snapshot separately from its versioned
+state and cursor; deleting a candidate does not restart the sweep or lose its count.
+A category is a literal single path component. An optional per-run limit pauses the
+same snapshot; resume continues it. Controls require the current revision. A new
+sweep replaces the previous snapshot and counters only after the running one pauses.
+
+Each file samples first/last and an even 1 percent spread, between 8 and 32 articles
+when that many exist. Known holes extend that sample up to 64 BODY reads. Two requests
+run at once, with a 25-second deadline for the whole file. Imported byte geometry,
+part numbers and plausible ranges are checked before a BODY reaches its caller or
+cache sink, with provider fallback. Missing total headers and self-contradictory
+obfuscated totals retain the 1.x tolerances. Inconsistent sampled file sizes cannot
+produce a healthy result. Partial volumes without proven offsets remain unverified.
+This is sampled content verification across the library, not a full-byte checksum.
+
+Provider unavailability, a deadline or malformed metadata is unverified, never proof
+of damage. Confirmed missing/corrupt articles enter the ordinary two-check repair
+policy, preserving automatic-repair settings, verified cached copies, reader holds
+and Arr authority checks. Source identity and metadata CAS prevent findings from
+marking a replacement; regular checks now preserve newer playback reports too.
+Recent findings retain at most 50 source IDs and outcomes without media titles.
+
+Priority checks and repairs precede pending media analysis. After four priority jobs,
+a maintenance slot rotates across the sweep, analysis and routine checks; a continuous
+explicit queue cannot exclude those lanes. Foreground streams/imports and new urgent
+requests interrupt a sampled file without advancing its cursor. Sweep journal errors
+do not prevent other health work. Failed hot files with newer requests rotate their
+queue timestamp while preserving the request generation.
+
+No new persistent setting or setup-wizard choice is introduced: this is an advanced
+Health operation, outside the critical new-install path. Migration 0016 is additive;
+**back up `/config` before upgrading**. Sweep snapshots and progress are stored inside the database for restart continuity.
+
+Validation is recorded in
+[the sampled-content receipt](validation/rust-v2-content-sweep-20261104.md).

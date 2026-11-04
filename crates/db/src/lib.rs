@@ -172,6 +172,7 @@ macro_rules! on {
 }
 
 pub mod catalogue;
+pub mod sweep;
 
 /// A file or directory in the virtual tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2156,6 +2157,34 @@ impl Db {
         Ok(())
     }
 
+    /// An in-flight check cannot overwrite a newer playback report or a replacement.
+    pub async fn update_metadata_if_current(
+        &self,
+        item: ItemId,
+        id: BlobId,
+        previous: &[u8],
+        data: &[u8],
+    ) -> Result<bool, Error> {
+        let sql = "UPDATE blobs SET data=$4 WHERE id=$2 AND data=$3 AND EXISTS(SELECT 1 FROM items WHERE id=$1 AND meta_blob=$2)";
+        let changed = on!(self,pool=>sqlx::query(sql).bind(item.0).bind(id.0).bind(previous).bind(data).execute(pool).await?.rows_affected())
+            == 1;
+        if changed {
+            self.blob_epoch.fetch_add(1, Ordering::Release);
+        }
+        Ok(changed)
+    }
+    pub async fn metadata_is_current(
+        &self,
+        item: ItemId,
+        id: BlobId,
+        data: &[u8],
+    ) -> Result<bool, Error> {
+        let sql = "SELECT EXISTS(SELECT 1 FROM items i JOIN blobs b ON b.id=i.meta_blob WHERE i.id=$1 AND i.meta_blob=$2 AND b.data=$3)";
+        Ok(
+            on!(self,pool=>sqlx::query_scalar(sql).bind(item.0).bind(id.0).bind(data).fetch_one(pool).await?),
+        )
+    }
+
     /// Changes after every [`Db::update_blob`] in this process, so a blob read under one
     /// epoch may be cached under it. Blobs are otherwise immutable.
     pub fn blob_epoch(&self) -> u64 {
@@ -2258,6 +2287,20 @@ impl Db {
         rows.into_iter().map(TryInto::try_into).collect()
     }
 
+    /// Maintenance gets a bounded slot even under a stream of explicit requests.
+    pub async fn due_routine_health(
+        &self,
+        now: i64,
+        routine: bool,
+    ) -> Result<Option<(Item, HealthStatus)>, Error> {
+        let sql = select_health!(
+            "WHERE kind<>1 AND meta_blob IS NOT NULL AND $1 AND recheck_requested=0 AND health_state NOT IN(4,5,7) AND COALESCE(next_health_check,0)<=$2 AND NOT EXISTS(SELECT 1 FROM urgent_health u WHERE u.item_id=items.id) ORDER BY COALESCE(next_health_check,0),id LIMIT 1"
+        );
+        let row: Option<HealthWorkRow> =
+            on!(self,pool=>sqlx::query_as(sql).bind(routine).bind(now).fetch_optional(pool).await?);
+        row.map(TryInto::try_into).transpose()
+    }
+
     /// `id` with its health bookkeeping.
     pub async fn health(&self, id: ItemId) -> Result<Option<(Item, HealthStatus)>, Error> {
         let sql = select_health!("WHERE id = $1");
@@ -2316,12 +2359,13 @@ impl Db {
         generation: i64,
     ) -> Result<(), Error> {
         let sql = "UPDATE items SET next_health_check = $2, \
-                   health_requested_at = CASE WHEN recheck_generation = $3 THEN NULL ELSE health_requested_at END, \
+                   health_requested_at = CASE WHEN recheck_generation = $3 THEN NULL ELSE $4 END, \
                    recheck_requested = CASE WHEN recheck_generation = $3 THEN 0 ELSE recheck_requested END WHERE id = $1";
         on!(self, pool => sqlx::query(sql)
             .bind(id.0)
             .bind(next_check)
             .bind(generation)
+            .bind(now_ms())
             .execute(pool)
             .await?
             .rows_affected());

@@ -115,6 +115,7 @@ pub(crate) struct Tag {
     pub(crate) progress: Option<Progress>,
     /// Expected `=ypart` offset; see [`Connection::read_body_with`].
     pub(crate) begin: Option<u64>,
+    pub(crate) expected: Option<crate::BodyExpectation>,
     /// Gets bodies whose caller left before they arrived.
     pub(crate) sink: Option<Arc<OnceLock<BodySink>>>,
     /// Waits for a connection with nothing in flight rather than pipeline behind
@@ -130,6 +131,7 @@ impl Tag {
         probe: None,
         progress: None,
         begin: None,
+        expected: None,
         sink: None,
         fresh: false,
     };
@@ -845,7 +847,12 @@ async fn run(
                     request.tag.step(Step::Receiving { provider });
                 })
                 .await
-                .map(Some),
+                .and_then(|body| {
+                    if let Some(expected) = request.tag.expected {
+                        expected.validate(&body)?;
+                    }
+                    Ok(Some(body))
+                }),
             Command::Stat => conn.read_stat().await.map(|()| None),
         };
         let timing = match request.command {

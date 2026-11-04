@@ -926,3 +926,44 @@ async fn warm_keeps_the_floor_only_where_eligible_and_never_during_a_lease() {
     client.warm().await;
     settle([2, 0, 0]).await;
 }
+
+#[tokio::test]
+async fn checked_bodies_reject_foreign_geometry_before_the_cache_sink() {
+    let corpus = Corpus::generate(1025, 2, ARTICLE_SIZE);
+    let wrong = LoopbackServer::start(corpus.articles.clone())
+        .await
+        .unwrap();
+    let downloads = Downloads::new(16);
+    let client = Client::new([provider(wrong.addr().port(), 0, None, &downloads)]);
+    let stored = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::clone(&stored);
+    client.set_sink(Box::new(move |_, _, _, _| {
+        count.fetch_add(1, Ordering::SeqCst);
+    }));
+    let id = &corpus.articles[0].message_id;
+    let expected = infinidysk_nntp::BodyExpectation {
+        part: Some(2),
+        ..Default::default()
+    };
+    assert!(matches!(
+        client.body_checked(id, Workload::Health, expected).await,
+        Err(Error::Yenc(_))
+    ));
+    assert_eq!(stored.load(Ordering::SeqCst), 0);
+    let body = client
+        .body_checked(
+            id,
+            Workload::Health,
+            infinidysk_nntp::BodyExpectation {
+                part: Some(1),
+                total: Some(2),
+                offset: Some(0),
+                decoded_len: Some(ARTICLE_SIZE as u64),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(body.data, corpus.data[..ARTICLE_SIZE]);
+    assert_eq!(stored.load(Ordering::SeqCst), 1);
+}

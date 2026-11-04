@@ -22,13 +22,14 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
+uuid.workspace = true
+utoipa.workspace = true
 
 [dev-dependencies]
 axum = { workspace = true, features = ["http1", "json", "query", "tokio"] }
 infinidysk-queue.workspace = true
 infinidysk-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
-uuid.workspace = true
 
 [lints]
 workspace = true

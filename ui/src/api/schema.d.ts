@@ -378,6 +378,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/health/content-sweep": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["content_sweep"];
+        put?: never;
+        post: operations["content_sweep_control"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health/regrabs": {
         parameters: {
             query?: never;
@@ -1906,6 +1922,72 @@ export interface components {
         CheckResult: "healthy" | "missing" | "degraded" | "inconclusive" | "damaged";
         /** @enum {string} */
         ConnectionState: "connected" | "waiting" | "paused" | "failing";
+        ContentSweep: {
+            /** Format: int64 */
+            revision: number;
+            state: components["schemas"]["ContentSweepState"];
+            /** Format: int64 */
+            total: number;
+        };
+        ContentSweepFinding: {
+            /** Format: int64 */
+            at: number;
+            /** Format: uuid */
+            item: string;
+            outcome: string;
+        };
+        ContentSweepOperation: {
+            category?: string | null;
+            /** Format: int32 */
+            limit?: number | null;
+            /** @enum {string} */
+            operation: "start";
+        } | {
+            /** @enum {string} */
+            operation: "pause";
+        } | {
+            /** @enum {string} */
+            operation: "resume";
+        };
+        ContentSweepRequest: components["schemas"]["ContentSweepOperation"] & {
+            /** Format: int64 */
+            revision: number;
+        };
+        ContentSweepState: {
+            category?: string | null;
+            /** Format: int64 */
+            checked: number;
+            /** Format: uuid */
+            cursor?: string | null;
+            /** Format: int64 */
+            damaged: number;
+            /** Format: int64 */
+            finished_at?: number | null;
+            /** Format: int64 */
+            healthy: number;
+            /** Format: int32 */
+            limit?: number | null;
+            /** Format: int32 */
+            processed_this_run: number;
+            recent: components["schemas"]["ContentSweepFinding"][];
+            /** Format: uuid */
+            run: string;
+            /** Format: int64 */
+            samples: number;
+            /** Format: int64 */
+            skipped: number;
+            /** Format: int64 */
+            started_at: number;
+            status: components["schemas"]["ContentSweepStatus"];
+            /** Format: int64 */
+            unverifiable: number;
+            /** Format: int64 */
+            updated_at: number;
+            /** Format: int32 */
+            version: number;
+        };
+        /** @enum {string} */
+        ContentSweepStatus: "idle" | "running" | "paused" | "complete";
         Contents: {
             /** Format: int64 */
             bytes: number;
@@ -3720,7 +3802,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a3c1-dd4b-7361-83ae-59f68061d695
+             * @default 01a1a3e1-fcbf-7211-890a-e0b6fb3d5590
              */
             id: string;
             /**
@@ -5408,6 +5490,48 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HealthHistoryEntry"][];
+                };
+            };
+        };
+    };
+    content_sweep: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContentSweep"];
+                };
+            };
+        };
+    };
+    content_sweep_control: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ContentSweepRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContentSweep"];
                 };
             };
         };

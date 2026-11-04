@@ -140,6 +140,120 @@ pub async fn run(
     (outcome, changed, head)
 }
 
+#[derive(Default, Debug)]
+pub(super) struct Sample {
+    pub sampled: u32,
+    pub missing: Vec<usize>,
+    pub corrupt: Vec<usize>,
+    pub inconclusive: u32,
+}
+/// Fork import-sweep budget: first/last and an even 1% spread, 8–32 BODY reads.
+/// Known holes are included, with an explicit 64-article ceiling for this pass.
+pub(super) async fn import_sample(client: &Client, meta: &FileMeta) -> Sample {
+    let parts = parts(meta);
+    let count: usize = parts.iter().map(|p| p.items.len()).sum();
+    let target = count.div_ceil(100).clamp(8, 32).min(count);
+    let mut selected: BTreeSet<usize> = media::spread(count, 1, 1, target).into_iter().collect();
+    let mut out = Sample::default();
+    let mut base = 0;
+    for part in &parts {
+        for index in part.missing.iter().chain(&part.corrupt) {
+            if (*index as usize) >= part.items.len() {
+                out.inconclusive += 1;
+                continue;
+            }
+            if selected.len() < 64 {
+                selected.insert(base + *index as usize);
+            }
+        }
+        base += part.items.len();
+    }
+    let starts: Vec<u64> = match meta {
+        FileMeta::Nzb(_) => vec![0],
+        FileMeta::Multipart(f) => f.parts.iter().map(|p| p.offset).collect(),
+    };
+    let mut jobs = Vec::new();
+    let mut base = 0;
+    for (part, start) in parts.into_iter().zip(starts) {
+        let mut at = start;
+        for (local, segment) in part.items.iter().enumerate() {
+            if selected.contains(&(base + local)) {
+                let whole = matches!(meta, FileMeta::Nzb(_));
+                let expected = infinidysk_nntp::BodyExpectation {
+                    part: whole.then(|| u32::try_from(local + 1).ok()).flatten(),
+                    total: whole
+                        .then(|| u32::try_from(part.items.len()).ok())
+                        .flatten(),
+                    offset: part.sizes_trusted.then_some(at),
+                    decoded_len: part.sizes_trusted.then_some(u64::from(segment.size)),
+                    file_size: None,
+                };
+                // Partial volumes without proven byte offsets cannot establish which
+                // posted part this BODY belongs to.
+                if !whole && !part.sizes_trusted {
+                    out.inconclusive += 1;
+                } else {
+                    jobs.push((base + local, base, segment.clone(), expected));
+                }
+            }
+            at = at.saturating_add(u64::from(segment.size));
+        }
+        base += part.items.len();
+    }
+    let mut sizes: BTreeMap<usize, Vec<(usize, u64)>> = BTreeMap::new();
+    let mut probes = stream::iter(jobs)
+        .map(|(i, group, s, expected)| async move {
+            (
+                i,
+                group,
+                expected,
+                client.body_checked(&s.id, Workload::Health, expected).await,
+            )
+        })
+        .buffer_unordered(2);
+    while let Some((i, group, expected, result)) = probes.next().await {
+        out.sampled += 1;
+        match result {
+            Ok(body) => {
+                if body.part.is_some() && body.file_size > 0 {
+                    sizes.entry(group).or_default().push((i, body.file_size));
+                } else if expected.total.is_some_and(|total| total > 1) {
+                    out.inconclusive += 1;
+                }
+            }
+            Err(NntpError::NotFound) => out.missing.push(i),
+            Err(NntpError::CrcMismatch { .. } | NntpError::Yenc(_) | NntpError::TooLarge) => {
+                out.corrupt.push(i);
+            }
+            Err(_) => out.inconclusive += 1,
+        }
+    }
+    for samples in sizes.into_values() {
+        let mut frequency: BTreeMap<u64, usize> = BTreeMap::new();
+        for &(_, size) in &samples {
+            *frequency.entry(size).or_default() += 1;
+        }
+        if frequency.len() < 2 {
+            continue;
+        }
+        let maximum = frequency.values().copied().max().unwrap_or(0);
+        let winners: Vec<u64> = frequency
+            .iter()
+            .filter_map(|(&size, &count)| (count == maximum).then_some(size))
+            .collect();
+        if winners.len() == 1 {
+            out.corrupt.extend(
+                samples
+                    .iter()
+                    .filter_map(|&(i, size)| (size != winners[0]).then_some(i)),
+            );
+        } else {
+            out.inconclusive += 1;
+        }
+    }
+    out
+}
+
 /// Adds flat `missing`/`corrupt` indices to `meta`'s sets; `true` when they changed.
 pub fn mark(meta: &mut FileMeta, missing: &[usize], corrupt: &[usize]) -> bool {
     let (_, mut all_missing, mut all_corrupt) = flatten(meta);
