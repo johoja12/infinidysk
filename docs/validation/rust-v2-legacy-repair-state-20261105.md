@@ -38,3 +38,10 @@ requests and unbound holds. A real loopback HTTP Arr fixture proves observation
 issues no external mutations, retains original-ID protection and resolves only
 the corresponding global hold. These fixtures are not live Arr or production
 acceptance.
+
+The three genuine 1.x C# writer/import/cache fixture cases also passed separately,
+as did both privileged kernel FUSE cases, including process-challenge reads.
+The two cache suites must run sequentially because they deliberately acquire the
+same exclusive source-fixture lease. An initial parallel run correctly refused
+that shared lease; the sequential rerun passed. Legacy cache bytes are copied into
+separate Rust storage; the runtimes never share a writable cache root.
