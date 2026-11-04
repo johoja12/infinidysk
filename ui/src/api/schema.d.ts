@@ -3145,6 +3145,30 @@ export interface components {
             quota_bytes: number;
             read_only: boolean;
         };
+        NativeCacheIo: {
+            /** Format: int64 */
+            active: number;
+            available_buffer_blocks: number;
+            /** Format: int64 */
+            elapsed_ms: number;
+            /** Format: int64 */
+            failed: number;
+            /** Format: int64 */
+            queued: number;
+            /** Format: int64 */
+            read_requests: number;
+            /** Format: int64 */
+            removal_requests: number;
+            /**
+             * Format: int64
+             * @description Physical writes completed and synced; catalogue publication is counted separately.
+             */
+            synced_write_bytes: number;
+            /** Format: int64 */
+            verified_read_bytes: number;
+            /** Format: int64 */
+            write_requests: number;
+        };
         /** @enum {string} */
         NativeCacheOperation: "pin" | "unpin" | "evict";
         NativeCacheProbe: {
@@ -3207,6 +3231,7 @@ export interface components {
             files: number;
             /** Format: int64 */
             hits: number;
+            io: components["schemas"]["NativeCacheIo"];
             /** Format: int64 */
             misses: number;
             /** Format: int64 */

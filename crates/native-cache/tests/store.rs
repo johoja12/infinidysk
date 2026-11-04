@@ -73,6 +73,10 @@ async fn committed_blocks_survive_restart_and_partial_blocks_are_not_coverage() 
     assert_eq!(ranges.len(), 2);
     assert_eq!(ranges[0].end, BLOCK);
     assert_eq!(cache.get(&lease, 0).await.unwrap(), data(7));
+    let io = cache.stats().await.unwrap().io;
+    assert_eq!(io.write_requests, 2);
+    assert_eq!(io.synced_write_bytes, BLOCK + 12);
+    assert_eq!(io.verified_read_bytes, BLOCK);
     drop(lease);
     drop(cache);
     let cache = Cache::open(settings).await.unwrap();
@@ -83,6 +87,15 @@ async fn committed_blocks_survive_restart_and_partial_blocks_are_not_coverage() 
         Bytes::from(vec![9; 12])
     );
     assert_eq!(cache.stats().await.unwrap().bytes, BLOCK + 12);
+    let io = cache.stats().await.unwrap().io;
+    assert_eq!(io.read_requests, 2);
+    assert_eq!(io.verified_read_bytes, BLOCK + 12);
+    assert_eq!(
+        io.synced_write_bytes, 0,
+        "physical counters reset after restart"
+    );
+    assert_eq!(io.active, 0);
+    assert_eq!(io.queued, 0);
 }
 
 #[tokio::test]

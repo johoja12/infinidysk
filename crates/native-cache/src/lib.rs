@@ -1,6 +1,8 @@
 //! Final-media bytes, below delivery: checksummed blocks in bounded chunk files.
 //! The catalogue stays on local storage; browsing never scans payload volumes.
 mod diagnostics;
+mod traffic;
+pub use traffic::Stats as IoStats;
 pub mod legacy;
 pub mod repair;
 pub use diagnostics::{Eviction, FolderDiagnostic, Probe};
@@ -294,6 +296,7 @@ pub struct Cache {
     live: Arc<Mutex<Live>>,
     entries: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     slots: Arc<Semaphore>,
+    io: Arc<traffic::Counters>,
     maintenance: Notify,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -320,6 +323,7 @@ pub struct Stats {
     pub misses: u64,
     pub skipped: u64,
     pub failed: u64,
+    pub io: IoStats,
 }
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[schema(as = NativeCacheCoverage)]
@@ -513,6 +517,7 @@ impl Cache {
             live: Arc::default(),
             entries: Mutex::default(),
             maintenance: Notify::new(),
+            io: Arc::default(),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
@@ -630,7 +635,9 @@ impl Cache {
             return Ok(None);
         };
         let name = format!("{}-{}.data", key.id(), start / chunk.cast_unsigned());
+        let mut observation = self.io.begin(traffic::Kind::Read);
         let job = tokio::task::spawn_blocking(move || {
+            observation.start();
             let (_permit, _lease) = (permit, io_lease);
             let file = folder.file(&name, false)?;
             let mut data = vec![
@@ -645,6 +652,7 @@ impl Cache {
                     "native cache block checksum differs",
                 ));
             }
+            observation.success(data.len() as u64);
             Ok::<_, io::Error>(Bytes::from(data))
         });
         match tokio::time::timeout(self.deadline(), job).await {
@@ -789,12 +797,15 @@ impl Cache {
             };
             let name = format!("{}-{}.data", key.id(), start / chunk);
             let folder = Arc::clone(folder);
+            let mut observation = self.io.begin(traffic::Kind::Write);
             let writing = tokio::task::spawn_blocking(move || {
+                observation.start();
                 let (_permit, _lease) = (permit, io_lease);
                 let file = folder.file(&name, true)?;
                 file.write_all_at(&data, start % chunk)?;
                 file.sync_all()?;
                 folder.root.sync_all()?;
+                observation.success(data.len() as u64);
                 Ok::<_, io::Error>(guard)
             });
             let Ok(Ok(Ok(_guard))) = tokio::time::timeout(self.deadline(), writing).await else {
@@ -997,6 +1008,7 @@ impl Cache {
             misses: self.misses.load(Ordering::Relaxed),
             skipped: self.skipped.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
+            io: self.io.snapshot(self.slots.available_permits()),
         })
     }
     pub async fn pin(&self, key: &Key, pinned: bool) -> Result<bool, Error> {
@@ -1062,7 +1074,9 @@ impl Cache {
             return Ok(false);
         };
         let name_prefix = key.id();
+        let mut observation = self.io.begin(traffic::Kind::Remove);
         let work = tokio::task::spawn_blocking(move || {
+            observation.start();
             let _permit = permit;
             folder.validate()?;
             for chunk in chunks {
@@ -1077,6 +1091,7 @@ impl Cache {
                 }
             }
             folder.root.sync_all()?;
+            observation.success(0);
             Ok::<_, io::Error>((guard, mark))
         });
         // A timed-out/cancelled delete still holds its generation/entry guards until
