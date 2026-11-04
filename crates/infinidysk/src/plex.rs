@@ -114,7 +114,7 @@ fn owner(headers: &HeaderMap) -> String {
     {
         hash.update(b"key");
         hash.update(bearer);
-    } else if let Some(cookie) = crate::auth::cookie(headers) {
+    } else if let Some(cookie) = crate::auth::cookie(headers, crate::auth::COOKIE) {
         hash.update(b"session");
         hash.update(cookie.as_bytes());
     } else {

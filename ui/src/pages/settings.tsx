@@ -20,6 +20,7 @@ import { useAuth } from "../auth";
 import { copyText, MASK, notAPassword, type Settings as Doc, useRestart, useSaveSettings, useSettings } from "../settings";
 import { LibraryPanel, PreviewDialog, type PreviewRequest, previewTitle } from "../library";
 import { MaintenancePanel } from "../maintenance";
+import { DatabasePanel } from "../database";
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
 import {
   AlertDialog,
@@ -213,6 +214,12 @@ const categories = [
   },
   {
     group: "System",
+    slug: "database",
+    title: "Database",
+    description: "Where infinidysk keeps its library, queue and history, and moving it to PostgreSQL",
+  },
+  {
+    group: "System",
     slug: "maintenance",
     title: "Maintenance",
     description: "Housekeeping jobs you can run now, try as a dry run, or schedule for a daily window",
@@ -296,8 +303,10 @@ function SecretField({
   readOnly,
   generate,
   reveal,
+  noAutofill,
   hint,
   tip,
+  error,
   action,
   onChange,
 }: {
@@ -310,8 +319,11 @@ function SecretField({
   generate?: boolean;
   /** Settings path of a key the server may reveal. */
   reveal?: "sab.api_key" | "auth.api_key" | "webdav.download_key" | "imports.strm_key";
+  /** Not a sign-in password, so password managers stay away. */
+  noAutofill?: boolean;
   hint?: string;
   tip?: string;
+  error?: string;
   action?: ReactNode;
   onChange: (value: string) => void;
 }) {
@@ -345,14 +357,14 @@ function SecretField({
         </>
       }
       hint={!stored && value && generate && !reveal ? "Copy it now; it is hidden once saved." : hint}
-      error={failed}
+      error={failed ?? error}
     >
       <div className="flex flex-wrap gap-2">
         <Input
           id={id}
           type={shown || (stored && revealed) ? "text" : "password"}
           className={cn("flex-1 font-mono", !short && "min-w-64")}
-          {...(reveal ? notAPassword : { autoComplete: "new-password" })}
+          {...(reveal || noAutofill ? notAPassword : { autoComplete: "new-password" })}
           disabled={locked || readOnly}
           placeholder={stored ? "••••••••" : "Not set"}
           value={stored ? (revealed ?? "") : value}
@@ -595,6 +607,7 @@ export function Settings() {
   const category = categories.find((c) => c.slug === slug);
   const settings = useSettings();
   const save = useSaveSettings();
+  const auth = useAuth();
   const status = useQuery({
     queryKey: ["status"],
     queryFn: () => body(api.GET("/api/v1/status")),
@@ -638,8 +651,33 @@ export function Settings() {
     setDraft(doc);
     setRefused(null);
   };
+  const saved = view.settings;
+  const ssoSaved = saved.auth.oidc.issuer !== "";
+  const proven = auth.data?.method === "sso" && auth.data.sso_current;
+  // What the SSO proof covers: the public URL only while it supplies the redirect URI.
+  const ssoEdited =
+    !same(draft.auth.oidc, saved.auth.oidc) ||
+    (!saved.auth.oidc.redirect_uri && draft.network.public_url !== saved.network.public_url);
+  // Only saved-on → off needs proof; with password sign-in already off, SSO stays editable.
+  const passwordOff =
+    (saved.auth.local_login || !ssoSaved) && !(draft.auth.local_login || draft.auth.oidc.issuer.trim() === "");
+  const passwordOffRefusal = !passwordOff
+    ? undefined
+    : ssoEdited
+      ? "Save the SSO changes and sign in with SSO again before turning password sign-in off."
+      : !proven
+        ? "Sign in with SSO using the saved settings before turning password sign-in off."
+        : undefined;
+  // Setting SSO up keeps password sign-in on until an SSO sign-in has worked.
+  const oidc = (v: Partial<Schemas["Oidc"]>) =>
+    patch("auth", { oidc: { ...draft.auth.oidc, ...v }, ...(!ssoSaved && { local_login: true }) });
+  const callback = `${draft.network.public_url || window.location.origin}/auth/oidc/callback`;
   const submit = (event: FormEvent) => {
     event.preventDefault();
+    if (passwordOffRefusal) {
+      toast.error(passwordOffRefusal);
+      return;
+    }
     save.mutate(draft, {
       onSuccess: (view) => {
         reset(view.settings);
@@ -657,7 +695,6 @@ export function Settings() {
   /** The save error, on the field it is about. */
   const invalid = (path: string) =>
     save.error instanceof HttpError && save.error.path === path ? save.error.message : undefined;
-  const saved = view.settings;
   const address = new URL(URL.canParse(saved.network.public_url) ? saved.network.public_url : location.origin);
   const addressHint = saved.network.public_url ? "From the Public URL." : "As this browser reaches infinidysk.";
   /** Changes that convert library files go through a preview of the saved settings. */
@@ -677,6 +714,7 @@ export function Settings() {
           {category.slug === "arr" && <ArrInstances title={category.title} description={category.description} />}
           {category.slug === "plex" && <PlexConnections />}
           {category.slug === "prefetch" && <PrefetchPanel />}
+          {category.slug === "database" && <DatabasePanel title={category.title} description={category.description} />}
           <form id="settings" onSubmit={submit}>
             {category.slug === "download-client" && (
               <Section category={category}>
@@ -1277,6 +1315,111 @@ export function Settings() {
                   </div>
                   <Password />
                 </SettingsPanel>
+                <SettingsPanel title="Single sign-on">
+                  <Field
+                    id="oidc-issuer"
+                    label={label(
+                      "Issuer URL",
+                      "auth.oidc.issuer",
+                      "Your identity provider's issuer, exactly as it publishes it. Leave empty to turn SSO off.",
+                    )}
+                    hint="Such as https://auth.example.com/application/o/infinidysk/ or https://keycloak.example.com/realms/media."
+                    error={invalid("auth.oidc.issuer")}
+                  >
+                    <Input
+                      id="oidc-issuer"
+                      type="url"
+                      className="font-mono"
+                      disabled={locked("auth.oidc.issuer")}
+                      value={draft.auth.oidc.issuer}
+                      onChange={(e) => oidc({ issuer: e.target.value })}
+                    />
+                  </Field>
+                  <Field id="oidc-client-id" label={label("Client ID", "auth.oidc.client_id")} error={invalid("auth.oidc.client_id")}>
+                    <Input
+                      id="oidc-client-id"
+                      autoComplete="off"
+                      disabled={locked("auth.oidc.client_id")}
+                      value={draft.auth.oidc.client_id}
+                      onChange={(e) => oidc({ client_id: e.target.value })}
+                    />
+                  </Field>
+                  <SecretField
+                    id="oidc-client-secret"
+                    label="Client secret"
+                    value={draft.auth.oidc.client_secret}
+                    locked={locked("auth.oidc.client_secret")}
+                    noAutofill
+                    error={invalid("auth.oidc.client_secret")}
+                    onChange={(client_secret) => oidc({ client_secret })}
+                  />
+                  <Field
+                    id="oidc-redirect-uri"
+                    label={label("Redirect URI", "auth.oidc.redirect_uri")}
+                    hint={
+                      <>
+                        Register exactly this address at your identity provider. Empty uses <code>{callback}</code> when the server
+                        sees the same address; behind a TLS proxy, set the public URL or list the proxy under trusted proxies.
+                      </>
+                    }
+                    error={invalid("auth.oidc.redirect_uri")}
+                  >
+                    <Input
+                      id="oidc-redirect-uri"
+                      type="url"
+                      className="font-mono"
+                      placeholder={callback}
+                      disabled={locked("auth.oidc.redirect_uri")}
+                      value={draft.auth.oidc.redirect_uri}
+                      onChange={(e) => oidc({ redirect_uri: e.target.value })}
+                    />
+                  </Field>
+                  <Field id="oidc-scopes" label={label("Scopes", "auth.oidc.scopes")} error={invalid("auth.oidc.scopes")}>
+                    <Input
+                      id="oidc-scopes"
+                      className="font-mono"
+                      placeholder="openid profile email"
+                      disabled={locked("auth.oidc.scopes")}
+                      value={draft.auth.oidc.scopes}
+                      onChange={(e) => oidc({ scopes: e.target.value })}
+                    />
+                  </Field>
+                  <Field
+                    id="oidc-username-claim"
+                    label={label("Username claim", "auth.oidc.username_claim")}
+                    hint="Falls back to preferred_username, email, then sub."
+                    error={invalid("auth.oidc.username_claim")}
+                  >
+                    <Input
+                      id="oidc-username-claim"
+                      className="font-mono"
+                      disabled={locked("auth.oidc.username_claim")}
+                      value={draft.auth.oidc.username_claim}
+                      onChange={(e) => oidc({ username_claim: e.target.value })}
+                    />
+                  </Field>
+                  {auth.data?.account && (
+                    <div className="space-y-2">
+                      <Toggle
+                        id="local-login"
+                        label={label("Password sign-in", "auth.local_login")}
+                        hint={
+                          !ssoSaved
+                            ? "Always on while SSO is off."
+                            : saved.auth.local_login && draft.auth.local_login && !proven
+                              ? "To turn this off, first sign in with SSO using the saved settings."
+                              : "Off: only SSO signs in. If your identity provider is down, set INFINIDYSK__AUTH__LOCAL_LOGIN=true and restart."
+                        }
+                        checked={draft.auth.local_login || !ssoSaved}
+                        disabled={
+                          locked("auth.local_login") || !ssoSaved || (saved.auth.local_login && draft.auth.local_login && !proven)
+                        }
+                        onChange={(local_login) => patch("auth", { local_login })}
+                      />
+                      {passwordOffRefusal && <p className="text-destructive text-xs">{passwordOffRefusal}</p>}
+                    </div>
+                  )}
+                </SettingsPanel>
                 <SettingsPanel title="Admin API">
                   <SecretField
                     id="admin-key"
@@ -1479,10 +1622,12 @@ function Password() {
     change.reset();
   };
   const guard = useDiscardGuard(!!(current || password), close);
-  if (auth.data?.setup_required) {
+  if (!auth.data?.account) {
     return (
       <p className="text-muted-foreground text-xs">
-        No admin account exists yet. When sign-in is required, the next visit asks you to create one.
+        {auth.data?.sso
+          ? "No admin account; sign-in uses SSO. If your identity provider is down, set INFINIDYSK__AUTH__MODE=local and restart, then open infinidysk from your local network."
+          : "No admin account exists yet. When sign-in is required, the next visit asks you to create one."}
       </p>
     );
   }
@@ -1490,7 +1635,7 @@ function Password() {
     <div className="flex items-start justify-between gap-4">
       <div>
         <p className="text-sm font-medium">Password</p>
-        <p className="text-muted-foreground mt-1 text-xs">Changing it signs out every other session.</p>
+        <p className="text-muted-foreground mt-1 text-xs">Changing it signs out every other password session.</p>
       </div>
       <Button type="button" variant="outline" onClick={() => setOpen(true)}>
         Change password

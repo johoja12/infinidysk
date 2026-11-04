@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type FormEvent, type ReactNode, useRef, useState } from "react";
+import { type FormEvent, type ReactNode, useEffect, useRef, useState } from "react";
 import { CircleAlert, Loader2, RotateCcw } from "lucide-react";
+import { useSearchParams } from "react-router";
 import { api, body, HttpError, type Schemas } from "./api/client";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -8,6 +9,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Failure, useTitle } from "./ui";
 import { duration } from "./format";
+import { switching, useSwitching } from "./database";
 
 export const authKey = ["auth"];
 
@@ -32,8 +34,20 @@ export function Spinner() {
 }
 
 /** Renders `children` once signed in; otherwise the setup or login form, or why the
- * import from C# failed. */
+ * import from C# failed. While the switch to PostgreSQL runs, its progress. */
 export function Gate({ children }: { children: ReactNode }) {
+  const client = useQueryClient();
+  const since = useSwitching();
+  const cutover = useQuery({
+    queryKey: ["cutover"],
+    queryFn: () => body(api.GET("/api/v1/database/cutover", { cache: "no-store" })),
+    retry: false,
+    refetchInterval: (query) => {
+      const data = query.state.data;
+      return since != null || !data || data.state === "running" ? 1000 : false;
+    },
+    refetchIntervalInBackground: true,
+  });
   const upgrade = useQuery({
     queryKey: ["upgrade"],
     queryFn: () => body(api.GET("/api/v1/upgrade/status", { cache: "no-store" })),
@@ -43,6 +57,17 @@ export function Gate({ children }: { children: ReactNode }) {
     },
     refetchIntervalInBackground: true,
   });
+  const cut = cutover.isError ? undefined : cutover.data;
+  // The new process answers: the switch is over, on PostgreSQL or back on SQLite with the reason.
+  const switched = since != null && cut?.state === "none" && cut.started_ms !== since;
+  useEffect(() => {
+    if (!switched) return;
+    switching.end();
+    void client.invalidateQueries();
+  }, [switched, client]);
+  if (cut?.state === "running") return <CutoverProgress progress={cut.progress ?? null} />;
+  if (since != null && !switched) return <CutoverProgress progress={null} />;
+  if (cutover.isPending) return <Spinner />;
   if (upgrade.isPending) return <Spinner />;
   if (upgrade.data?.state === "importing") return <UpgradeProgress status={upgrade.data} reconnecting={upgrade.isError} />;
   if (upgrade.data?.state === "failed") return <UpgradeFailed status={upgrade.data} />;
@@ -130,6 +155,57 @@ function UpgradeProgress({ status, reconnecting }: { status: Schemas["UpgradeSta
   );
 }
 
+const cutoverStages: Record<Schemas["ProgressStage"], string> = {
+  copying: "Applying last changes",
+  syncing: "Applying last changes",
+  verifying: "Checking",
+  switching: "Switching",
+};
+
+/** The switch to PostgreSQL; without `progress`, the old process is stopping or the new one is starting. */
+function CutoverProgress({ progress }: { progress: Schemas["CutoverProgress"] | null }) {
+  useTitle("Switching to PostgreSQL");
+  const phase = progress ? cutoverStages[progress.stage] : "Restarting…";
+  const percent = progress && progress.total > 0 ? Math.min(100, (progress.done / progress.total) * 100) : undefined;
+  return (
+    <main className="grid min-h-screen place-items-center p-4">
+      <div className="w-full max-w-md space-y-6">
+        <div className="flex flex-col items-center gap-3 text-center">
+          <img src="/mark.svg" alt="" className="size-12" />
+          <div>
+            <h1 className="text-xl font-medium">Switching to PostgreSQL</h1>
+            <p className="text-muted-foreground mt-1">Playback, WebDAV and imports pause until the switch finishes.</p>
+          </div>
+        </div>
+        <div className="space-y-5 border-y py-5">
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-4 text-sm">
+              <p role="status">
+                {phase}
+                {progress?.table ? <span className="text-muted-foreground font-mono"> · {progress.table}</span> : null}
+              </p>
+              <span className="text-muted-foreground shrink-0 tabular-nums">{percent === undefined ? "" : `${percent.toFixed(1)}%`}</span>
+            </div>
+            <div
+              className="bg-muted h-1.5 w-full overflow-hidden rounded-full"
+              role="progressbar"
+              aria-label={phase}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={percent}
+            >
+              <div
+                className={`bg-primary h-full ${percent === undefined ? "motion-safe:animate-pulse" : ""}`}
+                style={{ width: percent === undefined ? "33%" : `${percent}%` }}
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  );
+}
+
 function Signed({ children }: { children: ReactNode }) {
   const auth = useAuth();
   if (auth.isPending) return <Spinner />;
@@ -142,7 +218,7 @@ function Signed({ children }: { children: ReactNode }) {
   }
   if (!auth.data.required) return children;
   if (auth.data.setup_required) return <Credentials setup />;
-  if (!auth.data.user) return <Credentials setup={false} />;
+  if (!auth.data.user) return <Credentials setup={false} status={auth.data} />;
   return children;
 }
 
@@ -198,12 +274,28 @@ function credentialsError(error: Error, setup: boolean): string {
   if (error.status === 401 && !setup) return "Wrong username or password. The username is case-sensitive.";
   if (error.status === 409) return "An admin account already exists. Reload the page to sign in.";
   const message = error.message.charAt(0).toUpperCase() + error.message.slice(1);
-  return error.status === 400 ? `${message}.` : `${message}. Check the server log for details.`;
+  return error.status === 400 || error.status === 403 ? `${message}.` : `${message}. Check the server log for details.`;
 }
 
-function Credentials({ setup }: { setup: boolean }) {
+function Credentials({ setup, status }: { setup: boolean; status?: Schemas["AuthStatus"] }) {
   const client = useQueryClient();
   const passwordRef = useRef<HTMLInputElement>(null);
+  const [params, setParams] = useSearchParams();
+  // Read once, then dropped from the address bar so a reload does not repeat it.
+  const [outcome] = useState(() => params.get("sso"));
+  useEffect(() => {
+    if (params.has("sso")) {
+      setParams(
+        (p) => {
+          p.delete("sso");
+          return p;
+        },
+        { replace: true },
+      );
+    }
+  }, [params, setParams]);
+  const passwordLogin = setup || !!status?.password_login;
+  const sso = !setup && !!status?.sso;
   const [username, setUsername] = useState(setup ? "admin" : "");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -238,77 +330,115 @@ function Credentials({ setup }: { setup: boolean }) {
               {setup ? "Welcome to" : "Sign in to"} <Wordmark />
             </h1>
             <p className="text-muted-foreground mt-1">
-              {setup ? "Create the admin account to finish setting up." : "Use the admin account created during setup."}
+              {setup
+                ? "Create the admin account to finish setting up."
+                : sso && passwordLogin
+                  ? "Use single sign-on or the admin account."
+                  : sso
+                    ? "Use your identity provider."
+                    : "Use the admin account created during setup."}
             </p>
           </div>
         </div>
         <div className="bg-card space-y-4 rounded-lg border p-5">
-          <div className="space-y-2">
-            <Label htmlFor="username">Username</Label>
-            <Input
-              id="username"
-              autoComplete="username"
-              autoCapitalize="none"
-              autoCorrect="off"
-              spellCheck={false}
-              required
-              autoFocus
-              aria-invalid={wrong || undefined}
-              aria-describedby={wrong ? "credentials-error" : undefined}
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-            />
-          </div>
-          <div className="space-y-2">
-            <Label htmlFor="password">Password</Label>
-            <Input
-              ref={passwordRef}
-              id="password"
-              type="password"
-              autoComplete={setup ? "new-password" : "current-password"}
-              minLength={setup ? 8 : undefined}
-              required
-              aria-invalid={wrong || undefined}
-              aria-describedby={wrong ? "credentials-error" : undefined}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-            {setup && <p className="text-muted-foreground text-xs">At least 8 characters.</p>}
-          </div>
-          {setup && (
-            <div className="space-y-2">
-              <Label htmlFor="confirm-password">Confirm password</Label>
-              <Input
-                id="confirm-password"
-                type="password"
-                autoComplete="new-password"
-                required
-                aria-invalid={mismatch}
-                aria-describedby={mismatch ? "confirm-password-error" : undefined}
-                value={confirm}
-                onChange={(e) => setConfirm(e.target.value)}
-              />
-              {mismatch && (
-                <p id="confirm-password-error" className="text-destructive text-xs">
-                  Passwords do not match.
-                </p>
-              )}
-            </div>
+          {outcome === "failed" && (
+            <Alert variant="destructive">
+              <CircleAlert />
+              <AlertDescription>
+                SSO sign-in failed. Try again{passwordLogin ? ", or use your password" : ""}. The server log says why.
+              </AlertDescription>
+            </Alert>
           )}
-          <Button className="w-full" disabled={submit.isPending || mismatch}>
-            {submit.isPending && <Loader2 className="animate-spin" />}
-            {submit.isPending
-              ? setup
-                ? "Creating account…"
-                : "Signing in…"
-              : setup
-                ? "Create account"
-                : "Sign in"}
-          </Button>
-          {submit.isError && (
-            <div id="credentials-error">
-              <Failure error={new Error(credentialsError(submit.error, setup))} />
-            </div>
+          {outcome === "off" && (
+            <Alert>
+              <CircleAlert />
+              <AlertDescription>SSO is not set up. Sign in with your password.</AlertDescription>
+            </Alert>
+          )}
+          {passwordLogin && (
+            <>
+              <div className="space-y-2">
+                <Label htmlFor="username">Username</Label>
+                <Input
+                  id="username"
+                  autoComplete="username"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  required
+                  autoFocus
+                  aria-invalid={wrong || undefined}
+                  aria-describedby={wrong ? "credentials-error" : undefined}
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="password">Password</Label>
+                <Input
+                  ref={passwordRef}
+                  id="password"
+                  type="password"
+                  autoComplete={setup ? "new-password" : "current-password"}
+                  minLength={setup ? 8 : undefined}
+                  required
+                  aria-invalid={wrong || undefined}
+                  aria-describedby={wrong ? "credentials-error" : undefined}
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                />
+                {setup && <p className="text-muted-foreground text-xs">At least 8 characters.</p>}
+              </div>
+              {setup && (
+                <div className="space-y-2">
+                  <Label htmlFor="confirm-password">Confirm password</Label>
+                  <Input
+                    id="confirm-password"
+                    type="password"
+                    autoComplete="new-password"
+                    required
+                    aria-invalid={mismatch}
+                    aria-describedby={mismatch ? "confirm-password-error" : undefined}
+                    value={confirm}
+                    onChange={(e) => setConfirm(e.target.value)}
+                  />
+                  {mismatch && (
+                    <p id="confirm-password-error" className="text-destructive text-xs">
+                      Passwords do not match.
+                    </p>
+                  )}
+                </div>
+              )}
+              <Button className="w-full" disabled={submit.isPending || mismatch}>
+                {submit.isPending && <Loader2 className="animate-spin" />}
+                {submit.isPending
+                  ? setup
+                    ? "Creating account…"
+                    : "Signing in…"
+                  : setup
+                    ? "Create account"
+                    : "Sign in"}
+              </Button>
+              {submit.isError && (
+                <div id="credentials-error">
+                  <Failure error={new Error(credentialsError(submit.error, setup))} />
+                </div>
+              )}
+            </>
+          )}
+          {sso && (
+            <>
+              {passwordLogin && (
+                <div className="text-muted-foreground flex items-center gap-3 text-xs">
+                  <span className="bg-border h-px flex-1" />
+                  or
+                  <span className="bg-border h-px flex-1" />
+                </div>
+              )}
+              <Button asChild className="w-full" variant={passwordLogin ? "outline" : "default"}>
+                <a href="/auth/oidc/login">Sign in with SSO</a>
+              </Button>
+            </>
           )}
         </div>
       </form>

@@ -32,8 +32,8 @@ use uuid::Uuid;
 
 use crate::admin::{Admin, Fail};
 use crate::config::{
-    ArrInstance, ArrProfile, ConfigStore, ImportStrategy, Provider, Quota, QuotaPeriod, Secret,
-    Settings, UnownedAction,
+    ArrInstance, ArrProfile, ConfigStore, ImportStrategy, Oidc, Provider, Quota, QuotaPeriod,
+    Secret, Settings, UnownedAction,
 };
 use crate::quota::Quotas;
 
@@ -225,7 +225,7 @@ pub struct Upgrade {
 }
 
 /// These settings in place of the C# ones in `cs`.
-pub fn settings(cs: &Config) -> Upgrade {
+pub fn settings(cs: &Config) -> anyhow::Result<Upgrade> {
     let mut s = Settings::default();
     // C# often did not record a file's download, so no Arr can be asked to replace it.
     s.health.unowned_action = UnownedAction::ActionNeeded;
@@ -376,6 +376,7 @@ pub fn settings(cs: &Config) -> Upgrade {
         Ok(plex) if plex.validate().is_ok() => s.plex=plex,
         _ => notes.push("Plex connections were not carried over: invalid legacy settings; reconnect from Plex settings".into()),
     }
+    s.auth.oidc = oidc(|n| cs.var(n), cs.admin.is_some(), &mut notes)?;
     keep_valid(&mut s, &mut notes);
     fork::apply(cs, &mut s, &mut notes);
     let dropped: Vec<&str> = cs.keys().filter(|k| !MAPPED.contains(k)).collect();
@@ -385,12 +386,67 @@ pub fn settings(cs: &Config) -> Upgrade {
             dropped.join(", ")
         ));
     }
-    Upgrade {
+    Ok(Upgrade {
         settings: s,
         webdav_hash,
         quota_used,
         notes,
+    })
+}
+
+/// 1.x sign-in through OIDC, set only by the frontend's `OIDC_*` variables; 1.x had it on
+/// only with all three required ones. Without a 1.x admin account, settings 2.x rejects
+/// stop the import: dropping them would open setup to anyone.
+fn oidc<'a>(
+    var: impl Fn(&str) -> Option<&'a str>,
+    has_admin: bool,
+    notes: &mut Vec<String>,
+) -> anyhow::Result<Oidc> {
+    let mut o = Oidc::default();
+    let (Some(issuer), Some(id), Some(secret)) = (
+        var("OIDC_ISSUER"),
+        var("OIDC_CLIENT_ID"),
+        var("OIDC_CLIENT_SECRET"),
+    ) else {
+        return Ok(o);
+    };
+    issuer.clone_into(&mut o.issuer);
+    id.clone_into(&mut o.client_id);
+    o.client_secret = Secret(secret.to_owned());
+    if let Some(v) = var("OIDC_REDIRECT_URI") {
+        v.clone_into(&mut o.redirect_uri);
     }
+    if let Some(v) = var("OIDC_SCOPES") {
+        v.clone_into(&mut o.scopes);
+    }
+    if let Some(v) = var("OIDC_USERNAME_CLAIM") {
+        v.clone_into(&mut o.username_claim);
+    }
+    if let Err(error) = o.validate() {
+        anyhow::ensure!(
+            has_admin,
+            "single sign-on from 1.x cannot be carried over: {error}. 1.x had no local admin \
+             account, so the import stops instead of letting anyone create one. Fix the OIDC_* \
+             variables, or remove them to create a password account instead, then restart"
+        );
+        notes.push(format!(
+            "single sign-on not carried over: {error}; sign in with your 1.x password and set \
+             it up again under Settings → Access"
+        ));
+        return Ok(Oidc::default());
+    }
+    if let Some(claim) = var("OIDC_ADMIN_CLAIM") {
+        notes.push(format!(
+            "OIDC_ADMIN_CLAIM ({claim}) not carried over: every SSO user is an admin in 2.x, so \
+             users 1.x showed as read-only can now change settings; limit who may use this \
+             app in your identity provider"
+        ));
+    }
+    notes.push(
+        "single sign-on carried over from the OIDC_* variables, which 2.x no longer reads"
+            .to_owned(),
+    );
+    Ok(o)
 }
 
 /// Leaves the C# value of one field out of the settings.
@@ -627,7 +683,7 @@ fn arr_instances(
 pub async fn report(config: &Path) -> anyhow::Result<String> {
     let survey = infinidysk_import::survey(config).await?;
     let cs = Config::read(config, std::env::vars()).await?;
-    describe(&survey, &cs, &settings(&cs))
+    describe(&survey, &cs, &settings(&cs)?)
 }
 
 /// Config key: `"started"` while an import from C# runs, `"done"` once it finished.
@@ -739,7 +795,7 @@ async fn import_with_progress(
     );
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let cs = Config::read(config, vars).await?;
-    let mut upgrade = settings(&cs);
+    let mut upgrade = settings(&cs)?;
     db.write_config(&[(STATE_KEY, "\"started\"")], &[]).await?;
 
     let quotas = Quotas::load(db.clone()).await?;
@@ -764,6 +820,12 @@ async fn import_with_progress(
 
     let mut store = ConfigStore::load(db.clone(), std::iter::empty()).await?;
     if let Err(error) = store.save(upgrade.settings.clone()).await {
+        // Defaults without an admin account would open setup to anyone.
+        anyhow::ensure!(
+            !upgrade.settings.auth.oidc.enabled() || cs.admin.is_some(),
+            "saving the settings carried over from 1.x failed ({error}); without them \
+             single sign-on would be off and 1.x had no local admin account"
+        );
         upgrade.notes.push(format!(
             "settings not carried over ({error}); set them up again"
         ));
@@ -1231,6 +1293,10 @@ fn upgrade_router(server: Arc<UpgradeServer>) -> Router {
         )
         .route("/api/v1/upgrade/retry", post(post_upgrade_retry))
         .route(
+            "/api/v1/database/cutover",
+            get(crate::database::get_cutover_none),
+        )
+        .route(
             crate::healthcheck::PATH,
             get(|State(server): State<Arc<UpgradeServer>>| async move {
                 use crate::healthcheck::{Check, Report};
@@ -1335,6 +1401,8 @@ fn describe(
         "  admin login: {}",
         if cs.admin.is_some() {
             "accepted from C# at the first sign-in"
+        } else if s.auth.oidc.enabled() {
+            "none; sign in with SSO"
         } else {
             "created at first visit"
         }
@@ -1348,6 +1416,15 @@ fn describe(
     )?;
     writeln!(out, "  mount dir: {}", s.mount.dir)?;
     writeln!(out, "  public URL: {}", s.network.public_url)?;
+    writeln!(
+        out,
+        "  single sign-on: {}",
+        if s.auth.oidc.enabled() {
+            s.auth.oidc.issuer.as_str()
+        } else {
+            "off"
+        }
+    )?;
     writeln!(
         out,
         "  import strategy {:?}; STRM directory {}; STRM key {}; library folders: {}",
@@ -1645,6 +1722,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn import_router_reports_no_cutover() {
+        use axum::body::Body;
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let server = Arc::new(UpgradeServer {
+            status: watch::channel(UpgradeStatus::importing()).0,
+            retry: Notify::new(),
+        });
+        let app = upgrade_router(Arc::clone(&server));
+        for state in [UpgradeState::Importing, UpgradeState::Failed] {
+            server.status.send_modify(|status| status.state = state);
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/database/cutover")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(status["state"], "none");
+        }
+    }
+
+    #[tokio::test]
     async fn skipped_files_are_retried_after_the_previous_pass() {
         let db = Db::connect("sqlite::memory:").await.unwrap();
         assert!(!skipped_pending(&db).await.unwrap());
@@ -1752,5 +1859,82 @@ mod tests {
         assert_eq!(out[1].profile, None);
         assert_eq!(out[1].backbone.as_deref(), Some("omicron"));
         assert_eq!(used, [(out[1].id, 7)]);
+    }
+
+    fn oidc_vars(extra: &[(&'static str, &'static str)]) -> HashMap<&'static str, &'static str> {
+        [
+            (
+                "OIDC_ISSUER",
+                "https://auth.example.com/application/o/dysk/",
+            ),
+            ("OIDC_CLIENT_ID", "dysk"),
+            ("OIDC_CLIENT_SECRET", "sso-secret"),
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .collect()
+    }
+
+    #[test]
+    fn oidc_variables_carry_over_with_a_note_for_role_mapping() {
+        let vars = oidc_vars(&[
+            (
+                "OIDC_REDIRECT_URI",
+                "https://dysk.example.com/auth/oidc/callback",
+            ),
+            ("OIDC_ADMIN_CLAIM", "groups"),
+        ]);
+        let mut notes = Vec::new();
+        let o = oidc(|n| vars.get(n).copied(), false, &mut notes).unwrap();
+        assert_eq!(o.issuer, "https://auth.example.com/application/o/dysk/");
+        assert_eq!(o.client_id, "dysk");
+        assert_eq!(o.client_secret, Secret("sso-secret".into()));
+        assert_eq!(
+            o.redirect_uri,
+            "https://dysk.example.com/auth/oidc/callback"
+        );
+        let defaults = Oidc::default();
+        assert_eq!(
+            (o.scopes, o.username_claim),
+            (defaults.scopes, defaults.username_claim)
+        );
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("OIDC_ADMIN_CLAIM")));
+    }
+
+    #[test]
+    fn partial_oidc_variables_leave_sso_off() {
+        let vars = oidc_vars(&[]);
+        let mut notes = Vec::new();
+        let o = oidc(
+            |n| {
+                (n != "OIDC_CLIENT_SECRET")
+                    .then(|| vars.get(n).copied())
+                    .flatten()
+            },
+            false,
+            &mut notes,
+        )
+        .unwrap();
+        assert_eq!(o, Oidc::default());
+        assert_eq!(notes, Vec::<String>::new());
+    }
+
+    #[test]
+    fn invalid_1x_sso_without_an_admin_stops_the_import() {
+        let mut vars = oidc_vars(&[]);
+        vars.insert("OIDC_ISSUER", "http://auth.example.com/");
+        let error = oidc(|n| vars.get(n).copied(), false, &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("http://auth.example.com/") && error.contains("OIDC_*"),
+            "{error}"
+        );
+        let mut notes = Vec::new();
+        let o = oidc(|n| vars.get(n).copied(), true, &mut notes).unwrap();
+        assert_eq!(o, Oidc::default());
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("not carried over"), "{notes:?}");
     }
 }

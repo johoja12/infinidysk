@@ -227,7 +227,8 @@ mod tests {
         drop(db);
         let before = std::fs::read(&path).unwrap();
         let cs = Config::read(&root, []).await.unwrap();
-        let carried = super::super::settings(&cs);
+        let carried =
+            super::super::settings(&cs).expect("fork settings translate with OIDC validation");
         assert_eq!(
             carried.settings.imports.scan_dirs[0].path,
             "/fixture/read-only"

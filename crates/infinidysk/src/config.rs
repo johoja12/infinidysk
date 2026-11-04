@@ -211,6 +211,7 @@ pub struct Maintenance {
     /// Jobs that run in the window, once each per window.
     #[serde(deserialize_with = "known_jobs")]
     pub scheduled: Vec<MaintenanceJob>,
+    pub backup: BackupSettings,
 }
 
 impl Default for Maintenance {
@@ -218,9 +219,31 @@ impl Default for Maintenance {
         Self {
             window: MaintenanceWindow::default(),
             scheduled: vec![MaintenanceJob::RemoveDeadLinks],
+            backup: BackupSettings::default(),
         }
     }
 }
+
+/// Where backups go and how many the backup job keeps.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct BackupSettings {
+    /// Absolute folder; empty means `backups` beside the database.
+    pub dir: String,
+    /// Scheduled and manual backups kept; pinned, uploaded and added ones are extra.
+    pub keep: u16,
+}
+
+impl Default for BackupSettings {
+    fn default() -> Self {
+        Self {
+            dir: String::new(),
+            keep: 3,
+        }
+    }
+}
+
+pub const BACKUP_KEEP: RangeInclusive<u16> = 1..=100;
 
 /// Daily, in server time, as `HH:MM`. An end at or before the start ends the next day.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -263,6 +286,8 @@ impl MaintenanceWindow {
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum MaintenanceJob {
+    /// Writes a checked copy of the SQLite library database and prunes old copies.
+    BackupDatabase,
     /// Deletes downloads nothing in the library folders points to.
     RemoveUnlinked,
     /// Removes library links and STRM files whose download is gone, and has the Arr
@@ -273,7 +298,8 @@ pub enum MaintenanceJob {
 }
 
 impl MaintenanceJob {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
+        Self::BackupDatabase,
         Self::RemoveUnlinked,
         Self::RemoveDeadLinks,
         Self::CompactDatabase,
@@ -282,6 +308,7 @@ impl MaintenanceJob {
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
+            Self::BackupDatabase => "backup-database",
             Self::RemoveUnlinked => "remove-unlinked",
             Self::RemoveDeadLinks => "remove-dead-links",
             Self::CompactDatabase => "compact-database",
@@ -561,8 +588,8 @@ impl Sab {
     }
 }
 
-/// Admin API secrets; the admin login itself lives in the accounts table.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+/// Sign-in choices and admin API secrets; the admin login itself lives in the accounts table.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct Auth {
     /// `X-Api-Key` for scripts calling the admin API; separate from the SAB key.
@@ -571,6 +598,128 @@ pub struct Auth {
     pub session_key: Secret,
     /// Who must sign in to the web UI and admin API.
     pub mode: AuthMode,
+    /// Sign in with the admin username and password. Turning it off takes effect only
+    /// while SSO is set up.
+    pub local_login: bool,
+    /// Single sign-on through one OIDC provider.
+    pub oidc: Oidc,
+}
+
+impl Default for Auth {
+    fn default() -> Self {
+        Self {
+            api_key: Secret::default(),
+            session_key: Secret::default(),
+            mode: AuthMode::default(),
+            local_login: true,
+            oidc: Oidc::default(),
+        }
+    }
+}
+
+impl Auth {
+    /// Username and password sign-in is accepted; always while SSO is off.
+    #[must_use]
+    pub fn password_login(&self) -> bool {
+        self.local_login || !self.oidc.enabled()
+    }
+}
+
+/// SSO through one OIDC provider; on while `issuer` is set.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct Oidc {
+    /// Issuer URL exactly as the provider publishes it; empty turns SSO off.
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret: Secret,
+    /// Callback registered at the provider. Empty means `network.public_url`, else the
+    /// address the browser used, plus `/auth/oidc/callback`.
+    pub redirect_uri: String,
+    /// Space-separated; `openid` is always requested.
+    pub scopes: String,
+    /// ID-token claim shown as the username; then `preferred_username`, `email`, `sub`.
+    pub username_claim: String,
+}
+
+impl Default for Oidc {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            client_id: String::new(),
+            client_secret: Secret::default(),
+            redirect_uri: String::new(),
+            scopes: "openid profile email".to_owned(),
+            username_claim: "preferred_username".to_owned(),
+        }
+    }
+}
+
+impl Oidc {
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        !self.issuer.is_empty()
+    }
+
+    /// Trims the fields; checks them only while SSO is on, so clearing the issuer alone
+    /// always turns SSO off.
+    pub(crate) fn validate(&mut self) -> Result<(), Error> {
+        self.issuer = self.issuer.trim().to_owned();
+        self.client_id = self.client_id.trim().to_owned();
+        self.redirect_uri = self.redirect_uri.trim().to_owned();
+        self.username_claim = self.username_claim.trim().to_owned();
+        self.scopes = self.scopes.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !self.enabled() {
+            return Ok(());
+        }
+        if !issuer_ok(&self.issuer) {
+            return Err(invalid(
+                "auth.oidc.issuer",
+                format!(
+                    "Issuer {:?} must be an https:// address without a query (http:// only on this machine)",
+                    self.issuer
+                ),
+            ));
+        }
+        if self.client_id.is_empty() {
+            return Err(invalid(
+                "auth.oidc.client_id",
+                "SSO needs the client ID from your identity provider".to_owned(),
+            ));
+        }
+        if self.client_secret.0.is_empty() {
+            return Err(invalid(
+                "auth.oidc.client_secret",
+                "SSO needs the client secret from your identity provider".to_owned(),
+            ));
+        }
+        if !self.redirect_uri.is_empty() && !redirect_ok(&self.redirect_uri) {
+            return Err(invalid(
+                "auth.oidc.redirect_uri",
+                format!(
+                    "Redirect URI {:?} must be an http:// or https:// address without a fragment",
+                    self.redirect_uri
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `https://`, or `http://` to this machine ([`crate::oidc::secure`]), with no query or
+/// fragment. The trailing slash stays: discovery compares the issuer exactly.
+fn issuer_ok(issuer: &str) -> bool {
+    reqwest::Url::parse(issuer).is_ok_and(|u| {
+        crate::oidc::secure(u.scheme(), u.host_str().unwrap_or_default())
+            && u.query().is_none()
+            && u.fragment().is_none()
+    })
+}
+
+fn redirect_ok(uri: &str) -> bool {
+    reqwest::Url::parse(uri).is_ok_and(|u| {
+        matches!(u.scheme(), "http" | "https") && u.host_str().is_some() && u.fragment().is_none()
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -938,6 +1087,7 @@ impl Settings {
         out.sab.api_key = out.sab.api_key.masked();
         out.auth.api_key = out.auth.api_key.masked();
         out.auth.session_key = out.auth.session_key.masked();
+        out.auth.oidc.client_secret = out.auth.oidc.client_secret.masked();
         out.webdav.password = out.webdav.password.masked();
         out.webdav.download_key = out.webdav.download_key.masked();
         out.imports.strm_key = out.imports.strm_key.masked();
@@ -960,6 +1110,10 @@ impl Settings {
         self.sab.api_key.restore(&current.sab.api_key);
         self.auth.api_key.restore(&current.auth.api_key);
         self.auth.session_key.restore(&current.auth.session_key);
+        self.auth
+            .oidc
+            .client_secret
+            .restore(&current.auth.oidc.client_secret);
         self.webdav.password.restore(&current.webdav.password);
         self.webdav
             .download_key
@@ -1037,6 +1191,12 @@ impl Settings {
             );
             self.maintenance.window = d.maintenance.window;
         }
+        reset(
+            "maintenance.backup.keep",
+            &mut self.maintenance.backup.keep,
+            &BACKUP_KEEP,
+            d.maintenance.backup.keep,
+        );
         self.performance.reset_invalid();
         if let Some(limit) = self.network.download_limit_mb_per_s
             && !DOWNLOAD_LIMIT_MB_PER_S.contains(&limit)
@@ -1187,6 +1347,28 @@ impl Settings {
         }
         self.maintenance.scheduled.sort_unstable();
         self.maintenance.scheduled.dedup();
+        check(
+            "maintenance.backup.keep",
+            "Copies to keep",
+            self.maintenance.backup.keep,
+            &BACKUP_KEEP,
+        )?;
+        let backup_dir = self.maintenance.backup.dir.trim();
+        if !backup_dir.is_empty() {
+            if !backup_dir.starts_with('/') {
+                return Err(invalid(
+                    "maintenance.backup.dir",
+                    format!("Backup folder {backup_dir:?} must be an absolute path"),
+                ));
+            }
+            if std::path::Path::new(backup_dir).starts_with(&self.mount.dir) {
+                return Err(invalid(
+                    "maintenance.backup.dir",
+                    format!("Backup folder {backup_dir:?} must be outside the mount"),
+                ));
+            }
+        }
+        self.maintenance.backup.dir = backup_dir.to_owned();
         let strm_dir = self.imports.strm_dir.trim();
         if !strm_dir.starts_with('/') {
             return Err(invalid(
@@ -1333,6 +1515,7 @@ impl Settings {
             ));
         }
         self.network.public_url = url.to_owned();
+        self.auth.oidc.validate()?;
         if let Some(limit) = self.network.download_limit_mb_per_s {
             check(
                 "network.download_limit_mb_per_s",

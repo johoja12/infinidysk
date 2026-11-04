@@ -55,6 +55,8 @@ const OPTIMIZE_EVERY: Duration = Duration::from_hours(6);
 pub struct Boot {
     pub listen: SocketAddr,
     pub database_url: String,
+    /// Where `database_url` came from.
+    pub database_source: crate::database::Source,
     /// Owner of every mounted file.
     pub uid: u32,
     pub gid: u32,
@@ -71,25 +73,20 @@ pub struct Boot {
 }
 
 impl Boot {
-    /// `INFINIDYSK_LISTEN`, `INFINIDYSK_DATABASE_URL`, `PUID`, `PGID`,
+    /// `INFINIDYSK_LISTEN`, `INFINIDYSK_DATABASE_URL` (default: the URL in
+    /// `/config/database.toml`, else `/config/infinidysk.sqlite`), `PUID`, `PGID`,
     /// `INFINIDYSK_TRACE_MINUTES`, `INFINIDYSK_METRICS_PATH` (default: `metrics.sqlite`
     /// beside a SQLite database, else in `/config`), `INFINIDYSK_LOG_DIR` (default: `logs`
     /// in that same directory) and `INFINIDYSK_FFPROBE` (default:
     /// `ffprobe` on `PATH`).
     pub fn from_env() -> anyhow::Result<Self> {
-        let database_url = var(
-            "INFINIDYSK_DATABASE_URL",
-            "sqlite:/config/infinidysk.sqlite".to_owned(),
+        let (_, database_url, database_source) = crate::database::select(
+            std::env::var("INFINIDYSK_DATABASE_URL").ok(),
+            std::path::Path::new(crate::database::CONFIG_DIR),
         )?;
-        let beside = database_url
-            .strip_prefix("sqlite:")
-            .map(|p| {
-                p.trim_start_matches("//")
-                    .split('?')
-                    .next()
-                    .unwrap_or_default()
-            })
-            .and_then(|p| std::path::Path::new(p).parent())
+        let beside = sqlite_path(&database_url)
+            .as_deref()
+            .and_then(std::path::Path::parent)
             .filter(|dir| !dir.as_os_str().is_empty())
             .map_or_else(|| "/config".into(), std::path::Path::to_path_buf);
         Ok(Self {
@@ -98,12 +95,24 @@ impl Boot {
             log_dir: var("INFINIDYSK_LOG_DIR", beside.join("logs"))?,
             config_dir: beside,
             database_url,
+            database_source,
             uid: var("PUID", 1000)?,
             gid: var("PGID", 1000)?,
             trace_minutes: var("INFINIDYSK_TRACE_MINUTES", 0)?,
             ffprobe: var("INFINIDYSK_FFPROBE", "ffprobe".to_owned())?,
         })
     }
+}
+
+/// The file of a `sqlite:` URL; `None` for any other database.
+pub(crate) fn sqlite_path(url: &str) -> Option<std::path::PathBuf> {
+    url.strip_prefix("sqlite:").map(|p| {
+        p.trim_start_matches("//")
+            .split('?')
+            .next()
+            .unwrap_or_default()
+            .into()
+    })
 }
 
 /// `INFINIDYSK_LISTEN`, default `0.0.0.0:3000`.
@@ -125,7 +134,8 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exit {
     Stopped,
-    /// The admin API asked for a restart, to apply settings read only at startup.
+    /// The admin API asked for a restart, to apply settings read only at startup or a
+    /// restore, or a restored database did not open and boot rolls it back.
     Restart,
 }
 
@@ -137,9 +147,47 @@ pub async fn serve(
     vars: impl IntoIterator<Item = (String, String)>,
     cancel: CancellationToken,
 ) -> anyhow::Result<Exit> {
-    let db = Db::connect(&boot.database_url)
-        .await
-        .context("opening the database")?;
+    let pending = crate::backup::boot::apply_pending(boot)?;
+    let vars: Vec<(String, String)> = vars.into_iter().collect();
+    let db = match Db::connect(&boot.database_url).await {
+        Ok(db) => db,
+        Err(error) if pending.swapped() => {
+            let reason = format!("{:#}", anyhow::Error::from(error));
+            warn!(%reason, "the restored database did not open; putting the previous one back");
+            crate::backup::boot::begin_roll_back(boot, pending, &reason)?;
+            return Ok(Exit::Restart);
+        }
+        Err(error) => return Err(anyhow::Error::from(error).context("opening the database")),
+    };
+    // Past `finish` a restore no longer rolls back, so its settings must load first.
+    if pending.swapped()
+        && let Err(error) = ConfigStore::load(db.clone(), vars.iter().cloned()).await
+    {
+        db.close().await;
+        let reason = format!(
+            "{:#}",
+            anyhow::Error::from(error).context("loading settings")
+        );
+        warn!(%reason, "the restored database did not open; putting the previous one back");
+        crate::backup::boot::begin_roll_back(boot, pending, &reason)?;
+        return Ok(Exit::Restart);
+    }
+    crate::backup::boot::finish(&db, boot, pending).await?;
+    let booted = crate::database::serve_cutover(
+        listener,
+        db,
+        boot,
+        std::path::Path::new(crate::database::CONFIG_DIR),
+        crate::database::LIMITS,
+        &cancel,
+    )
+    .await
+    .context("switching to PostgreSQL")?;
+    let (listener, db) = (booted.listener, booted.db);
+    if cancel.is_cancelled() {
+        db.close().await;
+        return Ok(Exit::Stopped);
+    }
     let listener = crate::upgrade::serve_import(listener, &db, &boot.config_dir, &cancel)
         .await
         .context("serving the C# import")?;
@@ -657,6 +705,23 @@ pub async fn serve(
     );
     let library_task = tokio::spawn(Arc::clone(&library).run());
     let catalogue_task = tokio::spawn(Arc::clone(&library).run_catalogue());
+    let restart = Arc::new(AtomicBool::new(false));
+    let backups = Arc::new(
+        crate::backup::Backups::new(crate::backup::Parts {
+            db: db.clone(),
+            config: Arc::clone(&config),
+            // After a cutover the database is PostgreSQL, whatever the boot URL says.
+            live: if db.is_postgres() {
+                None
+            } else {
+                sqlite_path(&boot.database_url)
+            },
+            config_dir: boot.config_dir.clone(),
+            owner: (boot.uid, boot.gid),
+            tracker: Arc::clone(&maintenance_live),
+        })
+        .await,
+    );
     let maintenance = crate::maintenance::Maintenance::load(crate::maintenance::Parts {
         db: db.clone(),
         vfs: Arc::clone(&vfs),
@@ -668,6 +733,7 @@ pub async fn serve(
         metrics: Arc::clone(&metrics),
         mount_dir: settings.mount.dir.clone(),
         live: maintenance_live,
+        backups: Arc::clone(&backups),
     })
     .await;
     let maintenance_task = tokio::spawn(Arc::clone(&maintenance).run());
@@ -690,7 +756,6 @@ pub async fn serve(
         let cancel = cancel.clone();
         tokio::spawn(async move { updates.run(cancel).await })
     };
-    let restart = Arc::new(AtomicBool::new(false));
     let plex = Arc::new(
         crate::plex::Service::load(&db)
             .await
@@ -789,6 +854,15 @@ pub async fn serve(
             }
         })
     };
+    let database = crate::database::Migrator::new(
+        db.clone(),
+        boot,
+        std::path::Path::new(crate::database::CONFIG_DIR),
+        booted.file,
+        crate::database::LIMITS,
+        booted.error,
+    );
+    database.resume().await;
     let admin = Arc::new(Admin {
         predictions,
         library_metadata,
@@ -809,7 +883,9 @@ pub async fn serve(
         mount: mount_rx,
         library,
         maintenance,
+        backups,
         updates,
+        database: Arc::clone(&database),
         cancel: cancel.clone(),
         restart: Arc::clone(&restart),
     });
@@ -867,6 +943,7 @@ pub async fn serve(
     update_task.abort();
     warm_task.abort();
     optimize_task.abort();
+    database.stop().await;
     let _ = metrics_task.await;
     let _ = quota_task.await;
     #[cfg(target_os = "linux")]

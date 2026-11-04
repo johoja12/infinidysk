@@ -4,6 +4,23 @@
  */
 
 export interface paths {
+    "/api/v1/arr/discover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Checks every enabled Arr instance again now; the results show in the Arr status. */
+        post: operations["post_arr_discover"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/arr/reconcile": {
         parameters: {
             query?: never;
@@ -151,7 +168,7 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Changes the admin password (and optionally username); other sessions end. */
+        /** Changes the admin password (and optionally username); other password sessions end. */
         put: operations["change_password"];
         post?: never;
         delete?: never;
@@ -177,6 +194,164 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/backups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The backups, the folder and what restore left behind. */
+        get: operations["get_backups"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backups/last-restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Dismisses the last restore notice. */
+        delete: operations["delete_last_restore"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backups/legacy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Deletes the 1.x backup folders. */
+        delete: operations["delete_legacy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backups/undo": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Puts back the database the last restore replaced, at the next start. */
+        post: operations["post_undo"];
+        /** Deletes the undo copy. */
+        delete: operations["delete_undo"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backups/upload": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Stores an uploaded database file as a backup. It is checked when it is restored or
+         *     verified.
+         */
+        put: operations["put_upload"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backups/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Deletes one backup and its manifest. */
+        delete: operations["delete_backup"];
+        options?: never;
+        head?: never;
+        /** Pins a backup or sets its note. */
+        patch: operations["patch_backup"];
+        trace?: never;
+    };
+    "/api/v1/backups/{name}/file": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Downloads one backup; supports `Range` and `If-Range`. */
+        get: operations["get_backup_file"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backups/{name}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Copies and checks a backup, then restarts into it. */
+        post: operations["post_restore"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/backups/{name}/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Compares a backup with its checksum and checks it, in the maintenance slot. */
+        post: operations["post_verify"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/catalog": {
         parameters: {
             query?: never;
@@ -189,6 +364,76 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/database": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Which database runs, and any move to PostgreSQL. */
+        get: operations["get_database"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/database/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Connects to a PostgreSQL database and says whether infinidysk can move to it. Read-only. */
+        post: operations["post_database_check"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/database/cutover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Whether a switch to PostgreSQL runs. No sign-in needed. */
+        get: operations["get_cutover_none"];
+        put?: never;
+        /** Restarts on PostgreSQL. Playback, `WebDAV` and imports pause until the switch finishes. */
+        post: operations["post_cutover"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/database/migration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Starts copying to an empty PostgreSQL database and keeps it in sync. */
+        post: operations["post_migration"];
+        /** Cancels the move and tries to empty the PostgreSQL database again. */
+        delete: operations["delete_migration"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1918,7 +2163,23 @@ export interface components {
             /** @description The Arr's version when it answered with this key and type. */
             version?: string | null;
         };
-        /** @description Admin API secrets; the admin login itself lives in the accounts table. */
+        /** @description A restore or undo started in this run. */
+        Attempt: {
+            action: components["schemas"]["AttemptAction"];
+            /** Format: uuid */
+            id: string;
+            reason?: string | null;
+            state: components["schemas"]["AttemptState"];
+        };
+        /** @enum {string} */
+        AttemptAction: "restore" | "undo";
+        AttemptId: {
+            /** Format: uuid */
+            attempt: string;
+        };
+        /** @enum {string} */
+        AttemptState: "staging" | "restarting" | "failed";
+        /** @description Sign-in choices and admin API secrets; the admin login itself lives in the accounts table. */
         Auth: {
             /**
              * @description `X-Api-Key` for scripts calling the admin API; separate from the SAB key.
@@ -1926,10 +2187,28 @@ export interface components {
              */
             api_key: components["schemas"]["Secret"];
             /**
+             * @description Sign in with the admin username and password. Turning it off takes effect only
+             *     while SSO is set up.
+             * @default true
+             */
+            local_login: boolean;
+            /**
              * @description Who must sign in to the web UI and admin API.
              * @default required
              */
             mode: components["schemas"]["AuthMode"];
+            /**
+             * @description Single sign-on through one OIDC provider.
+             * @default {
+             *       "client_id": "",
+             *       "client_secret": "",
+             *       "issuer": "",
+             *       "redirect_uri": "",
+             *       "scopes": "openid profile email",
+             *       "username_claim": "preferred_username"
+             *     }
+             */
+            oidc: components["schemas"]["Oidc"];
             /**
              * @description Signs UI session cookies; changing it logs everyone out.
              * @default
@@ -1939,12 +2218,110 @@ export interface components {
         /** @enum {string} */
         AuthMode: "required" | "local" | "disabled";
         AuthStatus: {
+            /** @description An admin account with a password exists. */
+            account: boolean;
+            method?: components["schemas"]["Method"] | null;
+            /** @description The sign-in page offers username and password. */
+            password_login: boolean;
             /** @description This client must sign in; `false` when `auth.mode` exempts it. */
             required: boolean;
-            /** @description No admin account exists yet; `POST /api/v1/auth/setup` creates it. */
+            /** @description No admin account exists and SSO is off; `POST /api/v1/auth/setup` creates it. */
             setup_required: boolean;
+            /** @description The sign-in page offers Sign in with SSO. */
+            sso: boolean;
+            /** @description The SSO session was started under the saved SSO settings, so it proves they work. */
+            sso_current: boolean;
             /** @description The signed-in username. */
             user?: string | null;
+        };
+        /** @enum {string} */
+        Backend: "sqlite" | "postgres";
+        /** @enum {string} */
+        BackupKind: "scheduled" | "manual" | "uploaded" | "added";
+        BackupPatch: {
+            /** @description Trimmed; at most 500 characters. */
+            note?: string | null;
+            pinned?: boolean | null;
+        };
+        /** @description The copy the backup job wrote. */
+        BackupReport: {
+            /**
+             * Format: int64
+             * @description Writing, checking and hashing.
+             */
+            duration_ms: number;
+            name: string;
+            /**
+             * Format: int64
+             * @description Old backups deleted after it.
+             */
+            pruned: number;
+            /** Format: int64 */
+            pruned_bytes: number;
+            /** Format: int64 */
+            size_bytes: number;
+        };
+        /** @description Where backups go and how many the backup job keeps. */
+        BackupSettings: {
+            /**
+             * @description Absolute folder; empty means `backups` beside the database.
+             * @default
+             */
+            dir: string;
+            /**
+             * Format: int32
+             * @description Scheduled and manual backups kept; pinned, uploaded and added ones are extra.
+             * @default 3
+             */
+            keep: number;
+        };
+        BackupView: {
+            app_version?: string | null;
+            /** Format: int64 */
+            created_ms: number;
+            /** @description Shorter than its header says: still being copied, or cut off. */
+            incomplete: boolean;
+            /** Format: int64 */
+            items?: number | null;
+            kind: components["schemas"]["BackupKind"];
+            name: string;
+            /** @description Made by a newer infinidysk; restore is refused. */
+            newer: boolean;
+            note: string;
+            pinned: boolean;
+            /** Format: int64 */
+            schema_version?: number | null;
+            sha256?: string | null;
+            /** Format: int64 */
+            size_bytes: number;
+            source_name?: string | null;
+            /** Format: int64 */
+            verified_ms?: number | null;
+            verify_error?: string | null;
+        };
+        BackupsView: {
+            attempt?: components["schemas"]["Attempt"] | null;
+            /** @description Newest first. */
+            backups: components["schemas"]["BackupView"][];
+            /**
+             * Format: int64
+             * @description Used pages of the live database: about the size of one backup.
+             */
+            database_bytes: number;
+            /** @description The resolved folder. */
+            dir: string;
+            /** @description Why the folder cannot be used; backups fail until it is fixed. */
+            dir_error?: string | null;
+            /** Format: int64 */
+            free_bytes?: number | null;
+            /** Format: int32 */
+            keep: number;
+            last_restore?: components["schemas"]["LastRestore"] | null;
+            legacy?: components["schemas"]["LegacyBackups"] | null;
+            task?: components["schemas"]["TaskResult"] | null;
+            /** @description Why backups are unavailable (PostgreSQL); the rest is empty then. */
+            unavailable_reason?: string | null;
+            undo?: components["schemas"]["UndoView"] | null;
         };
         BreakerView: {
             /** Format: int64 */
@@ -2111,6 +2488,39 @@ export interface components {
         };
         /** @enum {string} */
         ConversionState: "idle" | "running" | "waiting" | "cancelled";
+        CutoverProgress: {
+            /** Format: int64 */
+            done: number;
+            stage: components["schemas"]["ProgressStage"];
+            table?: string | null;
+            /** Format: int64 */
+            total: number;
+        };
+        CutoverStarted: {
+            /**
+             * Format: int64
+             * @description This process's start, to tell it from the one that switches.
+             */
+            started_ms: number;
+        };
+        /** @enum {string} */
+        CutoverState: "none" | "running";
+        CutoverStatus: {
+            progress?: components["schemas"]["CutoverProgress"] | null;
+            /**
+             * Format: int64
+             * @description The answering process's start.
+             */
+            started_ms: number;
+            state: components["schemas"]["CutoverState"];
+        };
+        DatabaseCheck: {
+            /** @description Why this database cannot be used; absent when it can. */
+            error?: string | null;
+            /** @description The server version, when it answered. */
+            version?: string | null;
+            warnings: string[];
+        };
         DatabaseCompaction: {
             /**
              * Format: int64
@@ -2129,6 +2539,18 @@ export interface components {
             /** Format: int64 */
             size_bytes_before: number;
             skipped_reason?: string | null;
+        };
+        DatabaseUrl: {
+            /** @description `postgres://user:password@host:5432/database`. */
+            url: string;
+        };
+        DatabaseView: {
+            backend: components["schemas"]["Backend"];
+            /** @description `INFINIDYSK_DATABASE_URL` selects the database; it cannot be moved here. */
+            env_managed: boolean;
+            migration?: components["schemas"]["MigrationView"] | null;
+            /** @description `user@host:port/database` of the PostgreSQL database in use or being copied to. */
+            target?: string | null;
         };
         DefectView: {
             /**
@@ -2498,6 +2920,27 @@ export interface components {
         };
         /** @enum {string} */
         Kind: "speed" | "tune";
+        /** @description The last restore, from config key `backup.last_restore`. */
+        LastRestore: {
+            /** Format: int64 */
+            at_ms: number;
+            /** Format: uuid */
+            attempt: string;
+            backup: string;
+            /** Format: int64 */
+            backup_created_ms?: number | null;
+            /** @description Why the restored database did not open; the previous one is back. */
+            failed?: string | null;
+            /** @description Why an undo did not open; the restored database stayed. */
+            undo_failed?: string | null;
+        };
+        /** @description 1.x backup folders under `<config dir>/backups`. */
+        LegacyBackups: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            folders: number;
+        };
         LegacyCacheCursor: {
             /** @description Last fully processed entry. The next entry's last processed block is `offset`. */
             after_key?: string;
@@ -2902,6 +3345,13 @@ export interface components {
         /** @description Maintenance jobs and the daily window they run in (`infinidysk-lab:docs/maintenance-policy.md`). */
         Maintenance: {
             /**
+             * @default {
+             *       "dir": "",
+             *       "keep": 3
+             *     }
+             */
+            backup: components["schemas"]["BackupSettings"];
+            /**
              * @description Jobs that run in the window, once each per window.
              * @default [
              *       "remove-dead-links"
@@ -2945,7 +3395,7 @@ export interface components {
          * @description A maintenance job, in the order the window runs them.
          * @enum {string}
          */
-        MaintenanceJob: "remove-unlinked" | "remove-dead-links" | "compact-database";
+        MaintenanceJob: "backup-database" | "remove-unlinked" | "remove-dead-links" | "compact-database";
         MaintenanceJobView: {
             /** @description Runs in every window; `scheduled` cannot be turned off. */
             always_scheduled: boolean;
@@ -2964,6 +3414,7 @@ export interface components {
              * @description When the run started, Unix milliseconds; confirming names the report by it.
              */
             at_ms: number;
+            backup?: components["schemas"]["BackupReport"] | null;
             /**
              * Format: int64
              * @description Files outside the download history when the run started; for dead links, the
@@ -3136,6 +3587,11 @@ export interface components {
             pending: boolean;
             reason?: string | null;
         };
+        /**
+         * @description How a session was started.
+         * @enum {string}
+         */
+        Method: "password" | "sso";
         Metrics: {
             /**
              * @description Serve Prometheus metrics at `/metrics`, behind the admin API key
@@ -3143,6 +3599,32 @@ export interface components {
              * @default false
              */
             prometheus: boolean;
+        };
+        MigrationCancelled: {
+            /** @description Cleanup that did not finish; the move is cancelled either way. */
+            warnings: string[];
+        };
+        /** @enum {string} */
+        MigrationState: "copying" | "syncing" | "cutover";
+        MigrationView: {
+            /** Format: int64 */
+            done: number;
+            error?: string | null;
+            /**
+             * Format: int64
+             * @description Changes not yet on PostgreSQL after the last sync pass.
+             */
+            pending_changes?: number | null;
+            stage?: components["schemas"]["ProgressStage"] | null;
+            state: components["schemas"]["MigrationState"];
+            /** Format: int64 */
+            synced_at_ms?: number | null;
+            table?: string | null;
+            /**
+             * Format: int64
+             * @description 0 while unknown.
+             */
+            total: number;
         };
         Mount: {
             /**
@@ -3444,9 +3926,42 @@ export interface components {
             /** @description Keeps the current username when absent. */
             username?: string | null;
         };
+        /** @description SSO through one OIDC provider; on while `issuer` is set. */
+        Oidc: {
+            /** @default  */
+            client_id: string;
+            /** @default  */
+            client_secret: components["schemas"]["Secret"];
+            /**
+             * @description Issuer URL exactly as the provider publishes it; empty turns SSO off.
+             * @default
+             */
+            issuer: string;
+            /**
+             * @description Callback registered at the provider. Empty means `network.public_url`, else the
+             *     address the browser used, plus `/auth/oidc/callback`.
+             * @default
+             */
+            redirect_uri: string;
+            /**
+             * @description Space-separated; `openid` is always requested.
+             * @default openid profile email
+             */
+            scopes: string;
+            /**
+             * @description ID-token claim shown as the username; then `preferred_username`, `email`, `sub`.
+             * @default preferred_username
+             */
+            username_claim: string;
+        };
         Overview: {
             /** @description Reads in the window (at most 90 days) by program, most bytes first. */
             apps: components["schemas"]["AppUsage"][];
+            /**
+             * Format: int64
+             * @description When this was built, Unix milliseconds: the last point's bucket has filled up to here.
+             */
+            at: number;
             /** @description Newest first. */
             breaker_events: components["schemas"]["BreakerView"][];
             /** Format: int64 */
@@ -3869,6 +4384,8 @@ export interface components {
             /** Format: int64 */
             health: number;
             /** Format: int64 */
+            health_bytes: number;
+            /** Format: int64 */
             import_failures: number;
             /** Format: int64 */
             imports: number;
@@ -3889,6 +4406,8 @@ export interface components {
             peak_fetch_bps: number;
             /** Format: int64 */
             queue: number;
+            /** Format: int64 */
+            queue_bytes: number;
             /**
              * Format: int64
              * @description Finished reads and their stalls.
@@ -3905,12 +4424,19 @@ export interface components {
              * @description Finished requests by workload, cancelled ones left out.
              */
             stream: number;
+            /**
+             * Format: int64
+             * @description `fetched` by workload.
+             */
+            stream_bytes: number;
             /** Format: int64 */
             ts: number;
             /** Format: int64 */
             unhealthy: number;
             /** Format: int64 */
             warm: number;
+            /** Format: int64 */
+            warm_bytes: number;
         };
         PrefetchAttribution: {
             /** @default [] */
@@ -4228,6 +4754,8 @@ export interface components {
              */
             total: number;
         };
+        /** @enum {string} */
+        ProgressStage: "copying" | "syncing" | "verifying" | "switching";
         Proof: {
             /** Format: uuid */
             current_item: string;
@@ -4727,6 +5255,12 @@ export interface components {
             cpu_limit_cores: number;
             /**
              * Format: int64
+             * @description Page cache and reclaimable slab (dentries, inodes); the kernel may free it under
+             *     memory pressure, but it still counts toward the cgroup limit.
+             */
+            memory_kernel_cache_bytes: number;
+            /**
+             * Format: int64
              * @description `memory.max`, or the host's memory when that is lower or unset.
              */
             memory_limit_bytes: number;
@@ -4734,12 +5268,7 @@ export interface components {
             memory_limited: boolean;
             /**
              * Format: int64
-             * @description Page cache of files read; the kernel frees it when memory runs short.
-             */
-            memory_page_cache_bytes: number;
-            /**
-             * Format: int64
-             * @description Memory in use apart from page cache: the process, kernel and socket buffers.
+             * @description Memory in use apart from the kernel cache: the process, kernel and socket buffers.
              */
             memory_process_bytes: number;
             /**
@@ -4869,7 +5398,16 @@ export interface components {
             /**
              * @default {
              *       "api_key": "",
+             *       "local_login": true,
              *       "mode": "required",
+             *       "oidc": {
+             *         "client_id": "",
+             *         "client_secret": "",
+             *         "issuer": "",
+             *         "redirect_uri": "",
+             *         "scopes": "openid profile email",
+             *         "username_claim": "preferred_username"
+             *       },
              *       "session_key": ""
              *     }
              */
@@ -4910,6 +5448,10 @@ export interface components {
             imports: components["schemas"]["Imports"];
             /**
              * @default {
+             *       "backup": {
+             *         "dir": "",
+             *         "keep": 3
+             *       },
              *       "scheduled": [
              *         "remove-dead-links"
              *       ],
@@ -5089,6 +5631,8 @@ export interface components {
             state: components["schemas"]["ItemHealth"];
         };
         Status: {
+            /** @description Why scheduled backups need a look; absent when they are fine or off. */
+            backup_warning?: string | null;
             /** @description The full commit this build came from, when known. */
             commit?: string | null;
             disk_cache?: components["schemas"]["DiskCacheStatus"] | null;
@@ -5111,6 +5655,16 @@ export interface components {
             include_traces?: boolean;
             /** @description What happened and when; at most 10000 characters. */
             note?: string | null;
+        };
+        /** @enum {string} */
+        TaskAction: "verify" | "restore" | "undo";
+        /** @description A backup task that failed. */
+        TaskResult: {
+            action: components["schemas"]["TaskAction"];
+            /** Format: int64 */
+            finished_ms: number;
+            name: string;
+            reason: string;
         };
         TestStatus: {
             job?: components["schemas"]["Job"] | null;
@@ -5245,6 +5799,11 @@ export interface components {
             /** Format: int32 */
             read_ahead_memory_mb: number;
         };
+        /** @description The database a restore replaced, kept for undo. */
+        UndoView: {
+            /** Format: int64 */
+            size_bytes: number;
+        };
         /** @enum {string} */
         UnownedAction: "delete" | "action_needed";
         Update: {
@@ -5353,6 +5912,24 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    post_arr_discover: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Discovery started */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     get_reconcile: {
         parameters: {
             query?: never;
@@ -5537,6 +6114,15 @@ export interface operations {
                     "application/json": components["schemas"]["ApiError"];
                 };
             };
+            /** @description Password sign-in is turned off */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
         };
     };
     logout: {
@@ -5570,7 +6156,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Changed; sets a fresh session cookie */
+            /** @description Changed; a password session gets a fresh cookie */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -5615,7 +6201,364 @@ export interface operations {
                     "application/json": components["schemas"]["ApiError"];
                 };
             };
+            /** @description Sign-in uses SSO */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
             /** @description An admin account already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    get_backups: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BackupsView"];
+                };
+            };
+        };
+    };
+    delete_last_restore: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_legacy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    post_undo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttemptId"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    delete_undo: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    put_upload: {
+        parameters: {
+            query?: {
+                /** @description The file's original name, kept as `source_name`. */
+                name?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": number[];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BackupView"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    delete_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description backup work is running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    patch_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BackupPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BackupView"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    get_backup_file: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/vnd.sqlite3": number[];
+                };
+            };
+            206: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/vnd.sqlite3": number[];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            416: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    post_restore: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttemptId"];
+                };
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    post_verify: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            /** @description a job is running */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5641,6 +6584,183 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Catalog"];
+                };
+            };
+        };
+    };
+    get_database: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseView"];
+                };
+            };
+        };
+    };
+    post_database_check: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DatabaseUrl"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCheck"];
+                };
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    get_cutover_none: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CutoverStatus"];
+                };
+            };
+        };
+    };
+    post_cutover: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CutoverStarted"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    post_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DatabaseUrl"];
+            };
+        };
+        responses: {
+            /** @description Copying */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+        };
+    };
+    delete_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationCancelled"];
+                };
+            };
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiError"];
                 };
             };
         };

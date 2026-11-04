@@ -142,9 +142,9 @@ async fn queue_at_parts(
     path: &std::path::Path,
     timeout: Duration,
 ) -> (Queue, Arc<Client>) {
+    let max_connections = 5;
     let config = PoolConfig {
-        // Background work leaves one slot for playback; four remain for imports.
-        max_connections: 5,
+        max_connections,
         pipeline_depth: 4,
         idle_timeout: Duration::from_secs(5),
         min_connections: 0,
