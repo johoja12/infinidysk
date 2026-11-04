@@ -45,6 +45,8 @@ pub enum Error {
     Invalid(&'static str),
     #[error("repair publication witness failed; readback is required")]
     Witness,
+    #[error("repair source validation is unavailable")]
+    SourceUnavailable,
     #[error("repair publication requires reconciliation before another attempt")]
     Pending,
     #[error("article repair revision changed during the read")]
@@ -76,6 +78,13 @@ pub struct Patch {
     pub geometry: Geometry,
     pub proof: Proof,
     pub data: Bytes,
+}
+impl Patch {
+    /// Deterministic publication receipt, computed without writing storage. Hashing
+    /// belongs on a blocking worker when preparing a durable attempt journal.
+    pub fn expected_revision(&self) -> Result<[u8; 32], Error> {
+        prepare(self).map(|info| info.revision)
+    }
 }
 pub struct Article {
     pub geometry: Geometry,
@@ -409,6 +418,15 @@ impl Store {
     /// across the batch. If commit/fsync is uncertain, affected IDs stay Pending
     /// until explicit readback reconciliation; they never fall back to base bytes.
     pub async fn publish(&self, patches: Vec<Patch>) -> Result<(), Error> {
+        self.publish_checked(patches, async { Ok(()) }).await
+    }
+    /// Revalidate the current source after acquiring the publication barrier, before
+    /// any mutation or pending revision. The check must be read-only and must not
+    /// acquire publication/write-admission guards; callers hold those before entry.
+    pub async fn publish_checked<F>(&self, patches: Vec<Patch>, check: F) -> Result<(), Error>
+    where
+        F: Future<Output = Result<(), Error>> + Send,
+    {
         let writer = Arc::clone(&self.writer).lock_owned().await;
         if self.pending.load(Ordering::Acquire) {
             return Err(Error::Pending);
@@ -441,6 +459,9 @@ impl Store {
         .map_err(|_| Error::Invalid("repair preparation worker failed"))?;
         let prepared = prepared?;
         let _publication = self.publication_guard().await;
+        tokio::time::timeout(Duration::from_secs(5), check)
+            .await
+            .map_err(|_| Error::SourceUnavailable)??;
         let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
         let mut bytes: i64 =
             sqlx::query_scalar("SELECT COALESCE(SUM(LENGTH(payload)),0) FROM article_repairs")

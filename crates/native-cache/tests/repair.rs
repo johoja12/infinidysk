@@ -513,3 +513,101 @@ async fn monotonic_external_witnesses_complete_before_activation_and_readback_do
     drop(db);
     std::fs::remove_dir_all(path).expect("cleanup");
 }
+
+#[tokio::test]
+async fn source_check_runs_after_queued_mutations_and_before_pending_or_storage_changes() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    let gate = Arc::new(tokio::sync::RwLock::new(()));
+    assert!(store.set_mutation_gate(gate.clone()));
+    let old = gate.clone().read_owned().await;
+    let current = Arc::new(AtomicBool::new(true));
+    let checked = Arc::new(AtomicBool::new(false));
+    let generation = store.generation();
+    let task = {
+        let store = store.clone();
+        let current = current.clone();
+        let checked = checked.clone();
+        tokio::spawn(async move {
+            store
+                .publish_checked(vec![patch("guarded@fixture", b"restored")], async move {
+                    checked.store(true, Ordering::Release);
+                    if current.load(Ordering::Acquire) {
+                        Ok(())
+                    } else {
+                        Err(Error::Changed)
+                    }
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while gate.try_read().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("publication queued");
+    assert!(
+        !checked.load(Ordering::Acquire),
+        "source check must not run before the publication barrier"
+    );
+    current.store(false, Ordering::Release);
+    drop(old);
+    assert!(matches!(task.await.expect("task"), Err(Error::Changed)));
+    assert!(checked.load(Ordering::Acquire));
+    assert!(!store.is_pending());
+    assert_eq!(store.generation(), generation);
+    assert_eq!(store.epoch(), 0);
+    assert_eq!(store.revision("guarded@fixture"), Revision::Base);
+    let patch = patch("guarded@fixture", b"restored");
+    let expected = patch.expected_revision().expect("deterministic receipt");
+    store
+        .publish_checked(vec![patch], async { Ok(()) })
+        .await
+        .expect("current source");
+    assert_eq!(revision(&store, "guarded@fixture"), expected);
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+#[tokio::test]
+async fn cancelled_source_validation_has_no_ambiguous_publication_to_replay() {
+    use std::sync::Arc;
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let wait = Arc::new(tokio::sync::Notify::new());
+    let task = {
+        let store = store.clone();
+        let started = started.clone();
+        let wait = wait.clone();
+        tokio::spawn(async move {
+            store
+                .publish_checked(vec![patch("cancelled@fixture", b"restored")], async move {
+                    started.notify_one();
+                    wait.notified().await;
+                    Ok(())
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("source check entered");
+    assert!(!store.is_pending());
+    task.abort();
+    assert!(task.await.expect_err("aborted").is_cancelled());
+    assert!(!store.is_pending());
+    assert_eq!(store.epoch(), 0);
+    assert_eq!(store.revision("cancelled@fixture"), Revision::Base);
+    store
+        .publish(vec![patch("other@fixture", b"restored")])
+        .await
+        .expect("writer and publication guards released");
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
