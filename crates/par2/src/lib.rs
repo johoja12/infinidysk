@@ -4,6 +4,8 @@
 //! descriptions and slice checksums of its recovery set. Damaged packets are skipped by
 //! rescanning for the next packet magic, like other PAR2 clients do.
 
+pub mod repair;
+
 use std::collections::HashMap;
 use std::ops::Range;
 

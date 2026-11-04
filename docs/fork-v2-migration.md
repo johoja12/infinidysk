@@ -46,7 +46,7 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | R04 | P0 | Keep read/warm-triggered damaged-file repairs urgent through provider circuit outages (`HealthCheckService`, `PrefetchRepairHistory`, `eafe1705`) | Persisted urgent health state and bounded inconclusive retry; strict warming failures request the same priority. | Implemented for playback and the shared warming executor, including admitted current/history predictions; other source policies remain open |
 | R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Durable sampled-content snapshot, cursor, pause/resume, category and run limits implemented; fair maintenance slots and revision-safe fault publication included |
 | R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Durable source-bound journal, detached observation, revision-checked controls and current Arr-root authority implemented; read-only scan-root guards at admission and every mutation checkpoint included |
-| R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; this baseline has no equivalent recovery executor in health. Port trusted range/slice identity, bounded repair budgets, durable outcomes and separate worker scheduling before declaring repair parity. | Port |
+| R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | `crates/par2` currently parses indexes and verifies slices; a bounded GF16 reconstruction core is now implemented and tested against real par2cmdline recovery packets. Health still has no recovery executor. Port trusted range/slice identity, bounded repair budgets, durable outcomes and separate worker scheduling before declaring repair parity. | Port |
 | C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | First implementation in Rust; verified 1.x copy import implemented; broader fork data import remains M01 |
 | C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins and bounded block/folder probes implemented; offline catalogue reconstruction remains open |
 | C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Source identity and revision cleanup implemented; PAR2 repair-revision integration pending |
@@ -611,3 +611,32 @@ STRM signing keys remain accepted because these folders cannot be rewritten.
 The setting defaults to empty, validates path/mapping overlap and honors authoritative
 `INFINIDYSK__IMPORTS__SCAN_DIRS` ownership. It is an advanced existing-library option,
 so no new-install wizard input is introduced. See [the operator guide](fork-library-scan-roots.md).
+
+
+## PAR2 reconstruction core (2026-11-04)
+
+R07 now has a Rust GF16 recovery decoder in `crates/par2/src/repair.rs`.
+It retains only independent recovery equations, verifies every supplied and
+reconstructed slice, enforces missing-slice/memory/scan ceilings and supports
+cooperative cancellation. Failed reductions cannot return recovered data.
+The default is eight missing slices and 256 MB-scale memory (256 × 1024² bytes
+internally); no user setting or setup-wizard change is introduced by this core.
+
+The decoder follows the [PAR 2.0 specification](https://parchive.github.io/doc/Parity%20Volume%20Set%20Specification%20v2.0.html),
+including opaque set/file IDs, recoverable input order, GF16 coefficients, full
+32-bit recovery exponents and zero-padded final slices. Checksum-valid conflicting
+core packets fail closed. Packet checksums alone do not prove reconstructed data:
+IFSC validation remains mandatory. The caller must also verify whole-file MD5
+before publishing repairs.
+
+Focused validation: nine PAR2 tests pass (one field test, four existing index tests,
+four new recovery tests), and PAR2 all-target Clippy passes with warnings denied.
+The recovery tests use the existing independent par2cmdline fixture and check
+single/multiple/short-slice restoration, whole-file hashes, redundant equations,
+incomplete input, cancellation, memory limits, damaged packet hashes, forged
+recovery contents and conflicting metadata.
+
+This is a reconstruction foundation, not completed R07 or C03. Provider discovery,
+source/range binding, streaming packet collection, whole-file verification,
+durable worker scheduling and revision-safe publication remain required. No live
+repair, production deployment or cutover was performed.

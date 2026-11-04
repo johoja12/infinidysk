@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 infinidysk-yenc.workspace = true
 md-5.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
