@@ -1,6 +1,9 @@
 //! Read-only pointer discovery. Snapshot publication is atomic and configuration-bound;
 //! an incomplete NAS walk cannot erase a previously complete index.
-use super::{Known, Library, classify};
+mod scan;
+#[cfg(test)]
+use super::classify;
+use super::{Known, Library};
 use crate::{
     admin::{Admin, Fail},
     config::Settings,
@@ -9,28 +12,25 @@ use axum::{
     Json,
     extract::{Query, State},
 };
-use futures_util::{StreamExt as _, TryStreamExt as _};
-use infinidysk_core::media;
 use infinidysk_db::{catalogue::Link, now_ms};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
-use std::{
-    fs, io,
-    os::unix::fs::MetadataExt as _,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+#[cfg(test)]
+use std::{fs, io, os::unix::fs::MetadataExt as _, path::Path};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 const INTERVAL: i64 = 15 * 60 * 1000;
-// ponytail: per-root complete snapshots are capped at 50,000 links/150,000 entries;
-// larger roots need a durable paged walk and staged generation publication.
+// The test-only walker verifies pointer/protected-root classification. Production
+// scans use durable bounded slices and never collect an entire root in memory.
+#[cfg(test)]
 const MAX_WALK: usize = 150_000;
+#[cfg(test)]
 const MAX_LINKS: usize = 50_000;
+#[cfg(test)]
 const MAX_PATH_BYTES: usize = 16 * 1024 * 1024;
 
 fn digest(data: &[u8]) -> String {
@@ -59,6 +59,7 @@ fn scope(root: &str, settings: &Settings, known: &Known) -> Result<String, serde
     .map(|b| digest(&b))
 }
 
+#[cfg(test)]
 fn walk(root: &Path, known: &Known, cancel: &CancellationToken) -> io::Result<Vec<super::Found>> {
     let identity = fs::symlink_metadata(root)?;
     let physical_root = fs::canonicalize(root)?;
@@ -170,6 +171,14 @@ impl Library {
             return false;
         };
         let settings = self.settings().await;
+        let configured: Vec<_> = settings
+            .imports
+            .catalogue_dirs()
+            .map(|dir| dir.path.clone())
+            .collect();
+        if self.parts.db.catalogue_retain(&configured).await.is_err() {
+            return false;
+        }
         let known = self.catalogue_known(&settings).await;
         let Ok(roots) = self.parts.db.catalogue_roots().await else {
             return false;
@@ -201,29 +210,57 @@ impl Library {
                     )
                 })
             })
-            .min_by_key(|(_, _, attempted, _, requested)| (!*requested, *attempted));
+            .min_by_key(|(_, _, attempted, _, requested)| {
+                attempted.saturating_sub(if *requested { 60_000 } else { 0 })
+            });
         let Some((root, expected, _, generation, _)) = next else {
             return false;
         };
         let cancel = CancellationToken::new();
         let _cancel_on_drop = cancel.clone().drop_guard();
+        let owner = Uuid::new_v4();
+        let worker = owner.to_string();
         let result = tokio::time::timeout(
             Duration::from_secs(25),
-            self.catalogue_scan_root(&root, &expected, known, cancel.clone(), now, generation),
+            self.catalogue_scan_root(&root, &expected, known, cancel.clone(), generation, owner),
         )
         .await;
         cancel.cancel();
-        if !matches!(result, Ok(Ok(()))) {
-            let _ = self
-                .parts
-                .db
-                .catalogue_failed(
-                    &root,
-                    &expected,
-                    "Library scan incomplete; last complete index retained",
-                    generation,
-                )
-                .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                let _ = self.parts.db.catalogue_scan_fail(&root, &worker).await;
+                let _ = self
+                    .parts
+                    .db
+                    .catalogue_failed(
+                        &root,
+                        &expected,
+                        "Library scan incomplete; last complete index retained",
+                        generation,
+                    )
+                    .await;
+            }
+            Err(_) => {
+                if !self
+                    .parts
+                    .db
+                    .catalogue_scan_suspend(&root, &worker, true)
+                    .await
+                    .unwrap_or(false)
+                {
+                    let _ = self
+                        .parts
+                        .db
+                        .catalogue_failed(
+                            &root,
+                            &expected,
+                            "Library scan waiting for storage; last complete index retained",
+                            generation,
+                        )
+                        .await;
+                }
+            }
         }
         true
     }
@@ -233,61 +270,67 @@ impl Library {
         expected: &str,
         known: Known,
         cancel: CancellationToken,
-        at: i64,
         generation: i64,
+        owner: Uuid,
     ) -> anyhow::Result<()> {
         let permit = Arc::clone(&self.pointer_reads).try_acquire_owned()?;
         let root_path = PathBuf::from(root);
-        let worker_root = root_path.clone();
-        let worker = tokio::task::spawn_blocking(move || {
+        let checking = root_path.clone();
+        let checking_known = known.clone();
+        let metadata = tokio::task::spawn_blocking(move || {
+            scan::identity(&checking, &checking_known).map(|identity| (identity, permit))
+        })
+        .await??;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        let (identity, permit) = metadata;
+        let run = self
+            .parts
+            .db
+            .catalogue_scan_claim(
+                root,
+                expected,
+                owner,
+                (&identity.device, &identity.inode),
+                generation,
+            )
+            .await?;
+        let worker_id = run.worker.clone();
+        let worker_root = root_path;
+        let db = self.parts.db.clone();
+        let worker_cancel = cancel.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            walk(&worker_root, &known, &cancel)
+            scan::slice(&db, &worker_root, &known, &run, &worker_cancel)
         });
-        let found = worker.await??;
-        let links: Vec<Link> = futures_util::stream::iter(found.into_iter().map(|f| {
-            let root_path = &root_path;
-            async move {
-                let name = f
-                    .path
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("non-UTF8 library pointer"))?
-                    .to_owned();
-                let relative = f
-                    .path
-                    .strip_prefix(root_path)?
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("non-UTF8 relative path"))?
-                    .to_owned();
-                let group = relative.split('/').next().unwrap_or_default().to_owned();
-                let item = self.parts.db.item(f.item).await?;
-                let video = item.as_ref().is_some_and(|i| media::is_video(&i.name))
-                    || media::is_video(&name);
-                Ok::<_, anyhow::Error>(Link {
-                    root: root.to_owned(),
-                    path: name,
-                    relative_path: relative,
-                    group_name: group,
-                    item_id: f.item.0,
-                    pointer_hash: digest(f.pointer.text().as_bytes()),
-                    link_kind: if f.pointer.is_link() { 1 } else { 2 },
-                    video: i16::from(video),
-                })
+        let step = loop {
+            tokio::select! {
+                result=&mut worker=>break result??,
+                ()=tokio::time::sleep(Duration::from_millis(100))=>{
+                    if (self.parts.busy)() {
+                        cancel.cancel();self.parts.db.catalogue_scan_suspend(root,&worker_id,false).await?;return Ok(());
+                    }
+                },
             }
-        }))
-        .buffered(16)
-        .try_collect()
-        .await?;
+        };
+        if matches!(step, scan::Step::Pending) {
+            return Ok(());
+        }
         let _writing = self.parts.db.write_permit().await;
         let config = self.parts.config.read().await;
-        let current = config.settings();
-        let current_known = self.catalogue_known(current).await;
-        if scope(root, current, &current_known)? != expected || (self.parts.busy)() {
-            anyhow::bail!("library configuration or foreground activity changed");
+        let current_known = self.catalogue_known(config.settings()).await;
+        if scope(root, config.settings(), &current_known)? != expected {
+            self.parts
+                .db
+                .catalogue_scan_abandon(root, &worker_id)
+                .await?;
+        } else if !(self.parts.busy)() {
+            self.parts
+                .db
+                .catalogue_scan_publish(root, expected, &worker_id, now_ms())
+                .await?;
         }
-        self.parts
-            .db
-            .catalogue_replace(root, expected, &links, at, generation)
-            .await?;
         drop(config);
         Ok(())
     }
@@ -304,17 +347,25 @@ pub struct RootView {
     pub completed_generation: i64,
     pub stale: bool,
     pub error: Option<String>,
+    pub scan_entries: Option<u64>,
+    pub scan_links: Option<u64>,
+    pub scan_started_at: Option<i64>,
+    pub scan_updated_at: Option<i64>,
 }
 pub(crate) async fn roots(admin: &Admin) -> Result<Vec<RootView>, Fail> {
     let settings = admin.library.settings().await;
     let known = admin.library.catalogue_known(&settings).await;
     let stored = admin.vfs.db().catalogue_roots().await?;
+    let scans = admin.vfs.db().catalogue_scans().await?;
     Ok(settings
         .imports
         .catalogue_dirs()
         .map(|d| {
             let saved = stored.iter().find(|r| r.root == d.path);
             let expected = scope(&d.path, &settings, &known).ok();
+            let scan = scans
+                .iter()
+                .find(|scan| scan.root == d.path && expected.as_ref() == Some(&scan.scope));
             RootView {
                 root: d.path.clone(),
                 read_only: settings
@@ -334,6 +385,10 @@ pub(crate) async fn roots(admin: &Admin) -> Result<Vec<RootView>, Fail> {
                         || now_ms().saturating_sub(r.scanned_at.unwrap_or(0)) > INTERVAL
                 }),
                 error: saved.and_then(|r| r.error.clone()),
+                scan_entries: scan.map(|s| s.visited.cast_unsigned()),
+                scan_links: scan.map(|s| s.linked.cast_unsigned()),
+                scan_started_at: scan.map(|s| s.started_at),
+                scan_updated_at: scan.map(|s| s.updated_at),
             }
         })
         .collect())

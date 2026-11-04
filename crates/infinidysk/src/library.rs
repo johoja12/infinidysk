@@ -2154,76 +2154,88 @@ pub(crate) fn pointed(path: &Path, mount_dirs: &[String]) -> Option<ItemId> {
 /// One of our pointers at `path`, if it is one. With [`Known::any`], any link into a
 /// `.ids` folder and any STRM naming an item count.
 fn classify(path: &Path, meta: &fs::Metadata, known: &Known) -> Option<Found> {
-    let name = path.file_name()?.to_string_lossy();
+    classify_checked(path, meta, known).ok().flatten()
+}
+fn classify_checked(path: &Path, meta: &fs::Metadata, known: &Known) -> io::Result<Option<Found>> {
+    let Some(name) = path.file_name() else {
+        return Ok(None);
+    };
+    let name = name.to_string_lossy();
     if name.starts_with('.') && name.ends_with(".partial") {
-        return None;
+        return Ok(None);
     }
     if meta.file_type().is_symlink() {
-        let text = fs::read_link(path).ok()?.to_string_lossy().into_owned();
-        let resolved = normalize(&path.parent()?.join(&text));
-        let item = if known.mount_dirs.is_empty() {
-            let s = resolved.to_string_lossy();
-            let (_, ids) = s.rsplit_once("/.ids/")?;
-            ItemId::from_ids_path(&format!(".ids/{ids}"))?
-        } else {
-            known.mount_dirs.iter().find_map(|m| {
-                let rest = resolved.strip_prefix(m).ok()?;
-                ItemId::from_ids_path(rest.to_str()?)
-            })?
+        let text = fs::read_link(path)?.to_string_lossy().into_owned();
+        let Some(parent) = path.parent() else {
+            return Ok(None);
         };
-        return Some(Found {
+        let resolved = normalize(&parent.join(&text));
+        let item = if known.mount_dirs.is_empty() {
+            resolved
+                .to_string_lossy()
+                .rsplit_once("/.ids/")
+                .and_then(|(_, ids)| ItemId::from_ids_path(&format!(".ids/{ids}")))
+        } else {
+            known.mount_dirs.iter().find_map(|mount| {
+                ItemId::from_ids_path(resolved.strip_prefix(mount).ok()?.to_str()?)
+            })
+        };
+        return Ok(item.map(|item| Found {
             path: path.to_path_buf(),
             item,
             pointer: Pointer::Link(text),
             legacy: false,
-        });
+        }));
     }
     let is_strm = name
         .rsplit_once('.')
-        .is_some_and(|(_, e)| e.eq_ignore_ascii_case("strm"));
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("strm"));
     if !meta.is_file() || !is_strm || meta.len() > MAX_STRM_BYTES {
-        return None;
+        return Ok(None);
     }
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits() | nix::fcntl::OFlag::O_NONBLOCK.bits())
-        .open(path)
-        .ok()?;
-    let opened = file.metadata().ok()?;
+        .open(path)?;
+    let opened = file.metadata()?;
     if !opened.is_file() || opened.len() > MAX_STRM_BYTES {
-        return None;
+        return Ok(None);
     }
     let mut text = String::new();
-    file.take(MAX_STRM_BYTES + 1)
-        .read_to_string(&mut text)
-        .ok()?;
-    if text.len() as u64 > MAX_STRM_BYTES {
-        return None;
+    if let Err(error) = file.take(MAX_STRM_BYTES + 1).read_to_string(&mut text) {
+        return if error.kind() == io::ErrorKind::InvalidData {
+            Ok(None)
+        } else {
+            Err(error)
+        };
     }
-    let (item, ids, got) = parse_strm(&text)?;
-    let any = known.keys.is_empty() && known.mount_dirs.is_empty();
-    let current = || {
-        known
-            .keys
-            .iter()
-            .any(|k| infinidysk_webdav::strm_key(k, ids) == got)
+    if text.len() as u64 > MAX_STRM_BYTES {
+        return Ok(None);
+    }
+    let Some((item, ids, got)) = parse_strm(&text) else {
+        return Ok(None);
     };
-    let legacy = !any && !current();
+    let any = known.keys.is_empty() && known.mount_dirs.is_empty();
+    let current = known
+        .keys
+        .iter()
+        .any(|key| infinidysk_webdav::strm_key(key, ids) == got);
+    let legacy = !any && !current;
     if legacy
         && !(known.legacy
             && known
                 .keys
                 .iter()
-                .any(|k| infinidysk_webdav::legacy_strm_key(k, ids) == got))
+                .any(|key| infinidysk_webdav::legacy_strm_key(key, ids) == got))
     {
-        return None;
+        return Ok(None);
     }
-    Some(Found {
+    Ok(Some(Found {
         path: path.to_path_buf(),
         item,
         pointer: Pointer::Strm(text),
         legacy,
-    })
+    }))
 }
 
 /// The item, `.ids/…` path and `downloadKey` of a STRM's URL.
