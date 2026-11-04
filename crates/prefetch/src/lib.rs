@@ -1,5 +1,6 @@
 //! One bounded warming lane. Durable progress is a hint: every resumed block is verified
 //! again. Only strict final-media bytes can enter the shared native cache.
+mod lead;
 mod watched;
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
@@ -259,6 +260,7 @@ pub struct Queue {
     changed: Notify,
     wire: Arc<infinidysk_nntp::wire::Budget>,
     watched: Mutex<watched::Tracker>,
+    lead: Mutex<lead::Lead>,
     uncertain: AtomicBool,
 }
 impl Queue {
@@ -323,6 +325,7 @@ impl Queue {
             changed: Notify::new(),
             wire,
             watched: Mutex::default(),
+            lead: Mutex::default(),
             uncertain: AtomicBool::new(false),
         }))
     }
@@ -723,6 +726,7 @@ impl Queue {
         }
         settings.validate()?;
         let now = now_ms();
+        let protected = self.lead.lock().await.protected(&self.db, &self.vfs).await;
         let selected = {
             let mut current = self.lock_ledger().await?;
             if current.paused {
@@ -748,7 +752,17 @@ impl Queue {
                 .jobs
                 .iter()
                 .filter(|j| j.state == State::Queued && j.next_attempt <= now)
-                .min_by_key(|j| (std::cmp::Reverse(j.priority), j.created_at, j.id))
+                .min_by_key(|j| {
+                    let full =
+                        j.ranges.len() == 1 && j.ranges[0].start == 0 && j.ranges[0].end == j.size;
+                    (
+                        !full || !protected.contains(&ItemId(j.item)),
+                        std::cmp::Reverse(j.priority),
+                        j.updated_at,
+                        j.created_at,
+                        j.id,
+                    )
+                })
                 .cloned();
             if dirty {
                 self.save(&mut current, next).await?;

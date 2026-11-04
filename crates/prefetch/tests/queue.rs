@@ -725,3 +725,103 @@ async fn retained_verified_articles_warm_final_media_without_provider_or_wire_re
         2 * BLOCK
     );
 }
+
+#[tokio::test]
+async fn watched_full_file_keeps_its_lane_until_all_remaining_bytes_are_cached() {
+    let t = Temp::new();
+    let (vfs, item, _cache, _corpus, _server, _client) = fixture(&t, false).await;
+    let mut other = item.clone();
+    other.id = ItemId::new();
+    other.name = "other-file.mkv".into();
+    other.path = format!("{}/other-file.mkv", item.path.rsplit_once('/').unwrap().0);
+    let bytes = vfs
+        .db()
+        .blob(item.meta_blob.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let blob_id = BlobId::new();
+    other.meta_blob = Some(blob_id);
+    vfs.db()
+        .insert(&[other.clone()], &[(blob_id, &bytes)])
+        .await
+        .unwrap();
+    let q = Queue::load(vfs.db().clone(), Arc::clone(&vfs))
+        .await
+        .unwrap();
+    let watched = enqueue(&q, &item).await;
+    let urgent = q
+        .enqueue(
+            other.id,
+            &[Range {
+                start: 0,
+                end: other.size.unwrap(),
+            }],
+            100,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+    let mut read = vfs
+        .open(
+            &Node::Item(item.clone()),
+            Origin {
+                delivery: Delivery::WebDav,
+                client: "fixture-player".into(),
+                player: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    read.read_exact(&mut [0u8; 1]).await.unwrap();
+    drop(read);
+    // Short handle gaps retain the observed position. Foreground work still wins.
+    for _ in 0..100 {
+        if q.tick(&settings()).await.unwrap() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let status = q.status().await;
+    assert_eq!(
+        status
+            .jobs
+            .iter()
+            .find(|j| j.id == watched.id)
+            .unwrap()
+            .verified_bytes,
+        BLOCK
+    );
+    assert_eq!(
+        status
+            .jobs
+            .iter()
+            .find(|j| j.id == urgent.id)
+            .unwrap()
+            .verified_bytes,
+        0
+    );
+    assert!(q.tick(&settings()).await.unwrap());
+    assert_eq!(
+        q.status()
+            .await
+            .jobs
+            .iter()
+            .find(|j| j.id == watched.id)
+            .unwrap()
+            .state,
+        State::Complete
+    );
+    assert!(q.tick(&settings()).await.unwrap());
+    assert_eq!(
+        q.status()
+            .await
+            .jobs
+            .iter()
+            .find(|j| j.id == urgent.id)
+            .unwrap()
+            .verified_bytes,
+        BLOCK
+    );
+}
