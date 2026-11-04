@@ -685,6 +685,9 @@ impl Vfs {
                     .ok_or(Error::Repairing)?;
                 let item = &current;
                 let meta = self.meta(item).await?;
+                if !session.bind_source(&meta) {
+                    return Err(Error::Repairing);
+                }
                 let fingerprint = meta.fingerprint(&self.client)?;
                 let trace = session.trace();
                 let report = self.report.as_ref().map(|report| {

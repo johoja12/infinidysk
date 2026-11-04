@@ -4,7 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::io::{self, SeekFrom};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -101,6 +101,7 @@ pub struct Session {
     pub opened_at: SystemTime,
     pub size: u64,
     pub trace: Option<Arc<Trace>>,
+    source: OnceLock<Weak<crate::CachedMeta>>,
     served: AtomicU64,
     native_cache_bytes: Arc<AtomicU64>,
     pos: AtomicU64,
@@ -289,6 +290,7 @@ pub struct Sessions {
 #[derive(Default)]
 struct Inner {
     repairing: HashSet<ItemId>,
+    article_repairing: HashSet<String>,
     recent: VecDeque<Playback>,
     open: Vec<Arc<Session>>,
     /// Newest last.
@@ -311,6 +313,47 @@ impl Sessions {
             item,
         })
     }
+    /// Exclude every overlapping article source while retaining ordinary access to
+    /// unrelated files. Unknown in-progress opens defer admission until their source
+    /// is bound; new opens must bind before any reader can return bytes.
+    pub fn try_repair_articles(
+        self: &Arc<Self>,
+        item: ItemId,
+        ids: &[String],
+    ) -> Option<ArticleRepairGuard> {
+        if ids.is_empty()
+            || ids.len() > 1024
+            || ids.iter().any(|id| id.is_empty() || id.len() > 4096)
+        {
+            return None;
+        }
+        let ids: HashSet<_> = ids.iter().cloned().collect();
+        let mut inner = self.lock();
+        if inner.repairing.contains(&item)
+            || ids.iter().any(|id| inner.article_repairing.contains(id))
+            || inner.open.iter().any(|session| {
+                session.item == item
+                    || session
+                        .source
+                        .get()
+                        .and_then(Weak::upgrade)
+                        .is_none_or(|meta| intersects(&meta.file, &ids))
+            })
+        {
+            return None;
+        }
+        inner.repairing.insert(item);
+        inner.article_repairing.extend(ids.iter().cloned());
+        drop(inner);
+        Some(ArticleRepairGuard {
+            item_guard: RepairGuard {
+                sessions: self.clone(),
+                item,
+            },
+            ids,
+        })
+    }
+
     /// Called outside the session lock when the last overlapping handle closes.
     pub fn on_last_close(&self, callback: LastClose) {
         *self
@@ -407,6 +450,7 @@ impl Sessions {
             opened_at: SystemTime::now(),
             size,
             trace,
+            source: OnceLock::new(),
             served: AtomicU64::new(0),
             native_cache_bytes: Arc::new(AtomicU64::new(0)),
             pos: AtomicU64::new(0),
@@ -453,6 +497,36 @@ impl Drop for RepairGuard {
     }
 }
 
+fn intersects(meta: &infinidysk_core::FileMeta, ids: &HashSet<String>) -> bool {
+    let any = |segments: &infinidysk_core::Segments| {
+        segments
+            .items
+            .iter()
+            .any(|segment| ids.contains(&segment.id))
+    };
+    match meta {
+        infinidysk_core::FileMeta::Nzb(file) => any(&file.segments),
+        infinidysk_core::FileMeta::Multipart(file) => {
+            file.parts.iter().any(|part| any(&part.segments))
+        }
+    }
+}
+/// Keeps affected article admissions and the target item's repair slot closed until
+/// the publication finishes. Unrelated readers do not wait for this guard.
+pub struct ArticleRepairGuard {
+    item_guard: RepairGuard,
+    ids: HashSet<String>,
+}
+impl Drop for ArticleRepairGuard {
+    fn drop(&mut self) {
+        let mut inner = self.item_guard.sessions.lock();
+        for id in &self.ids {
+            inner.article_repairing.remove(id);
+        }
+        // item_guard then releases the item slot and invokes the existing wakeup.
+    }
+}
+
 /// Keeps a session listed as open until dropped.
 pub(crate) struct Guard {
     session: Arc<Session>,
@@ -460,6 +534,16 @@ pub(crate) struct Guard {
 }
 
 impl Guard {
+    pub(crate) fn bind_source(&self, meta: &Arc<crate::CachedMeta>) -> bool {
+        let inner = self.sessions.lock();
+        if intersects(&meta.file, &inner.article_repairing) {
+            return false;
+        }
+        let bound = self.session.source.set(Arc::downgrade(meta)).is_ok();
+        drop(inner);
+        bound
+    }
+
     pub(crate) fn native_cache_counter(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.session.native_cache_bytes)
     }
@@ -691,5 +775,122 @@ mod tests {
                 .start(item, "/fixture".into(), 1, origin())
                 .is_some()
         );
+    }
+    fn scoped_meta(id: &str) -> Arc<crate::CachedMeta> {
+        use infinidysk_core::{FileMeta, NzbFile, Segment, Segments};
+        Arc::new(crate::CachedMeta {
+            file: FileMeta::Nzb(NzbFile {
+                segments: Segments {
+                    items: vec![Segment {
+                        id: id.into(),
+                        size: 8,
+                        fallbacks: vec![],
+                    }],
+                    sizes_trusted: true,
+                    ..Segments::default()
+                },
+                proof: None,
+            }),
+            fingerprint: OnceLock::new(),
+            repaired_fingerprint: Mutex::new(None),
+        })
+    }
+    fn fixture_origin() -> Origin {
+        Origin {
+            delivery: Delivery::WebDav,
+            client: "fixture".into(),
+            player: None,
+        }
+    }
+    #[test]
+    fn article_publication_waits_for_other_items_that_share_the_source() {
+        let sessions = Arc::new(Sessions::default());
+        let first = ItemId::new();
+        let target = ItemId::new();
+        let meta = scoped_meta("shared@fixture");
+        let read = sessions
+            .start(first, "/fixture".into(), 8, fixture_origin())
+            .expect("read");
+        assert!(read.bind_source(&meta));
+        let ids = vec!["shared@fixture".into()];
+        assert!(sessions.try_repair_articles(target, &ids).is_none());
+        drop(read);
+        let publication = sessions
+            .try_repair_articles(target, &ids)
+            .expect("all affected readers closed");
+        assert!(
+            sessions.try_repair(target).is_none(),
+            "target mutations use the same repair slot"
+        );
+        assert!(
+            sessions
+                .start(target, "/fixture".into(), 8, fixture_origin())
+                .is_none()
+        );
+        let other = sessions
+            .start(first, "/fixture".into(), 8, fixture_origin())
+            .expect("source not bound yet");
+        assert!(
+            !other.bind_source(&meta),
+            "a different item cannot open the shared source during publication"
+        );
+        drop(other);
+        drop(publication);
+        let read = sessions
+            .start(first, "/fixture".into(), 8, fixture_origin())
+            .expect("reopen");
+        assert!(read.bind_source(&meta));
+    }
+    #[test]
+    fn unknown_opens_defer_publication_but_unrelated_sources_continue() {
+        let sessions = Arc::new(Sessions::default());
+        let target = ItemId::new();
+        let ids = vec!["patched@fixture".into()];
+        let unknown = sessions
+            .start(ItemId::new(), "/fixture".into(), 8, fixture_origin())
+            .expect("opening");
+        assert!(
+            sessions.try_repair_articles(target, &ids).is_none(),
+            "metadata loading is still an admitted open"
+        );
+        let unrelated = scoped_meta("unrelated@fixture");
+        assert!(unknown.bind_source(&unrelated));
+        let publication = sessions
+            .try_repair_articles(target, &ids)
+            .expect("unrelated existing reader continues");
+        let another = sessions
+            .start(ItemId::new(), "/fixture".into(), 8, fixture_origin())
+            .expect("new unrelated reader");
+        assert!(another.bind_source(&unrelated));
+        assert_eq!(sessions.open().len(), 2);
+        drop(publication);
+        assert!(sessions.try_repair(target).is_some());
+    }
+    #[test]
+    fn article_guard_wakes_the_target_and_finished_sessions_do_not_retain_source_metadata() {
+        let sessions = Arc::new(Sessions::default());
+        let item = ItemId::new();
+        let meta = scoped_meta("patched@fixture");
+        let weak = Arc::downgrade(&meta);
+        let read = sessions
+            .start(item, "/fixture".into(), 8, fixture_origin())
+            .expect("read");
+        assert!(read.bind_source(&meta));
+        drop(read);
+        drop(meta);
+        assert!(
+            weak.upgrade().is_none(),
+            "finished session history must not pin metadata cache entries"
+        );
+        let wake = Arc::new(Mutex::new(Vec::new()));
+        sessions.on_last_close(Arc::new({
+            let wake = wake.clone();
+            move |item| wake.lock().expect("wake").push(item)
+        }));
+        let publication = sessions
+            .try_repair_articles(item, &["patched@fixture".into()])
+            .expect("publication");
+        drop(publication);
+        assert_eq!(wake.lock().expect("wake").as_slice(), &[item]);
     }
 }
