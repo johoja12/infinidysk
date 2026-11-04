@@ -135,6 +135,13 @@ async fn queue_at_timeout(
     path: &std::path::Path,
     timeout: Duration,
 ) -> Queue {
+    queue_at_parts(servers, path, timeout).await.0
+}
+async fn queue_at_parts(
+    servers: &[&LoopbackServer],
+    path: &std::path::Path,
+    timeout: Duration,
+) -> (Queue, Arc<Client>) {
     let config = PoolConfig {
         // Background work leaves one slot for playback; four remain for imports.
         max_connections: 5,
@@ -162,7 +169,8 @@ async fn queue_at_timeout(
     let db = Db::connect(&format!("sqlite:{}", path.display()))
         .await
         .unwrap();
-    Queue::new(db, Arc::new(client))
+    let client = Arc::new(client);
+    (Queue::new(db, Arc::clone(&client)), client)
 }
 
 async fn run(queue: &Queue, db: &Db, xml: &[u8]) -> infinidysk_db::HistoryEntry {
@@ -1005,7 +1013,7 @@ async fn a_stalled_job_does_not_hold_up_the_next_one() {
         std::env::temp_dir().join(format!("infinidysk-gated-queue-{}.sqlite", ItemId::new()));
     // The observed blocked response must outlive the assertion deadline; a provider
     // timeout must not accidentally turn serial execution into a passing test.
-    let queue = queue_at_timeout(&[&server], &path, Duration::from_secs(60)).await;
+    let (queue, diagnostic) = queue_at_parts(&[&server], &path, Duration::from_secs(60)).await;
     let db = queue.db().clone();
     let job = Submission {
         file_name: "job.nzb",
@@ -1045,9 +1053,14 @@ async fn a_stalled_job_does_not_hold_up_the_next_one() {
         assert!(blocked.starts_with("d-"));
         d_job
     };
-    tokio::time::timeout(Duration::from_secs(10), finished(1))
-        .await
-        .expect("the other job finished while the first BODY remained held");
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), finished(1))
+            .await
+            .is_ok(),
+        "the other job must finish while the first BODY remains held; queue={:?}; provider={:?}",
+        queue.progress(),
+        diagnostic.stats()
+    );
     let history = db.history().await.unwrap();
     assert_eq!(history.len(), 1);
     assert_ne!(

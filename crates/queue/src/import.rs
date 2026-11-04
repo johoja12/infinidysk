@@ -20,7 +20,7 @@ use infinidysk_core::{
     ByteRange, FileMeta, FilePart, MultipartFile, NzbFile, Par2Proof, Segment, Segments, media,
 };
 use infinidysk_db::FirstCheck;
-use infinidysk_nntp::{ArticleFuture, Articles, Body, Client, Workload};
+use infinidysk_nntp::{ArticleFuture, Articles, Body, Client, Lane, Workload};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -268,6 +268,7 @@ struct Volume {
 // draining do not count against the next one. Carry the slot in the transport ticket if
 // that overshoot ever matters.
 struct Job {
+    lane: Lane,
     client: Arc<Client>,
     requests: Semaphore,
     progress: Arc<Progress>,
@@ -327,7 +328,10 @@ impl Articles for Job {
         Box::pin(async move {
             let (_slot, probe) = self.slot().await;
             self.progress.request();
-            let found = self.client.stat(id, Workload::Queue, Some(&probe)).await;
+            let found = self
+                .client
+                .stat_in_lane(id, self.lane, Workload::Queue, Some(&probe))
+                .await;
             self.progress.answer();
             self.done(&probe);
             found
@@ -344,7 +348,7 @@ impl Articles for Job {
             self.progress.request();
             let body = self
                 .client
-                .body_with(id, Workload::Queue, Some(&probe), None, begin)
+                .body_in_lane(id, self.lane, Workload::Queue, Some(&probe), begin)
                 .await;
             self.progress.answer();
             self.done(&probe);
@@ -374,6 +378,7 @@ pub async fn import(
 ) -> Result<(Vec<Output>, Vec<Option<FirstCheck>>), Error> {
     let started = Instant::now();
     let job = &Arc::new(Job {
+        lane: Lane::default(),
         client: Arc::clone(client),
         requests: Semaphore::new(CONCURRENCY),
         progress,
@@ -659,7 +664,7 @@ async fn fetch(job: &Job, id: &str, begin: Option<u64>) -> Result<Option<Body>, 
     job.progress.request();
     let body = job
         .client
-        .body_with(id, Workload::Queue, Some(&probe), None, begin)
+        .body_in_lane(id, job.lane, Workload::Queue, Some(&probe), begin)
         .await;
     job.progress.answer();
     job.done(&probe);
@@ -679,7 +684,10 @@ async fn stat(job: &Job, id: &str) -> Result<bool, Error> {
     let mut attempt = 0;
     let found = loop {
         job.progress.request();
-        let found = job.client.stat(id, Workload::Queue, Some(&probe)).await;
+        let found = job
+            .client
+            .stat_in_lane(id, job.lane, Workload::Queue, Some(&probe))
+            .await;
         job.progress.answer();
         match found {
             Ok(()) => break Ok(true),
@@ -1905,6 +1913,7 @@ mod tests {
             backbone: None,
         }]);
         let job = Arc::new(Job {
+            lane: Lane::default(),
             client: Arc::new(client),
             requests: Semaphore::new(CONCURRENCY),
             progress: Arc::new(Progress::default()),
@@ -1942,6 +1951,7 @@ mod tests {
     #[tokio::test]
     async fn key_derivations_wait_for_a_free_slot() {
         let job = Arc::new(Job {
+            lane: Lane::default(),
             client: Arc::new(Client::new([])),
             requests: Semaphore::new(CONCURRENCY),
             progress: Arc::new(Progress::default()),

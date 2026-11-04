@@ -589,3 +589,12 @@ Health operation, outside the critical new-install path. Migration 0016 is addit
 
 Validation is recorded in
 [the sampled-content receipt](validation/rust-v2-content-sweep-20261104.md).
+
+## Independent import lanes
+
+The sweep qualification exposed an intermittent upstream import stall. Requests
+from one import could pipeline behind another import's held BODY. Each import
+attempt now has a separate NNTP lane while retaining normal pipelining within its
+own lane and the same connection/permit limits. Explicit response gates prove that
+another import completes while the first response is still held, rather than
+relying on a timed stall. See [the isolation receipt](validation/rust-v2-import-isolation-20261104.md).

@@ -54,3 +54,9 @@ No new persistent setting or guided-setup input is added. The operation belongs 
 Health after installation. Migration 0016 is additive: **back up `/config` before
 upgrading**. No production service, 1.x checkout or writable cache root was changed.
 PAR2 execution, other listed migration groups and live acceptance remain separate.
+
+The explicit response gate subsequently exposed a real cross-job NNTP pipeline
+stall. It was fixed with per-import connection lanes; see
+[the isolation receipt](rust-v2-import-isolation-20261104.md). The prior failures
+must not be dismissed as only timing noise. The five repeated complete import-suite
+runs pass after the fix; aggregate workspace qualification remains separate.

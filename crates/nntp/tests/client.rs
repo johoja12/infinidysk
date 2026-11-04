@@ -967,3 +967,138 @@ async fn checked_bodies_reject_foreign_geometry_before_the_cache_sink() {
     assert_eq!(body.data, corpus.data[..ARTICLE_SIZE]);
     assert_eq!(stored.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn independent_lanes_do_not_pipeline_behind_another_jobs_stalled_reply() {
+    let articles = post("lanes", "fixture.bin", &[3; 32], 16);
+    let first = articles[0].message_id.clone();
+    let second = articles[1].message_id.clone();
+    let (server, mut gates) = LoopbackServer::start_gated_many(articles, 2).await.unwrap();
+    let mut gate_b = gates.pop().unwrap();
+    let mut gate_a = gates.pop().unwrap();
+    let downloads = Downloads::new(8);
+    let pool = Pool::new(
+        Endpoint::new(
+            "127.0.0.1",
+            server.addr().port(),
+            TlsMode::Plain,
+            None,
+            Duration::from_secs(60),
+        )
+        .unwrap(),
+        PoolConfig {
+            max_connections: 2,
+            pipeline_depth: 2,
+            idle_timeout: Duration::from_secs(30),
+            min_connections: 0,
+        },
+        Arc::clone(&downloads),
+    )
+    .unwrap();
+    let client = Arc::new(Client::new([Provider {
+        pool,
+        key: "fixture".into(),
+        name: "fixture".into(),
+        priority: 0,
+        backbone: None,
+    }]));
+    let lane_a = infinidysk_nntp::Lane::default();
+    let lane_b = infinidysk_nntp::Lane::default();
+    let a = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            client
+                .body_in_lane(&first, lane_a, Workload::Queue, None, None)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), gate_a.blocked())
+        .await
+        .unwrap()
+        .unwrap();
+    let connection_a = client.stats()[0].connections[0].id;
+    let b = {
+        let client = Arc::clone(&client);
+        let second = second.clone();
+        tokio::spawn(async move {
+            client
+                .body_in_lane(&second, lane_b, Workload::Queue, None, None)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), gate_b.blocked())
+        .await
+        .unwrap()
+        .unwrap();
+    let stat = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move {
+            client
+                .stat_in_lane(&second, lane_b, Workload::Queue, None)
+                .await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if client.stats()[0]
+                .connections
+                .iter()
+                .map(|c| c.requests)
+                .sum::<usize>()
+                == 3
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("same-lane STAT pipelined before either BODY was released");
+    let stats = client.stats();
+    let connections = &stats[0].connections;
+    assert_eq!(connections.len(), 2);
+    assert_eq!(
+        connections
+            .iter()
+            .find(|c| c.id == connection_a)
+            .unwrap()
+            .requests,
+        1,
+        "another job cannot queue behind held A"
+    );
+    assert_eq!(
+        connections
+            .iter()
+            .find(|c| c.id != connection_a)
+            .unwrap()
+            .requests,
+        2,
+        "same-lane BODY and STAT retain pipelining"
+    );
+    gate_b.release();
+    tokio::time::timeout(Duration::from_secs(5), b)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), stat)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        !a.is_finished(),
+        "independent job finished while A was still held"
+    );
+    gate_a.release();
+    a.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.stats()[0].busy != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(client.free_permits(), Some(8));
+    assert_eq!(server.peak_connections(), 2);
+}

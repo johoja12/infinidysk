@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::article::Body;
-use crate::client::BodySink;
+use crate::client::{BodySink, Lane};
 use crate::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
 use crate::downloads::{Downloads, Permit};
 use crate::stats::{Stats, Workload, outcome};
@@ -93,6 +93,7 @@ pub(crate) enum Failure {
 }
 
 struct Worker {
+    lane: AtomicU64,
     tx: mpsc::Sender<Request>,
     load: Arc<AtomicUsize>,
     task: tokio::task::AbortHandle,
@@ -121,6 +122,7 @@ pub(crate) struct Tag {
     /// Waits for a connection with nothing in flight rather than pipeline behind
     /// another request: a hedge queued behind a slow article is as slow as it.
     pub(crate) fresh: bool,
+    pub(crate) lane: Option<Lane>,
 }
 
 impl Tag {
@@ -134,6 +136,7 @@ impl Tag {
         expected: None,
         sink: None,
         fresh: false,
+        lane: None,
     };
 
     fn step(&self, step: Step) {
@@ -319,7 +322,7 @@ impl Pool {
             reserved
         };
         // Dropping a new connection's load leaves it idle in the pool.
-        join_all((0..reserved).map(|_| self.open(self.connecting()))).await;
+        join_all((0..reserved).map(|_| self.open(self.connecting(), None))).await;
     }
 
     /// Ends every connection now, abandoning the requests on them.
@@ -465,7 +468,8 @@ impl Pool {
                     .await
                     .ok_or(Failure::Request(Error::Closed))?;
                 tag.step(Step::Permitted { provider });
-                let (tx, load, ahead, connection) = self.worker(stream, tag.fresh).await?;
+                let (tx, load, ahead, connection) =
+                    self.worker(stream, tag.fresh, tag.lane).await?;
                 Ok::<_, Failure>((download, tx, load, ahead, connection))
             };
             let (download, tx, load, ahead, connection) = if stream {
@@ -521,6 +525,7 @@ impl Pool {
         &self,
         stream: bool,
         fresh: bool,
+        lane: Option<Lane>,
     ) -> Result<(mpsc::Sender<Request>, Load, usize, u32), Failure> {
         let mut impatient = false;
         loop {
@@ -545,6 +550,12 @@ impl Pool {
                     .workers
                     .iter()
                     .filter(|worker| !hold_headroom || worker.load.load(Ordering::Relaxed) > 0)
+                    .filter(|worker| {
+                        lane.is_none_or(|lane| {
+                            worker.load.load(Ordering::Relaxed) == 0
+                                || worker.lane.load(Ordering::Relaxed) == lane.0
+                        })
+                    })
                     .min_by_key(|w| w.load.load(Ordering::Relaxed));
                 let reserved = match best {
                     // Spread before pipelining: providers cap bandwidth per connection,
@@ -554,6 +565,12 @@ impl Pool {
                             || (!fresh && (impatient || (!spare && state.connecting == 0))) =>
                     {
                         let ahead = w.load.load(Ordering::Relaxed);
+                        // An unscoped caller makes the connection mixed until idle;
+                        // scoped callers may not pipeline behind that unknown work.
+                        if ahead == 0 || lane.is_none() {
+                            w.lane
+                                .store(lane.map_or(0, |lane| lane.0), Ordering::Relaxed);
+                        }
                         return Ok((
                             w.tx.clone(),
                             Load::watched(&w.load, &self.changed),
@@ -579,7 +596,7 @@ impl Pool {
                 (reserved, live)
             };
             if reserved {
-                let mut open = Box::pin(self.open(self.connecting()));
+                let mut open = Box::pin(self.open(self.connecting(), lane));
                 let opened = if stream && live {
                     let patience = STREAM_CONNECT_WAIT.min(self.endpoint.timeout() / 2);
                     if let Ok(opened) = timeout(patience, &mut open).await {
@@ -616,6 +633,7 @@ impl Pool {
     fn open(
         &self,
         connecting: Connecting,
+        lane: Option<Lane>,
     ) -> impl Future<Output = Result<Option<(mpsc::Sender<Request>, Load, u32)>, Failure>> + Send + 'static
     {
         let (endpoint, config) = (self.endpoint.clone(), self.config);
@@ -680,6 +698,7 @@ impl Pool {
             state.connect_error = None;
             state.connected = true;
             state.workers.push(Worker {
+                lane: AtomicU64::new(lane.map_or(0, |lane| lane.0)),
                 tx: tx.clone(),
                 load,
                 task: task.abort_handle(),

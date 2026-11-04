@@ -21,7 +21,7 @@ use bytes::Bytes;
 
 pub use article::{Body, BodyExpectation};
 pub use bandwidth::Bandwidth;
-pub use client::{BodySink, Client, Lease, Provider};
+pub use client::{BodySink, Client, Lane, Lease, Provider};
 pub use connection::{Connection, ConnectionStats, Endpoint, Phase, Progress, Timing, TlsMode};
 pub use downloads::Downloads;
 pub use pool::{Pool, PoolConfig};

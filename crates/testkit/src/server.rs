@@ -40,7 +40,7 @@ struct Behavior {
     stall: Option<(usize, Duration, bool)>,
     /// Connections beyond `max_connections` get no greeting instead of a 502.
     hang: bool,
-    gate: Option<Arc<Gate>>,
+    gates: Vec<Arc<Gate>>,
 }
 
 impl Default for Behavior {
@@ -51,7 +51,7 @@ impl Default for Behavior {
             impairment: Impairment::default(),
             stall: None,
             hang: false,
-            gate: None,
+            gates: Vec::new(),
         }
     }
 }
@@ -103,23 +103,44 @@ impl LoopbackServer {
     pub async fn start_gated(
         articles: impl IntoIterator<Item = Article>,
     ) -> io::Result<(Self, BodyGate)> {
-        let (started, seen) = watch::channel(None);
-        let (release, wait) = watch::channel(false);
-        let behavior = Behavior {
-            gate: Some(Arc::new(Gate {
+        let (server, mut gates) = Self::start_gated_many(articles, 1).await?;
+        Ok((server, gates.remove(0)))
+    }
+    /// Independently holds the first `count` BODY replies, in receive order.
+    pub async fn start_gated_many(
+        articles: impl IntoIterator<Item = Article>,
+        count: usize,
+    ) -> io::Result<(Self, Vec<BodyGate>)> {
+        if !(1..=64).contains(&count) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid gate count",
+            ));
+        }
+        let mut gates = Vec::new();
+        let mut controls = Vec::new();
+        for _ in 0..count {
+            let (started, seen) = watch::channel(None);
+            let (release, wait) = watch::channel(false);
+            gates.push(Arc::new(Gate {
                 started,
                 release: wait,
-            })),
-            ..Behavior::default()
-        };
-        let server = Self::start_with(articles, None, behavior).await?;
-        Ok((
-            server,
-            BodyGate {
+            }));
+            controls.push(BodyGate {
                 started: seen,
                 release,
+            });
+        }
+        let server = Self::start_with(
+            articles,
+            None,
+            Behavior {
+                gates,
+                ..Behavior::default()
             },
-        ))
+        )
+        .await?;
+        Ok((server, controls))
     }
 
     /// Delays handshakes and responses and throttles bodies like a remote provider.
@@ -351,9 +372,7 @@ async fn serve<S: AsyncRead + AsyncWrite>(
             "BODY" => {
                 remaining -= 1;
                 let nth = limit.bodies.fetch_add(1, Ordering::SeqCst);
-                if nth == 0
-                    && let Some(gate) = &limit.behavior.gate
-                {
+                if let Some(gate) = limit.behavior.gates.get(nth) {
                     let id = arg.trim().trim_start_matches('<').trim_end_matches('>');
                     gate.started.send_replace(Some(id.to_owned()));
                     let mut release = gate.release.clone();

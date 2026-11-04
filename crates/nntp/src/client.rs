@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
@@ -14,6 +14,23 @@ use crate::missing::Missing;
 use crate::pool::{Command, Failure, Load, Pool, Tag, join_all};
 use crate::stats::{self, ProviderStats, Rescue, Stats, Workload};
 use crate::{Error, Progress};
+
+/// Requests in one lane may pipeline together, but never behind another lane's
+/// unfinished reply. Import jobs use distinct lanes so a stalled job cannot capture
+/// a different job's otherwise independent connection work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lane(pub(crate) u64);
+impl Default for Lane {
+    fn default() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        loop {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            if id != 0 {
+                return Self(id);
+            }
+        }
+    }
+}
 
 /// Sees every body a request returns, with the message-id, who asked, and whether the
 /// caller had already left (the reply was drained to keep the connection in sync).
@@ -380,6 +397,50 @@ impl Client {
             },
         )
         .await
+    }
+
+    /// A BODY belonging to one independently scheduled operation. Requests from the
+    /// same lane retain normal pipelining and the global provider/permit limits.
+    pub async fn body_in_lane(
+        &self,
+        message_id: &str,
+        lane: Lane,
+        workload: Workload,
+        probe: Option<&Probe>,
+        begin: Option<u64>,
+    ) -> Result<Body, Error> {
+        self.body_tagged(
+            message_id,
+            Tag {
+                lane: Some(lane),
+                workload,
+                probe: probe.cloned(),
+                begin,
+                ..Tag::UNTRACKED
+            },
+        )
+        .await
+    }
+    /// A STAT in the same connection lane as that operation's BODY requests.
+    pub async fn stat_in_lane(
+        &self,
+        message_id: &str,
+        lane: Lane,
+        workload: Workload,
+        probe: Option<&Probe>,
+    ) -> Result<(), Error> {
+        self.request(
+            Command::Stat,
+            message_id,
+            Tag {
+                lane: Some(lane),
+                workload,
+                probe: probe.cloned(),
+                ..Tag::UNTRACKED
+            },
+        )
+        .await
+        .map(drop)
     }
 
     /// A playback body racing a slow fetch of the same article: waits for an idle
