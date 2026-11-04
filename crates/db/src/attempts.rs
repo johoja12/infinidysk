@@ -138,3 +138,52 @@ impl Db {
         rows.into_iter().map(Attempt::validate).collect()
     }
 }
+
+/// The terminal journal outcome and its required health readback are one commit.
+pub struct Completion<'a> {
+    pub state: &'a str,
+    pub next_attempt: i64,
+    pub now: i64,
+    pub payload: &'a str,
+    pub blob: infinidysk_core::BlobId,
+    pub raw: &'a [u8],
+}
+impl Db {
+    /// No acknowledged healthy/repaired outcome can leave the old replacement state
+    /// active. Stale metadata, a hidden source or an already accepted transition
+    /// changes neither side of this transaction.
+    pub async fn complete_repair_attempt(
+        &self,
+        old: &Attempt,
+        done: Completion<'_>,
+    ) -> Result<bool, Error> {
+        if old.state != "publishing"
+            || !matches!(done.state, "healthy" | "repaired")
+            || !valid(
+                done.state,
+                old.priority,
+                done.next_attempt,
+                done.now,
+                done.payload,
+            )
+            || old.revision == i64::MAX
+        {
+            return Err(Error::Corrupt("invalid repair completion"));
+        }
+        let changed = on!(self,pool=>{
+            let mut tx=pool.begin().await?;
+            let journal=sqlx::query("UPDATE par2_attempts SET state=$2,next_attempt=$3,updated_at=$4,payload=$5,revision=revision+1 WHERE id=$1 AND revision=$6 AND state='publishing' AND item_id=$7 AND source=$8")
+                .bind(old.id).bind(done.state).bind(done.next_attempt).bind(done.now).bind(done.payload).bind(old.revision).bind(old.item_id).bind(&old.source).execute(&mut *tx).await?.rows_affected()==1;
+            let checked=if journal {sqlx::query("UPDATE items SET health_state=0,next_health_check=$2,suspect_since=NULL,health_requested_at=CASE WHEN recheck_requested=0 THEN $2 ELSE COALESCE(health_requested_at,$2) END,recheck_requested=2,recheck_generation=recheck_generation+1 WHERE id=$1 AND health_state<>5 AND meta_blob=$3 AND EXISTS(SELECT 1 FROM blobs WHERE id=$3 AND data=$4)")
+                .bind(old.item_id).bind(done.now).bind(done.blob.0).bind(done.raw).execute(&mut *tx).await?.rows_affected()==1} else {false};
+            if journal && checked {
+                sqlx::query("INSERT INTO urgent_health(item_id) VALUES($1) ON CONFLICT(item_id) DO NOTHING").bind(old.item_id).execute(&mut *tx).await?;
+                tx.commit().await?;true
+            } else {tx.rollback().await?;false}
+        });
+        if changed {
+            self.notify(super::Change::Health);
+        }
+        Ok(changed)
+    }
+}

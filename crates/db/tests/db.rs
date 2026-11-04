@@ -10,6 +10,7 @@ async fn exercise(db: &Db) {
     repair_lineage(db).await;
     repair_observations(db).await;
     repair_attempts(db).await;
+    repair_completion(db).await;
     content_sweep(db).await;
     fair_rechecks(db).await;
     library_catalogue(db).await;
@@ -2211,4 +2212,176 @@ async fn repair_attempts(db: &Db) {
             );
         }
     }
+}
+
+async fn repair_completion(db: &Db) {
+    use infinidysk_db::attempts::Completion;
+    let parent = db
+        .item(ItemId::CONTENT)
+        .await
+        .expect("root")
+        .expect("content");
+    let mut item =
+        Item::child(&parent, "repair-completion-fixture.bin", ItemKind::NzbFile).expect("item");
+    let blob = BlobId::new();
+    item.meta_blob = Some(blob);
+    db.insert(std::slice::from_ref(&item), &[(blob, b"current")])
+        .await
+        .expect("insert");
+    let (_, mut status) = db.health(item.id).await.expect("health").expect("file");
+    status.state = HealthState::Repairing;
+    db.set_health(item.id, &status, Recheck::None)
+        .await
+        .expect("repairing");
+    let source = [8; 32];
+    let row = db
+        .enqueue_repair_attempt(item.id, &source, 0, 10, "verified")
+        .await
+        .expect("queue")
+        .expect("capacity");
+    assert!(
+        db.update_repair_attempt(&row, "publishing", 0, 10, 10, "manifest")
+            .await
+            .expect("intent")
+    );
+    let publishing = db
+        .repair_attempt(item.id, &source)
+        .await
+        .expect("readback")
+        .expect("intent");
+    assert!(
+        !db.complete_repair_attempt(
+            &publishing,
+            Completion {
+                state: "repaired",
+                next_attempt: 20,
+                now: 11,
+                payload: "complete",
+                blob,
+                raw: b"stale"
+            }
+        )
+        .await
+        .expect("stale source")
+    );
+    assert_eq!(
+        db.repair_attempt(item.id, &source)
+            .await
+            .expect("job")
+            .expect("job")
+            .revision,
+        publishing.revision
+    );
+    assert_eq!(
+        db.health(item.id)
+            .await
+            .expect("health")
+            .expect("file")
+            .1
+            .state,
+        HealthState::Repairing
+    );
+    assert!(
+        db.complete_repair_attempt(
+            &publishing,
+            Completion {
+                state: "repaired",
+                next_attempt: 20,
+                now: 11,
+                payload: "complete",
+                blob,
+                raw: b"current"
+            }
+        )
+        .await
+        .expect("atomic complete")
+    );
+    let (_, checked) = db.health(item.id).await.expect("health").expect("file");
+    assert_eq!(checked.state, HealthState::Unchecked);
+    assert_eq!(checked.recheck, Recheck::Playback);
+    assert_eq!(checked.recheck_generation, status.recheck_generation + 1);
+    assert!(db.health_is_urgent(item.id).await.expect("urgent"));
+    assert!(
+        !db.complete_repair_attempt(
+            &publishing,
+            Completion {
+                state: "repaired",
+                next_attempt: 20,
+                now: 11,
+                payload: "replay",
+                blob,
+                raw: b"current"
+            }
+        )
+        .await
+        .expect("accepted completion cannot replay")
+    );
+    assert_eq!(
+        db.health(item.id)
+            .await
+            .expect("health")
+            .expect("file")
+            .1
+            .recheck_generation,
+        checked.recheck_generation
+    );
+    let other = [9; 32];
+    let row = db
+        .enqueue_repair_attempt(item.id, &other, 0, 12, "verified")
+        .await
+        .expect("queue")
+        .expect("capacity");
+    assert!(
+        db.update_repair_attempt(&row, "publishing", 0, 12, 12, "manifest")
+            .await
+            .expect("intent")
+    );
+    let row = db
+        .repair_attempt(item.id, &other)
+        .await
+        .expect("readback")
+        .expect("intent");
+    let mut hidden = checked;
+    hidden.state = HealthState::Hidden;
+    db.set_health(item.id, &hidden, Recheck::None)
+        .await
+        .expect("replacement accepted");
+    assert!(
+        !db.complete_repair_attempt(
+            &row,
+            Completion {
+                state: "healthy",
+                next_attempt: 20,
+                now: 13,
+                payload: "complete",
+                blob,
+                raw: b"current"
+            }
+        )
+        .await
+        .expect("cannot reset replacement reconciliation")
+    );
+    assert_eq!(
+        db.health(item.id)
+            .await
+            .expect("health")
+            .expect("file")
+            .1
+            .state,
+        HealthState::Hidden
+    );
+    assert!(
+        db.update_repair_attempt(&row, "superseded", 0, 13, 13, "source removed")
+            .await
+            .expect("cleanup")
+    );
+    db.delete_item(item.id).await.expect("remove source");
+    assert_eq!(
+        db.repair_attempt(item.id, &source)
+            .await
+            .expect("history")
+            .expect("durable history")
+            .state,
+        "repaired"
+    );
 }

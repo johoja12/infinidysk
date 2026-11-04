@@ -143,6 +143,11 @@ pub type RepairAuthority =
 
 pub type CachedCopy = Arc<dyn Fn(Item) -> BoxFuture<'static, Option<bool>> + Send + Sync>;
 
+/// A durable local-repair queue hook. It must only admit/read back work, never
+/// fetch provider data or publish while running inside the health worker.
+pub type LocalRepair =
+    Arc<dyn Fn(Item, HealthStatus) -> BoxFuture<'static, Result<bool, Error>> + Send + Sync>;
+
 pub type ReadHold = Box<dyn std::any::Any + Send + Sync>;
 pub struct Health {
     read_gate: Option<Box<dyn Fn(ItemId) -> Option<ReadHold> + Send + Sync>>,
@@ -155,6 +160,7 @@ pub struct Health {
     in_use: Box<dyn Fn(ItemId) -> bool + Send + Sync>,
     analyzer: Option<Analyzer>,
     cached_copy: Option<CachedCopy>,
+    local_repair: Option<LocalRepair>,
     repair_authority: Option<RepairAuthority>,
     http: reqwest::Client,
     arr_wait: Duration,
@@ -226,6 +232,7 @@ impl Health {
             in_use: Box::new(|_| false),
             analyzer: None,
             cached_copy: None,
+            local_repair: None,
             repair_authority: None,
             http,
             arr_wait: ARR_WAIT,
@@ -277,6 +284,13 @@ impl Health {
     #[must_use]
     pub fn with_cached_copy(mut self, check: CachedCopy) -> Self {
         self.cached_copy = Some(check);
+        self
+    }
+
+    /// Admit and observe durable local repair without holding the replacement barrier.
+    #[must_use]
+    pub fn with_local_repair(mut self, repair: LocalRepair) -> Self {
+        self.local_repair = Some(repair);
         self
     }
 
@@ -504,6 +518,25 @@ impl Health {
         self.db.due_health_work(i64::MAX, routine, limit).await
     }
 
+    /// Callers hold database write admission before entry. Scheduling a fresh
+    /// check and recording its local repair outcome commit atomically, so loss of
+    /// the response cannot replay a completion or expose an old replacement state.
+    pub async fn complete_local_repair(
+        &self,
+        attempt: &infinidysk_db::attempts::Attempt,
+        done: infinidysk_db::attempts::Completion<'_>,
+    ) -> Result<bool, Error> {
+        let _mutation = Arc::clone(&self.mutation_gate).write_owned().await;
+        let _publication = self.publication_gate.lock().await;
+        let changed = self.db.complete_repair_attempt(attempt, done).await?;
+        if changed {
+            self.priority_cancel
+                .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+            self.wake.notify_one();
+        }
+        Ok(changed)
+    }
+
     /// Asks for a check of `id` soon; an `action_needed` file starts over as unchecked.
     /// `false` if there is no such file.
     pub async fn request_check(&self, id: ItemId) -> Result<bool, Error> {
@@ -591,6 +624,7 @@ impl Health {
         missing: &[usize],
         corrupt: &[usize],
     ) -> Result<(), Error> {
+        let _writing = self.db.write_permit().await;
         self.report_source(id, None, missing, corrupt)
             .await
             .map(|_| ())
@@ -631,6 +665,14 @@ impl Health {
             self.priority_cancel
                 .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
             self.wake.notify_one();
+            if self.settings.borrow().auto_repair
+                && let Some(local) = &self.local_repair
+            {
+                let current = self.db.health(id).await?;
+                if let Some((current, status)) = current {
+                    local(current, status).await?;
+                }
+            }
         }
         Ok(true)
     }
@@ -816,6 +858,13 @@ impl Health {
             }
         }
         self.db.set_health(item.id, &next, status.recheck).await?;
+        if next.state == HealthState::Suspect
+            && settings.auto_repair
+            && let Some(local) = &self.local_repair
+            && let Some((current, status)) = self.db.health(item.id).await?
+        {
+            local(current, status).await?;
+        }
         if let Some(revision) = checked_repair {
             self.db
                 .record_health_repair_observation(
@@ -1005,6 +1054,14 @@ impl Health {
         }
         if !settings.auto_repair {
             return self.give_up(item, status, "automatic repair is off").await;
+        }
+        if let Some(local) = &self.local_repair
+            && local(item.clone(), status).await?
+        {
+            self.db
+                .postpone_health(item.id, now_ms() + 5_000, status.recheck_generation)
+                .await?;
+            return Ok(());
         }
         let _source_mutation = Arc::clone(&self.mutation_gate).read_owned().await;
         if self.observe_overlay(item, status).await? {

@@ -411,3 +411,102 @@ async fn confirmed_absence_after_patch_eviction_does_not_loop_through_the_same_r
     drop(db);
     std::fs::remove_dir_all(path).expect("cleanup");
 }
+
+#[tokio::test]
+async fn local_repair_admission_precedes_the_replacement_barrier_and_defers_destructive_work() {
+    use std::sync::atomic::AtomicUsize;
+    let (db, item, client, store, path) = setup(1).await;
+    let h = health(db.clone(), client);
+    let gate = h.mutation_gate();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let h = h.with_local_repair(Arc::new({
+        let calls = calls.clone();
+        move |_, _| {
+            let calls = calls.clone();
+            let gate = gate.clone();
+            Box::pin(async move {
+                assert!(
+                    gate.try_write().is_ok(),
+                    "admission must run before replacement takes its shared publication barrier"
+                );
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            })
+        }
+    }));
+    assert!(h.step().await.expect("queued local repair"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(db.item(item.id).await.expect("source").is_some());
+    assert_eq!(
+        db.health(item.id)
+            .await
+            .expect("health")
+            .expect("file")
+            .1
+            .state,
+        HealthState::Repairing
+    );
+    let (_, mut state) = db.health(item.id).await.expect("health").expect("file");
+    state.state = HealthState::Unchecked;
+    state.next_check = Some(0);
+    db.set_health(item.id, &state, state.recheck)
+        .await
+        .expect("unchecked");
+    h.report(item.id, &[0], &[]).await.expect("playback fault");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "read/warm faults may admit non-destructive PAR2 work before Arr confirmation"
+    );
+    assert!(
+        db.health_is_urgent(item.id)
+            .await
+            .expect("persistent urgency")
+    );
+    drop(h);
+    drop(store);
+    drop(db);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+#[tokio::test]
+async fn disabling_automatic_repair_does_not_admit_new_local_attempts() {
+    use std::sync::atomic::AtomicUsize;
+    let (db, item, client, store, path) = setup(1).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let h = Health::new(
+        db.clone(),
+        client,
+        watch::channel(vec![]).1,
+        watch::channel(Settings {
+            auto_repair: false,
+            media_probe: false,
+            unowned_action: UnownedAction::ActionNeeded,
+            ..Settings::default()
+        })
+        .1,
+    )
+    .expect("health")
+    .with_local_repair(Arc::new({
+        let calls = calls.clone();
+        move |_, _| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            })
+        }
+    }));
+    assert!(h.step().await.expect("automatic repair off"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let (_, mut state) = db.health(item.id).await.expect("health").expect("file");
+    state.state = HealthState::Unchecked;
+    db.set_health(item.id, &state, state.recheck)
+        .await
+        .expect("unchecked");
+    h.report(item.id, &[0], &[]).await.expect("read report");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    drop(h);
+    drop(store);
+    drop(db);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
