@@ -872,3 +872,31 @@ provider-free NNTP reads, exhaust the original request allowance at assembly, an
 switch providers after whole-file verification to prove that changed healthy bytes
 in a mixed article are rejected. Automatic discovery, durable scheduling/outcomes,
 source/reader-gated publication and the separate worker remain open.
+
+### Payload retention and conclusive repair readback
+
+Known absent repair payloads can now use provider fallback while retaining their
+repair revision. Every candidate BODY must match both immutable geometry and the
+retained SHA-256 before delivery. Progressive delivery is disabled for this path.
+Validation precedes normal and abandoned cache sinks; cancelled wrong original
+responses cannot enter the repaired namespace. STAT also reads and proves the BODY.
+Provider absence is conclusive only when every configured provider answered;
+no providers and repair-directory I/O uncertainty remain unavailable.
+
+A durable per-item health receipt binds the exact source metadata identity and its
+repaired article revisions. Only a conclusive check of still-current metadata and
+request generation can record it. Rechecking a retained tombstone therefore cannot
+keep resetting a confirmed missing source into the same readback, including after
+restart. Changed repair revisions require a fresh independent check. Native-copy
+retention and the existing Arr/reader guards still apply before replacement.
+
+Health also holds the publication barrier from generation comparison through verdict
+and receipt persistence. A queued writer cannot activate in that gap. A deterministic
+concurrency test proves that the old verdict records only the old revision.
+
+Focused qualification: 45 tests pass across database SQLite/PostgreSQL, health and
+decoded-cache unit/integration targets; workspace all-target Clippy passes. Main
+migration 0018 is additive and its receipts are deleted with their item. Back up the
+config directory and external cache metadata before upgrading. No setting, API
+shape or setup-wizard control is introduced. Automatic PAR2 discovery, durable
+attempt scheduling/outcomes and the worker still remain open.

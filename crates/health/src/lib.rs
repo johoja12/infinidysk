@@ -24,6 +24,7 @@ use infinidysk_db::{
     ProbeAttempt, ProbeOutcome, Recheck, Repair, now_ms,
 };
 use infinidysk_nntp::{Articles, Client, RepairRevision};
+use sha2::{Digest as _, Sha256};
 use tokio::sync::{Notify, watch};
 
 use check::Outcome;
@@ -665,6 +666,9 @@ impl Health {
         } else {
             None
         };
+        // Hold source publication out from the generation comparison through
+        // verdict/receipt writes. A comparison alone leaves a publication race.
+        let _source_publication = Arc::clone(&self.mutation_gate).read_owned().await;
         let _publication = self.publication_gate.lock().await;
         if self
             .db
@@ -680,9 +684,14 @@ impl Health {
                 .await?;
             return Ok(());
         }
-        let current = if changed {
+        let next_raw = if changed {
+            Some(blob::encode_meta(&meta)?)
+        } else {
+            None
+        };
+        let current = if let Some(next_raw) = &next_raw {
             self.db
-                .update_metadata_if_current(item.id, blob_id, &raw, &blob::encode_meta(&meta)?)
+                .update_metadata_if_current(item.id, blob_id, &raw, next_raw)
                 .await?
         } else {
             self.db.metadata_is_current(item.id, blob_id, &raw).await?
@@ -693,6 +702,11 @@ impl Health {
                 .await?;
             return Ok(());
         }
+        let checked_repair = if matches!(&outcome, Outcome::Inconclusive(_)) {
+            None
+        } else {
+            self.repair_identity(blob_id, &meta)?
+        };
         let probe = self.db.media_probe(item.id).await?;
         let now = now_ms();
         let mut next = HealthStatus {
@@ -802,6 +816,17 @@ impl Health {
             }
         }
         self.db.set_health(item.id, &next, status.recheck).await?;
+        if let Some(revision) = checked_repair {
+            self.db
+                .record_health_repair_observation(
+                    item.id,
+                    &revision,
+                    blob_id,
+                    next_raw.as_deref().unwrap_or(&raw),
+                    status.recheck_generation,
+                )
+                .await?;
+        }
         Ok(())
     }
 
@@ -871,6 +896,32 @@ impl Health {
         Ok(if settled { 7 * DAY_MS } else { DAY_MS })
     }
 
+    fn repair_identity(&self, blob: BlobId, meta: &FileMeta) -> Result<Option<[u8; 32]>, Error> {
+        let mut hash = Sha256::new();
+        hash.update(b"health-repair-observation-v1");
+        hash.update(blob.0.as_bytes());
+        hash.update(meta.content_identity()?);
+        let mut repaired = false;
+        let runs = match meta {
+            FileMeta::Nzb(file) => vec![&file.segments],
+            FileMeta::Multipart(file) => file.parts.iter().map(|p| &p.segments).collect(),
+        };
+        for run in runs {
+            for segment in &run.items {
+                match self.client.repair_revision(&segment.id) {
+                    RepairRevision::Base => hash.update([0]),
+                    RepairRevision::Pending => return Ok(None),
+                    RepairRevision::Repaired(revision) => {
+                        repaired = true;
+                        hash.update([1]);
+                        hash.update(revision);
+                    }
+                }
+            }
+        }
+        Ok(repaired.then(|| hash.finalize().into()))
+    }
+
     /// Publication can outlive the process that queued it. Never delete the source
     /// while its repair is pending, or before checking repairs that cover its recorded
     /// holes. Current bytes still need a fresh check; this does not declare health.
@@ -904,6 +955,14 @@ impl Health {
             }
         }
         if !pending && (holes == 0 || !covered) {
+            return Ok(false);
+        }
+        if !pending
+            && let Some(revision) = self.repair_identity(blob_id, &meta)?
+            && self.db.health_repair_observed(item.id, &revision).await?
+        {
+            // Current repaired bytes already had a conclusive check. A tombstone
+            // cannot keep resetting a confirmed-missing source into readback.
             return Ok(false);
         }
         let _publication = self.publication_gate.lock().await;
@@ -1584,6 +1643,141 @@ mod tests {
     #[allow(dead_code, reason = "only needs to type-check")]
     fn run_is_spawnable(health: Arc<Health>) {
         tokio::spawn(async move { health.run().await });
+    }
+
+    #[tokio::test]
+    async fn repair_publication_waits_until_the_health_verdict_and_receipt_are_durable() {
+        use bytes::Bytes;
+        use infinidysk_core::{ItemKind, NzbFile, Segment, Segments};
+        use infinidysk_native_cache::repair::{Geometry, Patch, Proof, Store};
+        let path = std::env::temp_dir().join(format!(
+            "infinidysk-health-publication-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&path).expect("directory");
+        let db = Db::connect(&format!("sqlite:{}", path.join("main.sqlite").display()))
+            .await
+            .expect("db");
+        let root = db
+            .item(ItemId::CONTENT)
+            .await
+            .expect("root")
+            .expect("content");
+        let mut item = Item::child(&root, "fixture.mkv", ItemKind::NzbFile).expect("file");
+        let blob = BlobId::new();
+        item.meta_blob = Some(blob);
+        item.size = Some(8);
+        let meta = FileMeta::Nzb(NzbFile {
+            segments: Segments {
+                items: vec![Segment {
+                    id: "race@fixture".into(),
+                    size: 8,
+                    fallbacks: vec![],
+                }],
+                sizes_trusted: true,
+                ..Segments::default()
+            },
+            proof: None,
+        });
+        db.insert(
+            std::slice::from_ref(&item),
+            &[(blob, &blob::encode_meta(&meta).expect("encode"))],
+        )
+        .await
+        .expect("insert");
+        let patch = |data| Patch {
+            message_id: "race@fixture".into(),
+            geometry: Geometry {
+                offset: 0,
+                file_size: 8,
+                part: None,
+                total: None,
+            },
+            proof: Proof {
+                set: [1; 16],
+                file: [2; 16],
+                file_md5: [3; 16],
+                file_length: 8,
+            },
+            data: Bytes::from_static(data),
+        };
+        let store = Store::open(&path.join("repair")).await.expect("store");
+        store
+            .publish(vec![patch(b"restored")])
+            .await
+            .expect("old repair");
+        let client = Arc::new(Client::new([]));
+        assert!(client.set_repairs(store.clone()));
+        let settings = Settings {
+            media_probe: false,
+            ..Settings::default()
+        };
+        let h = Arc::new(
+            Health::new(
+                db.clone(),
+                client,
+                watch::channel(vec![]).1,
+                watch::channel(settings).1,
+            )
+            .expect("health"),
+        );
+        assert!(store.set_mutation_gate(h.mutation_gate()));
+        let old_identity = h
+            .repair_identity(blob, &meta)
+            .expect("identity")
+            .expect("repair");
+        let (_, status) = db.health(item.id).await.expect("health").expect("file");
+        let held = h.publication_gate.lock().await;
+        let check = {
+            let h = h.clone();
+            let item = item.clone();
+            tokio::spawn(async move { h.check(&item, status, &settings).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.mutation_gate.try_write().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("check holds the source publication guard before metadata writes");
+        let publish = {
+            let store = store.clone();
+            let patch = patch(b"newbytes");
+            tokio::spawn(async move { store.publish(vec![patch]).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while h.mutation_gate.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publication queued");
+        assert!(
+            !store.is_pending(),
+            "publication cannot activate between generation comparison and verdict persistence"
+        );
+        drop(held);
+        check.await.expect("check task").expect("check");
+        publish.await.expect("publication task").expect("publish");
+        assert!(
+            db.health_repair_observed(item.id, &old_identity)
+                .await
+                .expect("old verdict receipt")
+        );
+        let new_identity = h
+            .repair_identity(blob, &meta)
+            .expect("identity")
+            .expect("new repair");
+        assert_ne!(old_identity, new_identity);
+        assert!(
+            !db.health_repair_observed(item.id, &new_identity)
+                .await
+                .expect("new revision is unobserved")
+        );
+        drop(h);
+        drop(store);
+        drop(db);
+        std::fs::remove_dir_all(path).expect("cleanup");
     }
 
     #[test]

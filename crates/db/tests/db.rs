@@ -8,6 +8,7 @@ use infinidysk_db::{
 /// Exercises the tree, blob and config paths that must behave the same on both backends.
 async fn exercise(db: &Db) {
     repair_lineage(db).await;
+    repair_observations(db).await;
     content_sweep(db).await;
     fair_rechecks(db).await;
     library_catalogue(db).await;
@@ -1948,5 +1949,75 @@ async fn repair_lineage(db: &Db) {
     assert_eq!(
         db.repair_lineage().await.expect("retained"),
         Some(Lineage { id, epoch: 3 })
+    );
+}
+
+async fn repair_observations(db: &Db) {
+    let parent = db
+        .item(ItemId::CONTENT)
+        .await
+        .expect("root")
+        .expect("content");
+    let mut item =
+        Item::child(&parent, "repair-observation-fixture.bin", ItemKind::NzbFile).expect("file");
+    let blob = BlobId::new();
+    item.meta_blob = Some(blob);
+    db.insert(std::slice::from_ref(&item), &[(blob, b"current")])
+        .await
+        .expect("insert");
+    let generation = db
+        .health(item.id)
+        .await
+        .expect("health")
+        .expect("file")
+        .1
+        .recheck_generation;
+    let revision = [1; 32];
+    assert!(
+        !db.health_repair_observed(item.id, &revision)
+            .await
+            .expect("absent")
+    );
+    assert!(
+        !db.record_health_repair_observation(item.id, &revision, blob, b"stale", generation)
+            .await
+            .expect("stale bytes")
+    );
+    assert!(
+        !db.record_health_repair_observation(item.id, &revision, blob, b"current", generation + 1)
+            .await
+            .expect("stale request")
+    );
+    assert!(
+        !db.record_health_repair_observation(
+            item.id,
+            &revision,
+            BlobId::new(),
+            b"current",
+            generation
+        )
+        .await
+        .expect("other source")
+    );
+    assert!(
+        db.record_health_repair_observation(item.id, &revision, blob, b"current", generation)
+            .await
+            .expect("current receipt")
+    );
+    assert!(
+        db.health_repair_observed(item.id, &revision)
+            .await
+            .expect("persisted")
+    );
+    assert!(
+        !db.health_repair_observed(item.id, &[2; 32])
+            .await
+            .expect("new revision")
+    );
+    db.delete_item(item.id).await.expect("delete");
+    assert!(
+        !db.health_repair_observed(item.id, &revision)
+            .await
+            .expect("cascade")
     );
 }

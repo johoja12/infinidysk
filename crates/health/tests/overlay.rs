@@ -298,3 +298,116 @@ async fn disabling_new_repairs_does_not_skip_readback_of_previously_committed_da
     drop(db);
     std::fs::remove_dir_all(path).expect("cleanup");
 }
+
+#[tokio::test]
+async fn confirmed_absence_after_patch_eviction_does_not_loop_through_the_same_readback_after_restart()
+ {
+    use infinidysk_nntp::{Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode};
+    use infinidysk_testkit::LoopbackServer;
+    use std::time::Duration;
+    let (db, item, client, store, path) = setup(1).await;
+    store.publish(vec![patch(8)]).await.expect("repair");
+    store
+        .evict_payload("source-0@fixture")
+        .await
+        .expect("retention");
+    let server = LoopbackServer::start([]).await.expect("server");
+    let pool = Pool::new(
+        Endpoint::new(
+            "127.0.0.1",
+            server.addr().port(),
+            TlsMode::Plain,
+            None,
+            Duration::from_secs(5),
+        )
+        .expect("endpoint"),
+        PoolConfig {
+            max_connections: 1,
+            min_connections: 0,
+            pipeline_depth: 1,
+            idle_timeout: Duration::from_secs(5),
+        },
+        Downloads::new(2),
+    )
+    .expect("pool");
+    client.replace([Provider {
+        pool,
+        key: "fixture".into(),
+        name: "fixture".into(),
+        priority: 0,
+        backbone: None,
+    }]);
+    let h = health(db.clone(), client.clone());
+    assert!(h.step().await.expect("readback admission"));
+    assert!(h.step().await.expect("fresh confirmed provider miss"));
+    let (_, mut status) = db.health(item.id).await.expect("health").expect("file");
+    assert_eq!(status.state, HealthState::Suspect);
+    status.suspect_since = Some(0);
+    status.next_check = Some(0);
+    db.set_health(item.id, &status, status.recheck)
+        .await
+        .expect("confirmation due");
+    assert!(h.step().await.expect("second provider miss"));
+    assert_eq!(
+        db.health(item.id)
+            .await
+            .expect("health")
+            .expect("file")
+            .1
+            .state,
+        HealthState::Repairing
+    );
+    drop(h);
+    let h = health(db.clone(), client);
+    assert!(h.step().await.expect("replacement policy after restart"));
+    assert_eq!(
+        db.health(item.id)
+            .await
+            .expect("health")
+            .expect("file")
+            .1
+            .state,
+        HealthState::ActionNeeded,
+        "same repair revision cannot keep resetting confirmed absence"
+    );
+    let mut newer = patch(8);
+    newer.data = Bytes::from_static(b"newbytes");
+    store
+        .publish(vec![newer])
+        .await
+        .expect("new repair revision");
+    let (_, mut status) = db.health(item.id).await.expect("health").expect("file");
+    status.state = HealthState::Repairing;
+    status.next_check = Some(0);
+    db.set_health(item.id, &status, status.recheck)
+        .await
+        .expect("retry");
+    assert!(
+        h.step()
+            .await
+            .expect("new revision needs independent readback")
+    );
+    assert_eq!(
+        db.health(item.id)
+            .await
+            .expect("health")
+            .expect("file")
+            .1
+            .state,
+        HealthState::Unchecked
+    );
+    assert!(h.step().await.expect("new revision healthy"));
+    assert_eq!(
+        db.health(item.id)
+            .await
+            .expect("health")
+            .expect("file")
+            .1
+            .state,
+        HealthState::Healthy
+    );
+    drop(h);
+    drop(store);
+    drop(db);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
