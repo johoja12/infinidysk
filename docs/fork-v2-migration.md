@@ -933,3 +933,26 @@ article lengths, consecutive unknown ranges, forged anchors, low-memory rejectio
 before provider work, request limits, outages, cancellation/permit return and actual
 bad-CRC recovery. Durable attempts, scheduling, source/reader-gated publication and
 the application worker/settings are still open. No production provider was used.
+
+### Admission for guarded repair publication
+
+VFS sessions now bind their exact cached source metadata before constructing a
+reader. A repair can reserve the target item's mutation slot and every affected
+article ID atomically. Readers in other items sharing those IDs defer publication;
+unknown opens defer it until metadata is bound. New overlapping opens cannot return
+bytes while the reservation is held. Existing and new unrelated readers continue.
+Source references are weak so completed playback history does not pin metadata.
+Dropping the reservation uses the existing last-close wakeup for the target.
+
+`Store::publish_checked` evaluates a bounded read-only source check after acquiring
+the publication barrier, before a write transaction or pending revision. A source
+changed while publication was queued is refused without changing generation/epoch.
+Cancelling validation releases the writer without an uncertain commit to replay.
+The publisher can calculate a patch's deterministic expected revision before writing,
+so the durable worker can record an intent and reconcile acceptance after restart.
+
+Focused native-cache/VFS admission tests and all-target warnings-denied Clippy pass.
+New cases cover shared sources, unknown opens, unrelated reads, target mutation
+exclusion, wakeups, metadata retention, queued-source changes and cancelled checks.
+The worker still needs to acquire these guards, write its intent and invoke the
+checked publisher. This increment does not activate automatic reconstruction.
