@@ -16,6 +16,7 @@ async fn exercise(db: &Db) {
     content_sweep(db).await;
     fair_rechecks(db).await;
     library_catalogue(db).await;
+    library_staging(db).await;
     db.save_plex_classification("fixture-snapshot")
         .await
         .expect("classification snapshot");
@@ -2505,4 +2506,246 @@ async fn warming_history(db: &Db) {
     db.write_config(&[], &["fork_prefetch_v1"])
         .await
         .expect("test cleanup");
+}
+
+async fn library_staging(db: &Db) {
+    use infinidysk_db::catalogue::Link;
+    use infinidysk_db::library_scan::{Batch, Directory};
+    let root = "/staging-fixture";
+    let old = Link {
+        root: root.into(),
+        path: format!("{root}/Collection/old-file.mkv"),
+        relative_path: "Collection/old-file.mkv".into(),
+        group_name: "Collection".into(),
+        item_id: ItemId::new().0,
+        pointer_hash: "old-pointer".into(),
+        link_kind: 1,
+        video: 1,
+    };
+    let next = Link {
+        path: format!("{root}/Collection/new-file.mkv"),
+        relative_path: "Collection/new-file.mkv".into(),
+        pointer_hash: "new-pointer".into(),
+        ..old.clone()
+    };
+    db.catalogue_replace(root, "old-scope", std::slice::from_ref(&old), 1, 0)
+        .await
+        .expect("old snapshot");
+    let worker = uuid::Uuid::new_v4();
+    let run = db
+        .catalogue_scan_claim(root, "new-scope", worker, ("1", "2"), 0)
+        .await
+        .expect("claim");
+    let collection = format!("{root}/Collection");
+    db.catalogue_scan_checkpoint(
+        root,
+        &run.worker,
+        &Batch {
+            directory: root.into(),
+            seen: vec![collection.clone()],
+            directories: vec![Directory {
+                path: collection.clone(),
+                depth: 1,
+            }],
+            links: vec![],
+            complete: true,
+        },
+    )
+    .await
+    .expect("root checkpoint");
+    let batch = Batch {
+        directory: collection.clone(),
+        seen: vec![next.path.clone()],
+        directories: vec![],
+        links: vec![next.clone()],
+        complete: false,
+    };
+    db.catalogue_scan_checkpoint(root, &run.worker, &batch)
+        .await
+        .expect("private link checkpoint");
+    assert_eq!(
+        db.catalogue_links(Some(root), None, None, false, "", 10)
+            .await
+            .expect("old snapshot"),
+        vec![old.clone()]
+    );
+    assert!(
+        !db.catalogue_scan_publish(root, "new-scope", &run.worker, 2)
+            .await
+            .expect("incomplete cannot publish")
+    );
+    let resumed = db
+        .catalogue_scan_claim(root, "new-scope", uuid::Uuid::new_v4(), ("1", "2"), 0)
+        .await
+        .expect("resume");
+    assert_eq!((resumed.visited, resumed.linked), (2, 1));
+    assert!(
+        db.catalogue_scan_suspend(root, &resumed.worker, false)
+            .await
+            .expect("foreground yield")
+    );
+    assert!(
+        db.catalogue_scan_checkpoint(root, &resumed.worker, &batch)
+            .await
+            .is_err()
+    );
+    let resumed = db
+        .catalogue_scan_claim(root, "new-scope", uuid::Uuid::new_v4(), ("1", "2"), 0)
+        .await
+        .expect("resume after yield");
+    assert_eq!((resumed.visited, resumed.linked), (2, 1));
+    assert!(
+        db.catalogue_scan_checkpoint(root, &run.worker, &batch)
+            .await
+            .is_err(),
+        "late filesystem work is fenced"
+    );
+    assert!(
+        !db.catalogue_scan_publish(root, "new-scope", &run.worker, 2)
+            .await
+            .expect("old publisher is fenced")
+    );
+    db.catalogue_scan_checkpoint(
+        root,
+        &resumed.worker,
+        &Batch {
+            directory: collection,
+            seen: vec![],
+            directories: vec![],
+            links: vec![],
+            complete: true,
+        },
+    )
+    .await
+    .expect("directory EOF");
+    db.catalogue_request(root, "new-scope", 3)
+        .await
+        .expect("refresh while scanning");
+    assert!(
+        db.catalogue_scan_publish(root, "new-scope", &resumed.worker, 4)
+            .await
+            .expect("atomic publication")
+    );
+    assert_eq!(
+        db.catalogue_links(Some(root), None, None, false, "", 10)
+            .await
+            .expect("new snapshot"),
+        vec![next]
+    );
+    let roots = db.catalogue_roots().await.expect("roots");
+    let saved = roots.iter().find(|r| r.root == root).expect("root");
+    assert_eq!(saved.completed_generation, 0);
+    assert_eq!(saved.requested_generation, 1, "refresh remains pending");
+    let another = db
+        .catalogue_scan_claim(root, "new-scope", uuid::Uuid::new_v4(), ("1", "2"), 1)
+        .await
+        .expect("fresh generation");
+    assert_eq!(another.visited, 0);
+    db.catalogue_scan_fail(root, &run.worker)
+        .await
+        .expect("stale failure is ignored");
+    assert!(
+        db.catalogue_scan_directory(root, &another.worker)
+            .await
+            .expect("pending root")
+            .is_some()
+    );
+    db.catalogue_scan_fail(root, &another.worker)
+        .await
+        .expect("current failure");
+    assert_eq!(
+        db.catalogue_links(Some(root), None, None, false, "", 10)
+            .await
+            .expect("failure preserves snapshot")
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn staged_library_progress_survives_database_restart_and_source_identity_changes_reset_it() {
+    use infinidysk_db::library_scan::Batch;
+    let path = std::env::temp_dir().join(format!("infinidysk-stage-{}.sqlite", ItemId::new()));
+    let url = format!("sqlite:{}", path.display());
+    let db = Db::connect(&url).await.expect("open");
+    let run = db
+        .catalogue_scan_claim(
+            "/library-stage",
+            "scope",
+            uuid::Uuid::new_v4(),
+            ("1", "2"),
+            0,
+        )
+        .await
+        .expect("claim");
+    db.catalogue_scan_checkpoint(
+        "/library-stage",
+        &run.worker,
+        &Batch {
+            directory: "/library-stage".into(),
+            seen: vec!["/library-stage/file.txt".into()],
+            directories: vec![],
+            links: vec![],
+            complete: false,
+        },
+    )
+    .await
+    .expect("checkpoint");
+    db.close().await;
+    drop(db);
+    let db = Db::connect(&url).await.expect("reopen");
+    let resumed = db
+        .catalogue_scan_claim(
+            "/library-stage",
+            "scope",
+            uuid::Uuid::new_v4(),
+            ("1", "2"),
+            0,
+        )
+        .await
+        .expect("resume");
+    assert_eq!(resumed.visited, 1);
+    assert_eq!(
+        db.catalogue_scan_seen(
+            "/library-stage",
+            &resumed.worker,
+            &["/library-stage/file.txt".into()]
+        )
+        .await
+        .expect("seen")
+        .len(),
+        1
+    );
+    let changed = db
+        .catalogue_scan_claim(
+            "/library-stage",
+            "scope",
+            uuid::Uuid::new_v4(),
+            ("1", "3"),
+            0,
+        )
+        .await
+        .expect("changed physical root");
+    assert_eq!(changed.visited, 0);
+    assert_eq!(
+        db.catalogue_scan_seen(
+            "/library-stage",
+            &changed.worker,
+            &["/library-stage/file.txt".into()]
+        )
+        .await
+        .expect("reset seen")
+        .len(),
+        0
+    );
+    db.catalogue_retain(&[])
+        .await
+        .expect("removed roots forget only derived metadata");
+    assert_eq!(db.catalogue_scans().await.expect("stages").len(), 0);
+    assert_eq!(db.catalogue_roots().await.expect("roots").len(), 0);
+    db.close().await;
+    drop(db);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
 }

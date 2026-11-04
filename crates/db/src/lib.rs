@@ -173,6 +173,7 @@ macro_rules! on {
 
 pub mod attempts;
 pub mod catalogue;
+pub mod library_scan;
 pub mod repair;
 pub mod sweep;
 pub mod wire;
