@@ -1356,6 +1356,7 @@ async fn sqlite_storage_round_trips() {
     let url = format!("sqlite:{}", path.display());
     let db = Db::connect(&url).await.expect("connect");
     exercise(&db).await;
+    legacy_source_retirement(&db).await;
     legacy_repair_holds(&db).await;
     completed_pointer_removal(&db).await;
     adoption_during_cleanup_keeps_the_item(&db, &url).await;
@@ -1441,6 +1442,7 @@ async fn postgres_storage_round_trips() {
     let url = format!("{base}/{name}");
     let db = Db::connect(&url).await.expect("connect");
     exercise(&db).await;
+    legacy_source_retirement(&db).await;
     legacy_repair_holds(&db).await;
     completed_pointer_removal(&db).await;
     adoption_during_cleanup_keeps_the_item(&db, &url).await;
@@ -3175,4 +3177,125 @@ async fn check_file_names_a_1x_database() {
         .expect("check");
     assert!(check.incompatible.is_some(), "{check:?}");
     remove_set(&path);
+}
+
+async fn legacy_source_retirement(db: &Db) {
+    let root = db.item(ItemId::CONTENT).await.expect("root").expect("root");
+    let mut item = Item::child(&root, "retire-fixture.bin", ItemKind::NzbFile).expect("item");
+    let blob = BlobId::new();
+    item.meta_blob = Some(blob);
+    item.size = Some(1);
+    let provenance = "original-generation";
+    db.import_items_with_sources(
+        &[(item.clone(), HealthStatus::default())],
+        &[(blob, b"original")],
+        &[(item.id, provenance.into())],
+    )
+    .await
+    .expect("import");
+    let evidence = format!("retirement-{}", item.id);
+    db.retain_legacy_repair_request(&evidence, Some(item.id), "arr-request", "immutable", None)
+        .await
+        .expect("hold");
+    assert!(
+        !db.retire_legacy_source(&evidence, &item, b"original", provenance, "proof")
+            .await
+            .expect("unresolved")
+    );
+    db.observe_legacy_repair(&evidence, Some("observed"))
+        .await
+        .expect("proof");
+    assert!(
+        !db.retire_legacy_source(&evidence, &item, b"changed", provenance, "proof")
+            .await
+            .expect("changed bytes")
+    );
+    assert!(
+        !db.retire_legacy_source(&evidence, &item, b"original", "other-generation", "proof")
+            .await
+            .expect("changed provenance")
+    );
+    let mut changed = item.clone();
+    changed.created_at += 1;
+    assert!(
+        !db.retire_legacy_source(&evidence, &changed, b"original", provenance, "proof")
+            .await
+            .expect("changed lifetime")
+    );
+    changed = item.clone();
+    changed.path.push('x');
+    assert!(
+        !db.retire_legacy_source(&evidence, &changed, b"original", provenance, "proof")
+            .await
+            .expect("changed path")
+    );
+    changed = item.clone();
+    changed.size = Some(2);
+    assert!(
+        !db.retire_legacy_source(&evidence, &changed, b"original", provenance, "proof")
+            .await
+            .expect("changed size")
+    );
+    assert!(
+        db.wake_legacy_retirement(item.id)
+            .await
+            .expect("last-reader wake")
+    );
+    assert!(
+        db.legacy_retirement_candidates(0, 100)
+            .await
+            .expect("urgent candidates")
+            .iter()
+            .any(|r| r.evidence_id == evidence)
+    );
+    db.touch_legacy_retirement(&evidence)
+        .await
+        .expect("bounded attempt checkpoint");
+    let other = format!("unresolved-{}", item.id);
+    db.retain_legacy_repair_hold(&other, None, "link-removal", "uncertain")
+        .await
+        .expect("global hold");
+    assert!(
+        !db.retire_legacy_source(&evidence, &item, b"original", provenance, "proof")
+            .await
+            .expect("global uncertainty")
+    );
+    db.observe_legacy_repair(&other, Some("observed"))
+        .await
+        .expect("global proof");
+    let intent = db
+        .prepare_regrab(item.id, "fixture", "{}")
+        .await
+        .expect("new repair");
+    assert!(
+        !db.retire_legacy_source(&evidence, &item, b"original", provenance, "proof")
+            .await
+            .expect("active repair")
+    );
+    db.checkpoint_regrab(item.id, "fixture", intent.revision, "{}", true)
+        .await
+        .expect("terminal repair");
+    assert!(
+        db.retire_legacy_source(&evidence, &item, b"original", provenance, "fresh proof")
+            .await
+            .expect("retire")
+    );
+    assert!(db.item(item.id).await.expect("missing").is_none());
+    let audit = db.legacy_repair_status().await.expect("audit");
+    let audit = audit
+        .iter()
+        .find(|r| r.evidence_id == evidence)
+        .expect("retained audit");
+    assert!(audit.retired_at.is_some());
+    assert!(!audit.source_present);
+    assert!(
+        db.legacy_repair_held(item.id)
+            .await
+            .expect("retained evidence")
+    );
+    assert!(
+        !db.retire_legacy_source(&evidence, &item, b"original", provenance, "proof")
+            .await
+            .expect("idempotent")
+    );
 }

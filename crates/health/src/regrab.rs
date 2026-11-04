@@ -80,12 +80,18 @@ impl Health {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
+            tokio::select! {_=tick.tick()=>{},()=self.legacy_wake.notified()=>{}}
             if let Err(error) = self
                 .observe_legacy_repairs(infinidysk_db::now_ms() - 5 * super::MINUTE_MS, 3)
                 .await
             {
                 tracing::warn!(reason=%error,"legacy repair observation deferred");
+            }
+            if let Err(error) = self
+                .retire_legacy_sources(infinidysk_db::now_ms() - 5 * super::MINUTE_MS, 3)
+                .await
+            {
+                tracing::warn!(reason=%error,"legacy source retirement deferred");
             }
             if let Err(error) = self
                 .observe_regrabs(infinidysk_db::now_ms() - 5 * super::MINUTE_MS, 3)
@@ -591,6 +597,170 @@ mod tests {
             "original identity cannot start a fresh repair"
         );
         assert!(db.regrab_intent(item).await.unwrap().is_none());
+        assert_eq!(remote.deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.searches.load(Ordering::SeqCst), 0);
+        task.abort();
+        db.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+    #[tokio::test]
+    async fn legacy_retirement_waits_for_readers_cache_and_authority_then_survives_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "id-legacy-retirement-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite:{}", path.display());
+        let db = Db::connect(&url).await.unwrap();
+        let root = db
+            .item(infinidysk_core::ItemId::CONTENT)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut item = Item::child(&root, "fixture.mkv", ItemKind::NzbFile).unwrap();
+        let blob = BlobId::new();
+        item.meta_blob = Some(blob);
+        item.size = Some(1);
+        let meta = FileMeta::Nzb(NzbFile {
+            segments: Segments {
+                items: vec![Segment {
+                    id: "fixture@local".into(),
+                    size: 1,
+                    fallbacks: vec![],
+                }],
+                sizes_trusted: true,
+                ..Default::default()
+            },
+            proof: None,
+        });
+        let raw = infinidysk_core::blob::encode_meta(&meta).unwrap();
+        let provenance=serde_json::json!({"version":1,"size":1,"fingerprint":Sha256::digest(meta.content_identity().unwrap()).to_vec()}).to_string();
+        db.import_items_with_sources(
+            &[(item.clone(), infinidysk_db::HealthStatus::default())],
+            &[(blob, &raw)],
+            &[(item.id, provenance)],
+        )
+        .await
+        .unwrap();
+        let remote = Arc::new(Remote::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let arr = Arr {
+            id: uuid::Uuid::new_v4(),
+            name: "fixture".into(),
+            profile: arr::Profile::Radarr,
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            api_key: "fixture-key".into(),
+        };
+        let router = Router::new()
+            .fallback(handle)
+            .with_state(Arc::clone(&remote));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let request=serde_json::json!({"Id":uuid::Uuid::new_v4(),"Status":"requested","ArrHost":arr.url,"ArrMediaKind":"movie","ArrFileId":7,"ArrMediaIds":"3","LibraryPath":"/fixture/file.mkv","DavItemId":item.id.0.to_string()}).to_string();
+        db.retain_legacy_repair_request("retire", Some(item.id), "arr-request", &request, None)
+            .await
+            .unwrap();
+        let (_arr, arrs) = watch::channel(vec![arr]);
+        let (_settings, settings) = watch::channel(super::super::Settings::default());
+        let client = Arc::new(infinidysk_nntp::Client::new(
+            Vec::<infinidysk_nntp::Provider>::new(),
+        ));
+        let reader = Arc::new(AtomicUsize::new(1));
+        let cache = Arc::new(AtomicUsize::new(0));
+        let authority = Arc::new(AtomicUsize::new(0));
+        let health = Health::new(
+            db.clone(),
+            Arc::clone(&client),
+            arrs.clone(),
+            settings.clone(),
+        )
+        .unwrap()
+        .with_read_gate({
+            let reader = Arc::clone(&reader);
+            move |_| {
+                (reader.load(Ordering::SeqCst) == 0).then(|| Box::new(()) as super::super::ReadHold)
+            }
+        })
+        .with_cached_copy(Arc::new({
+            let cache = Arc::clone(&cache);
+            move |_| {
+                let state = cache.load(Ordering::SeqCst);
+                Box::pin(async move {
+                    match state {
+                        0 => None,
+                        1 => Some(true),
+                        _ => Some(false),
+                    }
+                })
+            }
+        }))
+        .with_repair_authority(Arc::new({
+            let authority = Arc::clone(&authority);
+            move |_, _| {
+                let allow = authority.load(Ordering::SeqCst) > 0;
+                Box::pin(async move { Ok(allow) })
+            }
+        }));
+        assert_eq!(
+            health.observe_legacy_repairs(i64::MAX, 10).await.unwrap(),
+            0
+        );
+        assert_eq!(health.retire_legacy_sources(i64::MAX, 10).await.unwrap(), 0);
+        remote.replaced.store(1, Ordering::SeqCst);
+        assert_eq!(
+            health.observe_legacy_repairs(i64::MAX, 10).await.unwrap(),
+            1
+        );
+        assert_eq!(
+            health.retire_legacy_sources(i64::MAX, 10).await.unwrap(),
+            0,
+            "reader protects source"
+        );
+        reader.store(0, Ordering::SeqCst);
+        health.readers_closed(item.id).await.unwrap();
+        assert_eq!(
+            db.legacy_retirement_candidates(0, 10).await.unwrap().len(),
+            1,
+            "last reader clears the retry interval"
+        );
+        assert_eq!(
+            health.retire_legacy_sources(i64::MAX, 10).await.unwrap(),
+            0,
+            "uncertain cache protects source"
+        );
+        cache.store(1, Ordering::SeqCst);
+        assert_eq!(
+            health.retire_legacy_sources(i64::MAX, 10).await.unwrap(),
+            0,
+            "complete retained copy protects source"
+        );
+        cache.store(2, Ordering::SeqCst);
+        assert_eq!(
+            health.retire_legacy_sources(i64::MAX, 10).await.unwrap(),
+            0,
+            "read-only root lacks authority"
+        );
+        authority.store(1, Ordering::SeqCst);
+        remote.replaced.store(0, Ordering::SeqCst);
+        assert_eq!(
+            health.retire_legacy_sources(i64::MAX, 10).await.unwrap(),
+            0,
+            "stale replacement proof cannot retire source"
+        );
+        remote.replaced.store(1, Ordering::SeqCst);
+        assert_eq!(health.retire_legacy_sources(i64::MAX, 10).await.unwrap(), 1);
+        assert!(db.item(item.id).await.unwrap().is_none());
+        assert!(
+            db.legacy_repair_held(item.id).await.unwrap(),
+            "original evidence remains"
+        );
+        drop(health);
+        db.close().await;
+        let db = Db::connect(&url).await.unwrap();
+        let health = Health::new(db.clone(), client, arrs, settings)
+            .unwrap()
+            .with_read_gate(|_| Some(Box::new(())));
+        assert_eq!(health.retire_legacy_sources(i64::MAX, 10).await.unwrap(), 0);
         assert_eq!(remote.deletes.load(Ordering::SeqCst), 0);
         assert_eq!(remote.searches.load(Ordering::SeqCst), 0);
         task.abort();

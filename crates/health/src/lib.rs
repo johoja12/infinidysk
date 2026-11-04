@@ -168,6 +168,7 @@ pub struct Health {
     counters: [AtomicU64; 4],
     inconclusive: Mutex<HashMap<ItemId, u32>>,
     wake: Notify,
+    legacy_wake: Notify,
     sweep_gate: tokio::sync::Mutex<()>,
     publication_gate: tokio::sync::Mutex<()>,
     mutation_gate: Arc<tokio::sync::RwLock<()>>,
@@ -240,6 +241,7 @@ impl Health {
             counters: Default::default(),
             inconclusive: Mutex::default(),
             wake: Notify::new(),
+            legacy_wake: Notify::new(),
             sweep_gate: tokio::sync::Mutex::new(()),
             publication_gate: tokio::sync::Mutex::new(()),
             mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
@@ -398,6 +400,9 @@ impl Health {
     async fn readers_closed_admitted(&self, item: ItemId) -> Result<(), Error> {
         if (self.in_use)(item) {
             return Ok(());
+        }
+        if self.db.wake_legacy_retirement(item).await? {
+            self.legacy_wake.notify_one();
         }
         let mut wake = self.db.release_reader_repair(item).await?;
         let automatic = self.settings.borrow().auto_repair;

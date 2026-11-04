@@ -2131,6 +2131,44 @@ impl Db {
         Ok(())
     }
 
+    /// Retire only the exact imported file checked by the caller, never a subtree or
+    /// a new generation at its old ID. Caller holds VFS reader/publication admission.
+    /// Evidence and the retirement receipt commit with deletion, and outlive it.
+    pub async fn retire_legacy_source(
+        &self,
+        evidence: &str,
+        item: &Item,
+        raw: &[u8],
+        provenance: &str,
+        proof: &str,
+    ) -> Result<bool, Error> {
+        let Some(meta) = item.meta_blob else {
+            return Ok(false);
+        };
+        if item.kind == ItemKind::Directory || !item.path.starts_with("/content/") {
+            return Ok(false);
+        }
+        let deleted = on!(self,pool=>{
+            let mut tx=pool.begin().await?;
+            // Take the writer/row lock before reading predicates on both backends.
+            sqlx::query("UPDATE items SET id=id WHERE id=$1").bind(item.id.0).execute(&mut *tx).await?;
+            sqlx::query("UPDATE blobs SET id=id WHERE id=$1").bind(meta.0).execute(&mut *tx).await?;
+            sqlx::query("UPDATE import_sources SET item_id=item_id WHERE item_id=$1").bind(item.id.0).execute(&mut *tx).await?;
+            let sql="SELECT EXISTS(SELECT 1 FROM items i JOIN blobs b ON b.id=i.meta_blob JOIN import_sources s ON s.item_id=i.id JOIN legacy_repair_holds h ON h.item_id=i.id WHERE h.evidence_id=$1 AND h.kind='arr-request' AND h.resolved_at IS NOT NULL AND h.retired_at IS NULL AND i.id=$2 AND i.meta_blob=$3 AND b.data=$4 AND s.provenance=$5 AND i.size=$6 AND i.path=$7 AND i.created_at=$8 AND i.kind=$9 AND i.health_state=$10 AND NOT EXISTS(SELECT 1 FROM items child WHERE child.parent_id=i.id) AND NOT EXISTS(SELECT 1 FROM legacy_repair_holds unresolved WHERE unresolved.resolved_at IS NULL AND (unresolved.item_id=i.id OR unresolved.item_id IS NULL)) AND NOT EXISTS(SELECT 1 FROM regrab_intents r WHERE r.item_id=i.id AND r.terminal=0))";
+            let matches:bool=sqlx::query_scalar(sql).bind(evidence).bind(item.id.0).bind(meta.0).bind(raw).bind(provenance).bind(item.size.map(u64::cast_signed)).bind(&item.path).bind(item.created_at).bind(item.kind as i16).bind(item.health_state as i16).fetch_one(&mut *tx).await?;
+            if matches {
+                sqlx::query("UPDATE legacy_repair_holds SET retired_at=$2,retirement_proof=$3 WHERE evidence_id=$1").bind(evidence).bind(now_ms()).bind(proof).execute(&mut *tx).await?;
+                delete_subtree!(self,tx,item.id.0);
+                tx.commit().await?;
+            }
+            matches
+        });
+        if deleted {
+            self.notify(Change::History);
+        }
+        Ok(deleted)
+    }
+
     /// Files under `/content` created before `before` that no download in history holds,
     /// in path order: what the unlinked-file cleanup may remove.
     pub async fn files_outside_history(&self, before: i64) -> Result<Vec<Item>, Error> {

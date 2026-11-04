@@ -1405,3 +1405,46 @@ async fn reimport_proof_binds_exact_offline_member_to_completed_accepted_job() {
     assert_eq!(server.await.unwrap().unwrap(), Exit::Stopped);
     std::fs::remove_dir_all(source).unwrap();
 }
+
+#[tokio::test]
+async fn legacy_repair_status_is_authenticated_bounded_and_excludes_private_evidence() {
+    let (addr, cancel, server, url) = start().await;
+    // Let startup finish its migrations before the test opens a second writer.
+    let (initial, raw) = send(
+        addr,
+        &admin_request("GET", "/api/v1/health/legacy-repairs", ""),
+    )
+    .await;
+    assert_eq!(initial, "HTTP/1.1 200 OK");
+    assert_eq!(serde_json::from_str::<Value>(&raw).unwrap(), json!([]));
+    let db = infinidysk_db::Db::connect(&url).await.unwrap();
+    db.retain_legacy_repair_hold(
+        "fixture-status",
+        None,
+        "arr-request",
+        "private-fixture-evidence",
+    )
+    .await
+    .unwrap();
+    let (code, raw) = send(
+        addr,
+        &admin_request("GET", "/api/v1/health/legacy-repairs", ""),
+    )
+    .await;
+    assert!(code.contains("200"));
+    let rows: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(rows[0]["evidence_id"], "fixture-status");
+    assert_eq!(rows[0]["source_present"], false);
+    assert!(!raw.contains("private-fixture-evidence"));
+    assert!(
+        !status(
+            addr,
+            "GET /api/v1/health/legacy-repairs HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .await
+        .contains("200")
+    );
+    cancel.cancel();
+    server.await.unwrap().unwrap();
+    db.close().await;
+}

@@ -189,3 +189,33 @@ pub async fn list(
         next,
     }))
 }
+
+#[derive(Serialize, ToSchema)]
+pub struct LegacyRepairStatus {
+    evidence_id: String,
+    item_id: Option<Uuid>,
+    kind: String,
+    observed_at: i64,
+    resolved_at: Option<i64>,
+    retired_at: Option<i64>,
+    source_present: bool,
+}
+#[utoipa::path(get,operation_id="legacy_repair_status",path="/api/v1/health/legacy-repairs",responses((status=200,body=Vec<LegacyRepairStatus>)))]
+pub async fn legacy_status(
+    State(admin): State<Arc<Admin>>,
+) -> Result<Json<Vec<LegacyRepairStatus>>, Fail> {
+    let rows = admin.queue.db().legacy_repair_status().await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|r| LegacyRepairStatus {
+                evidence_id: r.evidence_id,
+                item_id: r.item_id,
+                kind: r.kind,
+                observed_at: r.observed_at,
+                resolved_at: r.resolved_at,
+                retired_at: r.retired_at,
+                source_present: r.source_present,
+            })
+            .collect(),
+    ))
+}

@@ -107,6 +107,7 @@ impl Db {
 /// Private immutable legacy evidence; observation never authorizes an Arr write.
 #[derive(Clone, Debug, sqlx::FromRow)]
 pub struct LegacyRepairHold {
+    pub item_id: Option<Uuid>,
     pub evidence_id: String,
     pub kind: String,
     pub payload: String,
@@ -118,7 +119,7 @@ impl Db {
         before: i64,
         limit: u32,
     ) -> Result<Vec<LegacyRepairHold>, Error> {
-        let sql = "SELECT evidence_id,kind,payload,request_id FROM legacy_repair_holds WHERE resolved_at IS NULL AND observed_at<=$1 ORDER BY observed_at,created_at,evidence_id LIMIT $2";
+        let sql = "SELECT item_id,evidence_id,kind,payload,request_id FROM legacy_repair_holds WHERE resolved_at IS NULL AND observed_at<=$1 ORDER BY observed_at,created_at,evidence_id LIMIT $2";
         Ok(
             on!(self,pool=>sqlx::query_as(sql).bind(before).bind(i64::from(limit.min(100))).fetch_all(pool).await?),
         )
@@ -136,5 +137,52 @@ impl Db {
         let sql = "UPDATE legacy_repair_holds SET observed_at=$3,proof=$2,resolved_at=CASE WHEN $2 IS NULL THEN NULL ELSE $3 END WHERE evidence_id=$1 AND resolved_at IS NULL";
         on!(self,pool=>sqlx::query(sql).bind(evidence).bind(proof).bind(super::now_ms()).execute(pool).await?.rows_affected());
         Ok(())
+    }
+}
+
+impl Db {
+    /// Resolved bound requests still need current-generation and reader admission.
+    /// Missing items need no deletion; their evidence remains retained.
+    pub async fn legacy_retirement_candidates(
+        &self,
+        before: i64,
+        limit: u32,
+    ) -> Result<Vec<LegacyRepairHold>, Error> {
+        let sql = "SELECT item_id,evidence_id,kind,payload,request_id FROM legacy_repair_holds WHERE kind='arr-request' AND resolved_at IS NOT NULL AND retired_at IS NULL AND observed_at<=$1 AND EXISTS(SELECT 1 FROM items WHERE items.id=legacy_repair_holds.item_id) ORDER BY observed_at,created_at,evidence_id LIMIT $2";
+        Ok(
+            on!(self,pool=>sqlx::query_as(sql).bind(before).bind(i64::from(limit.min(100))).fetch_all(pool).await?),
+        )
+    }
+    pub async fn touch_legacy_retirement(&self, evidence: &str) -> Result<(), Error> {
+        on!(self,pool=>sqlx::query("UPDATE legacy_repair_holds SET observed_at=$2 WHERE evidence_id=$1").bind(evidence).bind(super::now_ms()).execute(pool).await?.rows_affected());
+        Ok(())
+    }
+}
+
+#[derive(sqlx::FromRow)]
+pub struct LegacyRepairStatus {
+    pub evidence_id: String,
+    pub item_id: Option<Uuid>,
+    pub kind: String,
+    pub observed_at: i64,
+    pub resolved_at: Option<i64>,
+    pub retired_at: Option<i64>,
+    pub source_present: bool,
+}
+impl Db {
+    /// Only bounded operational status; private original payloads never leave storage.
+    pub async fn legacy_repair_status(&self) -> Result<Vec<LegacyRepairStatus>, Error> {
+        let sql = "SELECT evidence_id,item_id,kind,observed_at,resolved_at,retired_at,EXISTS(SELECT 1 FROM items i WHERE i.id=h.item_id) AS source_present FROM legacy_repair_holds h ORDER BY created_at DESC,evidence_id LIMIT 128";
+        Ok(on!(self,pool=>sqlx::query_as(sql).fetch_all(pool).await?))
+    }
+}
+
+impl Db {
+    pub async fn wake_legacy_retirement(&self, item: ItemId) -> Result<bool, Error> {
+        let sql = "UPDATE legacy_repair_holds SET observed_at=$2 WHERE item_id=$1 AND resolved_at IS NOT NULL AND retired_at IS NULL";
+        Ok(
+            on!(self,pool=>sqlx::query(sql).bind(item.0).bind(-super::now_ms()).execute(pool).await?.rows_affected())
+                > 0,
+        )
     }
 }

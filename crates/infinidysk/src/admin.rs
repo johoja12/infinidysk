@@ -133,6 +133,7 @@ pub struct Admin {
         crate::content_sweep::status,crate::content_sweep::control,
         crate::regrabs::status,
         crate::regrabs::list,
+        crate::regrabs::legacy_status,
         crate::regrabs::control,
         get_health_schedule,
         get_rejected_releases,
@@ -359,6 +360,10 @@ pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
         .route(
             "/api/v1/health/content-sweep",
             get(crate::content_sweep::status).post(crate::content_sweep::control),
+        )
+        .route(
+            "/api/v1/health/legacy-repairs",
+            get(crate::regrabs::legacy_status),
         )
         .route("/api/v1/health/regrabs", get(crate::regrabs::list))
         .route(
