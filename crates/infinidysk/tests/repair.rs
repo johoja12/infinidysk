@@ -230,3 +230,51 @@ async fn an_existing_unbound_ledger_is_adopted_without_needing_new_attempts() {
     drop(db);
     std::fs::remove_dir_all(path).expect("cleanup");
 }
+
+#[tokio::test]
+async fn a_cache_folder_attached_after_empty_bootstrap_cannot_introduce_foreign_repair_history() {
+    let path = directory();
+    let db = Db::connect(&format!("sqlite:{}", path.join("main.sqlite").display()))
+        .await
+        .expect("db");
+    let cache = Arc::new(Cache::new(true, 1 << 20));
+    assert!(
+        open(&path, db.clone(), cache.clone(), None, false)
+            .await
+            .expect("empty bootstrap")
+            .is_none()
+    );
+    let config = CacheConfig {
+        disk: Some(DiskConfig {
+            dir: path.join("external"),
+            max_bytes: 1 << 20,
+            max_age: Duration::from_secs(3600),
+        }),
+        memory_enabled: true,
+        memory_bytes: 1 << 20,
+    };
+    let foreign = Cache::new(true, 1 << 20);
+    foreign.configure(&config).await;
+    let id = Uuid::new_v4();
+    foreign
+        .bind_repair_lineage(*id.as_bytes(), 7)
+        .await
+        .expect("old external history");
+    cache.configure(&config).await;
+    assert!(cache.stats().disk.is_none());
+    assert!(cache.stats().disk_failure.is_some());
+    assert_eq!(
+        foreign.repair_lineage().await.expect("marker untouched"),
+        Some((*id.as_bytes(), 7))
+    );
+    assert!(
+        db.repair_lineage()
+            .await
+            .expect("no poisoned binding")
+            .is_none()
+    );
+    drop(foreign);
+    drop(cache);
+    drop(db);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}

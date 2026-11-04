@@ -843,3 +843,9 @@ C# writer checks and both privileged FUSE checks pass separately. See the
 Automatic discovery, full-article patch assembly, durable attempt outcomes and the
 separate PAR2 worker are still open. No API/UI setting or setup-wizard branch is
 introduced here. Back up `/config` and external cache metadata before upgrading.
+
+Startup also seals the intentional absence of repair state. A cache folder attached
+later cannot introduce a foreign repair-history marker when no authoritative ledger
+is active; that disk tier stays disabled and its marker is left intact. Six startup
+tests and workspace all-target Clippy pass for this follow-up. This closes the case
+where an external cache was unavailable during startup and became available later.

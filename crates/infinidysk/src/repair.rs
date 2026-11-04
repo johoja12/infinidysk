@@ -49,6 +49,7 @@ pub async fn open(
         .context("checking the repair data directory")?;
     let anchor = tokio::fs::try_exists(path.join("repair-anchor.json")).await?;
     if !create && witnesses.iter().all(Option::is_none) && !database && !anchor {
+        decoded.seal_repair_lineage().await;
         return Ok(None);
     }
     if witnesses.iter().any(Option::is_some) && !database {
@@ -73,8 +74,9 @@ pub async fn open(
             "repair data does not match its database/cache witnesses; restore the matching repair-v2 directory"
         );
     }
+    let decoded_witness = decoded.clone();
     let witness: Witness = Arc::new(move |id, epoch| {
-        let (db, decoded, native) = (db.clone(), decoded.clone(), native.clone());
+        let (db, decoded, native) = (db.clone(), decoded_witness.clone(), native.clone());
         Box::pin(async move {
             tokio::time::timeout(WITNESS_WAIT, async {
                 if !db
@@ -107,5 +109,6 @@ pub async fn open(
     }
     tokio::time::timeout(OPEN_WAIT,store.reconcile()).await.context("repair ledger lineage reconciliation timed out")?
         .context("cannot confirm repair/cache lineage; check metadata and database availability, and restore matching state when a mismatch is reported")?;
+    decoded.seal_repair_lineage().await;
     Ok(Some(store))
 }

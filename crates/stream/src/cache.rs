@@ -90,6 +90,7 @@ pub struct Cache {
     disk_failure: Mutex<Option<(PathBuf, String)>>,
     inflight: Mutex<Inflight>,
     lineage: tokio::sync::Mutex<Option<([u8; 16], u64)>>,
+    lineage_sealed: AtomicBool,
     memory_hits: AtomicU64,
     disk_hits: AtomicU64,
     joined: AtomicU64,
@@ -170,6 +171,7 @@ impl Cache {
             disk_failure: Mutex::default(),
             inflight: Mutex::default(),
             lineage: tokio::sync::Mutex::new(None),
+            lineage_sealed: AtomicBool::new(false),
             memory_hits: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             joined: AtomicU64::new(0),
@@ -227,12 +229,36 @@ impl Cache {
             failure = Some((disk.dir().to_path_buf(), error.to_string()));
             next = None;
         }
+        if lineage.is_none()
+            && self.lineage_sealed.load(Ordering::Acquire)
+            && let Some(disk) = next.as_ref()
+        {
+            match disk.repair_lineage().await {
+                Ok(None) => {}
+                result => {
+                    let reason = result.err().map_or_else(
+                        || "cache has repair history but no authoritative repair ledger is active; restore matching repair data and restart".to_owned(),
+                        |error| error.to_string(),
+                    );
+                    failure = Some((disk.dir().to_path_buf(), reason));
+                    next = None;
+                }
+            }
+        }
         *self.disk.write().unwrap_or_else(PoisonError::into_inner) = next;
         *self
             .disk_failure
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = failure;
         drop(lineage); // Publish a configured disk only after its lineage check.
+    }
+
+    /// Finish startup adoption, including the intentional absence of a ledger.
+    /// Later cache-folder changes cannot silently introduce foreign repair history.
+    pub async fn seal_repair_lineage(&self) {
+        let guard = self.lineage.lock().await;
+        self.lineage_sealed.store(true, Ordering::Release);
+        drop(guard);
     }
 
     /// Read-only startup preflight. A failed adoption must not first write a new
