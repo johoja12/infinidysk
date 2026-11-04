@@ -238,6 +238,7 @@ pub async fn apply_with_progress(
     storage_root: &str,
     progress: impl Fn(Progress) + Sync,
 ) -> Result<Imported, Error> {
+    crate::repair_holds::import(config, db).await?;
     let mut cs = open(config).await?;
     let blobs = config.join("blobs");
     // C# wrote `DateTime.Now`, so its times are wall clock in its container's zone (`TZ`).

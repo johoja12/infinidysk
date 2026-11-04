@@ -136,6 +136,9 @@ async fn target(http: &reqwest::Client, arr: &Arr, owner: &Owner) -> Result<Targ
     };
     match current {
         None => Ok(Target::Gone),
+        Some(file) if file.id <= 0 => Err(Error::Unexpected(
+            "Arr returned an invalid replacement file id",
+        )),
         Some(file) if Some(file.id) != old => Ok(Target::Replaced),
         Some(file) if file.path != path => Err(Error::Unexpected(
             "file path changed during regrab; review before mutation",
@@ -567,4 +570,47 @@ pub async fn regrab_replaced(
     progress: &Regrab,
 ) -> Result<bool, Error> {
     Ok(target(http, arr, &progress.owner).await? == Target::Replaced)
+}
+
+/// Read-only bridge for a recorded 1.x request. It cannot return an Owner or a
+/// mutation-ready Regrab, and never dispatches delete, blocklist or search.
+pub async fn legacy_replacement_observed(
+    http: &reqwest::Client,
+    arr: &Arr,
+    kind: &str,
+    ids: &[i64],
+    file: i64,
+    path: &str,
+) -> Result<bool, Error> {
+    if file <= 0
+        || ids.is_empty()
+        || ids.len() > 256
+        || ids.iter().any(|id| *id <= 0)
+        || ids.iter().collect::<std::collections::HashSet<_>>().len() != ids.len()
+        || !path.starts_with('/')
+        || path.len() > 4096
+        || path.chars().any(char::is_control)
+        || path.split('/').any(|p| p == "." || p == "..")
+    {
+        return Err(Error::Unexpected("legacy Arr binding requires review"));
+    }
+    let shape = super::shape(http, arr).await?;
+    let media = match (kind, shape) {
+        ("movie", Some(super::Shape::Movies)) if ids.len() == 1 => Media::Movie(ids[0]),
+        ("episode", Some(super::Shape::Series)) => Media::Episodes(ids.to_vec()),
+        _ => {
+            return Err(Error::Unexpected(
+                "legacy Arr media kind differs from configured instance",
+            ));
+        }
+    };
+    let owner = Owner {
+        media,
+        imported_path: path.to_owned(),
+        imported_at: None,
+        recorded_file: Some(file),
+        current: None,
+        download_id: None,
+    };
+    Ok(target(http, arr, &owner).await? == Target::Replaced)
 }

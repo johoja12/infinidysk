@@ -1346,6 +1346,7 @@ async fn sqlite_storage_round_trips() {
     let url = format!("sqlite:{}", path.display());
     let db = Db::connect(&url).await.expect("connect");
     exercise(&db).await;
+    legacy_repair_holds(&db).await;
     completed_pointer_removal(&db).await;
     adoption_during_cleanup_keeps_the_item(&db, &url).await;
     db.close().await;
@@ -1430,6 +1431,7 @@ async fn postgres_storage_round_trips() {
     let url = format!("{base}/{name}");
     let db = Db::connect(&url).await.expect("connect");
     exercise(&db).await;
+    legacy_repair_holds(&db).await;
     completed_pointer_removal(&db).await;
     adoption_during_cleanup_keeps_the_item(&db, &url).await;
     db.close().await;
@@ -2933,5 +2935,55 @@ async fn mapped_source_fences(db: &Db) {
             .await
             .expect("proof cascade")
             .is_none()
+    );
+}
+
+async fn legacy_repair_holds(db: &Db) {
+    let item = ItemId::new();
+    let other = ItemId::new();
+    assert!(
+        !db.legacy_repair_held(item)
+            .await
+            .expect("legacy hold fixture")
+    );
+    db.retain_legacy_repair_hold("fixture-evidence", Some(item), "arr-request", "immutable")
+        .await
+        .expect("legacy hold fixture");
+    db.retain_legacy_repair_hold("fixture-evidence", Some(other), "changed", "changed")
+        .await
+        .expect("legacy hold fixture");
+    assert!(
+        db.legacy_repair_held(item)
+            .await
+            .expect("legacy hold fixture")
+    );
+    assert!(
+        !db.legacy_repair_held(other)
+            .await
+            .expect("legacy hold fixture")
+    );
+    db.retain_legacy_repair_hold("fixture-unbound", None, "link-removal", "intent")
+        .await
+        .expect("legacy hold fixture");
+    assert!(
+        db.legacy_repair_held(other)
+            .await
+            .expect("legacy hold fixture")
+    );
+    db.observe_legacy_repair("fixture-unbound", Some("replacement observed"))
+        .await
+        .expect("resolve unbound");
+    assert!(
+        !db.legacy_repair_held(other)
+            .await
+            .expect("resolved unbound")
+    );
+    db.observe_legacy_repair("fixture-evidence", Some("replacement observed"))
+        .await
+        .expect("observe bound");
+    assert!(
+        db.legacy_repair_held(item)
+            .await
+            .expect("original ID remains protected")
     );
 }

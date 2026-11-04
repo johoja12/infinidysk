@@ -9,6 +9,7 @@ mod memorypack;
 pub mod native;
 mod password;
 pub mod postgres;
+pub mod repair_holds;
 mod settings;
 
 use std::fmt;

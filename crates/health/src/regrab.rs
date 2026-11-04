@@ -82,6 +82,12 @@ impl Health {
         loop {
             tick.tick().await;
             if let Err(error) = self
+                .observe_legacy_repairs(infinidysk_db::now_ms() - 5 * super::MINUTE_MS, 3)
+                .await
+            {
+                tracing::warn!(reason=%error,"legacy repair observation deferred");
+            }
+            if let Err(error) = self
                 .observe_regrabs(infinidysk_db::now_ms() - 5 * super::MINUTE_MS, 3)
                 .await
             {
@@ -251,6 +257,11 @@ impl Health {
         job_name: &str,
         existing: Option<RegrabIntent>,
     ) -> Result<Result<(), arr::Error>, Error> {
+        if self.db.legacy_repair_held(item.id).await? {
+            return Ok(Err(arr::Error::Unexpected(
+                "legacy repair evidence requires reconciliation",
+            )));
+        }
         let expected = scope(&self.db, item, arr).await?;
         let initial = Saved {
             arr_id: arr.id.to_string(),
@@ -497,6 +508,129 @@ mod tests {
             "/api/v3/command"=>if s.searches.load(Ordering::SeqCst)>0 {serde_json::json!([{"id":11,"body":{"name":"MoviesSearch","movieIds":[3]}}])}else{serde_json::json!([])},
             _=>panic!("unexpected fixture endpoint {method} {path}"),
         }).into_response()
+    }
+    #[tokio::test]
+    async fn legacy_observation_proves_replacements_without_arr_mutation_or_repair_replay() {
+        let path = std::env::temp_dir().join(format!(
+            "id-legacy-observer-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let db = Db::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        let remote = Arc::new(Remote::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let arr = Arr {
+            id: uuid::Uuid::new_v4(),
+            name: "fixture".into(),
+            profile: arr::Profile::Radarr,
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            api_key: "fixture-key".into(),
+        };
+        let router = Router::new()
+            .fallback(handle)
+            .with_state(Arc::clone(&remote));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let item = infinidysk_core::ItemId::new();
+        let request = serde_json::json!({"Id":request_id,"Status":"requested","ArrHost":arr.url,"ArrMediaKind":"movie","ArrFileId":7,"ArrMediaIds":"3","LibraryPath":"/fixture/file.mkv","DavItemId":item.0.to_string()}).to_string();
+        db.retain_legacy_repair_request(
+            "request",
+            Some(item),
+            "arr-request",
+            &request,
+            Some(&request_id),
+        )
+        .await
+        .unwrap();
+        let removal = serde_json::json!({"event":"intent","requestId":request_id,"linkPath":"/fixture/file.mkv"}).to_string();
+        db.retain_legacy_repair_request(
+            "removal",
+            None,
+            "link-removal",
+            &removal,
+            Some(&request_id),
+        )
+        .await
+        .unwrap();
+        let (_arr, arrs) = watch::channel(vec![arr]);
+        let (_settings, settings) = watch::channel(super::super::Settings::default());
+        let client = Arc::new(infinidysk_nntp::Client::new(
+            Vec::<infinidysk_nntp::Provider>::new(),
+        ));
+        let health = Health::new(db.clone(), client, arrs, settings).unwrap();
+        assert_eq!(
+            health.observe_legacy_repairs(i64::MAX, 10).await.unwrap(),
+            0
+        );
+        assert!(
+            db.legacy_repair_held(infinidysk_core::ItemId::new())
+                .await
+                .unwrap()
+        );
+        remote.replaced.store(1, Ordering::SeqCst);
+        assert_eq!(
+            health.observe_legacy_repairs(i64::MAX, 10).await.unwrap(),
+            2
+        );
+        assert!(
+            db.pending_legacy_repairs(i64::MAX, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !db.legacy_repair_held(infinidysk_core::ItemId::new())
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.legacy_repair_held(item).await.unwrap(),
+            "original identity cannot start a fresh repair"
+        );
+        assert!(db.regrab_intent(item).await.unwrap().is_none());
+        assert_eq!(remote.deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.searches.load(Ordering::SeqCst), 0);
+        task.abort();
+        db.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+    #[tokio::test]
+    async fn legacy_evidence_blocks_manual_and_unowned_replacement_without_new_intent() {
+        let path =
+            std::env::temp_dir().join(format!("id-held-health-{}.sqlite", uuid::Uuid::new_v4()));
+        let db = Db::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .unwrap();
+        let root = db
+            .item(infinidysk_core::ItemId::CONTENT)
+            .await
+            .unwrap()
+            .unwrap();
+        let item = Item::child(&root, "fixture.mkv", ItemKind::NzbFile).unwrap();
+        db.insert(std::slice::from_ref(&item), &[]).await.unwrap();
+        db.retain_legacy_repair_hold(
+            "fixture-old-intent",
+            Some(item.id),
+            "arr-request",
+            "uncertain",
+        )
+        .await
+        .unwrap();
+        let (_arr, arrs) = watch::channel(vec![]);
+        let (_settings, settings) = watch::channel(super::super::Settings::default());
+        let client = Arc::new(infinidysk_nntp::Client::new(
+            Vec::<infinidysk_nntp::Provider>::new(),
+        ));
+        let health = Health::new(db.clone(), client, arrs, settings).unwrap();
+        assert!(!health.repair_allowed(item.id, None).await.unwrap());
+        assert!(health.request_repair(item.id).await.is_err());
+        assert!(db.regrab_intent(item.id).await.unwrap().is_none());
+        assert!(db.item(item.id).await.unwrap().is_some());
+        db.close().await;
+        let _ = std::fs::remove_file(path);
     }
     #[tokio::test]
     async fn restart_recovers_deleted_arr_target_and_uncertain_search_without_replaying() {

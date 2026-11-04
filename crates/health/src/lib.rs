@@ -3,6 +3,7 @@
 //! through the Arr that imported them.
 
 mod check;
+mod legacy;
 pub mod par2;
 mod regrab;
 pub use regrab::Control as RegrabControl;
@@ -308,6 +309,9 @@ impl Health {
     }
     /// Local read-only discovery cannot grant replacement or deletion authority.
     pub async fn repair_allowed(&self, item: ItemId, path: Option<String>) -> Result<bool, Error> {
+        if self.db.legacy_repair_held(item).await? {
+            return Ok(false);
+        }
         match &self.repair_authority {
             Some(authority) => {
                 authority(
@@ -1083,6 +1087,15 @@ impl Health {
                 .await?;
             return Ok(());
         }
+        if self.db.legacy_repair_held(item.id).await? {
+            return self
+                .give_up(
+                    item,
+                    status,
+                    "legacy repair evidence requires reconciliation before replacement",
+                )
+                .await;
+        }
         let _source_mutation = Arc::clone(&self.mutation_gate).read_owned().await;
         if self.observe_overlay(item, status).await? {
             return Ok(());
@@ -1349,6 +1362,15 @@ impl Health {
     /// Hourly look at a `hidden` file: gone once the Arr has its replacement, back to
     /// repairing (or `action_needed`) when the wait runs out.
     async fn reconcile(&self, item: &Item, status: HealthStatus) -> Result<(), Error> {
+        if self.db.legacy_repair_held(item.id).await? {
+            return self
+                .give_up(
+                    item,
+                    status,
+                    "legacy repair evidence requires reconciliation before source removal",
+                )
+                .await;
+        }
         let now = now_ms();
         let mut next = HealthStatus {
             next_check: Some(now + HOUR_MS),

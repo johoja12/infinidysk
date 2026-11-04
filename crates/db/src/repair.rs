@@ -69,3 +69,72 @@ impl Db {
         )
     }
 }
+
+impl Db {
+    /// Import immutable evidence before admitting any replacement mutation. A missing
+    /// binding deliberately blocks all replacements until explicit reconciliation.
+    pub async fn retain_legacy_repair_hold(
+        &self,
+        evidence_id: &str,
+        item: Option<ItemId>,
+        kind: &str,
+        payload: &str,
+    ) -> Result<(), Error> {
+        self.retain_legacy_repair_request(evidence_id, item, kind, payload, None)
+            .await
+    }
+    pub async fn retain_legacy_repair_request(
+        &self,
+        evidence_id: &str,
+        item: Option<ItemId>,
+        kind: &str,
+        payload: &str,
+        request: Option<&str>,
+    ) -> Result<(), Error> {
+        let sql = "INSERT INTO legacy_repair_holds(evidence_id,item_id,kind,payload,created_at,request_id) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(evidence_id) DO NOTHING";
+        on!(self,pool=>sqlx::query(sql).bind(evidence_id).bind(item.map(|id| id.0)).bind(kind).bind(payload).bind(super::now_ms()).bind(request).execute(pool).await?.rows_affected());
+        Ok(())
+    }
+    /// Resolved evidence still protects its original ID: observing a replacement
+    /// must never authorize a new repair of whatever now occupies that identity.
+    /// Proven unbound records stop imposing a global hold.
+    pub async fn legacy_repair_held(&self, item: ItemId) -> Result<bool, Error> {
+        let sql = "SELECT EXISTS(SELECT 1 FROM legacy_repair_holds WHERE item_id=$1 OR (item_id IS NULL AND resolved_at IS NULL))";
+        Ok(on!(self,pool=>sqlx::query_scalar(sql).bind(item.0).fetch_one(pool).await?))
+    }
+}
+
+/// Private immutable legacy evidence; observation never authorizes an Arr write.
+#[derive(Clone, Debug, sqlx::FromRow)]
+pub struct LegacyRepairHold {
+    pub evidence_id: String,
+    pub kind: String,
+    pub payload: String,
+    pub request_id: Option<String>,
+}
+impl Db {
+    pub async fn pending_legacy_repairs(
+        &self,
+        before: i64,
+        limit: u32,
+    ) -> Result<Vec<LegacyRepairHold>, Error> {
+        let sql = "SELECT evidence_id,kind,payload,request_id FROM legacy_repair_holds WHERE resolved_at IS NULL AND observed_at<=$1 ORDER BY observed_at,created_at,evidence_id LIMIT $2";
+        Ok(
+            on!(self,pool=>sqlx::query_as(sql).bind(before).bind(i64::from(limit.min(100))).fetch_all(pool).await?),
+        )
+    }
+    /// Ambiguous histories stay held rather than selecting one by timestamp.
+    pub async fn legacy_repair_requests(&self, request: &str) -> Result<Vec<String>, Error> {
+        let sql = "SELECT payload FROM legacy_repair_holds WHERE kind='arr-request' AND request_id=$1 ORDER BY evidence_id LIMIT 2";
+        Ok(on!(self,pool=>sqlx::query_scalar(sql).bind(request).fetch_all(pool).await?))
+    }
+    pub async fn observe_legacy_repair(
+        &self,
+        evidence: &str,
+        proof: Option<&str>,
+    ) -> Result<(), Error> {
+        let sql = "UPDATE legacy_repair_holds SET observed_at=$3,proof=$2,resolved_at=CASE WHEN $2 IS NULL THEN NULL ELSE $3 END WHERE evidence_id=$1 AND resolved_at IS NULL";
+        on!(self,pool=>sqlx::query(sql).bind(evidence).bind(proof).bind(super::now_ms()).execute(pool).await?.rows_affected());
+        Ok(())
+    }
+}

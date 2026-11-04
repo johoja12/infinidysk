@@ -14,7 +14,10 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use uuid::Uuid;
 
-pub use repair::tracked::{Regrab, RegrabStage, observe_tracked, regrab_replaced, replace_tracked};
+pub use repair::tracked::{
+    Regrab, RegrabStage, legacy_replacement_observed, observe_tracked, regrab_replaced,
+    replace_tracked,
+};
 pub use repair::{Import, Owner, all_imports, imports, owner, owner_of_file, replace};
 
 /// What the Arr shows in place of a stored secret.

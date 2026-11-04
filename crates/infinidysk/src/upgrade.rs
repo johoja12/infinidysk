@@ -723,6 +723,10 @@ async fn import_with_progress(
     config: &Path,
     progress: impl Fn(infinidysk_import::Progress) + Sync,
 ) -> anyhow::Result<()> {
+    // Also fence installations imported by an earlier Rust revision marked done.
+    if config.join("db.sqlite").is_file() {
+        infinidysk_import::repair_holds::import(config, db).await?;
+    }
     if !import_needed(db, config).await? {
         return Ok(());
     }
