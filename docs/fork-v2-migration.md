@@ -7,15 +7,14 @@ The inventory was derived from the fork's non-merge commits and file differences
 against upstream `v1` at `4a630deb6e599f3eadbe071a92417a93d74dc81f` on 2026-11-03.
 It groups related changes into capabilities; it is not a promise of complete parity.
 
-**Current checkpoint:** core repair/regrab tracking, automatic bounded PAR2,
-repair-aware native cache and verified 1.x cache-copy interoperability run in Rust.
-The library has persistent bounded link/classification snapshots, grouped browsing,
-file details and grouped read metrics. Smart Prefetch has a durable queue, scoped
-Plex predictions and catalogue sources, wire reservations, finish-watched/minimum
-policies, outcome history, conservative cached-lead scheduling, adaptive provider
-capacity and qualified playback backfills. The **full fork port is not complete**:
-remaining migration/operational workflows and performance/cutover gates remain open.
-The draft must not be treated as a production cutover.
+**Current checkpoint:** the main repair, library, Smart Prefetch, native-cache and
+migration workflows have Rust implementations. The latest increment adds guarded
+retirement of replaced legacy sources and operational visibility of retained repair
+evidence. Explicit streaming cancellation and archived-media parity regressions cover
+the last verification rows. Qualification results and limits are recorded in
+[final parity POC](validation/rust-v2-final-parity-poc-20261105.md).
+This draft is not a production cutover. Live integration, production storage and
+controlled performance acceptance remain distinct from generated local POC results.
 
 The 1.x source and production deployment remain unchanged. Port behavior into the
 Rust architecture; do not copy C# storage formats or add a second cache in front of
@@ -25,10 +24,10 @@ acceptance gates below pass.
 
 ## Latest upstream sync
 
-On 2026-11-04 the migration branch incorporated all 14 upstream commits through
-`27ce0448d4b6a27f4ffe990dadf2b195c29d72e5`. The original baseline above remains the
-historical starting point. Conflict decisions and validation are recorded in
-[upstream sync validation](validation/rust-v2-upstream-sync-20261104.md).
+On 2026-11-05 the migration branch incorporated upstream Rust `main` through
+`d4f5daf5991447d2726a5b22d9232c5d9c265c94`, including OIDC, backup/restore and database
+transfer. Fork database transfer covers all 38 application tables. See
+[upstream sync validation](validation/rust-v2-upstream-sync-20261105.md).
 
 ## Status and order
 
@@ -63,13 +62,13 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | L02 | P1 | Plex metadata matching and indexed library classification (`PlexLibraryMetadataService`, `LibraryCatalogService`) | Depends on P02/L01. Keep matching separate from authority to delete or regrab a file. | Opt-in complete persistent metadata snapshots, exact mapped/indexed paths and ambiguity-guarded display fallback implemented; live Plex acceptance pending |
 | L03 | P1 | File details: source identity, current cache ranges, health history, active regrab, manual regrab (`GetLibraryFileDetails`, file modal) | Compose new Rust admin APIs over L01/C05/R06; do not assume 1.x API compatibility. | Details now include source revision, cache ranges, indexed paths, active regrab and recent grouped reads; Plex classification and source-independent recovery controls included |
 | L04 | P1 | Live playback rows grouped across bursts, imported file ID, viewer attribution and cache-served reads (`ActiveReadRegistry`, `ActiveReadsBroadcaster`) | Rust `vfs::session` and traces exist; add only missing correlation/attribution and prove cleanup on reader drop. | Source/client/player burst grouping and exact native-cache served bytes implemented; fresh, scope/revision/time-bound verified Plex source-session correlation implemented with ambiguity preserved; it does not assign an HTTP/FUSE read to a remote viewer |
-| M01 | P0 | Import our actual fork data without losing ownership or repair state (`NzbDavMigration`, fork DB additions) | `crates/import` imports C# data, but fork tables/settings/cache layouts need an explicit compatibility report. Inventory unsupported settings and records; fail or report them rather than silently discard. | Private digest-bound SQLite export/verification preserves legacy settings, unknown DB tables and known journals; supported warming policies and read-only library selections now have typed translation with explicit activation review; Read-only, digest-bound PostgreSQL source snapshots and explicit source-timezone import/retry are implemented; uncertain repair requests and removal journals now have immutable typed holds, bounded read-only Arr observation, and original-ID replay protection; automatic legacy source retirement and operational parity remain open |
+| M01 | P0 | Import our actual fork data without losing ownership or repair state (`NzbDavMigration`, fork DB additions) | `crates/import` imports C# data, but fork tables/settings/cache layouts need an explicit compatibility report. Inventory unsupported settings and records; fail or report them rather than silently discard. | Private digest-bound SQLite export/verification preserves legacy settings, unknown DB tables and known journals; supported warming policies and read-only library selections now have typed translation with explicit activation review; Read-only, digest-bound PostgreSQL source snapshots and explicit source-timezone import/retry are implemented; uncertain repair requests and removal journals now have immutable typed holds, bounded read-only Arr observation, and original-ID replay protection; guarded local source retirement, retained audit and operational status UI implemented; unchanged generation, fresh replacement proof, automatic-repair policy, reader and cache/publication guards are required; no remote mutation replay |
 | M02 | P1 | Legacy NZB catalogue recovery, digest-bound mapped export packages and parallel canary mount (`tools/NzbDavMigration`) | Keep existing tools read-only initially. Decide whether to retain the external tool or add a Rust adapter; preserve package digest, source identity and rollback journal. | Exact original C# article identities, offline generation-fenced member capture and current-revision proof implemented; process-bound physical mount challenges, sampled validation, and separate resumable canary links with conditional offline rollback implemented; completed-job/subtree-bound exact new-ID member proofs and explicit digest-bound map validation implemented; bounded unique-candidate discovery, frozen priority and two-slot canary disposition orchestration implemented; native end-to-end generated canary qualification passed; live integration/cutover remain acceptance gates |
 | M03 | P1 | Pipelined batches, separate validation slot, resumable priority schedule and failed-import recovery (`NzbDavMigrationController`, `UsenetMigration`) | New Rust queue/admin contracts need adapters and restart-safe checkpoints. No acknowledgement without terminal proof. | Atomic exact-byte/options-bound migration acceptance and authenticated readback implemented; bounded independent import/validation lanes, exact member discovery, owned canary links, durable terminal dispositions and frozen schedule resume implemented; native end-to-end generated canary qualification passed; live integration/cutover remain acceptance gates |
 | M04 | P1 | Resumable external import runner, systemd service and Plex-hub priority ordering (`scripts/operations/plex-import-runner.py`, `plex_hub_priority.py`) | Adapt the operational tools to the new Rust import/admin contracts. Keep existing journals immutable; prove restart, duplicate-submission and priority-snapshot behavior against a separate canary. | Resumable Rust acceptance runner and isolated systemd service/timer templates implemented; complete current Rust prediction snapshots can generate frozen priority schedules, with exact sealed-batch resume; native end-to-end generated canary qualification passed; live integration/cutover remain acceptance gates |
 | S01 | P0 | Completed-link removal remains removed across restart (`DatabaseStore`, `3e981833`) | Rust VFS/database cleanup has different links; add protocol + restart tests for `/completed-symlinks` and source ownership. | Implemented with additive SQLite/PostgreSQL migration and WebDAV/FUSE checks |
-| S02 | P1 | Bounded cancelled-body cleanup and low-latency multipart reads (`UsenetSharp`, `NativeSourceCacheStream`; `963f3090`, `fe73df69`) | Rust uses Drop/lease guards, ordered pipelines and shared streaming. Verify connection/permit release and cold seek benchmarks; do not mechanically copy timeout values. | Verify |
-| S03 | P1 | Validate archived media before import completion; preserve first-volume order (`Queue`, `fe0dd0f2`, `c30fd88e`) | Rust queue/archive analyzer already exists. Port malformed-media and multipart ordering regression scenarios. | Verify |
+| S02 | P1 | Bounded cancelled-body cleanup and low-latency multipart reads (`UsenetSharp`, `NativeSourceCacheStream`; `963f3090`, `fe73df69`) | Rust uses Drop/lease guards, ordered pipelines and shared streaming. Verify connection/permit release and cold seek benchmarks; do not mechanically copy timeout values. | Cancellation/permit recovery verified with an explicitly gated stalled provider and next-read regression; controlled live performance remains an acceptance gate |
+| S03 | P1 | Validate archived media before import completion; preserve first-volume order (`Queue`, `fe0dd0f2`, `c30fd88e`) | Rust queue/archive analyzer already exists. Port malformed-media and multipart ordering regression scenarios. | Malformed stored RAR/7z media fails before handoff; reversed and obfuscated volume order regressions pass |
 | O01 | P0 | Exact source/image provenance and fork version in builds (`scripts/build-prod-image.sh`, `248bd117`) | Rust Docker/release pipeline uses its own embedding. Add fork identity without publishing stable upstream tags; require image/source receipt for trial. | Fork source identity, upstream-update isolation, repository-gated release publication and exact-source trial builder with pinned submodule receipts implemented; actual release image qualification pending |
 
 The paths in the specification column are on the pinned 1.x fork, not on this branch.
