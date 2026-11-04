@@ -37,6 +37,25 @@ class BuildPlan(unittest.TestCase):
         self.assertEqual(receipt['source_commit'], commit)
         self.assertEqual(receipt['image'], f'ghcr.io/johoja12/infinidysk-rust-trial:sha-{commit[:12]}')
 
+    def test_pinned_submodule_is_included_in_the_plan(self):
+        with tempfile.TemporaryDirectory(prefix='id-fork-module-') as child:
+            for command in [
+                ['git','init','--quiet','-b','fixture'],
+                ['git','config','user.name','Fixture'],
+                ['git','config','user.email','fixture@example.invalid'],
+            ]:
+                subprocess.run(command,cwd=child,check=True)
+            pathlib.Path(child,'source.txt').write_text('fixture')
+            subprocess.run(['git','add','.'],cwd=child,check=True)
+            subprocess.run(['git','commit','--quiet','-m','chore(test): seed native fixture'],cwd=child,check=True)
+            subprocess.run(['git','-c','protocol.file.allow=always','submodule','add','--quiet',child,'native'],cwd=self.root,check=True)
+            subprocess.run(['git','commit','--quiet','-am','chore(test): pin native fixture'],cwd=self.root,check=True)
+            result=self.invoke()
+            self.assertEqual(result.returncode,0,result.stderr)
+            self.assertEqual(json.loads(result.stdout)['submodules'][0]['path'],'native')
+            (self.root/'native/source.txt').write_text('changed')
+            self.assertNotEqual(self.invoke().returncode,0)
+
     def test_dirty_or_untracked_source_is_refused(self):
         (self.root / 'uncommitted').write_text('fixture')
         self.assertNotEqual(self.invoke().returncode, 0)
