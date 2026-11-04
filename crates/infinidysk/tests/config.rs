@@ -530,3 +530,60 @@ async fn provider_response_allowance_and_finish_share_are_validated_and_managed(
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
 }
+
+#[tokio::test]
+async fn source_policies_require_configured_servers_and_keep_environment_authority() {
+    let path = std::env::temp_dir().join(format!(
+        "infinidysk-source-policy-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("db");
+    let env=[("INFINIDYSK__PREFETCH__PLEX__SOURCES".to_owned(),r#"[{"server":"machine","viewer":"7","kind":"library","path":"/library/sections/1/all","limit":10}]"#.to_owned())];
+    let mut initial = ConfigStore::load(db.clone(), []).await.expect("settings");
+    let mut settings = initial.settings().clone();
+    settings.plex.servers.push(infinidysk_plex::Server {
+        id: "machine".into(),
+        name: "Fixture".into(),
+        url: "http://127.0.0.1:32400".into(),
+        token: infinidysk_plex::Token("fixture-token".into()),
+        enabled: true,
+        account_id: None,
+        path_mappings: vec![],
+    });
+    initial.save(settings).await.expect("configured server");
+    let mut store = ConfigStore::load(db.clone(), env).await.expect("settings");
+    let mut changed = store.settings().clone();
+    changed.prefetch.plex.sources.clear();
+    assert!(
+        matches!(store.save(changed).await,Err(Error::Locked(key)) if key=="prefetch.plex.sources")
+    );
+    let mut unsafe_view = Settings::default();
+    unsafe_view
+        .prefetch
+        .plex
+        .sources
+        .push(infinidysk_plex::sources::Source {
+            path: "/hubs/home?token=fixture-private-value".into(),
+            ..Default::default()
+        });
+    assert_eq!(unsafe_view.masked().prefetch.plex.sources[0].path, MASK);
+    let mut unconfigured = Settings::default();
+    unconfigured
+        .prefetch
+        .plex
+        .sources
+        .push(infinidysk_plex::sources::Source {
+            server: "machine".into(),
+            viewer: "7".into(),
+            kind: infinidysk_plex::sources::Kind::Library,
+            path: "/library/sections/1/all".into(),
+            ..Default::default()
+        });
+    assert!(unconfigured.validate().is_err());
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}

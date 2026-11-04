@@ -26,7 +26,7 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use utoipa::ToSchema;
 use uuid::Uuid;
 const STORE: &str = "fork_predictions_v1";
-const MAX: usize = 100;
+const MAX: usize = 1000;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 pub(crate) type LocalResolver = Arc<
     dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<Option<ItemId>, ()>> + Send>>
@@ -40,6 +40,9 @@ pub enum Source {
     Playback,
     NextEpisode,
     PartialMovie,
+    Hub,
+    Collection,
+    Library,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[schema(as=PlexPrediction)]
@@ -288,7 +291,11 @@ impl Predictions {
                         .enqueue_automatic(Automatic {
                             item: ItemId(item),
                             ranges: &p.ranges,
-                            priority: if p.source == Source::Playback { 90 } else { 50 },
+                            priority: match p.source {
+                                Source::Playback => 90,
+                                Source::NextEpisode | Source::PartialMovie => 50,
+                                _ => 30,
+                            },
                             intent: p.id,
                             revision,
                             scope: &owner,
@@ -467,6 +474,73 @@ impl Predictions {
                     return Err(Error::Invalid(
                         "Plex prediction pass exceeded its result limit",
                     ));
+                }
+            }
+            for selection in options
+                .sources
+                .iter()
+                .filter(|s| s.enabled && s.server == server.id)
+            {
+                if !options.policy.viewers.is_empty()
+                    && !options
+                        .policy
+                        .viewers
+                        .contains(&format!("{}:{}", server.id, selection.viewer))
+                {
+                    continue;
+                }
+                let viewer = self
+                    .client
+                    .viewer(server, &selection.viewer, &settings.plex.accounts)
+                    .await?;
+                let origin = match selection.kind {
+                    infinidysk_plex::sources::Kind::Hub => Source::Hub,
+                    infinidysk_plex::sources::Kind::Collection => Source::Collection,
+                    infinidysk_plex::sources::Kind::Library => Source::Library,
+                };
+                for candidate in self.client.prefetch_source(&viewer, selection).await? {
+                    if !options.policy.eligible(&candidate)
+                        || selection
+                            .excluded_shows
+                            .contains(candidate.show.as_ref().unwrap_or(&candidate.rating_key))
+                    {
+                        continue;
+                    }
+                    let media = if candidate.kind == "show" {
+                        next_episodes(
+                            &candidate,
+                            &self
+                                .client
+                                .next_episodes(&viewer, &candidate.rating_key)
+                                .await?,
+                            usize::from(options.next_episodes),
+                        )
+                    } else {
+                        vec![candidate]
+                    };
+                    for item in media {
+                        if options.policy.eligible(&item)
+                            && !selection
+                                .excluded_shows
+                                .contains(item.show.as_ref().unwrap_or(&item.rating_key))
+                            && seen.insert((
+                                server.id.clone(),
+                                selection.viewer.clone(),
+                                item.rating_key.clone(),
+                                origin as u8,
+                            ))
+                        {
+                            predictions.push(
+                                self.prediction(server, &item, origin, scope, settings)
+                                    .await?,
+                            );
+                            if predictions.len() > MAX {
+                                return Err(Error::Invalid(
+                                    "Plex prediction pass exceeded its result limit",
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -704,6 +778,19 @@ mod tests {
             }
             if path == "/status/sessions" {
                 return xml(format!("<MediaContainer>{}</MediaContainer>",video("current",1,if mode==5 {"/media/other.mkv"}else{"/media/current.mkv"},None,0).replace("</Video>","<User id=\"7\" title=\"Fixture profile\"/><Player state=\"playing\" machineIdentifier=\"player\"/><Session id=\"session\"/></Video>")));
+            }
+            if path == "/hubs/home/fixture" || path == "/library/sections/1/all" {
+                assert_eq!(
+                    headers.get("x-plex-token").unwrap(),
+                    "fixture-viewer-resource"
+                );
+                if mode == 6 {
+                    return Response::builder().status(503).body(Body::empty()).unwrap();
+                }
+                return xml(format!(
+                    "<MediaContainer totalSize=\"1\" offset=\"0\">{}</MediaContainer>",
+                    video("current", 1, "/media/current.mkv", None, 0)
+                ));
             }
             if path.starts_with("/library/metadata/") {
                 assert_eq!(
@@ -1295,5 +1382,59 @@ mod tests {
                 .any(|p| p.source == Source::Playback && p.item.is_none() && p.warning.is_some())
         );
         assert_eq!(f.queue.status().await.jobs.len(), 1);
+    }
+    #[tokio::test]
+    async fn selected_hubs_and_libraries_admit_scoped_sources_and_preserve_snapshot_on_failure() {
+        let f = fixture().await;
+        {
+            let mut config = f.config.write().await;
+            let mut settings = config.settings().clone();
+            settings.prefetch.plex.history = false;
+            settings.prefetch.plex.realtime = false;
+            settings.prefetch.plex.sources = vec![
+                infinidysk_plex::sources::Source {
+                    server: "machine".into(),
+                    viewer: "7".into(),
+                    path: "/hubs/home/fixture".into(),
+                    ..Default::default()
+                },
+                infinidysk_plex::sources::Source {
+                    server: "machine".into(),
+                    viewer: "7".into(),
+                    kind: infinidysk_plex::sources::Kind::Library,
+                    path: "/library/sections/1/all".into(),
+                    ..Default::default()
+                },
+            ];
+            config.save(settings).await.unwrap();
+            drop(config);
+        }
+        f.service.tick(true).await.unwrap();
+        let before = f.service.snapshot().await;
+        assert!(!before.stale);
+        assert!(
+            before
+                .predictions
+                .iter()
+                .any(|p| p.source == Source::Hub && p.item == Some(f.files[0].id.0))
+        );
+        assert!(
+            before
+                .predictions
+                .iter()
+                .any(|p| p.source == Source::Library)
+        );
+        let jobs = f.queue.status().await.jobs;
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|job| job.priority == 30));
+        f.state.mode.store(6, Ordering::SeqCst);
+        f.service.tick(true).await.unwrap();
+        let failed = f.service.snapshot().await;
+        assert!(failed.stale);
+        assert!(failed.error.is_some());
+        assert_eq!(
+            failed.predictions.iter().map(|p| p.id).collect::<Vec<_>>(),
+            before.predictions.iter().map(|p| p.id).collect::<Vec<_>>()
+        );
     }
 }

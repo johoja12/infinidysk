@@ -389,7 +389,10 @@ impl Client {
             let page: Vec<_> = root
                 .children
                 .into_iter()
-                .filter(|n| n.name == tag)
+                .filter(|n| {
+                    n.name == tag
+                        || tag == "Media" && matches!(n.name.as_str(), "Video" | "Directory")
+                })
                 .collect();
             let count =
                 u32::try_from(page.len()).map_err(|_| Error::Invalid("Plex page too large"))?;
@@ -545,6 +548,39 @@ impl Client {
             item.user = Some(viewer.viewer.clone());
         }
         Ok(items)
+    }
+    /// Fetch the explicitly selected ordered prefix with the exact viewer token.
+    /// Changed totals, duplicate identities and partial pages fail the whole pass.
+    pub async fn prefetch_source(
+        &self,
+        viewer: &ViewerServer,
+        source: &crate::sources::Source,
+    ) -> Result<Vec<Media>, Error> {
+        source.validate()?;
+        if source.server != viewer.server.id || source.viewer != viewer.viewer {
+            return Err(Error::Unauthorized);
+        }
+        if !source.enabled {
+            return Ok(Vec::new());
+        }
+        let nodes = self
+            .pages_window(
+                &viewer.server,
+                &source.path,
+                "Media",
+                100_000,
+                Some(u32::from(source.limit)),
+            )
+            .await?;
+        nodes
+            .iter()
+            .take(usize::from(source.limit))
+            .map(|node| {
+                let mut item = media(node)?;
+                item.user = Some(viewer.viewer.clone());
+                Ok(item)
+            })
+            .collect()
     }
     pub async fn viewer_metadata(&self, viewer: &ViewerServer, key: &str) -> Result<Media, Error> {
         let mut item = self.metadata(&viewer.server, key).await?;
@@ -1113,5 +1149,55 @@ mod tests {
             f.client.metadata(&f.server, "1").await,
             Err(Error::Invalid(_))
         ));
+    }
+    #[tokio::test]
+    async fn selected_hub_and_library_prefixes_use_only_verified_viewer_credentials() {
+        let f = fixture(|uri, headers| {
+            assert_eq!(
+                headers.get("X-Plex-Token").and_then(|v| v.to_str().ok()),
+                Some("viewer-source-token")
+            );
+            assert!(matches!(
+                uri.path(),
+                "/prefix/hubs/home/continueWatching" | "/prefix/library/sections/1/all"
+            ));
+            response(200, xml_page(0, 2, [1, 2]))
+        })
+        .await;
+        let viewer = ViewerServer {
+            server: Server {
+                token: Token("viewer-source-token".into()),
+                ..f.server.clone()
+            },
+            viewer: "7".into(),
+        };
+        for (kind, path) in [
+            (crate::sources::Kind::Hub, "/hubs/home/continueWatching"),
+            (crate::sources::Kind::Library, "/library/sections/1/all"),
+        ] {
+            let source = crate::sources::Source {
+                server: "machine".into(),
+                viewer: "7".into(),
+                kind,
+                path: path.into(),
+                limit: 1,
+                ..Default::default()
+            };
+            let items = f
+                .client
+                .prefetch_source(&viewer, &source)
+                .await
+                .expect("source");
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].user.as_deref(), Some("7"));
+            let wrong = crate::sources::Source {
+                viewer: "8".into(),
+                ..source
+            };
+            assert!(matches!(
+                f.client.prefetch_source(&viewer, &wrong).await,
+                Err(Error::Unauthorized)
+            ));
+        }
     }
 }

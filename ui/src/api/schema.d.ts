@@ -3548,7 +3548,7 @@ export interface components {
             warning?: string | null;
         };
         /** @enum {string} */
-        PlexPredictionSource: "playback" | "next_episode" | "partial_movie";
+        PlexPredictionSource: "playback" | "next_episode" | "partial_movie" | "hub" | "collection" | "library";
         /** @enum {string} */
         PlexPrefetchLocalFiles: "disabled" | "imported_pointers";
         PlexPrefetchSettings: {
@@ -3587,7 +3587,33 @@ export interface components {
              * @default 60
              */
             refresh_seconds: number;
+            /** @default [] */
+            sources: components["schemas"]["PlexPrefetchSource"][];
         };
+        PlexPrefetchSource: {
+            /** @default true */
+            enabled: boolean;
+            /** @default [] */
+            excluded_shows: string[];
+            /** @default hub */
+            kind: components["schemas"]["PlexPrefetchSourceKind"];
+            /**
+             * Format: int32
+             * @default 50
+             */
+            limit: number;
+            /**
+             * @description A relative Plex catalogue resource; never a supplied URL or credential.
+             * @default
+             */
+            path: string;
+            /** @default  */
+            server: string;
+            /** @default  */
+            viewer: string;
+        };
+        /** @enum {string} */
+        PlexPrefetchSourceKind: "hub" | "collection" | "library";
         PlexSelectServer: {
             handle: string;
             url: string;
@@ -3805,7 +3831,8 @@ export interface components {
              *         "viewers": []
              *       },
              *       "realtime": true,
-             *       "refresh_seconds": 60
+             *       "refresh_seconds": 60,
+             *       "sources": []
              *     }
              */
             plex: components["schemas"]["PlexPrefetchSettings"];
@@ -3930,7 +3957,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a68c-ee34-709a-9b1b-2e83fc48db4e
+             * @default 01a1a69e-5f8d-7674-88ad-ba9026599d59
              */
             id: string;
             /**
@@ -4644,7 +4671,8 @@ export interface components {
              *           "viewers": []
              *         },
              *         "realtime": true,
-             *         "refresh_seconds": 60
+             *         "refresh_seconds": 60,
+             *         "sources": []
              *       }
              *     }
              */

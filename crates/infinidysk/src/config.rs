@@ -942,6 +942,9 @@ impl Settings {
         out.webdav.download_key = out.webdav.download_key.masked();
         out.imports.strm_key = out.imports.strm_key.masked();
         out.plex = out.plex.masked(MASK);
+        for source in &mut out.prefetch.plex.sources {
+            source.mask_invalid_resource(MASK);
+        }
         for p in &mut out.providers {
             p.password = p.password.masked();
         }
@@ -1079,6 +1082,18 @@ impl Settings {
         self.prefetch
             .validate()
             .map_err(|e| invalid("prefetch", e.to_string()))?;
+        if self.prefetch.plex.sources.iter().any(|source| {
+            !self
+                .plex
+                .servers
+                .iter()
+                .any(|server| server.id == source.server)
+        }) {
+            return Err(invalid(
+                "prefetch.plex.sources",
+                "Plex warming sources require a configured server".to_owned(),
+            ));
+        }
         if self.prefetch.enabled && !self.native_cache.enabled {
             return Err(invalid(
                 "prefetch",

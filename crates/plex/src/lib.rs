@@ -1,5 +1,6 @@
 //! Fork Plex transport and policy. Tokens never appear in URLs, diagnostics or Debug.
 mod policy;
+pub mod sources;
 mod transport;
 mod xml;
 

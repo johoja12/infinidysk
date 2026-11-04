@@ -1,3 +1,4 @@
+import { PlexPrefetchSources } from "./plex-prefetch-sources";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, body, type Schemas } from "../api/client";
@@ -169,6 +170,7 @@ export function PlexPredictions() {
       <div className="grid gap-3 sm:grid-cols-2">
         {([['head_bytes','Minimum head (MB)'],['tail_bytes','Minimum tail (MB)']] as const).map(([key,label])=><ApplyNumber key={key} id={`prediction-${key}`} label={label} value={policy[key]/1000000} min={0} max={1000} disabled={change.isPending || locked(`prefetch.plex.policy.${key}`)} apply={n=>change.mutateAsync({policy:{[key]:n*1000000}})} />)}
       </div>
+      <PlexPrefetchSources value={value.sources} servers={view.data.settings.plex.servers} disabled={change.isPending || locked("prefetch.plex.sources")} apply={sources=>change.mutateAsync({options:{sources}})} />
       <ApplyList
         id="prediction-viewers"
         label="Viewer identities"
@@ -241,6 +243,9 @@ export function PlexPredictions() {
                         playback: "Playing file",
                         next_episode: "Next episode",
                         partial_movie: "Partially watched",
+                        hub: "Hub source",
+                        collection: "Collection source",
+                        library: "Library source",
                       }[p.source]
                     }
                   </p>

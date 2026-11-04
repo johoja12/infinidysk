@@ -86,6 +86,7 @@ pub struct PlexSettings {
     pub next_episodes: u8,
     pub refresh_seconds: u32,
     pub policy: infinidysk_plex::PredictionPolicy,
+    pub sources: Vec<infinidysk_plex::sources::Source>,
 }
 impl Default for PlexSettings {
     fn default() -> Self {
@@ -97,6 +98,7 @@ impl Default for PlexSettings {
             next_episodes: 2,
             refresh_seconds: 60,
             policy: infinidysk_plex::PredictionPolicy::default(),
+            sources: Vec::new(),
         }
     }
 }
@@ -110,6 +112,15 @@ impl PlexSettings {
             (1..=20).contains(&self.next_episodes),
             "Plex next-episode limit must be 1 to 20"
         );
+        ensure!(self.sources.len() <= 128, "too many Plex warming sources");
+        let mut seen = std::collections::HashSet::new();
+        for source in &self.sources {
+            source.validate()?;
+            ensure!(
+                seen.insert((&source.server, &source.viewer, source.kind, &source.path)),
+                "duplicate Plex warming source"
+            );
+        }
         self.policy.validate()?;
         Ok(())
     }
@@ -771,9 +782,6 @@ impl Queue {
         if let Some(bytes) = cache.get(&lease, block).await {
             self.checkpoint(&job, bytes.len() as u64, false).await?;
             return Ok(true);
-        }
-        if self.wire.clone().ready().await.is_err() {
-            return self.defer_wire(&job).await;
         }
         let length = BLOCK.min(job.size - job.offset);
         let Some(permit) = cache.try_buffer() else {
