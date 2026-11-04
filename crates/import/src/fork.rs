@@ -97,7 +97,7 @@ fn witness(path: &Path) -> Result<Option<Witness>, Error> {
         sha256,
     }))
 }
-fn input(path: &Path) -> Result<File, Error> {
+pub(crate) fn input(path: &Path) -> Result<File, Error> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
@@ -110,14 +110,14 @@ fn input(path: &Path) -> Result<File, Error> {
     }
     Ok(file)
 }
-fn output(path: &Path) -> Result<File, Error> {
+pub(crate) fn output(path: &Path) -> Result<File, Error> {
     Ok(OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(path)?)
 }
-fn hash(path: &Path, limit: u64) -> Result<(u64, String), Error> {
+pub(crate) fn hash(path: &Path, limit: u64) -> Result<(u64, String), Error> {
     let mut file = input(path)?.take(limit + 1);
     let mut digest = Sha256::new();
     let mut size = 0;
@@ -135,7 +135,7 @@ fn hash(path: &Path, limit: u64) -> Result<(u64, String), Error> {
     }
     Ok((size, hex(&digest.finalize())))
 }
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes
         .iter()
         .fold(String::with_capacity(bytes.len() * 2), |mut out, b| {
@@ -159,7 +159,7 @@ fn sqlite(path: &Path) -> Result<bool, Error> {
     file.read_exact(&mut header)?;
     Ok(&header == b"SQLite format 3\0")
 }
-struct Incomplete(PathBuf);
+pub(crate) struct Incomplete(pub(crate) PathBuf);
 impl Drop for Incomplete {
     fn drop(&mut self) {
         if !self.0.as_os_str().is_empty() {
@@ -177,11 +177,14 @@ pub async fn export(
     extras: &[PathBuf],
     vars: Vec<(String, String)>,
 ) -> Result<Manifest, Error> {
-    if vars.iter().any(|(key, value)| {
-        key == "DATABASE_PROVIDER"
-            && !value.trim().is_empty()
-            && !value.trim().eq_ignore_ascii_case("sqlite")
-    }) {
+    let postgres = config.join("postgres-source.json").try_exists()?;
+    if !postgres
+        && vars.iter().any(|(key, value)| {
+            key == "DATABASE_PROVIDER"
+                && !value.trim().is_empty()
+                && !value.trim().eq_ignore_ascii_case("sqlite")
+        })
+    {
         return Err(Error::Invalid(
             "this export supports legacy SQLite only; preserve a PostgreSQL source with a database-native backup",
         ));
@@ -213,6 +216,19 @@ pub async fn export(
         (config.join("plex-library-metadata.json"), false),
         (config.join("imported-content-sweep.json"), false),
     ];
+    let postgres_files: Vec<PathBuf> = if postgres {
+        crate::postgres::verify(&config)?;
+        [
+            "postgres-source.json",
+            "postgres-schema.json",
+            "postgres-rows.jsonl",
+        ]
+        .map(|name| config.join(name))
+        .into()
+    } else {
+        Vec::new()
+    };
+    sources.extend(postgres_files.iter().map(|path| (path.clone(), false)));
     for path in extras {
         if !path.is_absolute() || stamp(path)?.is_none() {
             return Err(Error::Invalid(
@@ -257,10 +273,22 @@ pub async fn export(
         let Some(info) = stamp(source)? else {
             continue;
         };
+        let pg = postgres_files.contains(source);
+        let limit = if *sqlite || pg {
+            MAX_DATABASE_BYTES
+        } else {
+            MAX_FILE_BYTES
+        };
         let file = format!(
             "{:03}.{}",
             manifest.entries.len(),
-            if *sqlite { "sqlite" } else { "journal" }
+            if *sqlite {
+                "sqlite"
+            } else if pg {
+                "postgres"
+            } else {
+                "journal"
+            }
         );
         let dest = destination.join(&file);
         if *sqlite {
@@ -298,26 +326,21 @@ pub async fn export(
             fs::set_permissions(&dest, fs::Permissions::from_mode(0o600))?;
             input(&dest)?.sync_all()?;
         } else {
-            let mut from = input(source)?.take(MAX_FILE_BYTES + 1);
+            let mut from = input(source)?.take(limit + 1);
             let mut to = output(&dest)?;
-            if std::io::copy(&mut from, &mut to)? > MAX_FILE_BYTES {
+            if std::io::copy(&mut from, &mut to)? > limit {
                 return Err(Error::Invalid("legacy journal exceeds export bound"));
             }
             to.sync_all()?;
         }
-        let (bytes, sha256) = hash(
-            &dest,
-            if *sqlite {
-                MAX_DATABASE_BYTES
-            } else {
-                MAX_FILE_BYTES
-            },
-        )?;
+        let (bytes, sha256) = hash(&dest, limit)?;
         manifest.entries.push(Entry {
             file,
             source: source.to_string_lossy().into_owned(),
             kind: if *sqlite {
                 "sqlite_snapshot"
+            } else if pg {
+                "postgres_snapshot"
             } else {
                 "journal"
             }
@@ -386,6 +409,7 @@ pub fn verify(directory: &Path) -> Result<Manifest, Error> {
             "sqlite_snapshot" => "sqlite",
             "journal" => "journal",
             "settings" => "settings",
+            "postgres_snapshot" => "postgres",
             _ => return Err(Error::Invalid("unknown legacy evidence kind")),
         };
         if e.file != format!("{i:03}.{ext}") {
@@ -393,7 +417,7 @@ pub fn verify(directory: &Path) -> Result<Manifest, Error> {
         }
         let (bytes, sha) = hash(
             &directory.join(&e.file),
-            if ext == "sqlite" {
+            if matches!(ext, "sqlite" | "postgres") {
                 MAX_DATABASE_BYTES
             } else {
                 MAX_FILE_BYTES

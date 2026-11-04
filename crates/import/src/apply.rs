@@ -241,7 +241,7 @@ pub async fn apply_with_progress(
     let mut cs = open(config).await?;
     let blobs = config.join("blobs");
     // C# wrote `DateTime.Now`, so its times are wall clock in its container's zone (`TZ`).
-    let tz = TimeZone::system();
+    let tz = crate::postgres::source_timezone(config).await?;
     if tz.is_unknown() {
         tracing::warn!(
             reason = "no time zone detected",
@@ -450,7 +450,8 @@ pub async fn retry_files(
     let blobs = config.join("blobs");
     let mut done = Imported::default();
     // Unreadable ids were reported by the first import.
-    let tree = tree(&mut cs, db, &TimeZone::system(), &mut Imported::default()).await?;
+    let tz = crate::postgres::source_timezone(config).await?;
+    let tree = tree(&mut cs, db, &tz, &mut Imported::default()).await?;
     let absent: HashMap<Uuid, &Item> = tree.dirs.iter().map(|(d, _)| (d.id.0, d)).collect();
     let mut dirs: HashSet<Uuid> = HashSet::new();
     let mut files = Vec::new();

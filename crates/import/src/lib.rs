@@ -7,6 +7,7 @@ pub mod fork;
 mod memorypack;
 pub mod native;
 mod password;
+pub mod postgres;
 mod settings;
 
 use std::fmt;
@@ -44,6 +45,8 @@ const LOG_EVERY: u32 = 30;
 pub enum Error {
     #[error("no C# database at {0}")]
     NoDatabase(PathBuf),
+    #[error("legacy PostgreSQL snapshot validation failed")]
+    Source(#[source] Box<fork::Error>),
     #[error("reading the C# database: {0}")]
     Db(#[from] sqlx::Error),
     #[error("reading C# blobs: {0}")]
@@ -100,6 +103,7 @@ impl Survey {
 
 /// Opens the C# database in `config` read-only.
 async fn open(config: &Path) -> Result<SqliteConnection, Error> {
+    postgres::source_timezone(config).await?;
     let path = config.join("db.sqlite");
     if !path.is_file() {
         return Err(Error::NoDatabase(path));

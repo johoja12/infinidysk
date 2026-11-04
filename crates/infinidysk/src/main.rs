@@ -25,6 +25,48 @@ async fn main() -> anyhow::Result<()> {
         print!("{}", infinidysk::upgrade::report(config.as_ref()).await?);
         return Ok(());
     }
+    if std::env::args().nth(1).as_deref() == Some("fork-pg-snapshot") {
+        use std::io::Read as _;
+        let args: Vec<_> = std::env::args().skip(2).collect();
+        anyhow::ensure!(
+            args.len() == 2,
+            "usage: infinidysk fork-pg-snapshot NEW_DIRECTORY SOURCE_IANA_TIMEZONE < PRIVATE_CONNECTION_FILE"
+        );
+        let mut connection = String::new();
+        std::io::stdin()
+            .take(16385)
+            .read_to_string(&mut connection)?;
+        anyhow::ensure!(
+            connection.len() <= 16384,
+            "connection settings exceed input bound"
+        );
+        let receipt =
+            infinidysk_import::postgres::snapshot(&connection, args[0].as_ref(), &args[1]).await?;
+        println!(
+            "legacy PostgreSQL snapshot: {} files, digest {}",
+            receipt.files.len(),
+            receipt.digest
+        );
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("fork-pg-verify") {
+        let args: Vec<_> = std::env::args().skip(2).collect();
+        anyhow::ensure!(
+            args.len() == 2,
+            "usage: infinidysk fork-pg-verify DIRECTORY EXPECTED_DIGEST"
+        );
+        let receipt = infinidysk_import::postgres::verify(args[0].as_ref())?;
+        anyhow::ensure!(
+            receipt.digest == args[1],
+            "PostgreSQL snapshot digest differs from the export receipt"
+        );
+        println!(
+            "legacy PostgreSQL snapshot verified: {} files, digest {}",
+            receipt.files.len(),
+            receipt.digest
+        );
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("fork-export") {
         let args: Vec<_> = std::env::args_os()
             .skip(2)
