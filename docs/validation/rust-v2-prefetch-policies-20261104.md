@@ -73,3 +73,27 @@ controlled cold-read/seek performance and broader library/migration acceptance
 remain separate work. No production image was built or deployed for this receipt.
 Back up `/config` before upgrading: the new wire budget and warming history tables
 are additive migrations which apply at startup.
+
+## Cached lead and fork-build follow-up
+
+The later policy/build source passed the full workspace suite: **564 passed, zero
+failed, six default ignores**, SQLite plus PostgreSQL 17, formatting and warnings-denied
+all-target workspace Clippy. API generation and the production UI build passed.
+A rebuilt native example passed the mobile source-settings acceptance again. Its
+runtime status reported `johoja12/infinidysk` as the source repository and no upstream
+replacement update. The 130-second timed test above was not repeated for these later
+scheduling/build changes.
+
+Full-file warming now keeps its slot while any observed reader lacks a ten-minute
+contiguous cached lead, using the conservative 12.5 MB/s fallback when media duration
+is unavailable. Handle gaps retain positions for two minutes and age their lead.
+Unknown positions or uncertain metadata cannot justify yielding. Equal-priority
+jobs use the oldest checkpoint first. Foreground provider waits still interrupt the
+warming block. This does not yet implement dynamic connection capacity or urgent
+seek-window backfill jobs.
+
+Five isolated trial-builder tests passed, including pinned native submodule inclusion
+and dirty submodule refusal. A read-only plan on clean commit `9a5869e2` included
+`crates/yenc/rapidyenc` at `d223ecc92aa20e95e86827f341a7019ba7b62ecb`. It selected a
+fork-owned, commit-specific GHCR tag. This is admission/manifest proof; no Docker
+image build, push, deployment or image-level performance result is claimed.
