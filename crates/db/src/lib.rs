@@ -175,6 +175,7 @@ pub mod attempts;
 pub mod catalogue;
 pub mod repair;
 pub mod sweep;
+pub mod wire;
 
 /// A file or directory in the virtual tree.
 #[derive(Clone, Debug, PartialEq, Eq)]

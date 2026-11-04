@@ -7,6 +7,8 @@ use infinidysk_db::{
 
 /// Exercises the tree, blob and config paths that must behave the same on both backends.
 async fn exercise(db: &Db) {
+    wire_allowance(db).await;
+    warming_history(db).await;
     repair_lineage(db).await;
     repair_observations(db).await;
     repair_attempts(db).await;
@@ -2420,4 +2422,87 @@ async fn repair_completion(db: &Db) {
             .state,
         "repaired"
     );
+}
+
+async fn wire_allowance(db: &Db) {
+    assert!(db.reserve_warming_wire(10, 0, 100).await.is_err());
+    let (a, b) = tokio::join!(
+        db.reserve_warming_wire(10, 80, 100),
+        db.reserve_warming_wire(10, 80, 100)
+    );
+    let mut granted = [
+        a.expect("first").expect("credit").granted,
+        b.expect("second").expect("credit").granted,
+    ];
+    granted.sort_unstable();
+    assert_eq!(granted, [20, 80]);
+    assert!(
+        db.reserve_warming_wire(10, 1, 100)
+            .await
+            .expect("exhausted")
+            .is_none()
+    );
+    assert!(
+        db.reserve_warming_wire(9, 1, 1000)
+            .await
+            .expect("rollback cannot reset")
+            .is_none()
+    );
+    assert!(
+        db.reserve_warming_wire(10, 1, 50)
+            .await
+            .expect("limit reduction")
+            .is_none()
+    );
+    let next = db
+        .reserve_warming_wire(11, 30, 100)
+        .await
+        .expect("new day")
+        .expect("credit");
+    assert_eq!((next.day, next.charged, next.granted), (11, 30, 30));
+    let last = db
+        .reserve_warming_wire(11, 100, 100)
+        .await
+        .expect("remaining")
+        .expect("credit");
+    assert_eq!(last.granted, 70);
+    assert_eq!(
+        db.warming_wire_usage()
+            .await
+            .expect("durable total")
+            .charged,
+        100
+    );
+}
+
+async fn warming_history(db: &Db) {
+    let id = uuid::Uuid::new_v4();
+    db.save_prefetch("first", &[(id, 10, "outcome".into())])
+        .await
+        .expect("atomic warming state");
+    db.save_prefetch("next", &[(id, 10, "outcome".into())])
+        .await
+        .expect("idempotent outcome");
+    assert_eq!(
+        db.prefetch_history(100).await.expect("history"),
+        ["outcome"]
+    );
+    assert!(
+        db.save_prefetch("not accepted", &[(uuid::Uuid::nil(), 11, "invalid".into())])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        db.config()
+            .await
+            .expect("config")
+            .into_iter()
+            .find(|(key, _)| key == "fork_prefetch_v1")
+            .expect("state")
+            .1,
+        "next"
+    );
+    db.write_config(&[], &["fork_prefetch_v1"])
+        .await
+        .expect("test cleanup");
 }
