@@ -9,6 +9,8 @@
 
 mod backfill;
 mod native;
+mod probe;
+pub use probe::Probe;
 mod reader;
 mod revision;
 mod session;
@@ -84,6 +86,8 @@ nzbs                queued NZBs, by category
 pub enum Node {
     Root,
     Readme,
+    /// Private, expiring mount validation; absent from persistent storage/listing.
+    Probe(Probe),
     /// `/content` or anything under it.
     Item(Item),
     /// `/.ids` (empty prefix) or one of its shard directories.
@@ -114,6 +118,7 @@ impl Node {
         match self {
             Self::Root => String::new(),
             Self::Readme => "README".to_owned(),
+            Self::Probe(probe) => probe.id().to_string(),
             Self::Item(item) | Self::Links(Some(item)) | Self::Link { item, .. } => {
                 item.name.clone()
             }
@@ -136,7 +141,9 @@ impl Node {
                 Kind::Dir
             }
             Self::Link { .. } => Kind::Symlink,
-            Self::Readme | Self::Item(_) | Self::IdFile(_) | Self::Nzb(_) => Kind::File,
+            Self::Readme | Self::Probe(_) | Self::Item(_) | Self::IdFile(_) | Self::Nzb(_) => {
+                Kind::File
+            }
         }
     }
 
@@ -144,6 +151,7 @@ impl Node {
     pub fn size(&self) -> u64 {
         match self {
             Self::Readme => README.len() as u64,
+            Self::Probe(probe) => probe.data().len() as u64,
             Self::Item(item) | Self::IdFile(item) => item.size.unwrap_or(0),
             Self::Nzb(entry) => entry.nzb_size,
             Self::Link { target, .. } => target.len() as u64,
@@ -202,6 +210,7 @@ pub struct Vfs {
     /// Decoded metadata by blob and [`Db::blob_epoch`], so reopening a file skips
     /// fetching and decoding it.
     metas: Metas,
+    mount_probes: probe::Registry,
 }
 
 // ponytail: a fixed 64 MB, about 570k segments; make it a setting if libraries outgrow it.
@@ -319,6 +328,7 @@ impl Vfs {
     ) -> Self {
         Self {
             db,
+            mount_probes: probe::Registry::default(),
             client,
             budget,
             cache: None,
@@ -342,6 +352,11 @@ impl Vfs {
                 quick_cache::sync::DefaultLifecycle::default(),
             ),
         }
+    }
+
+    /// An ephemeral challenge visible only through this running VFS instance.
+    pub fn mount_probe(&self) -> Probe {
+        self.mount_probes.issue()
     }
 
     /// Nonblocking hints from qualified foreground reads; payloads and storage
@@ -485,6 +500,9 @@ impl Vfs {
         };
         if *name != id.to_string() || !name.starts_with(&prefix) {
             return Ok(None);
+        }
+        if let Some(probe) = self.mount_probes.lookup(id) {
+            return Ok(Some(Node::Probe(probe)));
         }
         Ok(self
             .db
@@ -683,6 +701,10 @@ impl Vfs {
             |bytes: Vec<u8>| Ok(Some(Handle::new(Reader::Memory(Cursor::new(bytes)), None)));
         match node {
             Node::Readme => memory(README.as_bytes().to_vec()),
+            Node::Probe(probe) => self
+                .mount_probes
+                .lookup(probe.id())
+                .map_or(Ok(None), |current| memory(current.data().to_vec())),
             Node::Link { target, .. } => memory(target.clone().into_bytes()),
             Node::Nzb(entry) => {
                 let raw = self

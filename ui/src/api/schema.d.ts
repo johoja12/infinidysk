@@ -919,6 +919,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/migration/mount-probe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["migration_mount_probe"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/migration/submissions": {
         parameters: {
             query?: never;
@@ -3125,6 +3141,14 @@ export interface components {
              * @default false
              */
             epoch_times: boolean;
+        };
+        MountProof: {
+            /** Format: int64 */
+            expires_at: number;
+            ids_path: string;
+            sha256: string;
+            /** Format: int64 */
+            size: number;
         };
         MountStatus: {
             dir: string;
@@ -6888,6 +6912,25 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    migration_mount_probe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MountProof"];
+                };
             };
         };
     };

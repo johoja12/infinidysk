@@ -109,6 +109,7 @@ pub struct Admin {
         provider_test::delete_provider_tests,
         quota::get_provider_usage,
         quota::post_reset_usage,
+        crate::migration::mount_probe,
         crate::migration::proof::capture,
         crate::migration::submit, crate::migration::status,
         get_queue,
@@ -209,6 +210,10 @@ impl Modify for Security {
 
 pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
     Router::new()
+        .route(
+            "/api/v1/migration/mount-probe",
+            post(crate::migration::mount_probe),
+        )
         .route(
             "/api/v1/migration/legacy-proof",
             post(crate::migration::proof::capture),

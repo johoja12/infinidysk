@@ -138,17 +138,19 @@ async fn kernel(native: bool) {
     } else {
         None
     };
+    let vfs = Arc::new(
+        Vfs::new(
+            db.clone(),
+            client,
+            Budget::new(1 << 20),
+            1 << 20,
+            &mount_str,
+        )
+        .with_native_cache(cache.clone()),
+    );
+    let mount_probe = vfs.mount_probe();
     let task = tokio::spawn(run(
-        Arc::new(
-            Vfs::new(
-                db.clone(),
-                client,
-                Budget::new(1 << 20),
-                1 << 20,
-                &mount_str,
-            )
-            .with_native_cache(cache.clone()),
-        ),
+        Arc::clone(&vfs),
         Config {
             mount_dir: mount.clone(),
             uid: 1234,
@@ -171,6 +173,10 @@ async fn kernel(native: bool) {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        assert_eq!(
+            std::fs::read(mount.join(mount_probe.id().ids_path())).unwrap(),
+            mount_probe.data()
+        );
         let mut root: Vec<_> = std::fs::read_dir(&mount)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())

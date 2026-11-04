@@ -1195,3 +1195,39 @@ async fn legacy_member_proof_is_source_bound_and_never_claims_payload_validation
     cancel.cancel();
     assert_eq!(server.await.unwrap().unwrap(), Exit::Stopped);
 }
+
+#[tokio::test]
+async fn migration_mount_challenge_matches_actual_webdav_bytes_without_a_media_row() {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    let (addr, cancel, server, url) = start().await;
+    let (code, body) = send(
+        addr,
+        &admin_request("POST", "/api/v1/migration/mount-probe", ""),
+    )
+    .await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    let probe: Value = serde_json::from_str(&body).unwrap();
+    let path = probe["ids_path"].as_str().unwrap();
+    let mut connection = TcpStream::connect(addr).await.unwrap();
+    connection.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\nAuthorization: Basic YWRtaW46cHc=\r\n\r\n").as_bytes()).await.unwrap();
+    let mut reply = Vec::new();
+    connection.read_to_end(&mut reply).await.unwrap();
+    let split = reply.windows(4).position(|p| p == b"\r\n\r\n").unwrap();
+    assert!(reply.starts_with(b"HTTP/1.1 200 OK"));
+    let bytes = &reply[split + 4..];
+    assert_eq!(bytes.len(), 16);
+    let hash = Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, b| {
+            write!(out, "{b:02x}").unwrap();
+            out
+        });
+    assert_eq!(probe["sha256"], hash);
+    let db = infinidysk_db::Db::connect(&url).await.unwrap();
+    let id = ItemId::from_ids_path(path.trim_start_matches('/')).unwrap();
+    assert!(db.item(id).await.unwrap().is_none());
+    db.close().await;
+    cancel.cancel();
+    assert_eq!(server.await.unwrap().unwrap(), Exit::Stopped);
+}

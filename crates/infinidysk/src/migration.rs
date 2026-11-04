@@ -141,3 +141,21 @@ fn digest_bytes(bytes: &[u8]) -> String {
             out
         })
 }
+
+#[derive(Serialize, ToSchema)]
+pub struct MountProof {
+    pub ids_path: String,
+    pub size: u64,
+    pub sha256: String,
+    pub expires_at: i64,
+}
+#[utoipa::path(post,operation_id="migration_mount_probe",path="/api/v1/migration/mount-probe",responses((status=200,body=MountProof)))]
+pub async fn mount_probe(State(admin): State<Arc<Admin>>) -> Json<MountProof> {
+    let probe = admin.vfs.mount_probe();
+    Json(MountProof {
+        ids_path: format!("/{}", probe.id().ids_path()),
+        size: probe.data().len() as u64,
+        sha256: digest_bytes(probe.data()),
+        expires_at: probe.expires_at_ms(),
+    })
+}

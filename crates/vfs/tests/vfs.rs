@@ -455,3 +455,34 @@ async fn serves_content_links_ids_and_queued_nzbs() {
     );
     assert!(!names(&vfs, &format!("/.ids/{shards}")).await.contains(&id));
 }
+
+#[tokio::test]
+async fn mount_challenges_are_readable_only_in_the_issuing_vfs_and_never_persist() {
+    let db = Db::connect("sqlite::memory:").await.unwrap();
+    let client = Arc::new(Client::new([]));
+    let vfs = Vfs::new(
+        db.clone(),
+        Arc::clone(&client),
+        Budget::new(1_000_000),
+        0,
+        "/unused",
+    );
+    let other = Vfs::new(db.clone(), client, Budget::new(1_000_000), 0, "/unused");
+    let before = db.item_ids().await.unwrap();
+    let blobs = db.blob_ids().await.unwrap();
+    let probe = vfs.mount_probe();
+    let path = format!("/{}", probe.id().ids_path());
+    let node = vfs.lookup(&path).await.unwrap().unwrap();
+    assert_eq!(node.kind(), Kind::File);
+    assert_eq!(node.size(), 16);
+    assert_eq!(read_all(&vfs, &node).await, probe.data());
+    assert!(other.lookup(&path).await.unwrap().is_none());
+    assert!(db.item(probe.id()).await.unwrap().is_none());
+    let listed = vfs
+        .list(&Node::Shard(probe.id().to_string()[..5].into()))
+        .await
+        .unwrap();
+    assert!(!listed.iter().any(|n| n.name() == probe.id().to_string()));
+    assert_eq!(db.item_ids().await.unwrap(), before);
+    assert_eq!(db.blob_ids().await.unwrap(), blobs);
+}
