@@ -85,6 +85,11 @@ impl Work {
             self.started = Some(Instant::now());
         }
     }
+    pub(super) fn synced_write(&self, bytes: u64) {
+        self.counters
+            .write_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
     pub(super) fn success(&mut self, bytes: u64) {
         if self.success {
             return;

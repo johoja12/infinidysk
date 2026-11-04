@@ -86,7 +86,7 @@ pub struct Admin {
         library::playback::status,
         library::catalogue::status,library::catalogue::refresh,library::catalogue::groups,library::catalogue::files,
         crate::native_cache::evictions,crate::native_cache::diagnostics,crate::native_cache::probe,
-        crate::native_cache::status,
+        crate::native_cache::recovery_candidates,crate::native_cache::recover,crate::native_cache::status,
         crate::native_cache::files,
         crate::native_cache::action,
         crate::native_cache::coverage,
@@ -235,6 +235,10 @@ pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
             get(crate::plex::libraries),
         )
         .route("/api/v1/native-cache", get(crate::native_cache::status))
+        .route(
+            "/api/v1/native-cache/recovery",
+            get(crate::native_cache::recovery_candidates).post(crate::native_cache::recover),
+        )
         .route(
             "/api/v1/native-cache/evictions",
             get(crate::native_cache::evictions),

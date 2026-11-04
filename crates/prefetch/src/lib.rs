@@ -229,6 +229,7 @@ pub struct History {
 )]
 pub struct Status {
     pub paused: bool,
+    pub recovery_mode: bool,
     pub day: i64,
     pub charged_fill_bytes: u64,
     /// Observed NNTP bytes since process start, including abandoned drains.
@@ -395,6 +396,10 @@ impl Queue {
         };
         Status {
             paused: ledger.paused,
+            recovery_mode: self
+                .vfs
+                .native_cache()
+                .is_some_and(|cache| cache.recovery_mode()),
             day: ledger.day,
             charged_fill_bytes: ledger.charged,
             received_wire_bytes: self.wire.received(),
@@ -721,7 +726,13 @@ impl Queue {
         };
         self.wire
             .configure(settings.enabled, settings.daily_wire_bytes);
-        if !settings.enabled || self.foreground() {
+        if !settings.enabled
+            || self.foreground()
+            || self
+                .vfs
+                .native_cache()
+                .is_some_and(|cache| cache.recovery_mode())
+        {
             return Ok(false);
         }
         settings.validate()?;

@@ -825,3 +825,47 @@ async fn watched_full_file_keeps_its_lane_until_all_remaining_bytes_are_cached()
         BLOCK
     );
 }
+
+#[tokio::test]
+async fn cache_recovery_holds_warming_without_provider_or_daily_allowance_consumption() {
+    let t = Temp::new();
+    let (vfs, item, cache, _corpus, server, client) = fixture(&t, false).await;
+    let db = vfs.db().clone();
+    drop(vfs);
+    drop(cache);
+    let cache = Cache::open(Settings {
+        enabled: true,
+        recovery_mode: true,
+        min_file_mb: 0,
+        metadata_path: t.0.join("metadata").to_string_lossy().into_owned(),
+        folders: vec![FolderSettings {
+            id: Uuid::from_u128(1),
+            path: t.0.join("cache").to_string_lossy().into_owned(),
+            min_free_bytes: 0,
+            ..Default::default()
+        }],
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let vfs = Arc::new(
+        Vfs::new(
+            db,
+            client,
+            Budget::new(8 * 1024 * 1024),
+            0,
+            "/unused-test-mount",
+        )
+        .with_native_cache(Some(cache)),
+    );
+    let q = Queue::load(vfs.db().clone(), vfs).await.unwrap();
+    enqueue(&q, &item).await;
+    assert!(!q.tick(&settings()).await.unwrap());
+    let status = q.status().await;
+    assert!(status.recovery_mode);
+    assert_eq!(server.body_commands(), 0);
+    assert_eq!(status.charged_fill_bytes, 0);
+    assert_eq!(status.received_wire_bytes, 0);
+    assert_eq!(status.reserved_wire_bytes, Some(0));
+    assert_eq!(status.jobs[0].state, State::Queued);
+}

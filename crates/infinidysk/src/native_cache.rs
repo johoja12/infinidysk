@@ -13,6 +13,7 @@ use utoipa::{IntoParams, ToSchema};
 pub struct Status {
     pub configured: bool,
     pub available: bool,
+    pub recovery_mode: bool,
     pub reason: Option<String>,
     pub stats: Option<Stats>,
 }
@@ -28,6 +29,10 @@ pub async fn status(State(admin): State<Arc<Admin>>) -> Result<Json<Status>, Fai
     };
     Ok(Json(Status {
         configured: admin.config.read().await.settings().native_cache.enabled,
+        recovery_mode: admin
+            .vfs
+            .native_cache()
+            .is_some_and(|cache| cache.recovery_mode()),
         available: stats.is_some(),
         reason: admin.live.native_cache_error().map(str::to_owned),
         stats,
@@ -335,4 +340,62 @@ pub async fn probe(
     .await
     .map_err(|_| Fail::Unavailable("Cache probe timed out; retry the same cursor".into()))?;
     Ok(Json(result.map_err(|e| fail(&e))?))
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in=Query)]
+pub struct RecoveryQuery {
+    pub folder_id: uuid::Uuid,
+    pub after: Option<String>,
+}
+#[derive(Deserialize, ToSchema)]
+#[schema(as=NativeCacheRecoveryRequest)]
+pub struct RecoveryRequest {
+    pub folder_id: uuid::Uuid,
+    pub source: infinidysk_native_cache::RecoveryCandidate,
+    pub offset: u64,
+}
+#[utoipa::path(get,operation_id="native_cache_recovery_candidates",path="/api/v1/native-cache/recovery",params(RecoveryQuery),responses((status=200,body=infinidysk_native_cache::RecoveryPage)))]
+pub async fn recovery_candidates(
+    State(admin): State<Arc<Admin>>,
+    Query(query): Query<RecoveryQuery>,
+) -> Result<Json<infinidysk_native_cache::RecoveryPage>, Fail> {
+    let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
+    Ok(Json(
+        cache
+            .recovery_candidates(query.folder_id, query.after.as_deref())
+            .await
+            .map_err(|e| fail(&e))?,
+    ))
+}
+#[utoipa::path(post,operation_id="native_cache_recover",path="/api/v1/native-cache/recovery",request_body=RecoveryRequest,responses((status=200,body=infinidysk_native_cache::RecoveryReport)))]
+pub async fn recover(
+    State(admin): State<Arc<Admin>>,
+    Json(request): Json<RecoveryRequest>,
+) -> Result<Json<infinidysk_native_cache::RecoveryReport>, Fail> {
+    let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
+    let item = admin
+        .vfs
+        .db()
+        .item(infinidysk_core::ItemId(request.source.item))
+        .await
+        .map_err(|_| Fail::Internal)?
+        .ok_or(Fail::NotFound)?;
+    if item.health_state == infinidysk_db::HealthState::Hidden {
+        return Err(Fail::NotFound);
+    }
+    let key = admin.vfs.cache_key(&item).await.map_err(|_| {
+        Fail::Unavailable("Current source and repair revision could not be verified".into())
+    })?;
+    if key.revision() != request.source.revision || key.size() != request.source.size_bytes {
+        return Err(Fail::Bad(
+            "Source generation changed; refresh recovery candidates".into(),
+        ));
+    }
+    Ok(Json(
+        cache
+            .recover_blocks(request.folder_id, &key, request.offset)
+            .await
+            .map_err(|e| fail(&e))?,
+    ))
 }

@@ -1,6 +1,10 @@
 //! Final-media bytes, below delivery: checksummed blocks in bounded chunk files.
 //! The catalogue stays on local storage; browsing never scans payload volumes.
 mod diagnostics;
+mod manifest;
+pub use manifest::{
+    Candidate as RecoveryCandidate, Page as RecoveryPage, Report as RecoveryReport,
+};
 mod traffic;
 pub use traffic::Stats as IoStats;
 pub mod legacy;
@@ -50,6 +54,8 @@ pub enum Error {
 #[schema(as = NativeCacheSettings)]
 pub struct Settings {
     pub enabled: bool,
+    /// Explicit reconstruction mode: existing manifests may restore folder ownership; payload mutation stays off.
+    pub recovery_mode: bool,
     pub metadata_path: String,
     pub folders: Vec<FolderSettings>,
     pub buffer_mb: u32,
@@ -62,6 +68,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            recovery_mode: false,
             metadata_path: "/config/native-cache-v2".to_owned(),
             folders: vec![],
             buffer_mb: 32,
@@ -391,11 +398,22 @@ impl Cache {
                 .custom_flags(OFlag::O_DIRECTORY.bits() | OFlag::O_NOFOLLOW.bits())
                 .open(path)?;
             let meta = root.metadata()?;
-            let registered: Option<(String, String, String, String)> =
+            let mut registered: Option<(String, String, String, String)> =
                 sqlx::query_as("SELECT path,device,inode,marker FROM folders WHERE id=$1")
                     .bind(f.id.to_string())
                     .fetch_optional(&db)
                     .await?;
+            let mut adopted = false;
+            if registered.is_none() && settings.recovery_mode {
+                let marker = manifest::ownership(&root, f)?;
+                registered = Some((
+                    f.path.clone(),
+                    meta.dev().to_string(),
+                    meta.ino().to_string(),
+                    marker,
+                ));
+                adopted = true;
+            }
             // Validate identity before any create/open-for-write, including the lock.
             if let Some((registered_path, dev, ino, marker)) = &registered {
                 if registered_path != &f.path
@@ -493,6 +511,18 @@ impl Cache {
                 .await?;
                 marker
             };
+            if adopted {
+                sqlx::query(
+                    "INSERT INTO folders(id,path,device,inode,marker) VALUES($1,$2,$3,$4,$5)",
+                )
+                .bind(f.id.to_string())
+                .bind(&f.path)
+                .bind(meta.dev().to_string())
+                .bind(meta.ino().to_string())
+                .bind(&marker)
+                .execute(&db)
+                .await?;
+            }
             let folder = Folder {
                 settings: f.clone(),
                 root,
@@ -709,6 +739,9 @@ impl Cache {
         data: Bytes,
         permit: OwnedSemaphorePermit,
     ) -> Result<bool, Error> {
+        if self.settings.recovery_mode {
+            return Ok(false);
+        }
         let key = &lease.key;
         let Some(start) = block.checked_mul(BLOCK).filter(|at| *at < key.size) else {
             return Ok(false);
@@ -797,6 +830,8 @@ impl Cache {
             };
             let name = format!("{}-{}.data", key.id(), start / chunk);
             let folder = Arc::clone(folder);
+            let recovery_record =
+                manifest::Record::new(&folder, key, chunk, block, data.len() as u64, hash.clone());
             let mut observation = self.io.begin(traffic::Kind::Write);
             let writing = tokio::task::spawn_blocking(move || {
                 observation.start();
@@ -805,7 +840,9 @@ impl Cache {
                 file.write_all_at(&data, start % chunk)?;
                 file.sync_all()?;
                 folder.root.sync_all()?;
-                observation.success(data.len() as u64);
+                observation.synced_write(data.len() as u64);
+                manifest::append(&folder, &recovery_record)?;
+                observation.success(0);
                 Ok::<_, io::Error>(guard)
             });
             let Ok(Ok(Ok(_guard))) = tokio::time::timeout(self.deadline(), writing).await else {
@@ -836,6 +873,9 @@ impl Cache {
     /// Bounded whole-entry LRU/age eviction. Active leases and pins are always checked.
     pub async fn maintain(&self) -> Result<(), Error> {
         type Row = (String, String, i64, i64, i64);
+        if self.settings.recovery_mode {
+            return Ok(());
+        }
         for folder in self.folders.iter().filter(|f| !f.settings.read_only) {
             let mut used:i64=sqlx::query_scalar("SELECT COALESCE(SUM(b.len),0) FROM blocks b JOIN entries e ON e.key=b.key WHERE e.folder=$1").bind(folder.settings.id.to_string()).fetch_one(&self.db).await?;
             let high = folder.settings.quota_bytes / 100 * u64::from(folder.settings.high_percent);
@@ -894,18 +934,24 @@ impl Cache {
             ranges.len() == 1 && ranges[0].start == 0 && ranges[0].end == key.size
         };
         if key.size == 0 || !full(&self.coverage(key).await?) {
-            return Ok(Some(false));
+            return Ok(if self.settings.recovery_mode {
+                None
+            } else {
+                Some(false)
+            });
         }
         let Some(lease) = self.lease(key.clone()) else {
             return Ok(None);
         };
         for block in 0..key.size.div_ceil(BLOCK) {
             if self.get(&lease, block).await.is_none() {
-                return Ok(if full(&self.coverage(key).await?) {
-                    None
-                } else {
-                    Some(false)
-                });
+                return Ok(
+                    if self.settings.recovery_mode || full(&self.coverage(key).await?) {
+                        None
+                    } else {
+                        Some(false)
+                    },
+                );
             }
         }
         Ok(Some(true))
@@ -922,6 +968,9 @@ impl Cache {
             ranges.len() == 1 && ranges[0].start == 0 && ranges[0].end == key.size
         };
         if key.size == 0 || !full(&self.coverage(key).await?) {
+            if self.settings.recovery_mode {
+                return Ok(None);
+            }
             self.release_protection(key).await?;
             return Ok(Some(false));
         }
@@ -1028,6 +1077,9 @@ impl Cache {
     }
     /// Explicit eviction cannot remove an active or pinned generation.
     pub async fn evict(&self, key: &Key, reason: &str) -> Result<bool, Error> {
+        if self.settings.recovery_mode {
+            return Ok(false);
+        }
         {
             let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
             if live.readers.contains_key(key) || !live.evicting.insert(key.clone()) {
@@ -1089,6 +1141,15 @@ impl Cache {
                     Ok(()) | Err(nix::errno::Errno::ENOENT) => {}
                     Err(error) => return Err(io::Error::from(error)),
                 }
+            }
+            let manifest_name = format!("{name_prefix}{}", manifest::SUFFIX);
+            match nix::unistd::unlinkat(
+                &folder.root,
+                manifest_name.as_str(),
+                nix::unistd::UnlinkatFlags::NoRemoveDir,
+            ) {
+                Ok(()) | Err(nix::errno::Errno::ENOENT) => {}
+                Err(error) => return Err(io::Error::from(error)),
             }
             folder.root.sync_all()?;
             observation.success(0);
