@@ -31,6 +31,8 @@ pub struct Source {
     pub dependencies: Vec<String>,
     pub fingerprint: Vec<u8>,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped_identity: Option<crate::article_identity::Evidence>,
 }
 impl Source {
     /// Hash the original compressed stream without buffering a second metadata copy.
@@ -108,6 +110,7 @@ impl Source {
             dependencies,
             fingerprint: vec![],
             size: 0,
+            mapped_identity: None,
         }
     }
     pub(crate) fn finish(mut self, blob: &str, meta: &FileMeta) -> Result<String, String> {

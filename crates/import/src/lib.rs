@@ -2,6 +2,7 @@
 //! what an import would carry over, the C# settings, and [`apply`], which writes the data.
 
 mod apply;
+pub mod article_identity;
 mod csharp;
 pub mod fork;
 mod memorypack;
@@ -26,8 +27,8 @@ use sqlx::sqlite::SqliteConnectOptions;
 use uuid::Uuid;
 
 pub use crate::apply::{
-    Imported, Progress, Stage, apply, apply_with_progress, restore_nzb_downloads, retry_files,
-    stamp_download_ids,
+    Imported, Progress, Stage, apply, apply_with_progress, capture_mapped_source,
+    restore_nzb_downloads, retry_files, stamp_download_ids,
 };
 use crate::csharp::{LongRange, decode};
 pub use crate::password::{is_legacy, legacy_hash, verify_legacy};
@@ -43,6 +44,8 @@ const LOG_EVERY: u32 = 30;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("legacy source mapping: {0}")]
+    Mapping(&'static str),
     #[error("no C# database at {0}")]
     NoDatabase(PathBuf),
     #[error("legacy PostgreSQL snapshot validation failed")]

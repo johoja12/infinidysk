@@ -1078,3 +1078,120 @@ async fn migration_submission_readback_survives_a_lost_http_response() {
     cancel.cancel();
     assert_eq!(server.await.unwrap().unwrap(), Exit::Stopped);
 }
+
+#[tokio::test]
+async fn legacy_member_proof_is_source_bound_and_never_claims_payload_validation() {
+    use infinidysk_core::{BlobId, FileMeta, NzbFile, Segment, Segments, blob};
+    use infinidysk_db::{HealthState, HealthStatus};
+    use sha2::{Digest as _, Sha256};
+    let (addr, cancel, server, url) = start().await;
+    assert_eq!(
+        status(addr, &admin_request("GET", "/api/v1/status", "")).await,
+        "HTTP/1.1 200 OK"
+    );
+    let db = infinidysk_db::Db::connect(&url).await.unwrap();
+    let root = db.item(ItemId::CONTENT).await.unwrap().unwrap();
+    let mut file = Item::child(&root, "legacy-proof-fixture.bin", ItemKind::NzbFile).unwrap();
+    let meta = BlobId::new();
+    file.meta_blob = Some(meta);
+    file.size = Some(100);
+    file.health_state = HealthState::Ignored;
+    let metadata = FileMeta::Nzb(NzbFile {
+        segments: Segments {
+            items: vec![Segment {
+                id: "fixture@loopback".into(),
+                size: 100,
+                fallbacks: vec![],
+            }],
+            sizes_trusted: true,
+            ..Default::default()
+        },
+        proof: None,
+    });
+    let evidence = infinidysk_import::article_identity::Evidence {
+        version: 1,
+        kind: "direct-articles-v1".into(),
+        digest: "a".repeat(64),
+        payload_sha256: "b".repeat(64),
+        size: 100,
+    };
+    // This HTTP fixture seeds already-derived evidence. Original C# vectors and
+    // offline MemoryPack reconversion are tested in the import crate separately.
+    let source = infinidysk_import::native::Source {
+        version: 1,
+        base_generation: "generated-fixture".into(),
+        dependencies: vec![],
+        fingerprint: Sha256::digest(metadata.content_identity().unwrap()).to_vec(),
+        size: 100,
+        mapped_identity: Some(evidence.clone()),
+    };
+    let stored = serde_json::to_string(&source).unwrap();
+    let raw = blob::encode_meta(&metadata).unwrap();
+    db.import_items_with_sources(
+        &[(
+            file.clone(),
+            HealthStatus {
+                state: HealthState::Ignored,
+                ..Default::default()
+            },
+        )],
+        &[(meta, &raw)],
+        &[(file.id, stored.clone())],
+    )
+    .await
+    .unwrap();
+    let mut request = json!({"source_config":"/nonexistent-legacy-fixture","package_digest":"c".repeat(64),"legacy_item":file.id.0,"identity_kind":evidence.kind,"identity_digest":evidence.digest,"payload_sha256":evidence.payload_sha256,"size":100});
+    let (code, body) = send(
+        addr,
+        &admin_request(
+            "POST",
+            "/api/v1/migration/legacy-proof",
+            &request.to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(code, "HTTP/1.1 200 OK", "{body}");
+    let proof: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(proof["current_item"], json!(file.id.0));
+    assert_eq!(proof["payload_validated"], false);
+    assert_eq!(proof["ids_path"], format!("/{}", file.id.ids_path()));
+    assert_eq!(proof["record_digest"].as_str().unwrap().len(), 64);
+    request["identity_digest"] = json!("d".repeat(64));
+    assert_eq!(
+        status(
+            addr,
+            &admin_request(
+                "POST",
+                "/api/v1/migration/legacy-proof",
+                &request.to_string()
+            )
+        )
+        .await,
+        "HTTP/1.1 409 Conflict"
+    );
+    request["identity_digest"] = json!("a".repeat(64));
+    let mut changed = metadata.clone();
+    let FileMeta::Nzb(member) = &mut changed else {
+        panic!("direct fixture");
+    };
+    member.segments.items[0].id = "changed@loopback".into();
+    db.update_blob(meta, &blob::encode_meta(&changed).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        status(
+            addr,
+            &admin_request(
+                "POST",
+                "/api/v1/migration/legacy-proof",
+                &request.to_string()
+            )
+        )
+        .await,
+        "HTTP/1.1 503 Service Unavailable"
+    );
+    assert_eq!(db.import_source(file.id).await.unwrap().unwrap(), stored);
+    db.close().await;
+    cancel.cancel();
+    assert_eq!(server.await.unwrap().unwrap(), Exit::Stopped);
+}

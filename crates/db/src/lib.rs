@@ -1487,6 +1487,23 @@ impl Db {
         Ok(())
     }
 
+    /// Captures derived legacy evidence only while both provenance and exact current
+    /// metadata bytes remain unchanged. It never rewrites the source or media blob.
+    pub async fn capture_import_source(
+        &self,
+        item: ItemId,
+        meta: BlobId,
+        size: u64,
+        raw: &[u8],
+        expected: &str,
+        derived: &str,
+    ) -> Result<bool, Error> {
+        let sql = "UPDATE import_sources SET provenance=$5 WHERE item_id=$1 AND provenance=$4 AND EXISTS(SELECT 1 FROM items JOIN blobs ON blobs.id=items.meta_blob WHERE items.id=$1 AND items.meta_blob=$2 AND blobs.data=$3 AND items.size=$6 AND items.health_state<>$7)";
+        Ok(
+            on!(self,pool=>sqlx::query(sql).bind(item.0).bind(meta.0).bind(raw).bind(expected).bind(derived).bind(i64::try_from(size).map_err(|_|Error::Corrupt("source size exceeds bound"))?).bind(HealthState::Hidden as i16).execute(pool).await?.rows_affected())
+                == 1,
+        )
+    }
     pub async fn import_source(&self, item: ItemId) -> Result<Option<String>, Error> {
         let sql = "SELECT provenance FROM import_sources WHERE item_id=$1";
         Ok(on!(self, pool => sqlx::query_scalar(sql).bind(item.0).fetch_optional(pool).await?))

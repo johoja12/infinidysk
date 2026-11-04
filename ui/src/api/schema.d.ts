@@ -903,6 +903,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/migration/legacy-proof": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["migration_legacy_proof"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/migration/submissions": {
         parameters: {
             query?: never;
@@ -4172,6 +4188,27 @@ export interface components {
              */
             total: number;
         };
+        Proof: {
+            /** Format: uuid */
+            current_item: string;
+            identity_digest: string;
+            identity_kind: string;
+            ids_path: string;
+            /** Format: uuid */
+            legacy_item: string;
+            /** Format: int64 */
+            observed_at: number;
+            package_digest: string;
+            payload_sha256: string;
+            /** @description Exact metadata/article identity does not establish healthy media payloads. */
+            payload_validated: boolean;
+            record_digest: string;
+            /** Format: int64 */
+            size: number;
+            source_revision: string;
+            /** Format: int32 */
+            version: number;
+        };
         Provider: {
             /**
              * @description Catalog backbone id; a custom provider without one is its own group.
@@ -4593,6 +4630,17 @@ export interface components {
             /** @description Mount paths that stop working; library links pointing at them break. */
             links: string[];
             path: string;
+        };
+        Request: {
+            identity_digest: string;
+            identity_kind: string;
+            /** Format: uuid */
+            legacy_item: string;
+            package_digest: string;
+            payload_sha256: string;
+            /** Format: int64 */
+            size: number;
+            source_config: string;
         };
         RescueView: {
             /** Format: int64 */
@@ -6803,6 +6851,43 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ApiError"];
                 };
+            };
+        };
+    };
+    migration_legacy_proof: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Request"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Proof"];
+                };
+            };
+            /** @description Source identity changed */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Offline source unavailable or mapping lane busy */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };

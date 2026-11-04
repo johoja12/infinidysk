@@ -923,6 +923,7 @@ async fn exercise(db: &Db) {
     unlinked(db).await;
     restored_nzb_links(db).await;
     first_checks(db).await;
+    mapped_source_fences(db).await;
 }
 
 /// A finished job stores its files' first health checks with its output.
@@ -2826,5 +2827,111 @@ async fn migration_admission(db: &Db) {
             .await
             .expect("independent receipt"),
         Some(receipt)
+    );
+}
+
+async fn mapped_source_fences(db: &Db) {
+    let root = db
+        .item(ItemId::CONTENT)
+        .await
+        .expect("mapping root")
+        .expect("mapping root");
+    let mut item = Item::child(&root, "mapped-source-fixture.bin", ItemKind::NzbFile)
+        .expect("mapping fixture");
+    let meta = BlobId::new();
+    item.meta_blob = Some(meta);
+    item.size = Some(7);
+    db.import_items_with_sources(
+        &[(item.clone(), HealthStatus::default())],
+        &[(meta, b"fixture")],
+        &[(item.id, "original-evidence".into())],
+    )
+    .await
+    .expect("mapping fixture");
+    assert!(
+        !db.capture_import_source(
+            item.id,
+            meta,
+            8,
+            b"fixture",
+            "original-evidence",
+            "wrong-size"
+        )
+        .await
+        .expect("size fence")
+    );
+    assert!(
+        !db.capture_import_source(
+            item.id,
+            meta,
+            7,
+            b"changed",
+            "original-evidence",
+            "wrong-bytes"
+        )
+        .await
+        .expect("metadata fence")
+    );
+    assert!(
+        !db.capture_import_source(
+            item.id,
+            meta,
+            7,
+            b"fixture",
+            "stale-evidence",
+            "wrong-version"
+        )
+        .await
+        .expect("provenance fence")
+    );
+    assert!(
+        db.capture_import_source(
+            item.id,
+            meta,
+            7,
+            b"fixture",
+            "original-evidence",
+            "derived-evidence"
+        )
+        .await
+        .expect("capture evidence")
+    );
+    db.set_health(
+        item.id,
+        &HealthStatus {
+            state: HealthState::Hidden,
+            ..HealthStatus::default()
+        },
+        Recheck::None,
+    )
+    .await
+    .expect("source removed");
+    assert!(
+        !db.capture_import_source(
+            item.id,
+            meta,
+            7,
+            b"fixture",
+            "derived-evidence",
+            "hidden-source"
+        )
+        .await
+        .expect("hidden fence")
+    );
+    assert_eq!(
+        db.import_source(item.id)
+            .await
+            .expect("read proof")
+            .as_deref(),
+        Some("derived-evidence")
+    );
+    db.delete_item(item.id)
+        .await
+        .expect("remove mapping fixture");
+    assert!(
+        db.import_source(item.id)
+            .await
+            .expect("proof cascade")
+            .is_none()
     );
 }

@@ -964,14 +964,27 @@ async fn convert(
     blobs: &Path,
     sizer: &mut Sizer<'_>,
 ) -> Result<(FileMeta, bool, String), String> {
+    convert_with_mapping(row, blobs, sizer, false).await
+}
+async fn convert_with_mapping(
+    row: &FileRow,
+    blobs: &Path,
+    sizer: &mut Sizer<'_>,
+    mapping: bool,
+) -> Result<(FileMeta, bool, String), String> {
     let id = row.meta.clone().ok_or("no metadata blob")?;
     let blobs = blobs.to_owned();
+    let original_nzb = row.nzb.clone();
+    let mapping_size = row
+        .size
+        .filter(|v| *v >= 0 && *v != i64::MAX)
+        .and_then(|v| u64::try_from(v).ok());
     let sub_type = row.sub_type;
     let (file, source) = tokio::task::spawn_blocking(move || {
         let input = open_blob(&blobs, &id)
             .map_err(|e| format!("metadata blob: {e}"))?
             .ok_or("metadata blob: not found")?;
-        crate::native::Source::capture_reader(input, |input| {
+        let (file, mut source) = crate::native::Source::capture_reader(input, |input| {
             let file = match sub_type {
                 201 => decode(input, csharp::nzb_file).map(CsFile::Nzb),
                 202 => decode(input, csharp::rar_file).map(CsFile::Rar),
@@ -980,7 +993,21 @@ async fn convert(
             };
             let file = file.map_err(|e| format!("metadata blob: {e}"))?;
             Ok(file)
-        })
+        })?;
+        if mapping {
+            let nzb = original_nzb.ok_or("original NZB identity is missing")?;
+            let xml = read_blob(&blobs, &nzb, MAX_NZB_BLOB_BYTES)
+                .map_err(|_| "original NZB blob could not be read")?
+                .ok_or("original NZB blob is missing")?;
+            let document = crate::article_identity::parse(&xml)
+                .map_err(|_| "original NZB cannot supply an exact mapped identity")?;
+            source.mapped_identity = Some(
+                document
+                    .capture(&file, mapping_size.ok_or("original file size is unknown")?)
+                    .map_err(|_| "original article identity is incomplete or ambiguous")?,
+            );
+        }
+        Ok::<_, String>((file, source))
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -1119,6 +1146,126 @@ async fn convert(
     let damaged = damaged || meta.has_placeholders();
     let source = source.finish(row.meta.as_deref().ok_or("missing metadata id")?, &meta)?;
     Ok((meta, damaged, source))
+}
+
+/// Adds exact mapped-export evidence only after an offline C# reconversion matches
+/// the already imported source. No provider is configured for this operation.
+pub async fn capture_mapped_source(
+    config: &Path,
+    db: &Db,
+    id: ItemId,
+) -> Result<crate::article_identity::Evidence, Error> {
+    use sha2::{Digest as _, Sha256};
+    let item = db
+        .item(id)
+        .await?
+        .ok_or(Error::Mapping("imported source is missing"))?;
+    if item.health_state == HealthState::Hidden {
+        return Err(Error::Mapping("source is being replaced"));
+    }
+    let expected = db
+        .import_source(id)
+        .await?
+        .ok_or(Error::Mapping("source has no legacy provenance"))?;
+    let original: crate::native::Source = serde_json::from_str(&expected)
+        .map_err(|_| Error::Mapping("legacy provenance is unreadable"))?;
+    let meta_id = item
+        .meta_blob
+        .ok_or(Error::Mapping("imported metadata is missing"))?;
+    let raw = db
+        .blob_limited(meta_id, MAX_NZB_BLOB_BYTES)
+        .await?
+        .ok_or(Error::Mapping(
+            "imported metadata is missing or exceeds bound",
+        ))?;
+    let (current, raw, fingerprint) = tokio::task::spawn_blocking(move || -> Result<_, Error> {
+        let current = blob::decode_meta(&raw)?;
+        let fingerprint: Vec<u8> = Sha256::digest(current.content_identity()?).to_vec();
+        Ok((current, raw, fingerprint))
+    })
+    .await??;
+    if original.version != 1
+        || original.fingerprint != fingerprint
+        || original.size != current.size()
+        || item.size != Some(current.size())
+    {
+        return Err(Error::Mapping(
+            "imported source has changed since legacy conversion",
+        ));
+    }
+    if let Some(evidence) = original.mapped_identity {
+        if evidence.version != 1
+            || evidence.size != original.size
+            || !matches!(
+                evidence.kind.as_str(),
+                "direct-articles-v1" | "archive-articles-v2"
+            )
+            || evidence.digest.len() != 64
+            || evidence.payload_sha256.len() != 64
+        {
+            return Err(Error::Mapping(
+                "saved source mapping evidence is unsupported",
+            ));
+        }
+        return Ok(evidence);
+    }
+    let mut cs = open(config).await?;
+    let rows:Vec<FileRow>=sqlx::query_as(concat!(
+        "SELECT Id AS id,ParentId AS parent,Name AS name,Path AS path,SubType AS sub_type,FileSize AS size,FileBlobId AS meta,NzbBlobId AS nzb,",
+        ms!("CreatedAt")," AS created,ReleaseDate AS release_date,LastHealthCheck AS last_check,NextHealthCheck AS next_check,HealthRepairPending <> 0 AS repair_pending FROM DavItems WHERE Id=$1 OR Id=$2 OR Id=$3 OR Id=$4 LIMIT 2"
+    )).bind(id.0.to_string()).bind(id.0.to_string().to_uppercase()).bind(id.0.simple().to_string()).bind(id.0.simple().to_string().to_uppercase()).fetch_all(&mut cs).await?;
+    if rows.len() != 1 {
+        return Err(Error::Mapping(
+            "original legacy source is missing or ambiguous",
+        ));
+    }
+    let row = &rows[0];
+    let client = Client::new([]);
+    let part = match &current {
+        FileMeta::Nzb(file) => file.segments.items.first(),
+        FileMeta::Multipart(file) => file.parts.first().and_then(|p| p.segments.items.first()),
+    }
+    .map(|s| u64::from(s.size));
+    let volumes = match &current {
+        FileMeta::Nzb(_) => vec![],
+        FileMeta::Multipart(file) => file
+            .parts
+            .iter()
+            .filter_map(|p| p.proof.as_ref().map(|proof| proof.file_length))
+            .collect(),
+    };
+    let mut sizer = Sizer {
+        client: &client,
+        part,
+        volumes,
+        fetched: 0,
+        provider_errors: 0,
+    };
+    let (_, _, converted) = convert_with_mapping(row, &config.join("blobs"), &mut sizer, true)
+        .await
+        .map_err(|_| {
+            Error::Mapping("offline source conversion could not prove the current member")
+        })?;
+    let source: crate::native::Source = serde_json::from_str(&converted)
+        .map_err(|_| Error::Mapping("converted provenance is invalid"))?;
+    if source.base_generation != original.base_generation
+        || source.fingerprint != fingerprint
+        || source.size != original.size
+    {
+        return Err(Error::Mapping(
+            "offline source differs from the imported generation",
+        ));
+    }
+    let evidence = source
+        .mapped_identity
+        .ok_or(Error::Mapping("original source identity is unavailable"))?;
+    if !db
+        .capture_import_source(id, meta_id, current.size(), &raw, &expected, &converted)
+        .await?
+    {
+        return Err(Error::Mapping("source changed during mapping capture"));
+    }
+    Ok(evidence)
 }
 
 pub(crate) enum CsFile {
@@ -3341,5 +3488,40 @@ mod tests {
             std::fs::remove_dir_all(cs).unwrap();
         }
         std::fs::remove_dir_all(target).unwrap();
+    }
+    #[test]
+    fn mapped_identity_capture_matches_the_current_import_and_refuses_changed_metadata() {
+        use sha2::{Digest as _, Sha256};
+        use sqlx::{ConnectOptions as _, Connection as _};
+        rt().block_on(async {
+            let (config,job)=seed("/content","/content/job").await;
+            let id=ItemId(Uuid::now_v7());
+            let meta=multipart_blob(&config.join("blobs"));
+            let nzb=Uuid::now_v7();
+            let xml=br#"<nzb><file><segments><segment number="1" bytes="100">a@b</segment></segments></file></nzb>"#;
+            let path=blob_path(&config.join("blobs"),&nzb.to_string()).unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();std::fs::write(path,xml).unwrap();
+            let mut source=sqlx::sqlite::SqliteConnectOptions::new().filename(config.join("db.sqlite")).connect().await.unwrap();
+            sqlx::query("INSERT INTO DavItems(Id,ParentId,Name,Path,CreatedAt,Type,SubType,FileSize,FileBlobId,NzbBlobId) VALUES($1,$2,'member.bin','/content/job/member.bin','2025-01-01',2,203,100,$3,$4)")
+                .bind(id.0.to_string()).bind(job.to_string()).bind(&meta).bind(nzb.to_string()).execute(&mut source).await.unwrap();
+            source.close().await.unwrap();
+            let db=Db::connect("sqlite::memory:").await.unwrap();
+            let client=Client::new([]);
+            let done=apply(&config,&db,&client,"/fixture-completed").await.unwrap();assert_eq!(done.files,1);
+            let old=db.import_source(id).await.unwrap().unwrap();
+            let evidence=capture_mapped_source(&config,&db,id).await.unwrap();
+            assert_eq!(evidence.kind,"archive-articles-v2");assert_eq!(evidence.size,100);
+            assert_eq!(evidence.payload_sha256,crate::fork::hex(&Sha256::digest(xml)));
+            let captured=db.import_source(id).await.unwrap().unwrap();assert_ne!(captured,old);
+            assert_eq!(capture_mapped_source(Path::new("/nonexistent-legacy-fixture"),&db,id).await.unwrap(),evidence);
+            let item=db.item(id).await.unwrap().unwrap();let meta_id=item.meta_blob.unwrap();
+            let mut changed=blob::decode_meta(&db.blob(meta_id).await.unwrap().unwrap()).unwrap();
+            let FileMeta::Multipart(member)=&mut changed else{panic!("multipart fixture");};
+            member.parts[0].segments.items[0].id="changed@loopback".into();
+            db.update_blob(meta_id,&blob::encode_meta(&changed).unwrap()).await.unwrap();
+            assert!(capture_mapped_source(&config,&db,id).await.is_err());
+            assert_eq!(db.import_source(id).await.unwrap().unwrap(),captured);
+            db.close().await;std::fs::remove_dir_all(config).unwrap();
+        });
     }
 }

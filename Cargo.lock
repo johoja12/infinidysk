@@ -1320,6 +1320,7 @@ dependencies = [
  "infinidysk-vfs",
  "jiff",
  "nix",
+ "quick-xml",
  "serde",
  "serde_json",
  "sha2 0.11.1",

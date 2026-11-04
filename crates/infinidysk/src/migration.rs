@@ -1,5 +1,6 @@
 //! Operational migration admission and readback. Acceptance proves a queued NZB,
 //! never source-member correlation or permission to promote a library link.
+pub(crate) mod proof;
 use crate::admin::{Admin, Fail};
 use axum::{
     Json,
@@ -128,4 +129,15 @@ pub async fn status(
         return Ok(Json(None));
     };
     Ok(Json(Some(view(&admin, receipt).await?)))
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut out, b| {
+            write!(out, "{b:02x}").expect("formatting into String cannot fail");
+            out
+        })
 }
