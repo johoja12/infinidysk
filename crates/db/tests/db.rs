@@ -9,6 +9,7 @@ use infinidysk_db::{
 async fn exercise(db: &Db) {
     repair_lineage(db).await;
     repair_observations(db).await;
+    repair_attempts(db).await;
     content_sweep(db).await;
     fair_rechecks(db).await;
     library_catalogue(db).await;
@@ -2020,4 +2021,176 @@ async fn repair_observations(db: &Db) {
             .await
             .expect("cascade")
     );
+}
+
+async fn repair_attempts(db: &Db) {
+    let item = ItemId::new();
+    let source = [7; 32];
+    let next = ItemId::new();
+    let now = 10;
+    let (first, concurrent) = tokio::join!(
+        db.enqueue_repair_attempt(item, &source, 2, now, "{\"version\":1}"),
+        db.enqueue_repair_attempt(item, &source, 2, now, "{\"version\":1}")
+    );
+    let first = first.expect("admission").expect("capacity");
+    assert_eq!(
+        first.id,
+        concurrent
+            .expect("concurrent admission")
+            .expect("existing intent")
+            .id
+    );
+    let duplicate = db
+        .enqueue_repair_attempt(item, &source, 0, now, "replacement")
+        .await
+        .expect("read back accepted intent")
+        .expect("existing");
+    assert_eq!(first.id, duplicate.id);
+    assert_eq!(
+        duplicate.payload, first.payload,
+        "uncertain admission must not overwrite accepted intent"
+    );
+    assert!(
+        db.update_repair_attempt(&first, "running", 2, now, now, "running")
+            .await
+            .expect("claim")
+    );
+    assert!(
+        !db.update_repair_attempt(&first, "repaired", 0, now, now, "stale")
+            .await
+            .expect("stale CAS")
+    );
+    let publication = db
+        .enqueue_repair_attempt(next, &source, 2, now, "verified candidates")
+        .await
+        .expect("admit other")
+        .expect("capacity");
+    assert!(
+        db.update_repair_attempt(
+            &publication,
+            "publishing",
+            2,
+            now,
+            now,
+            "accepted-publication-intent"
+        )
+        .await
+        .expect("intent before mutation")
+    );
+    assert!(
+        db.enqueue_repair_attempt(ItemId::new(), &source, 0, 0, "urgent queued work")
+            .await
+            .expect("urgent admission")
+            .is_some()
+    );
+    assert_eq!(
+        db.recover_running_repair_attempts(now + 1)
+            .await
+            .expect("restart recovery"),
+        1
+    );
+    let deferred = db
+        .repair_attempt(item, &source)
+        .await
+        .expect("readback")
+        .expect("retained");
+    assert_eq!(deferred.state, "deferred");
+    let publishing = db
+        .repair_attempt(next, &source)
+        .await
+        .expect("readback")
+        .expect("retained");
+    assert_eq!(publishing.state, "publishing");
+    assert_eq!(
+        publishing.payload, "accepted-publication-intent",
+        "restart recovery cannot reset accepted/uncertain publication into a new provider attempt"
+    );
+    assert_eq!(
+        db.next_repair_attempt(now + 1)
+            .await
+            .expect("priority")
+            .expect("due")
+            .id,
+        publication.id
+    );
+    assert!(
+        db.update_repair_attempt(&publishing, "invented-state", 0, now, now, "invalid")
+            .await
+            .is_err()
+    );
+    let mut wrong = deferred.clone();
+    wrong.source = [9; 32].to_vec();
+    assert!(
+        !db.update_repair_attempt(&wrong, "running", 2, now, now, "wrong source")
+            .await
+            .expect("source scope CAS")
+    );
+    for _ in 0..124 {
+        assert!(
+            db.enqueue_repair_attempt(ItemId::new(), &source, 2, now, "queued")
+                .await
+                .expect("capacity fill")
+                .is_some()
+        );
+    }
+    let (one, two) = tokio::join!(
+        db.enqueue_repair_attempt(ItemId::new(), &source, 2, now, "last capacity one"),
+        db.enqueue_repair_attempt(ItemId::new(), &source, 2, now, "last capacity two")
+    );
+    assert_eq!(
+        usize::from(one.expect("admission one").is_some())
+            + usize::from(two.expect("admission two").is_some()),
+        1,
+        "capacity check and insertion must serialize on both backends"
+    );
+    assert!(
+        db.enqueue_repair_attempt(ItemId::new(), &source, 2, now, "overflow")
+            .await
+            .expect("bounded pending")
+            .is_none()
+    );
+    assert_eq!(
+        db.enqueue_repair_attempt(item, &source, 0, now, "retry")
+            .await
+            .expect("accepted intent still readable")
+            .expect("existing")
+            .id,
+        first.id
+    );
+    assert!(
+        db.update_repair_attempt(&deferred, "superseded", 2, now, now, "source replaced")
+            .await
+            .expect("finished")
+    );
+    assert!(
+        db.enqueue_repair_attempt(ItemId::new(), &source, 2, now, "new capacity")
+            .await
+            .expect("released capacity")
+            .is_some()
+    );
+    assert_eq!(
+        db.repair_attempts(1024)
+            .await
+            .expect("bounded history")
+            .len(),
+        129
+    );
+    assert!(db.repair_attempts(0).await.expect("empty page").is_empty());
+    let rows = db.repair_attempts(1024).await.expect("cleanup rows");
+    for row in rows {
+        if matches!(row.state.as_str(), "queued" | "publishing" | "deferred") {
+            assert!(
+                db.update_repair_attempt(
+                    &row,
+                    "superseded",
+                    row.priority,
+                    now,
+                    now,
+                    "fixture completed"
+                )
+                .await
+                .expect("cleanup pending")
+            );
+        }
+    }
 }
