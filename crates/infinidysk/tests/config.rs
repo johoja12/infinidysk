@@ -433,3 +433,54 @@ async fn additional_scan_roots_are_separate_validated_and_environment_owned() {
     db.close().await;
     let _ = std::fs::remove_file(path);
 }
+
+#[tokio::test]
+async fn par2_limits_are_validated_and_environment_authority_is_preserved() {
+    let path = std::env::temp_dir().join(format!(
+        "infinidysk-par2-config-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("db");
+    let mut store = ConfigStore::load(
+        db.clone(),
+        [("INFINIDYSK__HEALTH__PAR2__ENABLED".into(), "true".into())],
+    )
+    .await
+    .expect("config");
+    assert!(store.settings().health.par2.enabled);
+    assert!(store.locked().any(|key| key == "health.par2.enabled"));
+    let mut changed = store.settings().clone();
+    changed.health.par2.enabled = false;
+    assert!(
+        matches!(store.save(changed).await, Err(Error::Locked(key)) if key=="health.par2.enabled")
+    );
+    for (memory, slices, cooldown) in [
+        (127, 8, 6),
+        (2049, 8, 6),
+        (256, 0, 6),
+        (256, 65, 6),
+        (256, 8, 0),
+        (256, 8, 169),
+    ] {
+        let mut changed = store.settings().clone();
+        changed.health.par2.memory_mb = memory;
+        changed.health.par2.max_missing_slices = slices;
+        changed.health.par2.failure_cooldown_hours = cooldown;
+        assert!(store.save(changed).await.is_err());
+    }
+    let mut changed = store.settings().clone();
+    changed.health.par2.memory_mb = 128;
+    store.save(changed).await.expect("valid policy");
+    let reloaded = ConfigStore::load(db.clone(), []).await.expect("reload");
+    assert!(
+        !reloaded.settings().health.par2.enabled,
+        "environment values are never persisted"
+    );
+    assert_eq!(reloaded.settings().health.par2.memory_mb, 128);
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}

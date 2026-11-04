@@ -248,7 +248,7 @@ pub async fn serve(
         db.clone(),
         Arc::clone(&cache),
         native_cache.clone(),
-        false,
+        settings.health.par2.enabled,
     )
     .await?;
     if let Some(repairs) = &repair_store
@@ -364,6 +364,22 @@ pub async fn serve(
         let vfs = Arc::clone(&vfs);
         move |id| vfs.sessions().open().iter().any(|s| s.item == id)
     };
+    let par2_worker = if let Some(store) = &repair_store {
+        let worker = crate::repair::worker::Worker::load(
+            db.clone(),
+            Arc::clone(&client),
+            Arc::clone(&vfs),
+            Arc::clone(store),
+        )
+        .await?;
+        let importing = importing.clone();
+        if !worker.set_busy(Arc::new(importing)) {
+            anyhow::bail!("PAR2 workload admission is already installed");
+        }
+        Some(worker)
+    } else {
+        None
+    };
     let mut health = Health::new(db.clone(), Arc::clone(&client), arr_rx, health_rx)
         .context("setting up health checks")?
         .with_gates(importing.clone(), streaming.clone())
@@ -376,6 +392,24 @@ pub async fn serve(
                     .map(|guard| Box::new(guard) as infinidysk_health::ReadHold)
             }
         });
+    if let Some(worker) = &par2_worker {
+        let worker = Arc::downgrade(worker);
+        let config = Arc::clone(&config);
+        health = health.with_local_repair(Arc::new(move |item, _| {
+            let (worker, config) = (worker.clone(), Arc::clone(&config));
+            Box::pin(async move {
+                let policy = config.read().await.settings().health.par2;
+                if let Some(worker) = worker.upgrade() {
+                    worker.offer(item.id, policy).await.map_err(|error| {
+                        warn!(reason=%error, "local PAR2 admission deferred");
+                        infinidysk_health::Error::Regrab("local PAR2 admission unavailable")
+                    })
+                } else {
+                    Ok(false)
+                }
+            })
+        }));
+    }
     health = health.with_repair_authority({
         let config = Arc::clone(&config);
         let db = db.clone();
@@ -422,6 +456,27 @@ pub async fn serve(
         anyhow::bail!("repair publication coordination is already installed");
     }
 
+    if let Some(worker) = &par2_worker
+        && !worker.bind_health(&health)
+    {
+        anyhow::bail!("PAR2 health coordination is already installed");
+    }
+    let par2_task = par2_worker.as_ref().map(|worker| {
+        let (worker, config, cancel) = (Arc::clone(worker), Arc::clone(&config), cancel.clone());
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! { ()=cancel.cancelled()=>break, _=interval.tick()=>{} }
+                let health = config.read().await.settings().health.clone();
+                let mut policy = health.par2;
+                policy.enabled &= health.auto_repair;
+                if let Err(error) = worker.tick(policy, cancel.clone()).await {
+                    warn!(reason=%error, "background PAR2 repair deferred");
+                }
+            }
+        })
+    });
     let weak_health = Arc::downgrade(&health);
     vfs.sessions().on_last_close(Arc::new(move |item| {
         if let Some(health) = weak_health.upgrade()
@@ -550,6 +605,7 @@ pub async fn serve(
         tuning,
         native_settings: settings.native_cache.clone(),
         repair_store,
+        par2_worker,
         native_cache_error,
         experiments: settings.experiments.clone(),
         handoff: Arc::clone(&handoff),
@@ -763,6 +819,12 @@ pub async fn serve(
     cancel.cancel();
     worker.abort();
     health_task.abort();
+    if let Some(mut task) = par2_task
+        && tokio::time::timeout(DRAIN, &mut task).await.is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
     regrab_observer_task.abort();
     prefetch_task.abort();
     predictions_task.abort();
@@ -909,6 +971,7 @@ pub struct Live {
     tuning: Tuning,
     native_settings: infinidysk_native_cache::Settings,
     repair_store: Option<Arc<infinidysk_native_cache::repair::Store>>,
+    par2_worker: Option<Arc<crate::repair::worker::Worker>>,
     native_cache_error: Option<String>,
     experiments: Vec<String>,
     handoff: Arc<crate::handoff::Writer>,
@@ -987,7 +1050,8 @@ impl Live {
     // resize them live if restarts for tuning become a nuisance.
     pub fn restart_required(&self, settings: &Settings) -> bool {
         let tuning = settings.performance.effective();
-        settings.native_cache != self.native_settings
+        (settings.health.par2.enabled && self.par2_worker.is_none())
+            || settings.native_cache != self.native_settings
             || settings.mount.dir != self.mount_dir
             || settings.mount.epoch_times != self.epoch_times
             || tuning.read_ahead_memory_mb != self.tuning.read_ahead_memory_mb
@@ -998,6 +1062,10 @@ impl Live {
 
     pub const fn repair_store(&self) -> Option<&Arc<infinidysk_native_cache::repair::Store>> {
         self.repair_store.as_ref()
+    }
+
+    pub fn par2_worker(&self) -> Option<&Arc<crate::repair::worker::Worker>> {
+        self.par2_worker.as_ref()
     }
 
     pub fn native_cache_error(&self) -> Option<&str> {

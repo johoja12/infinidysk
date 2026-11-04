@@ -1148,6 +1148,7 @@ dependencies = [
  "infinidysk-import",
  "infinidysk-native-cache",
  "infinidysk-nntp",
+ "infinidysk-par2",
  "infinidysk-plex",
  "infinidysk-prefetch",
  "infinidysk-queue",

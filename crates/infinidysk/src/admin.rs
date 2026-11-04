@@ -121,6 +121,7 @@ pub struct Admin {
         post_retry,
         get_health,
         get_health_summary,
+        crate::repair::status,
         crate::content_sweep::status,crate::content_sweep::control,
         crate::regrabs::status,
         crate::regrabs::list,
@@ -313,6 +314,7 @@ pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
             "/api/v1/health/regrabs/{id}",
             get(crate::regrabs::status).post(crate::regrabs::control),
         )
+        .route("/api/v1/health/par2", get(crate::repair::status))
         .route("/api/v1/health/summary", get(get_health_summary))
         .route("/api/v1/health/schedule", get(get_health_schedule))
         .route("/api/v1/health/rejected", get(get_rejected_releases))

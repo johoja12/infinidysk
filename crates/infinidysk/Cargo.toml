@@ -51,6 +51,7 @@ zip.workspace = true
 infinidysk-fuse.workspace = true
 
 [dev-dependencies]
+infinidysk-par2.workspace = true
 infinidysk-plex = { workspace = true, features = ["test-support"] }
 http-body-util.workspace = true
 infinidysk-testkit.workspace = true

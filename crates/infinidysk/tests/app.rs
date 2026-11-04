@@ -50,6 +50,12 @@ async fn start() -> (SocketAddr, CancellationToken, Server, String) {
 
 /// Like [`start`], beside a C# `/config` whose `db.sqlite` holds `csharp_db`.
 async fn start_from(csharp_db: Option<&[u8]>) -> (SocketAddr, CancellationToken, Server, String) {
+    start_config(csharp_db, false).await
+}
+async fn start_config(
+    csharp_db: Option<&[u8]>,
+    par2: bool,
+) -> (SocketAddr, CancellationToken, Server, String) {
     let path = std::env::temp_dir().join(format!("infinidysk-app-{}.sqlite", ItemId::new()));
     if let Some(data) = csharp_db {
         std::fs::create_dir_all(path.with_extension("config")).unwrap();
@@ -70,6 +76,10 @@ async fn start_from(csharp_db: Option<&[u8]>) -> (SocketAddr, CancellationToken,
     };
     // No providers: a fresh install starts and is configured from the UI.
     let vars = [
+        (
+            "INFINIDYSK__HEALTH__PAR2__ENABLED".to_owned(),
+            par2.to_string(),
+        ),
         ("INFINIDYSK__WEBDAV__PASSWORD".to_owned(), "pw".to_owned()),
         (
             "INFINIDYSK__AUTH__API_KEY".to_owned(),
@@ -974,4 +984,36 @@ async fn webhooks(addr: SocketAddr, found: &Value, database_url: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     db.close().await;
+}
+
+#[tokio::test]
+async fn par2_runtime_starts_with_an_exclusive_ledger_and_keeps_inspection_authenticated() {
+    let (addr, cancel, server, url) = start_config(None, true).await;
+    let (code, body) = send(addr, &admin_request("GET", "/api/v1/health/par2", "")).await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), json!([]));
+    let (_, body) = send(addr, &admin_request("GET", "/api/v1/settings", "")).await;
+    let view: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["settings"]["health"]["par2"]["enabled"], true);
+    assert_eq!(view["restart_required"], false);
+    let (code, _) = send(
+        addr,
+        "GET /api/v1/health/par2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(code, "HTTP/1.1 401 Unauthorized");
+    let path = std::path::PathBuf::from(url.strip_prefix("sqlite:").unwrap());
+    let ledger = path
+        .with_extension("config")
+        .join("repair-v2/catalogue.sqlite");
+    assert!(ledger.is_file());
+    cancel.cancel();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        Exit::Stopped
+    );
 }

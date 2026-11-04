@@ -394,6 +394,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/health/par2": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Authenticated, bounded local repair attempt history. Provider IDs and proofs stay private. */
+        get: operations["par2_attempts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/health/regrabs": {
         parameters: {
             query?: never;
@@ -2219,6 +2236,16 @@ export interface components {
              */
             media_probe: boolean;
             /**
+             * @description Bounded background PAR2 reconstruction before release replacement.
+             * @default {
+             *       "enabled": false,
+             *       "failure_cooldown_hours": 6,
+             *       "max_missing_slices": 8,
+             *       "memory_mb": 256
+             *     }
+             */
+            par2: components["schemas"]["Par2Settings"];
+            /**
              * @description What happens to a broken file not imported by an Arr.
              * @default delete
              */
@@ -3257,6 +3284,43 @@ export interface components {
             workloads: components["schemas"]["WorkloadView"][];
             writer_error?: string | null;
         };
+        Par2Attempt: {
+            /** Format: int32 */
+            attempts: number;
+            /** Format: uuid */
+            id: string;
+            /** Format: uuid */
+            item: string;
+            /** Format: int64 */
+            next_attempt: number;
+            patch_articles: number;
+            /** Format: int64 */
+            patch_bytes: number;
+            reason?: string | null;
+            state: string;
+            /** Format: int64 */
+            updated_at: number;
+            urgent: boolean;
+        };
+        Par2Settings: {
+            /** @default false */
+            enabled: boolean;
+            /**
+             * Format: int32
+             * @default 6
+             */
+            failure_cooldown_hours: number;
+            /**
+             * Format: int32
+             * @default 8
+             */
+            max_missing_slices: number;
+            /**
+             * Format: int32
+             * @default 256
+             */
+            memory_mb: number;
+        };
         Paused: {
             paused: boolean;
         };
@@ -3810,7 +3874,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a408-f853-7542-8e76-24fe7480fc1c
+             * @default 01a1a636-764b-7135-8fb0-f5d013ea86b5
              */
             id: string;
             /**
@@ -4396,6 +4460,12 @@ export interface components {
              *       "degraded_tolerance": true,
              *       "enabled": true,
              *       "media_probe": true,
+             *       "par2": {
+             *         "enabled": false,
+             *         "failure_cooldown_hours": 6,
+             *         "max_missing_slices": 8,
+             *         "memory_mb": 256
+             *       },
              *       "unowned_action": "delete"
              *     }
              */
@@ -5541,6 +5611,25 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ContentSweep"];
+                };
+            };
+        };
+    };
+    par2_attempts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Par2Attempt"][];
                 };
             };
         };

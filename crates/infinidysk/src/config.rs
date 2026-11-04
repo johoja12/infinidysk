@@ -480,6 +480,8 @@ pub struct Health {
     pub unowned_action: UnownedAction,
     /// Analyze each good media file once with ffprobe, when it is installed.
     pub media_probe: bool,
+    /// Bounded background PAR2 reconstruction before release replacement.
+    pub par2: crate::repair::worker::Settings,
 }
 
 impl Default for Health {
@@ -491,6 +493,7 @@ impl Default for Health {
             degraded_tolerance: true,
             unowned_action: UnownedAction::Delete,
             media_probe: true,
+            par2: crate::repair::worker::Settings::default(),
         }
     }
 }
@@ -976,6 +979,24 @@ impl Settings {
     fn reset_invalid(&mut self) {
         let d = Self::default();
         reset(
+            "health.par2.max_missing_slices",
+            &mut self.health.par2.max_missing_slices,
+            &(1..=64),
+            d.health.par2.max_missing_slices,
+        );
+        reset(
+            "health.par2.memory_mb",
+            &mut self.health.par2.memory_mb,
+            &(128..=2048),
+            d.health.par2.memory_mb,
+        );
+        reset(
+            "health.par2.failure_cooldown_hours",
+            &mut self.health.par2.failure_cooldown_hours,
+            &(1..=168),
+            d.health.par2.failure_cooldown_hours,
+        );
+        reset(
             "health.check_percent",
             &mut self.health.check_percent,
             &CHECK_PERCENT,
@@ -1113,6 +1134,10 @@ impl Settings {
                 "Default category must not be empty".to_owned(),
             ));
         }
+        self.health
+            .par2
+            .validate()
+            .map_err(|error| invalid("health.par2", error.to_string()))?;
         check(
             "health.check_percent",
             "Check percent",

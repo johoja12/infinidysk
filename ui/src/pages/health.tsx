@@ -4,6 +4,7 @@ import { Link } from "react-router";
 import { Search, Stethoscope, TriangleAlert, Wrench } from "lucide-react";
 import { toast } from "sonner";
 import { api, body, type Schemas } from "../api/client";
+import { Par2Attempts } from "./par2-attempts";
 import { Regrabs } from "./regrabs";
 import { ContentSweep } from "./content-sweep";
 import { ago, stamp } from "../format";
@@ -388,6 +389,7 @@ export function Health() {
       <Schedule />
       <Rejected />
       <ContentSweep />
+      <Par2Attempts />
       <Regrabs />
       <h2 className="mb-3 font-medium">History</h2>
       <div className="mb-3 flex flex-wrap items-center gap-2">

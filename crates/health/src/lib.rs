@@ -287,7 +287,7 @@ impl Health {
         self
     }
 
-    /// Admit and observe durable local repair without holding the replacement barrier.
+    /// Admit and observe durable local repair before starting source replacement.
     #[must_use]
     pub fn with_local_repair(mut self, repair: LocalRepair) -> Self {
         self.local_repair = Some(repair);
@@ -383,7 +383,19 @@ impl Health {
     /// Advance only a repair explicitly held for a reader. Re-check after notification
     /// because another handle may have opened in the meantime.
     pub async fn readers_closed(&self, item: ItemId) -> Result<(), Error> {
-        if !(self.in_use)(item) && self.db.release_reader_repair(item).await? {
+        if (self.in_use)(item) {
+            return Ok(());
+        }
+        let _writing = self.db.write_permit().await;
+        let mut wake = self.db.release_reader_repair(item).await?;
+        let automatic = self.settings.borrow().auto_repair;
+        if automatic
+            && let Some(local) = &self.local_repair
+            && let Some((current, status)) = self.db.health(item).await?
+        {
+            wake |= local(current, status).await?;
+        }
+        if wake {
             self.priority_cancel
                 .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
             self.wake.notify_one();

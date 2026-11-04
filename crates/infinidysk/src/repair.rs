@@ -1,5 +1,7 @@
 //! Authoritative repair-data bootstrap. Disabling future attempts cannot disable
 //! already published articles or silently create a replacement for a lost ledger.
+mod source;
+pub mod worker;
 use anyhow::{Context as _, bail};
 use infinidysk_db::Db;
 use infinidysk_native_cache::{
@@ -111,4 +113,22 @@ pub async fn open(
         .context("cannot confirm repair/cache lineage; check metadata and database availability, and restore matching state when a mismatch is reported")?;
     decoded.seal_repair_lineage().await;
     Ok(Some(store))
+}
+
+/// Authenticated, bounded local repair attempt history. Provider IDs and proofs stay private.
+#[utoipa::path(get,operation_id="par2_attempts",path="/api/v1/health/par2",tag="health",responses((status=200,body=Vec<worker::Summary>)))]
+pub async fn status(
+    axum::extract::State(admin): axum::extract::State<Arc<crate::admin::Admin>>,
+) -> Result<axum::Json<Vec<worker::Summary>>, crate::admin::Fail> {
+    let rows = if let Some(worker) = admin.live.par2_worker() {
+        worker.status().await.map_err(|error| {
+            tracing::warn!(reason=%error, "PAR2 journal inspection unavailable");
+            crate::admin::Fail::Unavailable(
+                "PAR2 journal cannot be read; existing repair data is retained".into(),
+            )
+        })?
+    } else {
+        Vec::new()
+    };
+    Ok(axum::Json(rows))
 }
