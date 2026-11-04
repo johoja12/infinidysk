@@ -96,6 +96,14 @@ class LinksTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'overlaps'):
                 links.plan(plan['originalRoot'],plan['mountRoot'],Path(plan['originalRoot'])/'canary',[binding],'fixture')
 
+    def test_rollback_before_canary_creation_is_a_noop_without_new_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);plan,_=self.setup_plan(root);journal=runner.Journal(root/'journal','fixture-plan')
+            try:
+                self.assertEqual(links.rollback_canary(plan,journal),0)
+                self.assertFalse((root/'canary').exists())
+            finally:journal.close()
+
     def test_postwrite_source_change_rolls_back_only_new_canary_links(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);plan,_=self.setup_plan(root);journal=runner.Journal(root/'journal','fixture-plan');calls=[]

@@ -264,7 +264,10 @@ def apply_canary(value,journal,recheck):
 
 def rollback_canary(value,journal):
     check_plan(value)
-    destination=prepare_root(value,create=False)
+    try:
+        destination=prepare_root(value,create=False)
+    except FileNotFoundError:
+        return 0
     removed=0
     try:
         for row in reversed(value['links']):
