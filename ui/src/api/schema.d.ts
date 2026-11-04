@@ -3797,7 +3797,7 @@ export interface components {
             operation: components["schemas"]["PrefetchOperation"];
         };
         /** @enum {string} */
-        PrefetchFamily: "plex" | "read";
+        PrefetchFamily: "plex" | "read" | "backfill";
         /**
          * @description Foreground serving must last at least two minutes and exceed 67 MB before
          *     the configured share can admit a full-file completion job.
@@ -3941,10 +3941,13 @@ export interface components {
             charged_fill_bytes: number;
             /** Format: int64 */
             day: number;
+            /** Format: int64 */
+            dropped_backfills: number;
             history: components["schemas"]["PrefetchHistory"][];
             history_available: boolean;
             jobs: components["schemas"]["PrefetchJob"][];
             paused: boolean;
+            pending_backfills: number;
             /**
              * Format: int64
              * @description Observed NNTP bytes since process start, including abandoned drains.

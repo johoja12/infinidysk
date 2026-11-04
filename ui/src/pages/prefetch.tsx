@@ -203,6 +203,7 @@ export function PrefetchPanel() {
               job. Later cache eviction can remove them. Retry verifies current
               coverage again.
             </p>
+            <p className="text-xs text-muted-foreground">Playback backfills waiting for durable admission: {status.data.pending_backfills}. Hints dropped at the memory limit: {status.data.dropped_backfills}. Actual uncached ranges qualify after a handle serves 17 MB. Short probes do not qualify. Saved jobs survive restart.</p>
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm">
                 <thead className="text-muted-foreground">
@@ -226,6 +227,7 @@ export function PrefetchPanel() {
                         </td>
                         <td className="p-2">
                           {job.state}
+                          {job.family === "backfill" && <p className="text-xs text-muted-foreground">Playback backfill</p>}
                           {job.reason && (
                             <p className="max-w-64 text-xs text-muted-foreground">
                               {job.reason}

@@ -7,10 +7,12 @@
 //! - `/nzbs/<category>/<file>`: queued NZBs.
 //! - `/README`.
 
+mod backfill;
 mod native;
 mod reader;
 mod revision;
 mod session;
+pub use backfill::{Backfill, Backfills};
 
 use std::collections::{BTreeSet, HashMap};
 use std::hash::RandomState;
@@ -196,6 +198,7 @@ pub struct Vfs {
     /// Where the tree is mounted for the apps that follow links; link targets start here.
     mount_dir: String,
     sessions: Arc<Sessions>,
+    backfills: Arc<Backfills>,
     /// Decoded metadata by blob and [`Db::blob_epoch`], so reopening a file skips
     /// fetching and decoding it.
     metas: Metas,
@@ -326,6 +329,7 @@ impl Vfs {
             gaps: Mutex::default(),
             mount_dir: mount_dir.trim_end_matches('/').to_owned(),
             sessions: Arc::default(),
+            backfills: Arc::default(),
             metas: Metas::with_options(
                 quick_cache::OptionsBuilder::new()
                     .shards(1)
@@ -338,6 +342,12 @@ impl Vfs {
                 quick_cache::sync::DefaultLifecycle::default(),
             ),
         }
+    }
+
+    /// Nonblocking hints from qualified foreground reads; payloads and storage
+    /// operations stay off the handoff path.
+    pub fn backfills(&self) -> &Arc<Backfills> {
+        &self.backfills
     }
 
     /// Readers serve and keep segments through `cache`.
@@ -730,6 +740,7 @@ impl Vfs {
                             key,
                             gaps,
                             session.native_cache_counter(),
+                            Arc::clone(&self.backfills),
                         )
                     }
                     None => reader,

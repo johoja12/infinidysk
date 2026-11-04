@@ -761,6 +761,12 @@ pub async fn serve(
                         warn!(reason=%error,"automatic warming cleanup deferred");
                         continue;
                     }
+                    if let Err(error) = prefetch
+                        .observe_backfills(&config.settings().prefetch)
+                        .await
+                    {
+                        warn!(reason=%error,"playback backfill admission deferred");
+                    }
                     if let Err(error) = prefetch.observe_reads(&config.settings().prefetch).await {
                         warn!(reason=%error,"finish-watched admission deferred");
                     }

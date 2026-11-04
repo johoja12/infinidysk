@@ -1,5 +1,6 @@
 //! One bounded warming lane. Durable progress is a hint: every resumed block is verified
 //! again. Only strict final-media bytes can enter the shared native cache.
+mod backfill;
 mod lead;
 mod watched;
 use sha2::{Digest as _, Sha256};
@@ -157,6 +158,7 @@ pub enum Family {
     #[default]
     Plex,
     Read,
+    Backfill,
 }
 /// Internal admission carries the source revision and configuration that authorized it.
 pub struct Automatic<'a> {
@@ -237,6 +239,8 @@ pub struct History {
 pub struct Status {
     pub paused: bool,
     pub recovery_mode: bool,
+    pub pending_backfills: usize,
+    pub dropped_backfills: u64,
     pub day: i64,
     pub charged_fill_bytes: u64,
     /// Observed NNTP bytes since process start, including abandoned drains.
@@ -403,6 +407,8 @@ impl Queue {
         };
         Status {
             paused: ledger.paused,
+            pending_backfills: self.vfs.backfills().stats().0,
+            dropped_backfills: self.vfs.backfills().stats().1,
             recovery_mode: self
                 .vfs
                 .native_cache()
@@ -774,7 +780,8 @@ impl Queue {
                     let full =
                         j.ranges.len() == 1 && j.ranges[0].start == 0 && j.ranges[0].end == j.size;
                     (
-                        !full || !protected.contains(&ItemId(j.item)),
+                        !(full || j.family == Family::Backfill)
+                            || !protected.contains(&ItemId(j.item)),
                         std::cmp::Reverse(j.priority),
                         j.updated_at,
                         j.created_at,

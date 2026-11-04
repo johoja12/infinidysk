@@ -52,7 +52,22 @@ async fn fixture_with(
     LoopbackServer,
     Arc<Client>,
 ) {
-    let corpus = Corpus::generate(1025, 32, 256 * 1024);
+    fixture_sized(t, missing, stall, 32).await
+}
+async fn fixture_sized(
+    t: &Temp,
+    missing: bool,
+    stall: u8,
+    articles: usize,
+) -> (
+    Arc<Vfs>,
+    Item,
+    Arc<Cache>,
+    Corpus,
+    LoopbackServer,
+    Arc<Client>,
+) {
+    let corpus = Corpus::generate(1025, articles, 256 * 1024);
     let articles = corpus
         .articles
         .iter()
@@ -105,7 +120,7 @@ async fn fixture_with(
     });
     let id = BlobId::new();
     item.meta_blob = Some(id);
-    item.size = Some(2 * BLOCK);
+    item.size = Some(corpus.data.len() as u64);
     db.insert(
         &[category, item.clone()],
         &[(id, &blob::encode_meta(&meta).unwrap())],
@@ -868,4 +883,174 @@ async fn cache_recovery_holds_warming_without_provider_or_daily_allowance_consum
     assert_eq!(status.received_wire_bytes, 0);
     assert_eq!(status.reserved_wire_bytes, Some(0));
     assert_eq!(status.jobs[0].state, State::Queued);
+}
+
+#[tokio::test]
+async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without_replaying_probes()
+{
+    use infinidysk_prefetch::Family;
+    let t = Temp::new();
+    let (vfs, item, cache, corpus, _server, _client) = fixture_sized(&t, false, 0, 96).await;
+    let queue = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
+    let mut held = Vec::new();
+    while let Some(permit) = cache.try_buffer() {
+        held.push(permit);
+    }
+    let origin = Origin {
+        delivery: Delivery::WebDav,
+        client: "fixture-player".into(),
+        player: None,
+    };
+    let mut probe = vfs
+        .open(&Node::Item(item.clone()), origin.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    probe.seek(SeekFrom::Start(20 * 1024 * 1024)).await.unwrap();
+    probe.read_exact(&mut [0; 64]).await.unwrap();
+    drop(probe);
+    assert_eq!(
+        vfs.backfills().stats().0,
+        0,
+        "seek offsets do not qualify a probe"
+    );
+    let mut playback = vfs
+        .open(&Node::Item(item.clone()), origin)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut data = vec![0; 4 * infinidysk_native_cache::BLOCK_BYTES];
+    playback.read_exact(&mut data).await.unwrap();
+    drop(playback);
+    assert_eq!(data, corpus.data[..data.len()]);
+    assert_eq!(vfs.backfills().stats().0, 1);
+    assert_eq!(
+        cache.stats().await.unwrap().bytes,
+        0,
+        "buffer pressure left actual served bytes uncached"
+    );
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    queue
+        .observe_backfills(&WarmSettings::default())
+        .await
+        .unwrap();
+    assert!(queue.status().await.jobs.is_empty());
+    let full = enqueue(&queue, &item).await;
+    queue.observe_backfills(&settings()).await.unwrap();
+    let status = queue.status().await;
+    let backfill = status
+        .jobs
+        .iter()
+        .find(|j| j.family == Family::Backfill)
+        .unwrap();
+    let id = backfill.id;
+    assert_eq!(
+        backfill.ranges,
+        vec![Range {
+            start: 0,
+            end: 4 * BLOCK
+        }]
+    );
+    assert_eq!(backfill.priority, 100);
+    assert_eq!(status.pending_backfills, 0);
+    drop(queue);
+    let queue = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
+    queue.reconcile_automatic(None, None).await.unwrap();
+    queue.observe_reads(&settings()).await.unwrap();
+    assert!(queue.tick(&settings()).await.unwrap());
+    let status = queue.status().await;
+    assert_eq!(
+        status
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .unwrap()
+            .verified_bytes,
+        BLOCK,
+        "own-file backfill precedes a full-file policy"
+    );
+    assert_eq!(
+        status
+            .jobs
+            .iter()
+            .find(|j| j.id == full.id)
+            .unwrap()
+            .verified_bytes,
+        0
+    );
+    queue
+        .observe_backfills(&WarmSettings::default())
+        .await
+        .unwrap();
+    let status = queue.status().await;
+    assert_eq!(
+        status.jobs.iter().find(|j| j.id == id).unwrap().state,
+        State::Cancelled
+    );
+    assert_eq!(
+        status.jobs.iter().find(|j| j.id == full.id).unwrap().state,
+        State::Queued,
+        "policy cleanup preserves manual work"
+    );
+}
+
+#[tokio::test]
+async fn backfill_admission_fences_changed_sources_and_keeps_hints_after_database_failure() {
+    for changed_source in [true, false] {
+        let t = Temp::new();
+        let (vfs, item, cache, _corpus, _server, _client) = fixture_sized(&t, false, 0, 64).await;
+        let queue = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
+        let mut held = Vec::new();
+        while let Some(permit) = cache.try_buffer() {
+            held.push(permit);
+        }
+        let mut reader = vfs
+            .open(
+                &Node::Item(item.clone()),
+                Origin {
+                    delivery: Delivery::Fuse,
+                    client: "fixture-player".into(),
+                    player: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        reader
+            .read_exact(&mut vec![0; 4 * infinidysk_native_cache::BLOCK_BYTES])
+            .await
+            .unwrap();
+        drop(reader);
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert_eq!(vfs.backfills().stats().0, 1);
+        if changed_source {
+            let raw = vfs
+                .db()
+                .blob(item.meta_blob.unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut meta = blob::decode_meta(&raw).unwrap();
+            if let FileMeta::Nzb(file) = &mut meta {
+                file.segments.items[0].id = "replacement@test.invalid".into();
+            }
+            vfs.db()
+                .update_blob(item.meta_blob.unwrap(), &blob::encode_meta(&meta).unwrap())
+                .await
+                .unwrap();
+            queue.observe_backfills(&settings()).await.unwrap();
+            assert!(queue.status().await.jobs.is_empty());
+            assert_eq!(vfs.backfills().stats().0, 0);
+        } else {
+            vfs.db().close().await;
+            assert!(queue.observe_backfills(&settings()).await.is_err());
+            assert_eq!(
+                vfs.backfills().stats().0,
+                1,
+                "failed durable admission cannot acknowledge a playback hint"
+            );
+        }
+    }
 }

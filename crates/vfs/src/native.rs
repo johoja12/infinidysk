@@ -38,6 +38,7 @@ pub struct NativeReader {
     checked: Option<u64>,
     hit: Option<Bytes>,
     fill: Option<Fill>,
+    backfill: crate::backfill::Tracker,
 }
 impl NativeReader {
     pub(crate) fn wrap(
@@ -46,7 +47,9 @@ impl NativeReader {
         key: Key,
         gaps: Arc<Gaps>,
         native_cache_bytes: Arc<AtomicU64>,
+        backfills: Arc<crate::Backfills>,
     ) -> Reader {
+        let backfill = crate::backfill::Tracker::new(backfills, key.clone());
         let Some(lease) = cache.lease(key) else {
             return inner;
         };
@@ -65,6 +68,7 @@ impl NativeReader {
             checked: None,
             hit: None,
             fill: None,
+            backfill,
         }))
     }
     pub(crate) fn set_end(&mut self, end: u64) {
@@ -93,6 +97,7 @@ impl NativeReader {
             buf.put_slice(&data[within..within + n]);
             self.native_cache_bytes
                 .fetch_add(n as u64, Ordering::Relaxed);
+            self.backfill.served(n as u64);
             self.pos += n as u64;
             return Poll::Ready(Ok(()));
         }
@@ -140,6 +145,8 @@ impl NativeReader {
                 self.fill = None;
             }
         }
+        self.backfill.served(n as u64);
+        self.backfill.miss(self.pos, self.pos + n as u64);
         buf.advance(n);
         self.pos += n as u64;
         self.source_pos += n as u64;
