@@ -10,6 +10,7 @@ use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until};
 use tokio_rustls::TlsAcceptor;
@@ -29,7 +30,7 @@ pub struct Impairment {
 
 const BODY_CHUNK: usize = 64 * 1024;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Behavior {
     close_after: Option<usize>,
     max_connections: usize,
@@ -39,6 +40,7 @@ struct Behavior {
     stall: Option<(usize, Duration, bool)>,
     /// Connections beyond `max_connections` get no greeting instead of a 502.
     hang: bool,
+    gate: Option<Arc<Gate>>,
 }
 
 impl Default for Behavior {
@@ -49,7 +51,32 @@ impl Default for Behavior {
             impairment: Impairment::default(),
             stall: None,
             hang: false,
+            gate: None,
         }
+    }
+}
+
+struct Gate {
+    started: watch::Sender<Option<String>>,
+    release: watch::Receiver<bool>,
+}
+/// Explicitly releases the first BODY. The observed id identifies the blocked job.
+/// Unlike a timed stall, a slow test host cannot let the stall finish on its own.
+pub struct BodyGate {
+    started: watch::Receiver<Option<String>>,
+    release: watch::Sender<bool>,
+}
+impl BodyGate {
+    pub async fn blocked(&mut self) -> Option<String> {
+        loop {
+            if let Some(id) = self.started.borrow_and_update().clone() {
+                return Some(id);
+            }
+            self.started.changed().await.ok()?;
+        }
+    }
+    pub fn release(&self) {
+        self.release.send_replace(true);
     }
 }
 
@@ -69,6 +96,30 @@ pub struct LoopbackServer {
 impl LoopbackServer {
     pub async fn start(articles: impl IntoIterator<Item = Article>) -> io::Result<Self> {
         Self::start_with(articles, None, Behavior::default()).await
+    }
+
+    /// Holds the first BODY until its test explicitly releases it. Other connections
+    /// remain independent, permitting an ordering assertion without a timed race.
+    pub async fn start_gated(
+        articles: impl IntoIterator<Item = Article>,
+    ) -> io::Result<(Self, BodyGate)> {
+        let (started, seen) = watch::channel(None);
+        let (release, wait) = watch::channel(false);
+        let behavior = Behavior {
+            gate: Some(Arc::new(Gate {
+                started,
+                release: wait,
+            })),
+            ..Behavior::default()
+        };
+        let server = Self::start_with(articles, None, behavior).await?;
+        Ok((
+            server,
+            BodyGate {
+                started: seen,
+                release,
+            },
+        ))
     }
 
     /// Delays handshakes and responses and throttles bodies like a remote provider.
@@ -199,7 +250,7 @@ impl LoopbackServer {
                 peak_count.fetch_max(now, Ordering::SeqCst);
                 let open_count = Arc::clone(&open_count);
                 let limit = Limit {
-                    behavior,
+                    behavior: behavior.clone(),
                     rejected: now > behavior.max_connections,
                     bodies: Arc::clone(&body_count),
                 };
@@ -300,6 +351,18 @@ async fn serve<S: AsyncRead + AsyncWrite>(
             "BODY" => {
                 remaining -= 1;
                 let nth = limit.bodies.fetch_add(1, Ordering::SeqCst);
+                if nth == 0
+                    && let Some(gate) = &limit.behavior.gate
+                {
+                    let id = arg.trim().trim_start_matches('<').trim_end_matches('>');
+                    gate.started.send_replace(Some(id.to_owned()));
+                    let mut release = gate.release.clone();
+                    while !*release.borrow_and_update() {
+                        if release.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                }
                 let stall = limit
                     .behavior
                     .stall

@@ -6,4 +6,4 @@ mod corpus;
 mod server;
 
 pub use corpus::{Article, Corpus, post};
-pub use server::{Impairment, LoopbackServer};
+pub use server::{BodyGate, Impairment, LoopbackServer};

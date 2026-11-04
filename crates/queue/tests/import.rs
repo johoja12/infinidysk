@@ -128,6 +128,13 @@ async fn queue_on(servers: &[&LoopbackServer]) -> Queue {
 
 /// [`queue_on`] with its SQLite database at `path`.
 async fn queue_at(servers: &[&LoopbackServer], path: &std::path::Path) -> Queue {
+    queue_at_timeout(servers, path, Duration::from_secs(5)).await
+}
+async fn queue_at_timeout(
+    servers: &[&LoopbackServer],
+    path: &std::path::Path,
+    timeout: Duration,
+) -> Queue {
     let config = PoolConfig {
         // Background work leaves one slot for playback; four remain for imports.
         max_connections: 5,
@@ -141,7 +148,7 @@ async fn queue_at(servers: &[&LoopbackServer], path: &std::path::Path) -> Queue 
             server.addr().port(),
             TlsMode::Plain,
             None,
-            Duration::from_secs(5),
+            timeout,
         )
         .unwrap();
         Provider {
@@ -991,12 +998,14 @@ async fn categories_get_folders_before_any_download() {
 async fn a_stalled_job_does_not_hold_up_the_next_one() {
     let c = post("c", "Clip One.mkv", &mkv(4000, 1), 1000);
     let d = post("d", "Clip Two.mkv", &mkv(4000, 2), 1000);
-    // The first BODY, which belongs to whichever job starts first, stalls.
-    let server =
-        LoopbackServer::start_stalling([c.clone(), d.clone()].concat(), 0, Duration::from_secs(3))
-            .await
-            .unwrap();
-    let (_server, queue) = setup_on(server).await;
+    let (server, mut gate) = LoopbackServer::start_gated([c.clone(), d.clone()].concat())
+        .await
+        .unwrap();
+    let path =
+        std::env::temp_dir().join(format!("infinidysk-gated-queue-{}.sqlite", ItemId::new()));
+    // The observed blocked response must outlive the assertion deadline; a provider
+    // timeout must not accidentally turn serial execution into a passing test.
+    let queue = queue_at_timeout(&[&server], &path, Duration::from_secs(60)).await;
     let db = queue.db().clone();
     let job = Submission {
         file_name: "job.nzb",
@@ -1004,11 +1013,11 @@ async fn a_stalled_job_does_not_hold_up_the_next_one() {
         priority: 0,
         post_processing: 0,
     };
-    queue
+    let c_job = queue
         .enqueue(&job, &nzb(&[("Clip One.mkv", &c, 4000, 1000)]))
         .await
         .unwrap();
-    queue
+    let d_job = queue
         .enqueue(&job, &nzb(&[("Clip Two.mkv", &d, 4000, 1000)]))
         .await
         .unwrap();
@@ -1026,9 +1035,26 @@ async fn a_stalled_job_does_not_hold_up_the_next_one() {
         }
     };
 
-    tokio::time::timeout(Duration::from_secs(2), finished(1))
+    let blocked = tokio::time::timeout(Duration::from_secs(10), gate.blocked())
         .await
-        .expect("the other job finished during the stall");
+        .expect("first BODY observed")
+        .expect("gate open");
+    let blocked_job = if blocked.starts_with("c-") {
+        c_job
+    } else {
+        assert!(blocked.starts_with("d-"));
+        d_job
+    };
+    tokio::time::timeout(Duration::from_secs(10), finished(1))
+        .await
+        .expect("the other job finished while the first BODY remained held");
+    let history = db.history().await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_ne!(
+        history[0].0.id, blocked_job,
+        "the blocked job cannot be the concurrency proof"
+    );
+    gate.release();
     tokio::time::timeout(Duration::from_secs(10), finished(2))
         .await
         .expect("the stalled job finished after it");
