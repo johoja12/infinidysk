@@ -14,7 +14,7 @@ file details and grouped read metrics. Smart Prefetch has a durable queue, scope
 Plex predictions and catalogue sources, wire reservations, finish-watched/minimum
 policies, outcome history and conservative cached-lead scheduling. The **full fork
 port is not complete**: staged large-root walks, full warm-capacity/backfill behavior,
-verified read-to-Plex-viewer correlation, offline cache catalogue reconstruction,
+verified read-to-Plex-viewer correlation,
 remaining migration/operational workflows and performance/cutover gates remain open.
 The draft must not be treated as a production cutover.
 
@@ -51,7 +51,7 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Durable source-bound journal, detached observation, revision-checked controls and current Arr-root authority implemented; read-only scan-root guards at admission and every mutation checkpoint included |
 | R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | Separate bounded GF16 reconstruction lane with exact original-post proof binding, complete-article assembly, shared-reader/source publication admission and durable intent/outcome recovery. Provider outages defer work without proving permanent damage. | Automatic opt-in worker, durable journal/readback, original-post discovery, shared-reader publication admission and fresh-check completion implemented; runtime qualification below |
 | C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | First implementation in Rust; verified 1.x copy import implemented; broader fork data import remains M01 |
-| C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins, durable retained-copy health protection and bounded block/folder probes implemented; offline catalogue reconstruction remains open |
+| C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins, durable retained-copy health protection and bounded block/folder probes implemented; source-bound manifest reconstruction, explicit read-only recovery mode and current-revision verification implemented; live NAS acceptance remains open |
 | C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Durable article ledger, admission stamps, decoded-cache namespaces, final-media keys and dependent-reader guards implemented; startup/lineage checks, later cache attachment guards and retained-hash fallback implemented; automatic PAR2 publication is connected through the opt-in durable worker |
 | C04 | P1 | Progressive cold reads, bounded first-byte fill, coalesced fills, source window reuse (`NativeCachedStream`, `NativeSourceCacheStream`; `c6a70ba8`, `0c3c129f`) | Rust segment cache already coalesces in-flight reads. Benchmark FUSE/WebDAV seeks before adding buffering; preserve foreground priority and bounded memory/I/O under NAS stalls. | Progressive read-through and parallel block commits implemented; controlled performance qualification pending |
 | C05 | P1 | Native cache browser, verified ranges, eviction history, buffer/I/O diagnostics (`NativeCacheBrowser*`, cache APIs) | Rust cache statistics exist; final-media file/range APIs and catalogue UI depend on C01–C03. Queries must not warm files or scan NAS payloads. | Settings/browser/ranges/pin/evict and eviction-history/folder-diagnostic APIs implemented; probe/history/diagnostic tool UI and physical read/write/removal counters, queued/running work and buffer-slot diagnostics implemented; live storage acceptance remains open |
@@ -1076,3 +1076,14 @@ C# importer. Native storage paths stay inactive, warming requires explicit revie
 and unsupported identities/fields produce migration notes. See the
 [policy migration receipt](validation/rust-v2-fork-policy-migration-20261104.md).
 This does not activate legacy journals or complete PostgreSQL/operational migration.
+
+## Native cache recovery checkpoint
+
+Source `c237a355` adds recovery manifests, explicit owned-volume reconstruction,
+current-source verification, bounded resumable pages, conservative repair uncertainty
+and budget-free warming holds. A real native restart/corrupted-catalogue rehearsal
+recovered 8 MB through the UI and served full reads/cross-block seeks with no providers.
+After a normal restart, warming completed entirely from the recovered cache.
+The full suite passed 578/0/6, plus three original C# writer and two kernel-FUSE cases.
+See the [cache recovery receipt](validation/rust-v2-cache-recovery-20261104.md).
+The full fork port and production cutover remain unfinished.
