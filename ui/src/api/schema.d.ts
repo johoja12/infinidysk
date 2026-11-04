@@ -1015,6 +1015,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/native-cache/recovery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["native_cache_recovery_candidates"];
+        put?: never;
+        post: operations["native_cache_recover"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/overview": {
         parameters: {
             query?: never;
@@ -3193,6 +3209,35 @@ export interface components {
             /** Format: int32 */
             limit?: number | null;
         };
+        NativeCacheRecoveryCandidate: {
+            /** Format: uuid */
+            item: string;
+            key: string;
+            revision: string;
+            /** Format: int64 */
+            size_bytes: number;
+        };
+        NativeCacheRecoveryPage: {
+            after?: string | null;
+            entries: components["schemas"]["NativeCacheRecoveryCandidate"][];
+            /** Format: int32 */
+            rejected: number;
+        };
+        NativeCacheRecoveryRequest: {
+            /** Format: uuid */
+            folder_id: string;
+            /** Format: int64 */
+            offset: number;
+            source: components["schemas"]["NativeCacheRecoveryCandidate"];
+        };
+        NativeCacheRecoveryResult: {
+            /** Format: int64 */
+            next_offset?: number | null;
+            /** Format: int32 */
+            verified_blocks: number;
+            /** Format: int64 */
+            verified_bytes: number;
+        };
         NativeCacheSettings: {
             /**
              * Format: int32
@@ -3221,6 +3266,11 @@ export interface components {
              * @default 100
              */
             min_file_mb: number;
+            /**
+             * @description Explicit reconstruction mode: existing manifests may restore folder ownership; payload mutation stays off.
+             * @default false
+             */
+            recovery_mode: boolean;
         };
         NativeCacheStats: {
             /** Format: int64 */
@@ -3241,6 +3291,7 @@ export interface components {
             available: boolean;
             configured: boolean;
             reason?: string | null;
+            recovery_mode: boolean;
             stats?: components["schemas"]["NativeCacheStats"] | null;
         };
         Network: {
@@ -3885,6 +3936,7 @@ export interface components {
              * @description Observed NNTP bytes since process start, including abandoned drains.
              */
             received_wire_bytes: number;
+            recovery_mode: boolean;
             /** Format: int64 */
             reserved_wire_bytes?: number | null;
             state_available: boolean;
@@ -3989,7 +4041,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a6be-7a64-7071-b739-511b67467065
+             * @default 01a1a6eb-9766-7107-a81d-ab2ba1f93e4a
              */
             id: string;
             /**
@@ -4630,7 +4682,8 @@ export interface components {
              *       "folders": [],
              *       "io_timeout_ms": 1000,
              *       "metadata_path": "/config/native-cache-v2",
-             *       "min_file_mb": 100
+             *       "min_file_mb": 100,
+             *       "recovery_mode": false
              *     }
              */
             native_cache: components["schemas"]["NativeCacheSettings"];
@@ -6765,6 +6818,51 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["NativeCacheProbe"];
+                };
+            };
+        };
+    };
+    native_cache_recovery_candidates: {
+        parameters: {
+            query: {
+                folder_id: string;
+                after?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeCacheRecoveryPage"];
+                };
+            };
+        };
+    };
+    native_cache_recover: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NativeCacheRecoveryRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeCacheRecoveryResult"];
                 };
             };
         };

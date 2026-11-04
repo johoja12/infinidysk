@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
 
+import { NativeCacheRecovery } from "./native-cache-recovery";
 import { NativeCacheProbe, NativeCacheTools } from "./native-cache-tools";
 
 type Settings = Schemas["NativeCacheSettings"];
@@ -20,6 +21,7 @@ export function NativeCachePanel({value,locked,onChange}:{value:Settings;locked:
     <SettingsPanel title="Final-media cache">
       <p className="text-sm text-muted-foreground">Keeps verified media chunks for playback over FUSE, WebDAV and STRM. Storage changes take effect after a restart. Use a separate, empty folder for a new cache.</p>
       <Toggle id="native-cache-enabled" label={<>Enable final-media cache <Locked locked={locked("native_cache.enabled")} /></>} checked={value.enabled} disabled={locked("native_cache.enabled")} onChange={enabled=>patch({enabled})}/>
+      <Toggle id="native-recovery-mode" label={<>Recovery mode <Locked locked={locked("native_cache.recovery_mode")} /></>} hint="Requires a restart. Reconstructs coverage only from matching Rust recovery records and verified bytes. Payload writes and eviction stay off until you turn this off and restart. Existing older chunks without records cannot be reconstructed." checked={value.recovery_mode} disabled={locked("native_cache.recovery_mode")} onChange={recovery_mode=>patch({recovery_mode})}/>
       <Field id="native-catalogue" label="Local catalogue directory" hint="Keep this on local storage, separate from media cache volumes.">
         <Input id="native-catalogue" value={value.metadata_path} disabled={locked("native_cache.metadata_path")} onChange={e=>patch({metadata_path:e.target.value})}/>
       </Field>
@@ -43,16 +45,16 @@ export function NativeCachePanel({value,locked,onChange}:{value:Settings;locked:
         <Button type="button" variant="outline" disabled={locked("native_cache.folders")} onClick={()=>patch({folders:[...value.folders,{id:crypto.randomUUID(),path:"",enabled:true,read_only:false,priority:0,quota_bytes:100e9,min_free_bytes:1e9,max_age_hours:0,high_percent:90,low_percent:80}]})}>Add cache folder</Button>
       </div>
     </SettingsPanel>
-    <NativeCacheBrowser />
+    <NativeCacheBrowser folders={value.folders} />
     <LegacyCacheImport />
   </>;
 }
-function NativeCacheBrowser() {
+function NativeCacheBrowser({folders}:{folders:Schemas["NativeCacheFolder"][]}) {
   const queryClient=useQueryClient();const [offset,setOffset]=useState(0);const [selected,setSelected]=useState<Entry|null>(null);const [evict,setEvict]=useState<Entry|null>(null);
   const status=useQuery({queryKey:['native-cache-status'],queryFn:()=>body(api.GET('/api/v1/native-cache')),refetchInterval:5000});
   const entries=useQuery({queryKey:['native-cache-files',offset],queryFn:()=>body(api.GET('/api/v1/native-cache/files',{params:{query:{offset,limit:50}}})),enabled:status.data?.available===true,refetchInterval:5000});
   const coverage=useQuery({queryKey:['native-cache-coverage',selected],queryFn:()=>body(api.POST('/api/v1/native-cache/coverage',{body:selected!})),enabled:selected!==null});
-  const action=useMutation({mutationFn:({entry,operation}:{entry:Entry;operation:Schemas['NativeCacheOperation']})=>body(api.POST('/api/v1/native-cache/files',{body:{entry,operation}})),onSuccess:async changed=>{if(!changed)toast.info('The file is active, pinned, or already removed.');setSelected(null);await queryClient.invalidateQueries({queryKey:['native-cache-files']});await queryClient.invalidateQueries({queryKey:['native-cache-status']});},onError:error=>toast.error(error.message)});
+  const action=useMutation({mutationFn:({entry,operation}:{entry:Entry;operation:Schemas['NativeCacheOperation']})=>body(api.POST('/api/v1/native-cache/files',{body:{entry,operation}})),onSuccess:async changed=>{if(!changed)toast.info(status.data?.recovery_mode ? 'Cache recovery mode keeps payloads read only.' : 'The file is active, pinned, or already removed.');setSelected(null);await queryClient.invalidateQueries({queryKey:['native-cache-files']});await queryClient.invalidateQueries({queryKey:['native-cache-status']});},onError:error=>toast.error(error.message)});
   return <><AlertDialog open={evict!==null} onOpenChange={open=>{if(!open)setEvict(null);}}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>Evict cached file?</AlertDialogTitle><AlertDialogDescription>Future playback will fetch this file from its Usenet source. Active or pinned files stay protected.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>Cancel</AlertDialogCancel><AlertDialogAction onClick={()=>{if(evict)action.mutate({entry:evict,operation:'evict'});setEvict(null);}}>Evict</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
   <SettingsPanel title="Cached files">
     {status.error&&<Failure error={status.error}/>}
@@ -61,6 +63,7 @@ function NativeCacheBrowser() {
       <p className="text-sm text-muted-foreground">{status.data.stats?.files??0} files · {bytes(status.data.stats?.bytes??0)} verified bytes. Coverage is a catalogue snapshot; reads verify stored bytes. Health checks automatically pin a complete copy of a damaged source. Unpinning that copy allows eviction.</p>
       {status.data.stats?.io && <div className="space-y-1 rounded-lg border p-3 text-xs text-muted-foreground"><p className="text-sm font-medium text-foreground">Storage I/O since restart</p><p>{bytes(status.data.stats.io.verified_read_bytes)} verified block reads · {bytes(status.data.stats.io.synced_write_bytes)} synced writes</p><p>{status.data.stats.io.active} running · {status.data.stats.io.queued} queued · {status.data.stats.io.available_buffer_blocks} buffer blocks available · {status.data.stats.io.failed} failed requests</p><p>Tracks physical cache work, including work still running after a caller times out. Synced writes can precede catalogue publication. These totals are separate from bytes sent to players and provider traffic.</p></div>}
       <NativeCacheTools />
+      <NativeCacheRecovery folders={folders}/>
       {entries.error&&<Failure error={entries.error}/>}
       <div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr className="border-b text-left text-muted-foreground"><th className="p-2">File</th><th className="p-2">Coverage</th><th className="p-2">Actions</th></tr></thead><tbody>
         {entries.data?.map(entry=><tr key={`${entry.item}-${entry.revision}`} className="border-b"><td className="p-2 font-mono text-xs">{entry.item.slice(0,8)} · {entry.revision.slice(0,8)}</td><td className="p-2">{bytes(entry.cached_bytes)} / {bytes(entry.size_bytes)}</td><td className="flex gap-1 p-2"><Button type="button" variant="ghost" size="sm" onClick={()=>setSelected(entry)}>Ranges</Button><Button type="button" variant="ghost" size="sm" disabled={action.isPending} onClick={()=>action.mutate({entry,operation:entry.pinned?'unpin':'pin'})}>{entry.pinned?'Unpin':'Pin'}</Button><Button type="button" variant="ghost" size="sm" disabled={entry.pinned||action.isPending} onClick={()=>setEvict(entry)}>Evict</Button></td></tr>)}

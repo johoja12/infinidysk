@@ -182,7 +182,7 @@ export function PrefetchPanel() {
           <>
             <div className="flex flex-wrap items-center gap-3">
               <p className="text-sm">
-                {!value.enabled ? "Disabled" : status.data.paused ? "Paused" : "Running"} ·{" "}
+                {!value.enabled ? "Disabled" : status.data.recovery_mode ? "Held for cache recovery" : status.data.paused ? "Paused" : "Running"} ·{" "}
                 {bytes(status.data.charged_fill_bytes)} charged today
               </p>
               <Button
