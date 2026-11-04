@@ -58,7 +58,7 @@ function NativeCacheBrowser() {
     {status.error&&<Failure error={status.error}/>}
     {status.data?.reason&&<p className="text-sm text-destructive">{status.data.reason}</p>}
     {!status.data?.available?<p className="text-sm text-muted-foreground">The final-media cache is inactive. Enable it, save settings, and restart to use it.</p>:<>
-      <p className="text-sm text-muted-foreground">{status.data.stats?.files??0} files · {bytes(status.data.stats?.bytes??0)} verified bytes. Coverage is a catalogue snapshot; reads verify stored bytes.</p>
+      <p className="text-sm text-muted-foreground">{status.data.stats?.files??0} files · {bytes(status.data.stats?.bytes??0)} verified bytes. Coverage is a catalogue snapshot; reads verify stored bytes. Health checks automatically pin a complete copy of a damaged source. Unpinning that copy allows eviction.</p>
       <NativeCacheTools />
       {entries.error&&<Failure error={entries.error}/>}
       <div className="overflow-x-auto"><table className="w-full text-sm"><thead><tr className="border-b text-left text-muted-foreground"><th className="p-2">File</th><th className="p-2">Coverage</th><th className="p-2">Actions</th></tr></thead><tbody>

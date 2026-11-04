@@ -406,3 +406,62 @@ async fn eviction_cursors_are_persistent_and_ignore_newer_events_between_pages()
         older[0].cursor
     );
 }
+
+#[tokio::test]
+async fn only_complete_cache_copies_gain_durable_health_protection_and_manual_pins_survive_release()
+{
+    let t = Temp::new();
+    let settings = t.settings();
+    let cache = Cache::open(settings.clone()).await.unwrap();
+    let k = key(2 * BLOCK);
+    let lease = cache.lease(k.clone()).unwrap();
+    cache.put(&lease, 0, data(7)).await.unwrap();
+    assert_eq!(cache.verify_and_protect(&k).await.unwrap(), Some(false));
+    assert!(!cache.entries(0, 10).await.unwrap()[0].pinned);
+    cache.put(&lease, 1, data(8)).await.unwrap();
+    drop(lease);
+    assert_eq!(cache.verify_and_protect(&k).await.unwrap(), Some(true));
+    assert!(!cache.evict(&k, "protected copy").await.unwrap());
+    drop(cache);
+    let cache = Cache::open(settings).await.unwrap();
+    assert!(cache.entries(0, 10).await.unwrap()[0].pinned);
+    assert!(
+        !cache
+            .evict(&k, "restart cannot forget health protection")
+            .await
+            .unwrap()
+    );
+    assert!(cache.pin(&k, true).await.unwrap());
+    assert!(
+        !cache.release_protection(&k).await.unwrap(),
+        "a manual pin supersedes automatic protection"
+    );
+    assert!(!cache.evict(&k, "manual pin").await.unwrap());
+    assert!(cache.pin(&k, false).await.unwrap());
+    assert_eq!(cache.verify_and_protect(&k).await.unwrap(), Some(true));
+    assert!(cache.release_protection(&k).await.unwrap());
+    assert!(cache.evict(&k, "source revision changed").await.unwrap());
+}
+#[tokio::test]
+async fn unavailable_cache_storage_keeps_health_protection_and_corruption_releases_it() {
+    let t = Temp::new();
+    let cache = Cache::open(t.settings()).await.unwrap();
+    let k = key(BLOCK);
+    let lease = cache.lease(k.clone()).unwrap();
+    cache.put(&lease, 0, data(7)).await.unwrap();
+    drop(lease);
+    let payload = t.payload(&k, 0);
+    let folder = payload.parent().unwrap();
+    let away = folder.with_extension("away");
+    std::fs::rename(folder, &away).unwrap();
+    assert_eq!(cache.verify_and_protect(&k).await.unwrap(), None);
+    assert!(
+        cache.entries(0, 10).await.unwrap()[0].pinned,
+        "uncertain storage must not lose its only-copy protection"
+    );
+    std::fs::rename(&away, folder).unwrap();
+    std::fs::write(&payload, b"torn").unwrap();
+    assert_eq!(cache.verify_and_protect(&k).await.unwrap(), Some(false));
+    assert!(!cache.entries(0, 10).await.unwrap()[0].pinned);
+    assert!(cache.coverage(&k).await.unwrap().is_empty());
+}

@@ -421,7 +421,7 @@ impl Worker {
         if let Some(cache) = self.vfs.native_cache() {
             let verified = tokio::time::timeout(Duration::from_secs(5), async {
                 let key = self.vfs.cache_key(&scope.item).await.ok()?;
-                cache.verify_complete(&key).await.ok()?
+                cache.verify_and_protect(&key).await.ok()?
             })
             .await
             .ok()

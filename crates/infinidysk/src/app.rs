@@ -351,7 +351,15 @@ pub async fn serve(
                             if current == Some(false)
                                 && let Ok(Some(key)) = cache.resolve(&entry).await
                             {
-                                let _ = cache.evict(&key, "source changed or removed").await;
+                                match cache.release_protection(&key).await {
+                                    Ok(_) => {
+                                        let _ =
+                                            cache.evict(&key, "source changed or removed").await;
+                                    }
+                                    Err(error) => {
+                                        warn!(reason=%error, "stale cache protection retained");
+                                    }
+                                }
                             }
                         }
                     }
@@ -442,7 +450,7 @@ pub async fn serve(
             let vfs = Arc::clone(&vfs);
             Box::pin(async move {
                 let key = vfs.cache_key(&item).await.ok()?;
-                tokio::time::timeout(Duration::from_secs(5), cache.verify_complete(&key))
+                tokio::time::timeout(Duration::from_secs(5), cache.verify_and_protect(&key))
                     .await
                     .ok()?
                     .ok()?

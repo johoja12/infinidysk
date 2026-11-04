@@ -900,6 +900,50 @@ impl Cache {
         Ok(Some(true))
     }
 
+    /// Retain a complete catalogue copy before probing storage. Uncertain I/O
+    /// keeps protection; conclusive incomplete/corrupt coverage releases only the
+    /// automatic protection. User pins remain independent.
+    pub async fn verify_and_protect(&self, key: &Key) -> Result<Option<bool>, Error> {
+        let Some(_lease) = self.lease(key.clone()) else {
+            return Ok(None);
+        };
+        let full = |ranges: &[Coverage]| {
+            ranges.len() == 1 && ranges[0].start == 0 && ranges[0].end == key.size
+        };
+        if key.size == 0 || !full(&self.coverage(key).await?) {
+            self.release_protection(key).await?;
+            return Ok(Some(false));
+        }
+        let protected = sqlx::query(
+            "UPDATE entries SET pinned=CASE WHEN pinned=0 THEN 2 ELSE pinned END WHERE key=$1",
+        )
+        .bind(key.id())
+        .execute(&self.db)
+        .await?
+        .rows_affected()
+            > 0;
+        if !protected {
+            return Ok(None);
+        }
+        let result = self.verify_complete(key).await?;
+        if result == Some(false) {
+            self.release_protection(key).await?;
+        }
+        Ok(result)
+    }
+    /// Release stale health protection after source removal or revision change.
+    /// A manual pin is never cleared by this maintenance operation.
+    pub async fn release_protection(&self, key: &Key) -> Result<bool, Error> {
+        Ok(
+            sqlx::query("UPDATE entries SET pinned=0 WHERE key=$1 AND pinned=2")
+                .bind(key.id())
+                .execute(&self.db)
+                .await?
+                .rows_affected()
+                > 0,
+        )
+    }
+
     pub async fn coverage(&self, key: &Key) -> Result<Vec<Coverage>, Error> {
         let blocks: Vec<(i64, i64)> =
             sqlx::query_as("SELECT block,len FROM blocks WHERE key=$1 AND valid=1 ORDER BY block")
@@ -956,15 +1000,11 @@ impl Cache {
         })
     }
     pub async fn pin(&self, key: &Key, pinned: bool) -> Result<bool, Error> {
-        if self
-            .live
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .evicting
-            .contains(key)
-        {
+        // The lease prevents eviction from starting between admission and the
+        // durable pin update, including while SQLite is busy.
+        let Some(_lease) = self.lease(key.clone()) else {
             return Ok(false);
-        }
+        };
 
         Ok(sqlx::query("UPDATE entries SET pinned=$2 WHERE key=$1")
             .bind(key.id())
