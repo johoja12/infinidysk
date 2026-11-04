@@ -36,11 +36,16 @@ type Stream = Either<TcpStream, TlsStream<TcpStream>>;
 
 /// Counts the NNTP bytes read (after TLS) into the provider's [`Usage`] and the
 /// [`Bandwidth`] bill.
+type GrantFuture =
+    Pin<Box<dyn std::future::Future<Output = Result<(), crate::wire::Denied>> + Send>>;
 struct Metered {
     inner: Stream,
     usage: Option<Arc<Usage>>,
     unpaid: u64,
     link: Arc<Link>,
+    budget: Option<Arc<crate::wire::Budget>>,
+    granting: Arc<AtomicBool>,
+    grant: Option<GrantFuture>,
 }
 
 impl AsyncRead for Metered {
@@ -49,9 +54,47 @@ impl AsyncRead for Metered {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let mut credit = if let Some(budget) = self.budget.clone() {
+            loop {
+                if let Some(credit) = budget.take(buf.remaining()) {
+                    break Some(credit);
+                }
+                self.granting.store(true, Ordering::Relaxed);
+                let grant = self
+                    .grant
+                    .get_or_insert_with(|| Box::pin(budget.clone().ready()));
+                match grant.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(result) => {
+                        self.grant = None;
+                        self.granting.store(false, Ordering::Relaxed);
+                        if let Err(error) = result {
+                            return Poll::Ready(Err(error.into()));
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
         let before = buf.filled().len();
-        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
-        let read = (buf.filled().len() - before) as u64;
+        let poll = if let Some(credit) = &credit {
+            let mut limited = ReadBuf::new(buf.initialize_unfilled_to(credit.len()));
+            let result = Pin::new(&mut self.inner).poll_read(cx, &mut limited);
+            let read = limited.filled().len();
+            buf.advance(read);
+            result
+        } else {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        };
+        let count = buf.filled().len() - before;
+        if let Some(credit) = &mut credit {
+            credit.used(count);
+        }
+        let read = count as u64;
         if read > 0 {
             self.link.last_byte.store(now_ns(), Ordering::Relaxed);
         }
@@ -303,6 +346,15 @@ impl Connection {
         &self.stream.get_ref().link
     }
 
+    pub(crate) fn set_wire_budget(&mut self, budget: Option<Arc<crate::wire::Budget>>) {
+        self.stream.get_mut().budget = budget;
+        self.stream.get_mut().grant = None;
+        self.stream
+            .get_ref()
+            .granting
+            .store(false, Ordering::Relaxed);
+    }
+
     /// Connects, reads the greeting and authenticates.
     pub async fn connect(endpoint: &Endpoint) -> Result<Self, Error> {
         let timeout_after = endpoint.timeout;
@@ -349,6 +401,9 @@ impl Connection {
                     inner: stream,
                     usage: endpoint.usage.clone(),
                     unpaid: 0,
+                    budget: None,
+                    granting: Arc::default(),
+                    grant: None,
                     link: Arc::new(Link::new()),
                 },
             ),
@@ -627,9 +682,16 @@ impl Connection {
         if self.stream.buffer().is_empty() {
             self.pay().await;
         }
+        let granting = Arc::clone(&self.stream.get_ref().granting);
         let buf = timeout(self.timeout, self.stream.fill_buf())
             .await
-            .map_err(|_| Error::Timeout)??;
+            .map_err(|_| {
+                if granting.load(Ordering::Relaxed) {
+                    Error::Io(crate::wire::Denied.into())
+                } else {
+                    Error::Timeout
+                }
+            })??;
         if buf.is_empty() {
             return Err(Error::Closed);
         }
@@ -640,10 +702,17 @@ impl Connection {
     async fn read_line(&mut self) -> Result<(), Error> {
         self.pay().await;
         self.line.clear();
+        let granting = Arc::clone(&self.stream.get_ref().granting);
         let mut limited = (&mut self.stream).take(MAX_LINE_LEN);
         let n = timeout(self.timeout, limited.read_until(b'\n', &mut self.line))
             .await
-            .map_err(|_| Error::Timeout)??;
+            .map_err(|_| {
+                if granting.load(Ordering::Relaxed) {
+                    Error::Io(crate::wire::Denied.into())
+                } else {
+                    Error::Timeout
+                }
+            })??;
         if n == 0 {
             return Err(Error::Closed);
         }

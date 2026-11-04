@@ -111,6 +111,7 @@ pub(crate) enum Command {
 #[derive(Clone)]
 pub(crate) struct Tag {
     pub(crate) workload: Workload,
+    pub(crate) wire: Option<Arc<crate::wire::Budget>>,
     pub(crate) repair_revision: RepairRevision,
     pub(crate) provider: u16,
     pub(crate) stats: Option<Arc<Stats>>,
@@ -131,6 +132,7 @@ pub(crate) struct Tag {
 impl Tag {
     pub(crate) const UNTRACKED: Self = Self {
         workload: Workload::Stream,
+        wire: None,
         repair_revision: RepairRevision::Base,
         provider: 0,
         stats: None,
@@ -464,11 +466,17 @@ impl Pool {
         message_id: &str,
         tag: &Tag,
     ) -> Result<Option<Body>, Failure> {
+        if tag.wire.as_ref().is_some_and(|b| b.blocked()) {
+            return Err(Failure::Request(Error::Io(crate::wire::Denied.into())));
+        }
         let (mut failed, mut unanswered) = (0, 0);
         let provider = tag.provider;
         let stream = tag.workload == Workload::Stream;
         let deadline = tokio::time::Instant::now() + self.stream_wait;
         loop {
+            if tag.wire.as_ref().is_some_and(|b| b.blocked()) {
+                return Err(Failure::Request(Error::Io(crate::wire::Denied.into())));
+            }
             let wait = async {
                 let download = self
                     .downloads
@@ -510,6 +518,7 @@ impl Pool {
                 _ticket: ticket,
             };
             match dispatch(&tx, request).await {
+                Some(Err(error)) if error.is_wire_budget() => return Err(Failure::Request(error)),
                 // Playback fails over to the next provider rather than wait out another stall.
                 Some(Err(Error::Timeout)) if stream => {
                     return Err(Failure::Request(Error::Timeout));
@@ -860,6 +869,7 @@ async fn run(
         let Some(request) = in_flight.pop_front() else {
             continue;
         };
+        conn.set_wire_budget(request.tag.wire.clone());
         let provider = request.tag.provider;
         request.tag.step(Step::Reading { provider });
         let abandoned = request
@@ -917,8 +927,18 @@ async fn run(
         {
             dropped(&host, error, in_flight.len() + rx.len());
         }
+        let budget_denied = result.as_ref().is_err_and(Error::is_wire_budget);
         // A dropped receiver means the caller was cancelled; the reply is drained anyway.
         request.answer(result, timing.decode);
+        if budget_denied {
+            rx.close();
+            for pending in in_flight.drain(..) {
+                pending.answer(Err(Error::Io(crate::wire::Denied.into())), Duration::ZERO);
+            }
+            while let Some(pending) = rx.recv().await {
+                pending.answer(Err(Error::Io(crate::wire::Denied.into())), Duration::ZERO);
+            }
+        }
         if !reusable {
             return;
         }

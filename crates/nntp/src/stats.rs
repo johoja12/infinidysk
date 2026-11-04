@@ -176,7 +176,10 @@ pub struct Rescue {
 }
 
 /// How a request that got this error ended.
-pub(crate) const fn outcome(error: &Error) -> Outcome {
+pub(crate) fn outcome(error: &Error) -> Outcome {
+    if error.is_wire_budget() {
+        return Outcome::Cancelled;
+    }
     let reason = match error {
         Error::NotFound => return Outcome::NotFound,
         Error::Timeout => Reason::Timeout,

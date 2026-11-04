@@ -12,6 +12,7 @@ mod pool;
 mod stats;
 mod tls;
 mod usage;
+pub mod wire;
 
 use std::fmt;
 use std::future::Future;
@@ -86,6 +87,9 @@ pub trait Articles: Send + Sync {
 }
 
 impl Error {
+    pub fn is_wire_budget(&self) -> bool {
+        matches!(self, Self::Io(error) if error.get_ref().and_then(<dyn std::error::Error + Send + Sync>::downcast_ref::<wire::Denied>).is_some())
+    }
     /// Why a connect failed, worded for the person who set the provider up.
     #[must_use]
     pub fn connect_problem(&self) -> String {

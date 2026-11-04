@@ -92,6 +92,8 @@ pub struct Client {
     /// Requests admitted and not yet finished.
     admitted: Arc<AtomicUsize>,
     foreground: Arc<AtomicUsize>,
+    warm_wire: OnceLock<Arc<crate::wire::Budget>>,
+    warm_lane: Lane,
 }
 
 /// Exclusive use of the providers for a diagnostic: background requests wait at
@@ -158,6 +160,8 @@ impl Client {
             preempt: Arc::default(),
             admitted: Arc::default(),
             foreground: Arc::default(),
+            warm_wire: OnceLock::new(),
+            warm_lane: Lane::default(),
         };
         client.replace(providers);
         client
@@ -198,6 +202,13 @@ impl Client {
     }
 
     /// Sets the [`BodySink`]; only the first call takes effect.
+    pub fn warming_budget(&self) -> Option<&Arc<crate::wire::Budget>> {
+        self.warm_wire.get()
+    }
+    pub fn set_warming_budget(&self, budget: Arc<crate::wire::Budget>) -> bool {
+        self.warm_wire.set(budget).is_ok()
+    }
+
     pub fn set_sink(&self, sink: BodySink) {
         let _ = self.sink.set(sink);
     }
@@ -646,6 +657,10 @@ impl Client {
         message_id: &str,
         mut tag: Tag,
     ) -> Result<(Option<Body>, RepairRevision), Error> {
+        if tag.workload == Workload::Warm {
+            tag.wire = self.warm_wire.get().cloned();
+            tag.lane = Some(self.warm_lane);
+        }
         if message_id.is_empty() {
             return Err(Error::NotFound);
         }
@@ -769,6 +784,9 @@ impl Client {
                     ..base.clone()
                 };
                 let result = entry.provider.pool.fetch(command, message_id, &tag).await;
+                if matches!(&result, Err(Failure::Request(error)) if error.is_wire_budget()) {
+                    return Err(Error::Io(crate::wire::Denied.into()));
+                }
                 // No slot in time says nothing about the provider: the attempt drops unrecorded.
                 if matches!(result, Err(Failure::Request(Error::Unavailable))) {
                     skipped = true;
@@ -1072,5 +1090,87 @@ mod tests {
             "the probe recorded nothing and freed its slot"
         );
         drop(held);
+    }
+    #[tokio::test]
+    async fn warming_wire_exhaustion_is_exact_and_does_not_trip_providers_or_charge_playback() {
+        let corpus = Corpus::generate(1025, 1, 32768);
+        let id = corpus.articles[0].message_id.clone();
+        let server = LoopbackServer::start(corpus.articles)
+            .await
+            .expect("server");
+        let downloads = Downloads::new(4);
+        let client = Client::new([provider(&server, &downloads)]);
+        let charged = Arc::new(AtomicU64::new(0));
+        let budget = crate::wire::Budget::new(Arc::new({
+            let charged = charged.clone();
+            move |_, requested, limit| {
+                let charged = charged.clone();
+                Box::pin(async move {
+                    let old = charged.load(Ordering::SeqCst);
+                    let grant = requested.min(limit.saturating_sub(old));
+                    if grant == 0 {
+                        return Err(crate::wire::Denied);
+                    }
+                    charged.fetch_add(grant, Ordering::SeqCst);
+                    Ok(grant)
+                })
+            }
+        }));
+        budget.configure(true, 4096);
+        assert!(client.set_warming_budget(budget.clone()));
+        let error = client
+            .body(&id, Workload::Warm, None)
+            .await
+            .expect_err("wire cap");
+        assert!(error.is_wire_budget());
+        assert_eq!(budget.received(), 4096);
+        assert_eq!(charged.load(Ordering::SeqCst), 4096);
+        assert!(!client.snapshot()[0].breaker.is_open());
+        let body = client
+            .body(&id, Workload::Stream, None)
+            .await
+            .expect("playback remains independent");
+        assert_eq!(body.data.len(), 32768);
+        assert_eq!(budget.received(), 4096);
+        assert_eq!(downloads.available_permits(), 4);
+    }
+    #[tokio::test]
+    async fn warming_wire_observes_full_protocol_response_including_abandoned_body_drain() {
+        let corpus = Corpus::generate(1025, 1, 32768);
+        let id = corpus.articles[0].message_id.clone();
+        let expected =
+            corpus.articles[0].wire.len() + format!("222 0 <{id}> body follows\r\n").len();
+        let (server, mut gate) = LoopbackServer::start_gated(corpus.articles)
+            .await
+            .expect("server");
+        let downloads = Downloads::new(4);
+        let client = Arc::new(Client::new([provider(&server, &downloads)]));
+        let budget = crate::wire::Budget::new(Arc::new(|_, requested, _| {
+            Box::pin(async move { Ok(requested) })
+        }));
+        budget.configure(true, 1_000_000);
+        assert!(client.set_warming_budget(budget.clone()));
+        let task = {
+            let client = client.clone();
+            tokio::spawn(async move { client.body(&id, Workload::Warm, None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), gate.blocked())
+            .await
+            .expect("request started");
+        task.abort();
+        let _ = task.await;
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while downloads.available_permits() != 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain");
+        assert_eq!(
+            budget.received(),
+            expected as u64,
+            "cancelled callers cannot erase bytes received by the draining transport"
+        );
     }
 }
