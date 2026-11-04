@@ -720,7 +720,12 @@ impl Cache {
                 }
                 Ok(None)
             }
-            _ => {
+            Err(_) => {
+                self.read_timeouts.fetch_add(1, Ordering::Relaxed);
+                self.failed.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
+            }
+            Ok(Err(_)) => {
                 self.failed.fetch_add(1, Ordering::Relaxed);
                 Ok(None)
             }

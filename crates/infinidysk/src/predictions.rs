@@ -1057,6 +1057,9 @@ mod tests {
             backbone: None,
         }]));
         let cache = Cache::open(CacheSettings {
+            // Functional prediction/cache interop, independent of host fsync load.
+            // Actual cache deadline/lease behavior is tested with a gated worker.
+            io_timeout_ms: 10_000,
             enabled: true,
             min_file_mb: 0,
             metadata_path: temp.0.join("meta").to_string_lossy().into_owned(),
@@ -1099,6 +1102,7 @@ mod tests {
             .unwrap();
         let mut settings = config.settings().clone();
         settings.native_cache.enabled = true;
+        settings.native_cache.io_timeout_ms = 10_000;
         settings.native_cache.folders = vec![FolderSettings {
             id: Uuid::new_v4(),
             path: temp.0.join("payload").to_string_lossy().into_owned(),

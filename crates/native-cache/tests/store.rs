@@ -523,3 +523,70 @@ async fn verified_playback_does_not_wait_for_a_catalogue_recency_writer() {
     }
     panic!("queued recency was not persisted after the writer released");
 }
+
+#[test]
+fn a_cache_read_deadline_keeps_its_physical_lease_until_queued_io_finishes() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let temp = Temp::new();
+        let mut settings = temp.settings();
+        settings.io_timeout_ms = 10_000;
+        let cache = Cache::open(settings.clone()).await.unwrap();
+        let key = key(BLOCK);
+        let lease = cache.lease(key.clone()).unwrap();
+        assert!(cache.put(&lease, 0, data(9)).await.unwrap());
+        drop(lease);
+        drop(cache);
+        settings.io_timeout_ms = 100;
+        let cache = Cache::open(settings).await.unwrap();
+        let lease = cache.lease(key.clone()).unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let gate = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = wait.recv();
+        });
+        ready.await.unwrap();
+        assert!(cache.get(&lease, 0).await.is_none());
+        drop(lease);
+        let stats = cache.stats().await.unwrap();
+        assert_eq!(stats.read_timeouts, 1);
+        assert_eq!(stats.io.queued, 1);
+        assert!(!cache.evict(&key, "queued read fixture").await.unwrap());
+        assert_eq!(cache.stats().await.unwrap().io.removal_requests, 0);
+        release.send(()).unwrap();
+        gate.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let io = cache.stats().await.unwrap().io;
+                if io.queued == 0 && io.active == 0 {
+                    assert_eq!(io.verified_read_bytes, BLOCK);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Admission must now succeed. Completion remains subject to the deliberately
+        // short storage deadline, so do not assert host unlink/fsync speed here.
+        let _ = cache.evict(&key, "completed read fixture").await.unwrap();
+        assert_eq!(cache.stats().await.unwrap().io.removal_requests, 1);
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let io = cache.stats().await.unwrap().io;
+                if io.active == 0 && io.queued == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    });
+}
