@@ -234,6 +234,9 @@ def apply_canary(value,journal,recheck):
                     previous=journal.latest.get(key,{})
                     if not stat.S_ISLNK(info.st_mode) or os.readlink(name,dir_fd=parent)!=row['target'] or previous.get('state') not in ('link_intent','link_created'):
                         raise ValueError('Canary entry changed or is not owned by this plan')
+                    receipt=previous.get('receipt',{})
+                    if previous['state']=='link_created' and (info.st_dev,info.st_ino)!=(receipt.get('device'),receipt.get('inode')):
+                        raise ValueError('Canary entry identity changed since creation')
                 else:
                     journal.append(key,'link_intent',{'planDigest':value['planDigest'],'relative':row['relative'],'target':row['target']})
                     os.symlink(row['target'],name,dir_fd=parent);os.fsync(parent);created+=1

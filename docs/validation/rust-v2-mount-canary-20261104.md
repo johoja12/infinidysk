@@ -21,9 +21,9 @@ conditional offline rollback. It requires neither the backend nor source mount;
 changed or foreign links are preserved. Empty owned directories and the ownership
 marker remain. Keep the plan and journals for recovery.
 
-Eleven Python tests passed using generated filesystem data and simulated API
+Twelve Python tests passed using generated filesystem data and simulated API
 proofs, including actual bounded reader subprocesses, resume, rollback, source
-changes and timeout handling. This coordinator evidence is distinct from native
+changes, refusing a substituted inode even at the same target, and timeout handling. This coordinator evidence is distinct from native
 FUSE qualification and does not certify a production migration. Sampled reads do
 not certify whole-file health. Canary directories are private to the invoking
 user; application access requires a deliberate permissions review. Generic NZB

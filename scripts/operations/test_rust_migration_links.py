@@ -65,6 +65,21 @@ class LinksTests(unittest.TestCase):
             finally:
                 journal.close()
 
+    def test_same_target_foreign_inode_cannot_be_adopted_on_resume(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);plan,_=self.setup_plan(root);journal=runner.Journal(root/'journal','fixture-plan')
+            try:
+                links.apply_canary(plan,journal,lambda proof:None)
+                target=root/'canary/folder/fixture.mkv';saved=os.readlink(target)
+                target.rename(target.with_name('foreign-backup'))
+                os.symlink(saved,target)
+                with self.assertRaisesRegex(ValueError,'identity changed'):
+                    links.apply_canary(plan,journal,lambda proof:None)
+                self.assertEqual(links.rollback_canary(plan,journal),0)
+                self.assertTrue(target.is_symlink())
+            finally:
+                journal.close()
+
     def test_invalid_probe_or_payload_and_root_overlap_are_refused(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary);plan,binding=self.setup_plan(root)
