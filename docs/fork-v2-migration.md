@@ -837,7 +837,9 @@ verdict publication. Existing repairs receive this readback even with new automa
 repair attempts disabled.
 
 Five application startup tests and four health integration tests cover these paths.
-The full qualification receipt will be recorded after the workspace run completes.
+The full run passes **504 tests**, zero failures, six ignored; all three original
+C# writer checks and both privileged FUSE checks pass separately. See the
+[repair bootstrap qualification](validation/rust-v2-repair-bootstrap-20261104.md).
 Automatic discovery, full-article patch assembly, durable attempt outcomes and the
 separate PAR2 worker are still open. No API/UI setting or setup-wizard branch is
 introduced here. Back up `/config` and external cache metadata before upgrading.
