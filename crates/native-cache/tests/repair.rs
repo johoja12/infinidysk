@@ -375,3 +375,52 @@ async fn symlinked_anchors_and_replaced_metadata_directories_cannot_redirect_sta
     );
     std::fs::remove_dir_all(path).expect("cleanup");
 }
+
+#[tokio::test]
+async fn the_actual_ledger_serves_body_and_stat_without_providers_and_checks_geometry() {
+    use infinidysk_nntp::{BodyExpectation, Client, Workload};
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    let client = Client::new([]);
+    assert!(client.set_repairs(store.clone()));
+    store
+        .publish(vec![patch("a@fixture", b"restored")])
+        .await
+        .expect("repair");
+    let body = client
+        .body_checked(
+            "a@fixture",
+            Workload::Health,
+            BodyExpectation {
+                offset: Some(8),
+                decoded_len: Some(8),
+                file_size: Some(100),
+                ..BodyExpectation::default()
+            },
+        )
+        .await
+        .expect("body without providers");
+    assert_eq!(body.data.as_ref(), b"restored");
+    assert_eq!(body.part, Some(2));
+    client
+        .stat("a@fixture", Workload::Health, None)
+        .await
+        .expect("STAT against verified repair");
+    assert!(
+        client
+            .body_with("a@fixture", Workload::Stream, None, None, Some(9))
+            .await
+            .is_err()
+    );
+    store
+        .evict_payload("a@fixture")
+        .await
+        .expect("payload retention");
+    assert!(matches!(
+        client.stat("a@fixture", Workload::Health, None).await,
+        Err(infinidysk_nntp::Error::Unavailable)
+    ));
+    drop(client);
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}

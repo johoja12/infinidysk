@@ -21,6 +21,8 @@ tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync",
 tracing.workspace = true
 
 [dev-dependencies]
+uuid.workspace = true
+infinidysk-native-cache.workspace = true
 infinidysk-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util"] }
 

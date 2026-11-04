@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 bytes.workspace = true
+sha2.workspace = true
 tracing.workspace = true
 infinidysk-native-cache.workspace = true
 infinidysk-core.workspace = true

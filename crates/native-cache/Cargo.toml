@@ -10,6 +10,7 @@ publish.workspace = true
 
 [dependencies]
 bytes.workspace = true
+infinidysk-nntp.workspace = true
 nix = { workspace = true, features = ["fs"] }
 serde.workspace = true
 serde_json.workspace = true

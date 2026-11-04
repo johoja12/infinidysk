@@ -9,6 +9,7 @@
 
 mod native;
 mod reader;
+mod revision;
 mod session;
 
 use std::collections::{BTreeSet, HashMap};
@@ -19,8 +20,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use infinidysk_core::{BlobId, FileMeta, ItemId, ItemKind, blob, media};
 use infinidysk_db::{Db, HealthState, Item, QueueEntry};
-use infinidysk_nntp::Client;
+use infinidysk_nntp::{Client, RepairRevision};
 use infinidysk_stream::{Budget, Cache, Fault, Gaps, Report};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 pub use reader::{PartsReader, Reader};
@@ -217,14 +219,70 @@ type Metas = quick_cache::sync::Cache<
 struct CachedMeta {
     file: FileMeta,
     fingerprint: OnceLock<[u8; 32]>,
+    repaired_fingerprint: Mutex<Option<(u64, [u8; 32])>>,
 }
 impl CachedMeta {
-    fn fingerprint(&self) -> Result<[u8; 32], Error> {
+    fn base_fingerprint(&self) -> Result<[u8; 32], Error> {
         if let Some(value) = self.fingerprint.get() {
             return Ok(*value);
         }
         let digest = infinidysk_native_cache::Key::fingerprint(&self.file.content_identity()?);
         Ok(*self.fingerprint.get_or_init(|| digest))
+    }
+    fn fingerprint(&self, client: &Client) -> Result<[u8; 32], Error> {
+        let base = self.base_fingerprint()?;
+        for _ in 0..2 {
+            let generation = client.repair_generation();
+            if generation == 0 {
+                return Ok(base);
+            }
+            if let Some((saved, value)) = *self
+                .repaired_fingerprint
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                && saved == generation
+            {
+                return Ok(value);
+            }
+            let mut hash = None;
+            let mut add = |segments: &infinidysk_core::Segments| -> Result<(), Error> {
+                for segment in &segments.items {
+                    match client.repair_revision(&segment.id) {
+                        RepairRevision::Base => {}
+                        RepairRevision::Pending => return Err(Error::Repairing),
+                        RepairRevision::Repaired(revision) => {
+                            let hash = hash.get_or_insert_with(|| {
+                                let mut hash = Sha256::new();
+                                hash.update(b"infinidysk-file-repairs-v1");
+                                hash.update(base);
+                                hash
+                            });
+                            hash.update((segment.id.len() as u64).to_le_bytes());
+                            hash.update(&segment.id);
+                            hash.update(revision);
+                        }
+                    }
+                }
+                Ok(())
+            };
+            match &self.file {
+                FileMeta::Nzb(file) => add(&file.segments)?,
+                FileMeta::Multipart(file) => {
+                    for part in &file.parts {
+                        add(&part.segments)?;
+                    }
+                }
+            }
+            let value = hash.map_or(base, |hash| hash.finalize().into());
+            if client.repair_generation() == generation {
+                *self
+                    .repaired_fingerprint
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some((generation, value));
+                return Ok(value);
+            }
+        }
+        Err(Error::Repairing)
     }
 }
 impl std::ops::Deref for CachedMeta {
@@ -329,9 +387,18 @@ impl Vfs {
             FileMeta::Multipart(f) => f.parts.iter().map(|p| &p.segments).collect(),
         };
         let (mut known, mut base) = (BTreeSet::new(), 0);
+        let mut repaired = Vec::new();
         for part in parts {
             let flat = |i: &u32| base + usize::try_from(*i).unwrap_or(usize::MAX);
             known.extend(part.missing.iter().chain(&part.corrupt).map(flat));
+            for (i, segment) in part.items.iter().enumerate() {
+                if matches!(
+                    self.client.repair_revision(&segment.id),
+                    RepairRevision::Repaired(_)
+                ) {
+                    repaired.push(base + i);
+                }
+            }
             base += part.items.len();
         }
         // Archive members' bytes are not the container's, so they get no budget.
@@ -339,6 +406,7 @@ impl Vfs {
             && matches!(meta, FileMeta::Nzb(_))
             && media::is_gap_tolerant(&item.name);
         gaps.refresh(known, budget);
+        gaps.repaired(repaired);
         gaps
     }
 
@@ -583,7 +651,7 @@ impl Vfs {
         let meta = self.meta(item).await?;
         Ok(infinidysk_native_cache::Key::from_fingerprint(
             item.id.0,
-            meta.fingerprint()?,
+            meta.fingerprint(&self.client)?,
             item.size.unwrap_or(0),
         ))
     }
@@ -617,6 +685,7 @@ impl Vfs {
                     .ok_or(Error::Repairing)?;
                 let item = &current;
                 let meta = self.meta(item).await?;
+                let fingerprint = meta.fingerprint(&self.client)?;
                 let trace = session.trace();
                 let report = self.report.as_ref().map(|report| {
                     let (report, id) = (Arc::clone(report), item.id);
@@ -639,7 +708,7 @@ impl Vfs {
                     Some(cache) => {
                         let key = infinidysk_native_cache::Key::from_fingerprint(
                             item.id.0,
-                            meta.fingerprint()?,
+                            fingerprint,
                             item.size.unwrap_or(0),
                         );
                         native::NativeReader::wrap(
@@ -652,6 +721,12 @@ impl Vfs {
                     }
                     None => reader,
                 };
+                let reader = revision::RevisionReader::wrap(
+                    reader,
+                    meta,
+                    Arc::clone(&self.client),
+                    fingerprint,
+                );
                 Ok(Some(Handle::new(reader, Some(session))))
             }
             _ => Ok(None),
@@ -661,7 +736,15 @@ impl Vfs {
     /// A reader for media analysis: no session, cache, fault reports or read-ahead, and
     /// reads fail instead of zero-filling.
     pub async fn open_analysis(&self, item: &Item) -> Result<Reader, Error> {
-        self.open_meta(&*self.meta(item).await?)
+        let meta = self.meta(item).await?;
+        let fingerprint = meta.fingerprint(&self.client)?;
+        let reader = self.open_meta(&meta)?;
+        Ok(revision::RevisionReader::wrap(
+            reader,
+            meta,
+            Arc::clone(&self.client),
+            fingerprint,
+        ))
     }
 
     /// Background warming has no playback session, filler, hedges or segment read-ahead.
@@ -670,8 +753,10 @@ impl Vfs {
             let (report, id) = (Arc::clone(report), item.id);
             Arc::new(move |index, fault| report(id, index, fault)) as Report
         });
-        Ok(Reader::new(
-            &*self.meta(item).await?,
+        let meta = self.meta(item).await?;
+        let fingerprint = meta.fingerprint(&self.client)?;
+        let reader = Reader::new(
+            &meta,
             &self.client,
             &self.budget,
             None,
@@ -679,7 +764,13 @@ impl Vfs {
             None,
             report.as_ref(),
         )?
-        .into_warming())
+        .into_warming();
+        Ok(revision::RevisionReader::wrap(
+            reader,
+            meta,
+            Arc::clone(&self.client),
+            fingerprint,
+        ))
     }
 
     /// The file's decoded metadata; concurrent first opens fetch it once.
@@ -701,6 +792,7 @@ impl Vfs {
                 Ok(Arc::new(CachedMeta {
                     file,
                     fingerprint: OnceLock::new(),
+                    repaired_fingerprint: Mutex::new(None),
                 }))
             })
             .await

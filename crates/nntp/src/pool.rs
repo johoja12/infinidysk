@@ -11,7 +11,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::timeout;
 
 use crate::article::Body;
-use crate::client::{BodySink, Lane};
+use crate::client::{BodySink, Lane, RepairRevision};
 use crate::connection::{ConnectionStats, Link, Phase, Timing, validate_message_id};
 use crate::downloads::{Downloads, Permit};
 use crate::stats::{Stats, Workload, outcome};
@@ -110,6 +110,7 @@ pub(crate) enum Command {
 #[derive(Clone)]
 pub(crate) struct Tag {
     pub(crate) workload: Workload,
+    pub(crate) repair_revision: RepairRevision,
     pub(crate) provider: u16,
     pub(crate) stats: Option<Arc<Stats>>,
     pub(crate) probe: Option<Probe>,
@@ -128,6 +129,7 @@ pub(crate) struct Tag {
 impl Tag {
     pub(crate) const UNTRACKED: Self = Self {
         workload: Workload::Stream,
+        repair_revision: RepairRevision::Base,
         provider: 0,
         stats: None,
         probe: None,
@@ -181,7 +183,13 @@ impl Request {
         } else if let (Ok(Some(body)), Some(sink)) =
             (&result, self.tag.sink.as_ref().and_then(|s| s.get()))
         {
-            sink(&self.message_id, self.tag.workload, body, true);
+            sink(
+                &self.message_id,
+                self.tag.workload,
+                body,
+                true,
+                self.tag.repair_revision,
+            );
         }
     }
 

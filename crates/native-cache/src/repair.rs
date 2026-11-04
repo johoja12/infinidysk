@@ -50,12 +50,7 @@ pub enum Error {
     #[error("repair ledger exceeds its payload, batch or record allowance")]
     Budget,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Revision {
-    Base,
-    Pending,
-    Repaired([u8; 32]),
-}
+pub use infinidysk_nntp::RepairRevision as Revision;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Geometry {
     pub offset: u64,
@@ -296,7 +291,7 @@ impl Store {
             root,
             id,
             epoch: AtomicU64::new(epoch),
-            generation: AtomicU64::new(0),
+            generation: AtomicU64::new(epoch.max(1)),
             pending: AtomicBool::new(false),
             index: RwLock::new(index),
             writer: Arc::new(Mutex::new(())),
@@ -328,17 +323,20 @@ impl Store {
             Some(Entry::Verified(info)) => Revision::Repaired(info.revision),
         }
     }
-    pub async fn get(&self, id: &str, revision: [u8; 32]) -> Result<Article, Error> {
-        let info = match self
+    fn info(&self, id: &str, revision: [u8; 32]) -> Result<Info, Error> {
+        match self
             .index
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
         {
-            Some(Entry::Verified(info)) if info.revision == revision => *info,
-            Some(Entry::Pending) => return Err(Error::Pending),
-            _ => return Err(Error::Changed),
-        };
+            Some(Entry::Verified(info)) if info.revision == revision => Ok(*info),
+            Some(Entry::Pending) => Err(Error::Pending),
+            _ => Err(Error::Changed),
+        }
+    }
+    pub async fn get(&self, id: &str, revision: [u8; 32]) -> Result<Article, Error> {
+        let info = self.info(id, revision)?;
         if !info.present {
             return Err(Error::PayloadMissing);
         }
@@ -681,4 +679,48 @@ async fn load(db: &SqlitePool) -> Result<BTreeMap<String, Entry>, Error> {
         index.insert(id, Entry::Verified(info));
     }
     Ok(index)
+}
+
+impl infinidysk_nntp::ArticleRepairs for Store {
+    fn revision(&self, id: &str) -> Revision {
+        Self::revision(self, id)
+    }
+    fn generation(&self) -> u64 {
+        Self::generation(self)
+    }
+    fn expectation(
+        &self,
+        id: &str,
+        revision: [u8; 32],
+    ) -> Result<infinidysk_nntp::BodyExpectation, infinidysk_nntp::Error> {
+        let info = self
+            .info(id, revision)
+            .map_err(|_| infinidysk_nntp::Error::Unavailable)?;
+        Ok(infinidysk_nntp::BodyExpectation {
+            offset: Some(info.geometry.offset),
+            file_size: Some(info.geometry.file_size),
+            decoded_len: Some(info.length as u64),
+            part: info.geometry.part,
+            total: info.geometry.total,
+        })
+    }
+    fn body<'a>(
+        &'a self,
+        id: &'a str,
+        revision: [u8; 32],
+    ) -> infinidysk_nntp::ArticleFuture<'a, infinidysk_nntp::Body> {
+        Box::pin(async move {
+            let article = self
+                .get(id, revision)
+                .await
+                .map_err(|_| infinidysk_nntp::Error::Unavailable)?;
+            Ok(infinidysk_nntp::Body {
+                data: article.data,
+                offset: article.geometry.offset,
+                file_size: article.geometry.file_size,
+                part: article.geometry.part,
+                total: article.geometry.total,
+            })
+        })
+    }
 }

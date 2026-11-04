@@ -55,6 +55,20 @@ impl Gaps {
         state.budget = budget;
     }
 
+    /// A verified global article repair supersedes both imported and playback-found
+    /// holes. The monotonic fill generation is retained for in-flight cache writes.
+    pub fn repaired(&self, indices: impl IntoIterator<Item = usize>) {
+        let mut state = self.lock();
+        let mut changed = false;
+        for index in indices {
+            changed |= state.known.remove(&index);
+            changed |= state.found.remove(&index);
+        }
+        if changed {
+            state.in_a_row.clear();
+        }
+    }
+
     /// Nothing happened for so long that the state may be dropped.
     pub fn stale(&self) -> bool {
         self.lock()

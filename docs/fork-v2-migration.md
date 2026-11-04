@@ -736,3 +736,46 @@ external cache lineage and guarded publication still need integration. C03 remai
 open. The new local tables are additive; **back up `/config`, including the native
 cache metadata and repair anchor, before upgrading**. No persisted user setting or
 setup-wizard branch is introduced by this primitive.
+
+### Repair revisions below delivery
+
+The ledger now implements the NNTP client's verified-article source interface.
+BODY and STAT consult repaired articles before provider circuits and missing-article
+memoization. Pending or missing repaired payloads return unavailability; they never
+silently read the original source. Cached repaired bodies still validate their
+immutable article geometry.
+
+Provider admission captures a revision in each request tag. Normal and abandoned
+response sinks receive that captured stamp. Memory, disk and in-flight decoded-body
+keys include the stamp, with original unmodified IDs preserved at the base revision.
+A new repair cannot join an older provider flight. A delayed original body cannot
+be stored as a newer repair. Original IDs containing NUL cannot collide with the
+internal revision namespace.
+
+Final-media fingerprints include only relevant repaired article IDs/revisions.
+Unrelated file keys stay identical. One captured fingerprint covers both the native
+cache lease and the outer read guard. Affected existing handles must reopen after
+publication, including other items sharing an article. Unrelated readers continue.
+The guard checks before and after reads and covers analysis/warming readers too.
+Verified repairs clear imported and playback-discovered hole suppression while
+retaining monotonic filler counters for cache-fill safety.
+
+The existing 1.x copy endpoint compares the current VFS key with the independently
+preserved original source key. A Rust repair changes that key and therefore refuses
+to copy original cached bytes into a newer repaired generation. Unmodified keys
+remain identical with an empty repair ledger. The original C# full-import fixture
+now attaches this repair layer when testing provider-free reads and seeks.
+
+Focused qualification for this integration: **121 tests pass** across NNTP, decoded
+cache, native cache and VFS, with the optional original-writer check ignored in that
+ordinary run. Workspace all-target Clippy and formatting pass. New integration tests
+hold an original NNTP response while a repaired read completes, check cancelled-body
+stamps, reopen the versioned disk cache, reject wrong geometry, retire dependent
+handles, preserve unrelated reads, and reuse verified final-media data after repair
+payload eviction and ledger restart.
+
+Application bootstrap has not attached the ledger yet. Durable external cache
+lineage/configuration witnesses must be checked before doing so; a lost metadata
+directory must not resurrect an external base-version disk cache. Automatic worker
+publication, discovery, outcomes and reader-gated activation are still open. These
+storage/stream APIs are not a claim that automatic PAR2 repair is live.

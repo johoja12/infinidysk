@@ -444,7 +444,7 @@ async fn bodies_drained_after_the_caller_left_reach_the_sink() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     client.set_sink(Box::new({
         let seen = Arc::clone(&seen);
-        move |id, _, body, drained| {
+        move |id, _, body, drained, _| {
             seen.lock()
                 .unwrap()
                 .push((id.to_owned(), body.data.len(), drained));
@@ -937,7 +937,7 @@ async fn checked_bodies_reject_foreign_geometry_before_the_cache_sink() {
     let client = Client::new([provider(wrong.addr().port(), 0, None, &downloads)]);
     let stored = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let count = Arc::clone(&stored);
-    client.set_sink(Box::new(move |_, _, _, _| {
+    client.set_sink(Box::new(move |_, _, _, _, _| {
         count.fetch_add(1, Ordering::SeqCst);
     }));
     let id = &corpus.articles[0].message_id;

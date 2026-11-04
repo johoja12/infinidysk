@@ -2,7 +2,9 @@
 //! optionally on disk, and one fetch in flight per article that concurrent readers join
 //! instead of repeating.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::hash::RandomState;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,7 +15,7 @@ use bytes::Bytes;
 use futures_util::future::{BoxFuture, FutureExt, Shared, WeakShared};
 use infinidysk_core::trace::{Event, Probe, Step, Tier};
 use infinidysk_core::wait::Wait;
-use infinidysk_nntp::{Client, Error, Progress, Workload};
+use infinidysk_nntp::{Client, Error, Progress, RepairRevision, Workload};
 use quick_cache::sync::DefaultLifecycle;
 use quick_cache::{OptionsBuilder, Weighter};
 
@@ -43,6 +45,42 @@ type Memory = quick_cache::sync::Cache<
     RandomState,
     DefaultLifecycle<Arc<str>, Bytes>,
 >;
+
+struct Stamped {
+    message: Arc<str>,
+    key: Arc<str>,
+    revision: RepairRevision,
+}
+impl Stamped {
+    fn new(id: &str, revision: RepairRevision) -> Result<Self, Arc<Error>> {
+        Ok(Self {
+            message: id.into(),
+            key: cache_key(id, revision)
+                .ok_or_else(|| Arc::new(Error::Unavailable))?
+                .as_ref()
+                .into(),
+            revision,
+        })
+    }
+}
+fn cache_key(id: &str, revision: RepairRevision) -> Option<Cow<'_, str>> {
+    if id.as_bytes().contains(&0) {
+        return None;
+    }
+    match revision {
+        RepairRevision::Base => Some(Cow::Borrowed(id)),
+        RepairRevision::Pending => None,
+        RepairRevision::Repaired(hash) => {
+            let mut key = String::with_capacity(id.len() + 80);
+            key.push_str(id);
+            key.push_str("\0repair-v1\0");
+            for byte in hash {
+                write!(key, "{byte:02x}").expect("formatting into String cannot fail");
+            }
+            Some(Cow::Owned(key))
+        }
+    }
+}
 
 pub struct Cache {
     memory: Memory,
@@ -194,12 +232,22 @@ impl Cache {
             .clone()
     }
 
-    /// Keeps a decoded body for later readers.
+    /// Keeps an original decoded body. Admission-stamped sinks use `insert_revision`.
     pub fn insert(&self, message_id: &str, data: Bytes) {
-        if let Some(disk) = self.disk() {
-            disk.offer(message_id, data.clone());
+        self.insert_revision(message_id, RepairRevision::Base, data);
+    }
+    /// Uses the revision captured before the provider request, never the revision
+    /// current when a cancelled or delayed response finally reaches the sink.
+    pub fn insert_revision(&self, message_id: &str, revision: RepairRevision, data: Bytes) {
+        if let Some(key) = cache_key(message_id, revision) {
+            self.insert_key(&key, data);
         }
-        self.remember(message_id, data);
+    }
+    fn insert_key(&self, key: &str, data: Bytes) {
+        if let Some(disk) = self.disk() {
+            disk.offer(key, data.clone());
+        }
+        self.remember(key, data);
     }
 
     fn remember(&self, message_id: &str, data: Bytes) {
@@ -238,40 +286,66 @@ impl Cache {
         probe: Option<&Probe>,
         progress: Option<Progress>,
     ) -> Body {
-        let cached = self
-            .enabled
-            .load(Ordering::Relaxed)
-            .then(|| self.memory.get(message_id))
-            .flatten();
-        if let Some(data) = cached {
-            self.served(&self.memory_hits, &data, Tier::Memory, probe);
+        for _ in 0..2 {
+            let revision = client.repair_revision(message_id);
+            let key =
+                cache_key(message_id, revision).ok_or_else(|| Arc::new(Error::Unavailable))?;
+            let cached = self
+                .enabled
+                .load(Ordering::Relaxed)
+                .then(|| self.memory.get(key.as_ref()))
+                .flatten();
+            if let Some(data) = cached {
+                if client.repair_revision(message_id) != revision {
+                    continue;
+                }
+                client
+                    .check_cached_repair(message_id, revision, begin, data.len())
+                    .map_err(Arc::new)?;
+                self.served(&self.memory_hits, &data, Tier::Memory, probe);
+                return Ok(data);
+            }
+            let stamped = Stamped {
+                message: message_id.into(),
+                key: key.as_ref().into(),
+                revision,
+            };
+            let (flight, joined) = self.flight(client, stamped, begin, probe, progress.clone());
+            let result = flight.await;
+            if client.repair_revision(message_id) != revision {
+                continue;
+            }
+            let (data, from_disk) = result?;
+            client
+                .check_cached_repair(message_id, revision, begin, data.len())
+                .map_err(Arc::new)?;
+            if joined {
+                self.served(&self.joined, &data, Tier::Shared, probe);
+            } else if from_disk {
+                self.served(&self.disk_hits, &data, Tier::Disk, probe);
+            }
             return Ok(data);
         }
-        let (flight, joined) = self.flight(client, message_id, begin, probe, progress);
-        let (data, from_disk) = flight.await?;
-        if joined {
-            self.served(&self.joined, &data, Tier::Shared, probe);
-        } else if from_disk {
-            self.served(&self.disk_hits, &data, Tier::Disk, probe);
-        }
-        Ok(data)
+        Err(Arc::new(Error::Unavailable))
     }
 
-    /// Fetches from providers outside any shared flight, keeping the result.
-    pub(crate) async fn direct(
+    async fn fetch(
         &self,
         client: &Client,
-        message_id: &str,
+        stamp: &Stamped,
         begin: Option<u64>,
         probe: Option<&Probe>,
         progress: Option<&Progress>,
     ) -> Body {
         self.misses.fetch_add(1, Ordering::Relaxed);
         let body = client
-            .body_with(message_id, Workload::Stream, probe, progress, begin)
+            .body_with(&stamp.message, Workload::Stream, probe, progress, begin)
             .await;
+        if client.repair_revision(&stamp.message) != stamp.revision {
+            return Err(Arc::new(Error::Unavailable));
+        }
         let data = body.map_err(Arc::new)?.data;
-        self.insert(message_id, data.clone());
+        self.insert_key(&stamp.key, data.clone());
         Ok(data)
     }
 
@@ -283,10 +357,14 @@ impl Cache {
         begin: Option<u64>,
         probe: Option<&Probe>,
     ) -> Body {
+        let stamp = Stamped::new(message_id, client.repair_revision(message_id))?;
         self.misses.fetch_add(1, Ordering::Relaxed);
         let body = client.hedge(message_id, probe, begin).await;
+        if client.repair_revision(message_id) != stamp.revision {
+            return Err(Arc::new(Error::Unavailable));
+        }
         let data = body.map_err(Arc::new)?.data;
-        self.insert(message_id, data.clone());
+        self.insert_key(&stamp.key, data.clone());
         Ok(data)
     }
 
@@ -306,7 +384,7 @@ impl Cache {
     fn flight(
         self: &Arc<Self>,
         client: &Arc<Client>,
-        message_id: &str,
+        stamp: Stamped,
         begin: Option<u64>,
         probe: Option<&Probe>,
         progress: Option<Progress>,
@@ -315,7 +393,7 @@ impl Cache {
         if let Some((generation, flight, leader)) =
             inflight
                 .flights
-                .get(message_id)
+                .get(&stamp.key)
                 .and_then(|(generation, weak, leader)| {
                     Some((*generation, weak.upgrade()?, leader.clone()))
                 })
@@ -337,25 +415,23 @@ impl Cache {
         }
         let landing = Landing {
             cache: Arc::downgrade(self),
-            key: message_id.into(),
+            key: Arc::clone(&stamp.key),
             generation,
         };
+        let key = Arc::clone(&stamp.key);
         let (cache, client, probe) = (Arc::clone(self), Arc::clone(client), probe.cloned());
         let flight = async move {
             if let Some(disk) = cache.disk()
                 && let Some(data) = disk.get(&landing.key, probe.as_ref()).await
             {
+                client
+                    .check_cached_repair(&stamp.message, stamp.revision, begin, data.len())
+                    .map_err(Arc::new)?;
                 cache.remember(&landing.key, data.clone());
                 return Ok((data, true));
             }
             let body = cache
-                .direct(
-                    &client,
-                    &landing.key,
-                    begin,
-                    probe.as_ref(),
-                    progress.as_ref(),
-                )
+                .fetch(&client, &stamp, begin, probe.as_ref(), progress.as_ref())
                 .await;
             drop(landing);
             Ok((body?, false))
@@ -363,9 +439,7 @@ impl Cache {
         .boxed()
         .shared();
         if let Some(weak) = flight.downgrade() {
-            inflight
-                .flights
-                .insert(message_id.into(), (generation, weak, leader));
+            inflight.flights.insert(key, (generation, weak, leader));
         }
         drop(inflight);
         (flight, false)
@@ -440,3 +514,6 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 }
+
+#[cfg(test)]
+mod repair_tests;

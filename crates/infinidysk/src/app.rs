@@ -244,9 +244,9 @@ pub async fn serve(
         // Imports read a release's first segments; playback usually starts there. A
         // stream's abandoned read-ahead arrives anyway, and seeks often come back to it.
         let cache = Arc::clone(&cache);
-        client.set_sink(Box::new(move |id, workload, body, drained| {
+        client.set_sink(Box::new(move |id, workload, body, drained, revision| {
             if workload == Workload::Queue || (drained && workload == Workload::Stream) {
-                cache.insert(id, body.data.clone());
+                cache.insert_revision(id, revision, body.data.clone());
             }
         }));
     }

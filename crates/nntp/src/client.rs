@@ -34,7 +34,25 @@ impl Default for Lane {
 
 /// Sees every body a request returns, with the message-id, who asked, and whether the
 /// caller had already left (the reply was drained to keep the connection in sync).
-pub type BodySink = Box<dyn Fn(&str, Workload, &Body, bool) + Send + Sync>;
+pub type BodySink = Box<dyn Fn(&str, Workload, &Body, bool, RepairRevision) + Send + Sync>;
+
+/// Captured before admission. A late original response must retain Base even if
+/// publication has since installed a repaired article with the same message ID.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RepairRevision {
+    #[default]
+    Base,
+    Pending,
+    Repaired([u8; 32]),
+}
+/// A durable, verified article source below every consumer of NNTP bodies. Missing
+/// or uncertain repaired payloads are errors, never permission to use base bytes.
+pub trait ArticleRepairs: Send + Sync {
+    fn revision(&self, id: &str) -> RepairRevision;
+    fn generation(&self) -> u64;
+    fn expectation(&self, id: &str, revision: [u8; 32]) -> Result<crate::BodyExpectation, Error>;
+    fn body<'a>(&'a self, id: &'a str, revision: [u8; 32]) -> crate::ArticleFuture<'a, Body>;
+}
 
 /// One provider's pool and its place in the cascade.
 pub struct Provider {
@@ -61,6 +79,7 @@ pub struct Client {
     known: Mutex<Vec<Known>>,
     missing: Missing,
     sink: Arc<OnceLock<BodySink>>,
+    repairs: OnceLock<Arc<dyn ArticleRepairs>>,
     /// Rare (a miss followed by a hit), so a lock is fine.
     rescues: Mutex<HashMap<(u16, u16, trace::Outcome), u64>>,
     /// Background requests pass this before being counted; a [`Lease`] holds it shut.
@@ -129,6 +148,7 @@ impl Client {
             known: Mutex::default(),
             missing: Missing::default(),
             sink: Arc::default(),
+            repairs: OnceLock::new(),
             rescues: Mutex::default(),
             gate: Arc::default(),
             preempt: Arc::default(),
@@ -175,6 +195,55 @@ impl Client {
     /// Sets the [`BodySink`]; only the first call takes effect.
     pub fn set_sink(&self, sink: BodySink) {
         let _ = self.sink.set(sink);
+    }
+
+    /// Attaches the app-wide durable repair ledger once, before serving requests.
+    pub fn set_repairs(&self, source: Arc<dyn ArticleRepairs>) -> bool {
+        self.repairs.set(source).is_ok()
+    }
+    #[must_use]
+    pub fn repair_revision(&self, id: &str) -> RepairRevision {
+        self.repairs
+            .get()
+            .map_or(RepairRevision::Base, |source| source.revision(id))
+    }
+    #[must_use]
+    pub fn repair_generation(&self) -> u64 {
+        self.repairs.get().map_or(0, |source| source.generation())
+    }
+
+    /// Validates already-cached repaired bytes against the ledger's immutable
+    /// geometry without reading its payload or using a provider connection.
+    pub fn check_cached_repair(
+        &self,
+        id: &str,
+        revision: RepairRevision,
+        begin: Option<u64>,
+        length: usize,
+    ) -> Result<(), Error> {
+        match revision {
+            RepairRevision::Base => Ok(()),
+            RepairRevision::Pending => Err(Error::Unavailable),
+            RepairRevision::Repaired(stamp) => {
+                let expected = self
+                    .repairs
+                    .get()
+                    .ok_or(Error::Unavailable)?
+                    .expectation(id, stamp)?;
+                if begin
+                    .zip(expected.offset)
+                    .is_some_and(|(wanted, actual)| wanted != actual)
+                    || expected
+                        .decoded_len
+                        .is_some_and(|actual| actual != length as u64)
+                {
+                    return Err(Error::Yenc(
+                        "cached repair does not match expected article geometry",
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Requests that skipped a provider because it recently lacked the article.
@@ -484,12 +553,10 @@ impl Client {
 
     async fn body_tagged(&self, message_id: &str, tag: Tag) -> Result<Body, Error> {
         let workload = tag.workload;
-        let body = self
-            .request(Command::Body, message_id, tag)
-            .await?
-            .ok_or(Error::Protocol)?;
+        let (body, revision) = self.request(Command::Body, message_id, tag).await?;
+        let body = body.ok_or(Error::Protocol)?;
         if let Some(sink) = self.sink.get() {
-            sink(message_id, workload, &body, false);
+            sink(message_id, workload, &body, false, revision);
         }
         Ok(body)
     }
@@ -560,8 +627,56 @@ impl Client {
         Load::acquire(&self.admitted)
     }
 
-    #[allow(clippy::significant_drop_tightening)] // False positive: `order` holds only references.
     async fn request(
+        &self,
+        command: Command,
+        message_id: &str,
+        mut tag: Tag,
+    ) -> Result<(Option<Body>, RepairRevision), Error> {
+        if message_id.is_empty() {
+            return Err(Error::NotFound);
+        }
+        validate_message_id(message_id)?;
+        for _ in 0..2 {
+            let revision = self.repair_revision(message_id);
+            tag.repair_revision = revision;
+            let result = match revision {
+                RepairRevision::Pending => Err(Error::Unavailable),
+                RepairRevision::Base => {
+                    self.provider_request(command, message_id, tag.clone())
+                        .await
+                }
+                RepairRevision::Repaired(stamp) => {
+                    let Some(source) = self.repairs.get() else {
+                        return Err(Error::Unavailable);
+                    };
+                    match source.body(message_id, stamp).await {
+                        Ok(body) => {
+                            if body.data.len() > crate::article::MAX_DECODED_LEN {
+                                return Err(Error::TooLarge);
+                            }
+                            if let Some(expected) = tag.expected {
+                                expected.validate(&body)?;
+                            } else if tag.begin.is_some_and(|begin| body.offset != begin) {
+                                return Err(Error::Yenc(
+                                    "repair does not match expected article offset",
+                                ));
+                            }
+                            Ok((command == Command::Body).then_some(body))
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            if self.repair_revision(message_id) == revision {
+                return result.map(|body| (body, revision));
+            }
+        }
+        Err(Error::Unavailable)
+    }
+
+    #[allow(clippy::significant_drop_tightening)] // False positive: `order` holds only references.
+    async fn provider_request(
         &self,
         command: Command,
         message_id: &str,

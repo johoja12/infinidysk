@@ -3237,6 +3237,12 @@ mod tests {
         })
         .await
         .unwrap();
+        // The original C# generations also remain reusable with the Rust repair
+        // layer attached. An empty ledger preserves every unmodified source key.
+        let repairs = infinidysk_native_cache::repair::Store::open(&target.join("cache-meta"))
+            .await
+            .unwrap();
+        assert!(client.set_repairs(repairs));
         let vfs = Vfs::new(
             db.clone(),
             client,

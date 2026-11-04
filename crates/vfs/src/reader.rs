@@ -18,6 +18,7 @@ use crate::Error;
 /// [`AsyncRead`] + [`AsyncSeek`] over one file of the tree.
 pub enum Reader {
     Native(Box<crate::native::NativeReader>),
+    Revision(Box<crate::revision::RevisionReader>),
     Memory(Cursor<Vec<u8>>),
     Segments(SegmentReader),
     Parts(PartsReader),
@@ -155,7 +156,7 @@ impl Reader {
     #[must_use]
     pub(crate) fn with_gaps(self, gaps: Arc<Gaps>) -> Self {
         match self {
-            Self::Memory(_) | Self::Native(_) => self,
+            Self::Memory(_) | Self::Native(_) | Self::Revision(_) => self,
             Self::Segments(r) => Self::Segments(r.with_gaps(gaps)),
             Self::Parts(mut r) => {
                 r.inner = r.inner.with_gaps(gaps);
@@ -172,7 +173,7 @@ impl Reader {
     #[must_use]
     pub(crate) fn with_watch(self, watch: Arc<Watch>) -> Self {
         match self {
-            Self::Memory(_) | Self::Native(_) => self,
+            Self::Memory(_) | Self::Native(_) | Self::Revision(_) => self,
             Self::Segments(r) => Self::Segments(r.with_watch(watch)),
             Self::Parts(mut r) => {
                 r.inner = r.inner.with_watch(watch);
@@ -189,7 +190,7 @@ impl Reader {
     #[must_use]
     pub(crate) fn into_strict(self) -> Self {
         match self {
-            Self::Memory(_) | Self::Native(_) => self,
+            Self::Memory(_) | Self::Native(_) | Self::Revision(_) => self,
             Self::Segments(r) => Self::Segments(r.with_strict()),
             Self::Parts(mut r) => {
                 r.inner = r.inner.with_strict();
@@ -205,7 +206,7 @@ impl Reader {
     /// Strict one-article window, using the provider warming class.
     pub(crate) fn into_warming(self) -> Self {
         match self {
-            Self::Memory(_) | Self::Native(_) => self,
+            Self::Memory(_) | Self::Native(_) | Self::Revision(_) => self,
             Self::Segments(r) => Self::Segments(r.with_warming()),
             Self::Parts(mut r) => {
                 r.inner = r.inner.with_warming();
@@ -222,6 +223,7 @@ impl Reader {
     pub fn set_end(&mut self, end: u64) {
         match self {
             Self::Native(r) => r.set_end(end),
+            Self::Revision(r) => r.set_end(end),
             Self::Memory(_) => {}
             Self::Segments(r) => r.set_end(end),
             Self::Parts(r) => r.set_end(end),
@@ -240,6 +242,7 @@ impl AsyncRead for Reader {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Native(r) => Pin::new(r).poll_read(cx, buf),
+            Self::Revision(r) => Pin::new(r).poll_read(cx, buf),
             Self::Memory(r) => Pin::new(r).poll_read(cx, buf),
             Self::Segments(r) => Pin::new(r).poll_read(cx, buf),
             Self::Parts(r) => Pin::new(r).poll_read(cx, buf),
@@ -252,6 +255,7 @@ impl AsyncSeek for Reader {
     fn start_seek(self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
         match self.get_mut() {
             Self::Native(r) => Pin::new(r).start_seek(position),
+            Self::Revision(r) => Pin::new(r).start_seek(position),
             Self::Memory(r) => Pin::new(r).start_seek(position),
             Self::Segments(r) => Pin::new(r).start_seek(position),
             Self::Parts(r) => Pin::new(r).start_seek(position),
@@ -262,6 +266,7 @@ impl AsyncSeek for Reader {
     fn poll_complete(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
         match self.get_mut() {
             Self::Native(r) => Pin::new(r).poll_complete(cx),
+            Self::Revision(r) => Pin::new(r).poll_complete(cx),
             Self::Memory(r) => Pin::new(r).poll_complete(cx),
             Self::Segments(r) => Pin::new(r).poll_complete(cx),
             Self::Parts(r) => Pin::new(r).poll_complete(cx),

@@ -420,7 +420,7 @@ fn client(scenario: &Scenario, port: u16) -> Result<Arc<Client>, infinidysk_nntp
     let client = Client::new([provider]);
     // Clones every body like the app's cache-warming sink does for queue and drained bodies.
     if std::env::var_os("BENCH_SINK").is_some() {
-        client.set_sink(Box::new(|_, _, body, _| {
+        client.set_sink(Box::new(|_, _, body, _, _| {
             std::hint::black_box(body.data.clone());
         }));
     }
