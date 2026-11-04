@@ -387,6 +387,14 @@ impl Health {
             return Ok(());
         }
         let _writing = self.db.write_permit().await;
+        self.readers_closed_admitted(item).await
+    }
+    /// Internal callers already own write admission; acquiring it again can wait
+    /// behind maintenance while that maintenance waits for the caller itself.
+    async fn readers_closed_admitted(&self, item: ItemId) -> Result<(), Error> {
+        if (self.in_use)(item) {
+            return Ok(());
+        }
         let mut wake = self.db.release_reader_repair(item).await?;
         let automatic = self.settings.borrow().auto_repair;
         if automatic
@@ -1098,7 +1106,7 @@ impl Health {
             self.db.hold_repair_for_reader(item.id).await?;
             self.db.set_health(item.id, &next, status.recheck).await?;
             // Covers last-close racing the persisted hold publication.
-            self.readers_closed(item.id).await?;
+            self.readers_closed_admitted(item.id).await?;
             return Ok(());
         }
         if let Some(check) = &self.cached_copy

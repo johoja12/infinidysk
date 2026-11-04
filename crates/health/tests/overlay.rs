@@ -510,3 +510,66 @@ async fn disabling_automatic_repair_does_not_admit_new_local_attempts() {
     drop(db);
     std::fs::remove_dir_all(path).expect("cleanup");
 }
+
+#[tokio::test]
+async fn last_reader_racing_repair_admission_does_not_deadlock_a_waiting_maintenance_pause() {
+    let (db, _item, client, store, path) = setup(1).await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let first = Arc::new(AtomicBool::new(true));
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let health = Arc::new(
+        health(db.clone(), client)
+            .with_in_use({
+                let checks = checks.clone();
+                move |_| checks.fetch_add(1, Ordering::SeqCst) == 0
+            })
+            .with_local_repair(Arc::new({
+                let (entered, resume, first) = (entered.clone(), resume.clone(), first.clone());
+                move |_, _| {
+                    let (entered, resume, first) = (entered.clone(), resume.clone(), first.clone());
+                    Box::pin(async move {
+                        if first.swap(false, Ordering::SeqCst) {
+                            entered.notify_one();
+                            resume.notified().await;
+                        }
+                        Ok(false)
+                    })
+                }
+            })),
+    );
+    let mut step = {
+        let health = health.clone();
+        tokio::spawn(async move { health.step().await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+        .await
+        .expect("repair owns write admission");
+    let mut pause = Box::pin(db.pause_writes());
+    assert!(
+        std::future::poll_fn(|cx| std::task::Poll::Ready(
+            std::future::Future::poll(pause.as_mut(), cx).is_pending()
+        ))
+        .await,
+        "maintenance waits behind the admitted health step"
+    );
+    resume.notify_one();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), &mut step).await;
+    let passed = result.is_ok();
+    if let Ok(result) = result {
+        assert!(result.expect("health task").expect("health step"));
+    } else {
+        step.abort();
+        let _ = step.await;
+    }
+    drop(pause);
+    assert!(checks.load(Ordering::SeqCst) >= 2);
+    drop(health);
+    drop(store);
+    db.close().await;
+    std::fs::remove_dir_all(path).expect("cleanup");
+    assert!(
+        passed,
+        "last-close reconciliation nested write admission behind maintenance's pending exclusive pause"
+    );
+}
