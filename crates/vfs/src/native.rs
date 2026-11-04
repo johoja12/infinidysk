@@ -188,6 +188,11 @@ impl AsyncSeek for NativeReader {
             SeekFrom::End(delta) => this.lease.key().size().checked_add_signed(delta),
         }
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "seek before start of file"))?;
+        // Consumers may confirm the current offset before each read. Keeping the
+        // same position must retain verified bytes already accumulating in a block.
+        if pos == this.pos {
+            return Ok(());
+        }
         this.pos = pos;
         this.lookup = None;
         this.checked = None;

@@ -445,3 +445,54 @@ async fn repair_exclusion_blocks_new_delivery_handles_and_rechecks_stale_nodes()
     );
     assert!(vfs.sessions().open().is_empty());
 }
+
+#[tokio::test]
+async fn repeated_seeks_to_the_current_position_preserve_a_complete_cache_fill() {
+    let t = Temp::new();
+    let (vfs, node, cache, corpus, server) = fixture(&t, false).await;
+    let mut reader = vfs
+        .open(&node, origin(Delivery::Fuse))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut position = 0u64;
+    let mut buffer = vec![0; 64 * 1024];
+    while position < BLOCK {
+        // Legal position checks between reads must not discard already observed bytes.
+        reader.seek(SeekFrom::Start(position)).await.unwrap();
+        reader.read_exact(&mut buffer).await.unwrap();
+        let offset = usize::try_from(position).unwrap();
+        assert_eq!(buffer, corpus.data[offset..offset + buffer.len()]);
+        position += u64::try_from(buffer.len()).unwrap();
+    }
+    drop(reader);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cache.stats().await.unwrap().bytes < BLOCK {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("complete read must publish a verified native block");
+    let providerless = Vfs::new(
+        vfs.db().clone(),
+        Arc::new(Client::new([])),
+        Budget::new(8 * 1024 * 1024),
+        0,
+        "/unused-test-mount",
+    )
+    .with_native_cache(Some(Arc::clone(&cache)));
+    let before = server.body_commands();
+    let mut cached = providerless
+        .open(&node, origin(Delivery::WebDav))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    cached.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, corpus.data);
+    assert_eq!(
+        server.body_commands(),
+        before,
+        "a new providerless VFS must use the persisted block"
+    );
+}
