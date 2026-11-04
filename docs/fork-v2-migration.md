@@ -14,7 +14,7 @@ file details and grouped read metrics. Smart Prefetch has a durable queue, scope
 Plex predictions and catalogue sources, wire reservations, finish-watched/minimum
 policies, outcome history, conservative cached-lead scheduling, adaptive provider
 capacity and qualified playback backfills. The **full fork port is not complete**:
-verified read-to-Plex-viewer correlation, detailed warming rate/repair attribution,
+detailed warming rate/repair attribution and historical backfill viewer labels,
 remaining migration/operational workflows and performance/cutover gates remain open.
 The draft must not be treated as a production cutover.
 
@@ -63,7 +63,7 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | L01 | P1 | Persisted library link index, additional scan roots, video filter, catalogue/grouped browse (`Services/Library`, `LibraryLinkMaps`) | Rust library conversion/reconciliation exists, but not the fork catalogue and grouping. Preserve exact source-to-link mapping and bounded scans. | Persistent configuration-bound link snapshots, additional read-only roots, video grouping and browser implemented; durable directory/entry/link staging, worker fences and atomic complete-generation publication implemented; 51,001-link native restart acceptance passed |
 | L02 | P1 | Plex metadata matching and indexed library classification (`PlexLibraryMetadataService`, `LibraryCatalogService`) | Depends on P02/L01. Keep matching separate from authority to delete or regrab a file. | Opt-in complete persistent metadata snapshots, exact mapped/indexed paths and ambiguity-guarded display fallback implemented; live Plex acceptance pending |
 | L03 | P1 | File details: source identity, current cache ranges, health history, active regrab, manual regrab (`GetLibraryFileDetails`, file modal) | Compose new Rust admin APIs over L01/C05/R06; do not assume 1.x API compatibility. | Details now include source revision, cache ranges, indexed paths, active regrab and recent grouped reads; Plex classification and source-independent recovery controls included |
-| L04 | P1 | Live playback rows grouped across bursts, imported file ID, viewer attribution and cache-served reads (`ActiveReadRegistry`, `ActiveReadsBroadcaster`) | Rust `vfs::session` and traces exist; add only missing correlation/attribution and prove cleanup on reader drop. | Source/client/player burst grouping and exact native-cache served bytes implemented; verified Plex viewer correlation remains open |
+| L04 | P1 | Live playback rows grouped across bursts, imported file ID, viewer attribution and cache-served reads (`ActiveReadRegistry`, `ActiveReadsBroadcaster`) | Rust `vfs::session` and traces exist; add only missing correlation/attribution and prove cleanup on reader drop. | Source/client/player burst grouping and exact native-cache served bytes implemented; fresh, scope/revision/time-bound verified Plex source-session correlation implemented with ambiguity preserved; it does not assign an HTTP/FUSE read to a remote viewer |
 | M01 | P0 | Import our actual fork data without losing ownership or repair state (`NzbDavMigration`, fork DB additions) | `crates/import` imports C# data, but fork tables/settings/cache layouts need an explicit compatibility report. Inventory unsupported settings and records; fail or report them rather than silently discard. | Private digest-bound SQLite export/verification preserves legacy settings, unknown DB tables and known journals; supported warming policies and read-only library selections now have typed translation with explicit activation review; PostgreSQL-source translation, journal activation and operational parity remain open |
 | M02 | P1 | Legacy NZB catalogue recovery, digest-bound mapped export packages and parallel canary mount (`tools/NzbDavMigration`) | Keep existing tools read-only initially. Decide whether to retain the external tool or add a Rust adapter; preserve package digest, source identity and rollback journal. | Replace / adapter |
 | M03 | P1 | Pipelined batches, separate validation slot, resumable priority schedule and failed-import recovery (`NzbDavMigrationController`, `UsenetMigration`) | New Rust queue/admin contracts need adapters and restart-safe checkpoints. No acknowledgement without terminal proof. | Port |
@@ -1112,3 +1112,15 @@ See the [capacity receipt](validation/rust-v2-warming-capacity-20261104.md) and
 [backfill receipt](validation/rust-v2-playback-backfill-20261104.md). Full migration,
 verified Plex correlation, detailed rate/repair attribution and release qualification
 remain open.
+
+
+## Plex source-session correlation checkpoint
+
+Source `aaff9828` adds verified selected Plex sessions to exact-source playback/file
+rows. It preserves multiple candidate players/viewers, rejects stale/restored or
+mismatched source evidence, and keeps absent session paths unresolved. The full
+suite passed 593/0/6 with SQL backends, Clippy and API/UI builds. Actual native APIs
+prove absent verification stays unknown; a separately labelled UI response fixture
+qualifies multi-viewer/mobile presentation. See the
+[correlation receipt](validation/rust-v2-playback-correlation-20261104.md).
+Warming rate/repair follow-up, historical backfill context and migration remain open.
