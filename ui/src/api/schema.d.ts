@@ -2536,10 +2536,22 @@ export interface components {
             /** Format: int64 */
             opened_at: number;
             player?: string | null;
+            /**
+             * @description Selected Plex sessions reported for this exact source revision. These do
+             *     not identify which viewer caused a particular HTTP/FUSE read.
+             */
+            plex_sessions: components["schemas"]["LibraryReportedPlexSession"][];
             /** Format: int64 */
             position_bytes: number;
             /** Format: int64 */
             served_bytes: number;
+        };
+        LibraryReportedPlexSession: {
+            context: components["schemas"]["PlexPlaybackContext"];
+            /** Format: int64 */
+            observed_at: number;
+            server: string;
+            viewer: string;
         };
         LibraryView: {
             /** @description The saved settings are the confirmed form; otherwise a preview applies them. */
@@ -3556,11 +3568,25 @@ export interface components {
             local_path?: string | null;
             plex_path: string;
         };
+        /**
+         * @description A selected live session reported by a verified server, with an independently
+         *     verified viewer credential and an exact session-file/current-metadata match.
+         *     It reports activity for a source, not the identity of an HTTP/FUSE caller.
+         */
+        PlexPlaybackContext: {
+            /** Format: int64 */
+            duration_ms: number;
+            player?: string | null;
+            session: string;
+            state: string;
+            viewer_name?: string | null;
+        };
         PlexPrediction: {
             /** Format: uuid */
             id: string;
             /** Format: uuid */
             item?: string | null;
+            playback?: components["schemas"]["PlexPlaybackContext"][];
             ranges: components["schemas"]["PrefetchRange"][];
             rating_key: string;
             revision?: string | null;

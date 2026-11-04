@@ -5,7 +5,7 @@ use axum::{Json, extract::State};
 use infinidysk_vfs::Playback;
 use serde::Serialize;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -27,6 +27,17 @@ pub struct Burst {
     pub served_bytes: u64,
     pub native_cache_bytes: u64,
     pub position_bytes: u64,
+    /// Selected Plex sessions reported for this exact source revision. These do
+    /// not identify which viewer caused a particular HTTP/FUSE read.
+    pub plex_sessions: Vec<ReportedSession>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, ToSchema)]
+#[schema(as=LibraryReportedPlexSession)]
+pub struct ReportedSession {
+    pub server: String,
+    pub viewer: String,
+    pub context: crate::predictions::PlaybackContext,
+    pub observed_at: i64,
 }
 fn ms(t: SystemTime) -> i64 {
     t.duration_since(UNIX_EPOCH)
@@ -72,6 +83,7 @@ pub(crate) fn grouped(mut reads: Vec<Playback>) -> Vec<Burst> {
                 served_bytes: r.served,
                 native_cache_bytes: r.native_cache_bytes,
                 position_bytes: r.position,
+                plex_sessions: Vec::new(),
             });
         }
     }
@@ -81,7 +93,88 @@ pub(crate) fn grouped(mut reads: Vec<Playback>) -> Vec<Burst> {
 }
 #[utoipa::path(get,operation_id="library_playback",path="/api/v1/library/playback",responses((status=200,body=Vec<Burst>)))]
 pub async fn status(State(admin): State<Arc<Admin>>) -> Json<Vec<Burst>> {
-    Json(grouped(admin.vfs.sessions().playback()))
+    Json(correlated(&admin, grouped(admin.vfs.sessions().playback())).await)
+}
+
+/// No Plex network access on the read/status path. Scope changes, restored/stale
+/// evidence and unavailable current source metadata all leave attribution unknown.
+pub(crate) async fn correlated(admin: &Admin, mut rows: Vec<Burst>) -> Vec<Burst> {
+    let snapshot = admin.predictions.snapshot().await;
+    let wanted: HashSet<_> = rows.iter().map(|row| row.item).collect();
+    let mut revisions = HashMap::new();
+    if fresh(&snapshot, infinidysk_db::now_ms()) {
+        for id in snapshot
+            .predictions
+            .iter()
+            .filter(|p| !p.playback.is_empty())
+            .filter_map(|p| p.item)
+            .filter(|id| wanted.contains(id))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .take(32)
+        {
+            if let Ok(Some(item)) = admin.vfs.db().item(infinidysk_core::ItemId(id)).await
+                && let Ok(key) = admin.vfs.cache_key(&item).await
+            {
+                revisions.insert(id, key.revision().to_owned());
+            }
+        }
+    }
+    let latest = admin.predictions.snapshot().await;
+    if latest.scope == snapshot.scope && latest.updated_at == snapshot.updated_at && !latest.stale {
+        attach(&snapshot, &revisions, &mut rows, infinidysk_db::now_ms());
+    }
+    rows
+}
+fn fresh(snapshot: &crate::predictions::Snapshot, now: i64) -> bool {
+    !snapshot.stale
+        && snapshot.error.is_none()
+        && snapshot
+            .updated_at
+            .is_some_and(|at| now >= at && now - at <= 120_000)
+}
+fn attach(
+    snapshot: &crate::predictions::Snapshot,
+    revisions: &HashMap<Uuid, String>,
+    rows: &mut [Burst],
+    now: i64,
+) {
+    for row in rows.iter_mut() {
+        row.plex_sessions.clear();
+    }
+    if !fresh(snapshot, now) {
+        return;
+    }
+    let at = snapshot.updated_at.unwrap_or(0);
+    for p in snapshot
+        .predictions
+        .iter()
+        .filter(|p| p.source == crate::predictions::Source::Playback)
+    {
+        let Some(item) = p
+            .item
+            .filter(|id| revisions.get(id) == p.revision.as_ref() && p.revision.is_some())
+        else {
+            continue;
+        };
+        for row in rows.iter_mut().filter(|row| {
+            row.item == item
+                && row.last_seen_at >= at.saturating_sub(30_000)
+                && row.opened_at <= at.saturating_add(120_000)
+        }) {
+            for context in &p.playback {
+                let session = ReportedSession {
+                    server: p.server.clone(),
+                    viewer: p.viewer.clone(),
+                    context: context.clone(),
+                    observed_at: at,
+                };
+                if row.plex_sessions.len() < 32 && !row.plex_sessions.contains(&session) {
+                    row.plex_sessions.push(session);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -123,6 +216,93 @@ mod tests {
                 joined.native_cache_bytes
             ),
             (2, 20, 14)
+        );
+    }
+    #[test]
+    fn source_context_requires_fresh_matching_revision_and_read_window_and_preserves_ambiguity() {
+        use crate::predictions::{PlaybackContext, Prediction, Snapshot, Source};
+        let item = ItemId::new();
+        let revision = "a".repeat(64);
+        let prediction = Prediction {
+            id: Uuid::nil(),
+            server: "server".into(),
+            viewer: "viewer-a".into(),
+            rating_key: "fixture".into(),
+            title: "fixture".into(),
+            source: Source::Playback,
+            item: Some(item.0),
+            revision: Some(revision.clone()),
+            size: 100,
+            ranges: vec![],
+            warning: None,
+            playback: vec![PlaybackContext {
+                session: "session-a".into(),
+                viewer_name: Some("Fixture A".into()),
+                player: Some("Fixture player".into()),
+                state: "playing".into(),
+                duration_ms: 60_000,
+            }],
+        };
+        let mut other = prediction.clone();
+        other.viewer = "viewer-b".into();
+        other.playback[0].session = "session-b".into();
+        let mut snapshot = Snapshot {
+            scope: "scope".into(),
+            predictions: vec![prediction, other],
+            updated_at: Some(200_000),
+            refreshing: false,
+            stale: false,
+            error: None,
+            warning: None,
+        };
+        let mut rows = grouped(vec![Playback {
+            id: 1,
+            item,
+            delivery: Delivery::Fuse,
+            client: "fixture-process".into(),
+            player: None,
+            opened_at: UNIX_EPOCH + Duration::from_secs(190),
+            closed_at: Some(UNIX_EPOCH + Duration::from_secs(205)),
+            served: 100,
+            native_cache_bytes: 100,
+            position: 100,
+        }]);
+        let revisions = HashMap::from([(item.0, revision)]);
+        attach(&snapshot, &revisions, &mut rows, 210_000);
+        assert_eq!(
+            rows[0].plex_sessions.len(),
+            2,
+            "both viewers remain candidates for the source, with no chosen reader identity"
+        );
+        attach(
+            &snapshot,
+            &HashMap::from([(item.0, "b".repeat(64))]),
+            &mut rows,
+            210_000,
+        );
+        assert_eq!(
+            rows[0].plex_sessions.len(),
+            0,
+            "same item ID with a changed source is not the same activity"
+        );
+        snapshot.stale = true;
+        attach(&snapshot, &revisions, &mut rows, 210_000);
+        assert_eq!(rows[0].plex_sessions.len(), 0);
+        snapshot.stale = false;
+        attach(&snapshot, &revisions, &mut rows, 320_001);
+        assert_eq!(
+            rows[0].plex_sessions.len(),
+            0,
+            "old source sessions expire even with a long refresh interval"
+        );
+        attach(&snapshot, &revisions, &mut rows, 199_999);
+        assert_eq!(rows[0].plex_sessions.len(), 0, "future evidence is unknown");
+        rows[0].last_seen_at = 169_999;
+        attach(&snapshot, &revisions, &mut rows, 210_000);
+        assert_eq!(
+            rows[0].plex_sessions.len(),
+            0,
+            "a later session cannot label an older unrelated read burst"
         );
     }
 }

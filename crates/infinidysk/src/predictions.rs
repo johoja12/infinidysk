@@ -44,6 +44,36 @@ pub enum Source {
     Collection,
     Library,
 }
+/// A selected live session reported by a verified server, with an independently
+/// verified viewer credential and an exact session-file/current-metadata match.
+/// It reports activity for a source, not the identity of an HTTP/FUSE caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as=PlexPlaybackContext)]
+pub struct PlaybackContext {
+    pub session: String,
+    pub viewer_name: Option<String>,
+    pub player: Option<String>,
+    pub state: String,
+    pub duration_ms: u64,
+}
+impl PlaybackContext {
+    fn from_session(session: &infinidysk_plex::Session) -> Self {
+        let bounded = |value: &str| value.chars().take(256).collect::<String>();
+        Self {
+            session: bounded(&session.id),
+            viewer_name: session.user_name.as_deref().map(bounded),
+            player: session.player.as_deref().map(bounded),
+            state: session.state.clone(),
+            duration_ms: session.media.duration_ms,
+        }
+    }
+    fn valid(&self) -> bool {
+        self.session.len() <= 1024
+            && self.viewer_name.as_ref().is_none_or(|n| n.len() <= 1024)
+            && self.player.as_ref().is_none_or(|n| n.len() <= 1024)
+            && matches!(self.state.as_str(), "playing" | "paused")
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[schema(as=PlexPrediction)]
 pub struct Prediction {
@@ -58,6 +88,8 @@ pub struct Prediction {
     pub size: u64,
     pub ranges: Vec<Range>,
     pub warning: Option<String>,
+    #[serde(default)]
+    pub playback: Vec<PlaybackContext>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Saved {
@@ -69,6 +101,9 @@ struct Saved {
 #[derive(Clone, Debug, Serialize, ToSchema)]
 #[schema(as=PlexPredictionSnapshot)]
 pub struct Snapshot {
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) scope: String,
     pub predictions: Vec<Prediction>,
     pub updated_at: Option<i64>,
     pub refreshing: bool,
@@ -151,6 +186,7 @@ impl Predictions {
         let state = self.current.lock().unwrap_or_else(PoisonError::into_inner);
         let saved = state.saved.as_ref().filter(|s| s.scope == scope);
         Snapshot {
+            scope,
             predictions: saved.map_or_else(Vec::new, |s| s.predictions.clone()),
             updated_at: saved.map(|s| s.updated_at),
             refreshing: state.refreshing,
@@ -321,6 +357,8 @@ impl Predictions {
             // Validate the configured machine before accepting history or sessions.
             self.client.test_server(server).await?;
             let mut inputs = Vec::new();
+            let mut sessions =
+                HashMap::<(String, String, Option<String>), Vec<PlaybackContext>>::new();
             if options.history {
                 inputs.extend(
                     options
@@ -343,6 +381,17 @@ impl Predictions {
                     .filter(|s| matches!(s.state.as_str(), "playing" | "paused"))
                 {
                     if options.policy.allows_viewer(&server.id, &session.user) {
+                        let contexts = sessions
+                            .entry((
+                                session.user.clone(),
+                                session.media.rating_key.clone(),
+                                session.media.file.clone(),
+                            ))
+                            .or_default();
+                        if contexts.len() >= 32 {
+                            return Err(Error::Invalid("too many matching Plex playback sessions"));
+                        }
+                        contexts.push(PlaybackContext::from_session(&session));
                         let mut media = session.media;
                         media.user = Some(session.user);
                         inputs.push((media, true));
@@ -410,12 +459,7 @@ impl Predictions {
                 // from metadata authorized for this exact viewer.
                 if realtime {
                     current.view_offset_ms = input.view_offset_ms;
-                    if input
-                        .file
-                        .as_ref()
-                        .zip(current.file.as_ref())
-                        .is_some_and(|(playing, scoped)| playing != scoped)
-                    {
+                    if input.file.is_none() || input.file != current.file {
                         // Do not guess the selected version from metadata's first Part.
                         current.file = None;
                     }
@@ -434,10 +478,27 @@ impl Predictions {
                         source as u8,
                     ))
                 {
-                    predictions.push(
-                        self.prediction(server, &current, source, scope, settings)
-                            .await?,
-                    );
+                    let mut prediction = self
+                        .prediction(server, &current, source, scope, settings)
+                        .await?;
+                    if realtime
+                        && prediction.item.is_some()
+                        && input.file.is_some()
+                        && input.file == current.file
+                    {
+                        prediction.playback = sessions
+                            .get(&(
+                                user.to_owned(),
+                                input.rating_key.clone(),
+                                input.file.clone(),
+                            ))
+                            .cloned()
+                            .unwrap_or_default();
+                        for session in &mut prediction.playback {
+                            session.duration_ms = current.duration_ms;
+                        }
+                    }
+                    predictions.push(prediction);
                 }
                 if current.kind == "episode"
                     && let Some(show) = &current.show
@@ -556,6 +617,7 @@ impl Predictions {
             size: 0,
             ranges: Vec::new(),
             warning: None,
+            playback: Vec::new(),
         };
         let item = match media
             .file
@@ -644,7 +706,12 @@ fn valid_saved(saved: &Saved) -> bool {
         && saved.updated_at > 0
         && saved.predictions.len() <= MAX
         && saved.predictions.iter().all(|p| {
-            p.ranges.len() <= 64 && p.ranges.iter().all(|r| r.start < r.end && r.end <= p.size)
+            p.ranges.len() <= 64
+                && p.ranges.iter().all(|r| r.start < r.end && r.end <= p.size)
+                && p.playback.len() <= 32
+                && p.playback.iter().all(PlaybackContext::valid)
+                && (p.playback.is_empty()
+                    || p.source == Source::Playback && p.item.is_some() && p.revision.is_some())
         })
 }
 pub(crate) fn scope(settings: &Settings) -> String {
@@ -767,7 +834,18 @@ mod tests {
                 ));
             }
             if path == "/status/sessions" {
-                return xml(format!("<MediaContainer>{}</MediaContainer>",video("current",1,if mode==5 {"/media/other.mkv"}else{"/media/current.mkv"},None,0).replace("</Video>","<User id=\"7\" title=\"Fixture profile\"/><Player state=\"playing\" machineIdentifier=\"player\"/><Session id=\"session\"/></Video>")));
+                let mut first = video("current",1,if mode==5 {"/media/other.mkv"}else{"/media/current.mkv"},None,0).replace("</Video>","<User id=\"7\" title=\"Fixture profile\"/><Player state=\"playing\" title=\"Fixture player A\" machineIdentifier=\"player\"/><Session id=\"session\"/></Video>");
+                if mode == 8 {
+                    first = first.replace(" file=\"/media/current.mkv\"", "");
+                }
+                let second = if mode == 7 {
+                    first
+                        .replace("Fixture player A", "Fixture player B")
+                        .replace("id=\"session\"", "id=\"session-b\"")
+                } else {
+                    String::new()
+                };
+                return xml(format!("<MediaContainer>{first}{second}</MediaContainer>"));
             }
             if path == "/hubs/home/fixture" || path == "/library/sections/1/all" {
                 assert_eq!(
@@ -1439,5 +1517,58 @@ mod tests {
         f.service.tick(true).await.unwrap();
         assert_eq!(f.service.snapshot().await.predictions.len(), 0);
         assert_eq!(f.queue.status().await.jobs.len(), 0);
+    }
+    #[tokio::test]
+    async fn verified_source_context_preserves_multiple_players_and_rejects_missing_session_paths()
+    {
+        let f = fixture().await;
+        f.state.mode.store(7, Ordering::SeqCst);
+        f.service.tick(true).await.unwrap();
+        let snapshot = f.service.snapshot().await;
+        assert!(!snapshot.stale);
+        let live = snapshot
+            .predictions
+            .iter()
+            .find(|p| p.source == Source::Playback)
+            .unwrap();
+        assert!(live.item.is_some());
+        assert_eq!(live.playback.len(), 2);
+        assert_eq!(live.playback[0].session, "session");
+        assert_eq!(live.playback[1].session, "session-b");
+        assert_eq!(
+            live.playback[0].viewer_name.as_deref(),
+            Some("Fixture profile")
+        );
+        assert!(
+            snapshot
+                .predictions
+                .iter()
+                .filter(|p| p.source != Source::Playback)
+                .all(|p| p.playback.is_empty())
+        );
+        f.state.mode.store(2, Ordering::SeqCst);
+        f.service.tick(true).await.unwrap();
+        assert!(
+            f.service
+                .snapshot()
+                .await
+                .predictions
+                .iter()
+                .all(|p| p.playback.is_empty()),
+            "unverified viewers cannot inherit source identity"
+        );
+        f.state.mode.store(8, Ordering::SeqCst);
+        f.service.tick(true).await.unwrap();
+        let snapshot = f.service.snapshot().await;
+        let live = snapshot
+            .predictions
+            .iter()
+            .find(|p| p.source == Source::Playback)
+            .unwrap();
+        assert!(live.item.is_none());
+        assert!(
+            live.playback.is_empty(),
+            "a missing session Part must not use metadata's first Part"
+        );
     }
 }

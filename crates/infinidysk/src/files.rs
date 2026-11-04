@@ -602,6 +602,7 @@ pub async fn get_file(
             .filter(|s| s.item == item.id)
             .collect(),
     );
+    let playback = crate::library::playback::correlated(&admin, playback).await;
     Ok(Json(FileDetails {
         source_revision: key.map(|k| k.revision().to_owned()),
         cached_ranges,
