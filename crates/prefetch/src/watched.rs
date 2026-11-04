@@ -9,7 +9,7 @@ use std::{
 const MIN_BYTES: u64 = 64 * 1024 * 1024;
 const MIN_SESSION: i64 = 120_000;
 const IDLE: i64 = 30_000;
-type Key = (ItemId, String, Option<String>);
+type Key = (ItemId, &'static str, String, Option<String>);
 #[derive(Default)]
 struct Watch {
     started: i64,
@@ -42,7 +42,7 @@ impl Tracker {
             if r.served == 0 {
                 continue;
             }
-            let key = (r.item, r.client, r.player);
+            let key = (r.item, r.delivery.label(), r.client, r.player);
             if !self.watches.contains_key(&key) && self.watches.len() >= 128 {
                 continue;
             }
@@ -63,7 +63,7 @@ impl Tracker {
             w.last = w.last.max(last);
         }
         let mut qualified = HashMap::<ItemId, u64>::new();
-        for ((item, _, _), w) in &self.watches {
+        for ((item, _, _, _), w) in &self.watches {
             if w.last.saturating_sub(w.started) >= MIN_SESSION && w.bytes >= MIN_BYTES {
                 qualified
                     .entry(*item)
@@ -128,6 +128,18 @@ mod tests {
             tracker.observe(vec![a, b], 1_331_000),
             [(item, MIN_BYTES)],
             "polling counts each byte once, including native-cache playback"
+        );
+    }
+    #[test]
+    fn different_delivery_methods_cannot_join_short_scans_into_watched_evidence() {
+        let item = ItemId::new();
+        let mut first = read(1, item, 1000, 1060, MIN_BYTES / 2);
+        first.delivery = Delivery::Fuse;
+        let second = read(2, item, 1070, 1130, MIN_BYTES / 2);
+        let mut tracker = Tracker::default();
+        assert_eq!(
+            tracker.observe(vec![first, second], 1_130_000),
+            Vec::<(ItemId, u64)>::new()
         );
     }
 }
