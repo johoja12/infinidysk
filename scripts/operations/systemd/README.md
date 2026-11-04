@@ -31,7 +31,21 @@ bounded to two release slots. Failed, completed, missing-history and uncertain
 submissions remain durable outcomes rather than automatic retries. Member/source
 validation and canary link planning run separately with
 `rust-migration-canary.py`; neither service nor script acknowledges production
-cutover. Full multi-batch priority and acknowledgement orchestration remains open.
+cutover. The separate batch service below adds frozen priority and canary disposition orchestration.
 
 Validation: `systemd-analyze verify --man=no` accepted both templates. The service
 was not installed, enabled or run against production.
+
+For the two-slot canary workflow use `infinidysk-rust-batches@` with a separate
+`%i-batches.env` copied from `rust-batches.env.example`. Its state directory and
+journal are separate from the single-package service. Install all reviewed Python
+operations modules together. The backend must see the same explicit offline
+configuration path, mounted read-only when it runs in a container. The canary
+mount and original library are also read-only inputs to these scripts.
+
+The batch service allows 600 seconds per discovery/validation phase and 1800
+seconds for a pass. Large batches may need a reviewed unit override; when changing
+`--phase-timeout`, leave time for both phases and the last bounded import request.
+A timeout preserves child journals and owned canary plans. It does not acknowledge
+a batch or authorize replay. Never run both services against the same acceptance
+journal. Stop the timer for explicit dispositions or manual rollback.

@@ -71,6 +71,15 @@ jobs:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  migration-tools:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: 1
+    steps:
+      - uses: actions/checkout@v7
+      - run: python3 -m unittest discover -s scripts/operations -p 'test_rust*.py'
+      - run: systemd-analyze verify --man=no scripts/operations/systemd/infinidysk-rust-import@.service scripts/operations/systemd/infinidysk-rust-import@.timer scripts/operations/systemd/infinidysk-rust-batches@.service scripts/operations/systemd/infinidysk-rust-batches@.timer
+
   discord-announce:
     runs-on: ubuntu-latest
     steps:
