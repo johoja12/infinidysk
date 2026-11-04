@@ -597,7 +597,7 @@ function Details({
                     </Button>
                     <ConfirmButton
                       variant="outline"
-                      disabled={repair.isPending}
+                      disabled={repair.isPending || details.data.repair_allowed !== true}
                       label={
                         <>
                           <Wrench />
@@ -609,6 +609,7 @@ function Details({
                       confirm="Repair via Arr"
                       onConfirm={() => repair.mutate()}
                     />
+                    {details.data.repair_allowed !== true && <p className="text-sm text-muted-foreground">{details.data.repair_allowed === false ? "This source has no managed library mapping. Read-only scan folders cannot authorize replacement." : "Repair authority is unavailable. Reload file details before requesting replacement."}</p>}
                   </>
                 )}
                 {media?.available && (

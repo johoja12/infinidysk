@@ -910,8 +910,7 @@ impl Maintenance {
     ) -> Result<Pointers, Stop> {
         let roots: Vec<PathBuf> = settings
             .imports
-            .library_dirs
-            .iter()
+            .catalogue_dirs()
             .map(|d| PathBuf::from(&d.path))
             .collect();
         let strm_dir = PathBuf::from(&settings.imports.strm_dir);

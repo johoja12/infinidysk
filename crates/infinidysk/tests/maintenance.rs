@@ -146,6 +146,8 @@ async fn removes_only_files_no_library_link_points_to() {
     let root = std::env::temp_dir().join(format!("infinidysk-maintenance-{}", ItemId::new()));
     let (lib, mount) = (root.join("lib"), root.join("mnt"));
     fs::create_dir_all(&lib).unwrap();
+    let scan = root.join("readonly");
+    fs::create_dir_all(&scan).unwrap();
     fs::create_dir_all(mount.join(".ids")).unwrap();
 
     let db_path = root.join("infinidysk.sqlite");
@@ -160,6 +162,7 @@ async fn removes_only_files_no_library_link_points_to() {
     let (_, view) = admin(addr, "GET", "/api/v1/settings", "").await;
     let mut settings = view["settings"].clone();
     settings["imports"]["library_dirs"] = json!([{ "path": lib, "arr_path": "/tv" }]);
+    settings["imports"]["scan_dirs"] = json!([{ "path":scan,"arr_path":"/readonly" }]);
     settings["health"]["enabled"] = json!(false);
     let (code, _) = admin(addr, "PUT", "/api/v1/settings", &settings.to_string()).await;
     assert_eq!(code, "HTTP/1.1 200 OK");
@@ -177,8 +180,9 @@ async fn removes_only_files_no_library_link_points_to() {
     let (gone_job, gone) = download(&db, "gone", &["g.mkv"]).await;
     db.delete_history(&[old_job, gone_job]).await.unwrap();
     let pointer = |item: &Item| format!("{}/{}", mount.display(), item.id.ids_path());
-    for item in &old[..6] {
-        std::os::unix::fs::symlink(pointer(item), lib.join(&item.name)).unwrap();
+    for (index, item) in old[..6].iter().enumerate() {
+        let folder = if index == 0 { &scan } else { &lib };
+        std::os::unix::fs::symlink(pointer(item), folder.join(&item.name)).unwrap();
     }
     let exists = async |item: &Item| db.item_by_path(&item.path).await.unwrap().is_some();
 
@@ -330,6 +334,14 @@ async fn removes_dead_links_and_has_the_arr_search_again() {
     let (lib, mount) = (root.join("lib"), root.join("mnt"));
     let show = lib.join("Show");
     fs::create_dir_all(&show).unwrap();
+    let scan = root.join("readonly");
+    fs::create_dir_all(&scan).unwrap();
+    let scan_dead = scan.join("dead.mkv");
+    std::os::unix::fs::symlink(
+        format!("{}/{}", mount.display(), ItemId::new().ids_path()),
+        &scan_dead,
+    )
+    .unwrap();
     fs::create_dir_all(mount.join(".ids")).unwrap();
 
     let sonarr_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -351,6 +363,7 @@ async fn removes_dead_links_and_has_the_arr_search_again() {
         "url": format!("http://{sonarr}"), "api_key": "k",
     }]);
     settings["imports"]["library_dirs"] = json!([{ "path": lib, "arr_path": "/tv" }]);
+    settings["imports"]["scan_dirs"] = json!([{ "path":scan,"arr_path":"/readonly" }]);
     settings["network"]["public_url"] = json!("http://media.example");
     settings["health"]["enabled"] = json!(false);
     let (code, _) = admin(addr, "PUT", "/api/v1/settings", &settings.to_string()).await;
@@ -437,6 +450,10 @@ async fn removes_dead_links_and_has_the_arr_search_again() {
         ]
     );
 
+    assert!(
+        fs::symlink_metadata(&scan_dead).unwrap().is_symlink(),
+        "dead-link cleanup cannot unlink discovery-only pointers"
+    );
     db.close().await;
     cancel.cancel();
     server.await.unwrap().unwrap();

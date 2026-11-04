@@ -322,10 +322,18 @@ pub struct Imports {
     pub strm_key: Secret,
     /// Folders holding the Arrs' libraries, walked when pointers change form.
     pub library_dirs: Vec<LibraryDir>,
+    /// Additional read-only catalogue roots. Never converted or cleaned.
+    pub scan_dirs: Vec<LibraryDir>,
     /// Read-only Plex classification; no media is fetched.
     pub plex_matching: bool,
     /// None selects all enabled servers; an empty list explicitly selects none.
     pub plex_server_ids: Option<Vec<String>>,
+}
+
+impl Imports {
+    pub fn catalogue_dirs(&self) -> impl Iterator<Item = &LibraryDir> {
+        self.library_dirs.iter().chain(&self.scan_dirs)
+    }
 }
 
 /// A folder of an Arr's library.
@@ -381,6 +389,7 @@ impl Default for Imports {
             strm_dir: "/data/completed-downloads".to_owned(),
             strm_key: Secret::default(),
             library_dirs: Vec::new(),
+            scan_dirs: Vec::new(),
             plex_matching: false,
             plex_server_ids: None,
         }
@@ -1193,6 +1202,64 @@ impl Settings {
                     "imports.library_dirs",
                     format!("Library folder {path:?} {what}"),
                 ));
+            }
+        }
+        self.imports.scan_dirs.retain(|d| !d.path.trim().is_empty());
+        if self.imports.scan_dirs.len() > 64 {
+            return Err(invalid(
+                "imports.scan_dirs",
+                "Use at most 64 additional scan folders".into(),
+            ));
+        }
+        for dir in &mut self.imports.scan_dirs {
+            for path in [&mut dir.path, &mut dir.arr_path] {
+                let trimmed = path.trim();
+                if !trimmed.is_empty()
+                    && (!trimmed.starts_with('/')
+                        || trimmed.chars().any(char::is_control)
+                        || std::path::Path::new(trimmed)
+                            .components()
+                            .any(|c| matches!(c, std::path::Component::ParentDir)))
+                {
+                    return Err(invalid(
+                        "imports.scan_dirs",
+                        "Scan folders require absolute paths without traversal".into(),
+                    ));
+                }
+                if trimmed == "/" {
+                    return Err(invalid(
+                        "imports.scan_dirs",
+                        "Do not scan a filesystem root".into(),
+                    ));
+                }
+                *path = trimmed.trim_end_matches('/').to_owned();
+            }
+        }
+        for (i, dir) in self.imports.scan_dirs.iter().enumerate() {
+            let overlaps = |a: &str, b: &str| !b.is_empty() && (inside(a, b) || inside(b, a));
+            if [
+                self.mount.dir.as_str(),
+                self.imports.strm_dir.as_str(),
+                self.native_cache.metadata_path.as_str(),
+            ]
+            .iter()
+            .any(|p| overlaps(&dir.path, p))
+                || self
+                    .native_cache
+                    .folders
+                    .iter()
+                    .any(|f| overlaps(&dir.path, &f.path))
+                || self
+                    .imports
+                    .library_dirs
+                    .iter()
+                    .any(|p| overlaps(&dir.path, &p.path) || overlaps(dir.arr_path(), p.arr_path()))
+                || self.imports.scan_dirs.iter().enumerate().any(|(j, p)| {
+                    i != j
+                        && (overlaps(&dir.path, &p.path) || overlaps(dir.arr_path(), p.arr_path()))
+                })
+            {
+                return Err(invalid("imports.scan_dirs","Scan folders must not overlap managed library, mount, completed output, cache or other scan folders".into()));
             }
         }
         self.network

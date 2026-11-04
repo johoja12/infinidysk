@@ -79,6 +79,14 @@ impl Owner {
         self.download_id.as_deref()
     }
 
+    /// Current exact Arr file path, or its proven original path after deletion.
+    #[must_use]
+    pub fn file_path(&self) -> &str {
+        self.current
+            .as_ref()
+            .map_or(self.imported_path.as_str(), |file| file.path.as_str())
+    }
+
     /// The Arr has since imported a different file for this media. Compared by file id
     /// where we recorded one, else by the file being added after the import, else by
     /// path; so the same file under a new path (a STRM, a rename) is not a replacement.

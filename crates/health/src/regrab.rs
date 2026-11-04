@@ -303,6 +303,7 @@ impl Health {
         let reviewed_at = saved.reviewed_at;
         let configuration = self.arr.clone();
         let readers = &self.in_use;
+        let authority = &self.repair_authority;
         let checkpoint = move |progress: Regrab| {
             let (db, scope, version, arr_id, job_name) = (
                 db.clone(),
@@ -322,6 +323,23 @@ impl Health {
                 ) && readers(id)
                 {
                     return Err(arr::Error::Uncertain("reader opened; regrab waits"));
+                }
+                if matches!(
+                    progress.stage,
+                    RegrabStage::BlocklistPending
+                        | RegrabStage::DeletePending
+                        | RegrabStage::SearchPending
+                ) && let Some(authority) = authority
+                    && !authority(
+                        id,
+                        super::RepairTarget::ArrPath(progress.owner.file_path().to_owned()),
+                    )
+                    .await
+                    .map_err(|_| arr::Error::Checkpoint)?
+                {
+                    return Err(arr::Error::Unexpected(
+                        "read-only scan folder cannot authorize regrab",
+                    ));
                 }
                 let configured = configuration
                     .borrow()
@@ -538,6 +556,31 @@ mod tests {
         let client = Arc::new(infinidysk_nntp::Client::new(
             Vec::<infinidysk_nntp::Provider>::new(),
         ));
+        // A policy change between preflight and the durable mutation checkpoint
+        // must still prevent the actual Arr write.
+        let admissions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let checks = Arc::clone(&admissions);
+        let guarded = Health::new(
+            db.clone(),
+            Arc::clone(&client),
+            arrs.clone(),
+            settings.clone(),
+        )
+        .unwrap()
+        .with_repair_authority(Arc::new(move |_, path| {
+            let checks = Arc::clone(&checks);
+            Box::pin(async move {
+                Ok(matches!(path, super::super::RepairTarget::Inspect)
+                    || checks.fetch_add(1, Ordering::SeqCst) == 0)
+            })
+        }));
+        guarded.request_repair(item.id).await.unwrap();
+        guarded.step().await.unwrap();
+        assert!(admissions.load(Ordering::SeqCst) >= 2);
+        assert_eq!(remote.deletes.load(Ordering::SeqCst), 0);
+        assert_eq!(remote.searches.load(Ordering::SeqCst), 0);
+        assert!(db.item(item.id).await.unwrap().is_some());
+        drop(guarded);
         let health = Health::new(
             db.clone(),
             Arc::clone(&client),

@@ -158,6 +158,7 @@ pub async fn serve(
     crate::upgrade::keep_unowned_migrated(&db, &mut store).await;
     crate::maintenance::schedule_dead_links(&db, &mut store).await;
     let settings = store.settings().clone();
+    let config = Arc::new(RwLock::new(store));
     infinidysk_core::enable_experiments(&settings.experiments);
     let tuning = settings.performance.effective();
 
@@ -358,6 +359,19 @@ pub async fn serve(
                     .map(|guard| Box::new(guard) as infinidysk_health::ReadHold)
             }
         });
+    health = health.with_repair_authority({
+        let config = Arc::clone(&config);
+        let db = db.clone();
+        Arc::new(move |item, path| {
+            let (config, db) = (Arc::clone(&config), db.clone());
+            Box::pin(async move {
+                let settings = config.read().await.settings().clone();
+                crate::library::authority::allows(&db, &settings, item, path)
+                    .await
+                    .map_err(infinidysk_health::Error::from)
+            })
+        })
+    });
     let busy = {
         let (importing, streaming) = (importing.clone(), streaming.clone());
         move || importing() || streaming()
@@ -516,7 +530,6 @@ pub async fn serve(
         experiments: settings.experiments.clone(),
         handoff: Arc::clone(&handoff),
     };
-    let config = Arc::new(RwLock::new(store));
     let auth = Arc::new(
         Auth::load(db.clone(), Arc::clone(&config))
             .await

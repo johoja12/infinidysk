@@ -130,6 +130,15 @@ pub enum Analysis {
 /// Analyzes one file's media (§5.7).
 pub type Analyzer = Arc<dyn Fn(Item) -> BoxFuture<'static, Analysis> + Send + Sync>;
 
+#[derive(Clone, Debug)]
+pub enum RepairTarget {
+    Inspect,
+    ArrPath(String),
+    UnownedDelete,
+}
+pub type RepairAuthority =
+    Arc<dyn Fn(ItemId, RepairTarget) -> BoxFuture<'static, Result<bool, Error>> + Send + Sync>;
+
 pub type CachedCopy = Arc<dyn Fn(Item) -> BoxFuture<'static, Option<bool>> + Send + Sync>;
 
 pub type ReadHold = Box<dyn std::any::Any + Send + Sync>;
@@ -144,6 +153,7 @@ pub struct Health {
     in_use: Box<dyn Fn(ItemId) -> bool + Send + Sync>,
     analyzer: Option<Analyzer>,
     cached_copy: Option<CachedCopy>,
+    repair_authority: Option<RepairAuthority>,
     http: reqwest::Client,
     arr_wait: Duration,
     counters: [AtomicU64; 4],
@@ -213,6 +223,7 @@ impl Health {
             in_use: Box::new(|_| false),
             analyzer: None,
             cached_copy: None,
+            repair_authority: None,
             http,
             arr_wait: ARR_WAIT,
             counters: Default::default(),
@@ -263,6 +274,25 @@ impl Health {
     pub fn with_cached_copy(mut self, check: CachedCopy) -> Self {
         self.cached_copy = Some(check);
         self
+    }
+
+    #[must_use]
+    pub fn with_repair_authority(mut self, authority: RepairAuthority) -> Self {
+        self.repair_authority = Some(authority);
+        self
+    }
+    /// Local read-only discovery cannot grant replacement or deletion authority.
+    pub async fn repair_allowed(&self, item: ItemId, path: Option<String>) -> Result<bool, Error> {
+        match &self.repair_authority {
+            Some(authority) => {
+                authority(
+                    item,
+                    path.map_or(RepairTarget::Inspect, RepairTarget::ArrPath),
+                )
+                .await
+            }
+            None => Ok(true),
+        }
     }
 
     /// How long an Arr gets to queue a replacement on its own after a blocklist.
@@ -487,6 +517,11 @@ impl Health {
         let Some((_, mut status)) = self.db.health(id).await? else {
             return Ok(false);
         };
+        if !self.repair_allowed(id, None).await? {
+            return Err(Error::Regrab(
+                "source has no managed library mapping; read-only scan folders cannot authorize replacement",
+            ));
+        }
         if status.state != HealthState::Hidden {
             status.state = HealthState::Repairing;
             status.next_check = Some(now_ms());
@@ -950,6 +985,11 @@ impl Health {
                     (arr, owner, job_name)
                 }
                 Lookup::Unowned(reason) => {
+                    if let Some(authority) = &self.repair_authority
+                        && !authority(item.id, RepairTarget::UnownedDelete).await?
+                    {
+                        return self.give_up(item,status,"additional scan roots require Arr authority; automatic deletion of unowned sources is disabled").await;
+                    }
                     return match settings.unowned_action {
                         UnownedAction::Delete => {
                             tracing::warn!(path = %item.path, reason = %reason, "deleted a broken file no Arr can replace");
@@ -970,6 +1010,18 @@ impl Health {
                 }
             }
         };
+        if !self
+            .repair_allowed(item.id, Some(owner.file_path().to_owned()))
+            .await?
+        {
+            return self
+                .give_up(
+                    item,
+                    status,
+                    "replacement requires a current managed library path; scan roots confer no authority",
+                )
+                .await;
+        }
         // Blocklisting makes the Arr search, so the shared search limit applies first.
         let (kind, ids) = owner.searches();
         if existing.is_none()

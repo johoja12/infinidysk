@@ -432,11 +432,7 @@ impl Metadata {
                             .iter()
                             .filter(|l| {
                                 !l.stale
-                                    && settings
-                                        .imports
-                                        .library_dirs
-                                        .iter()
-                                        .any(|d| d.path == l.root)
+                                    && settings.imports.catalogue_dirs().any(|d| d.path == l.root)
                             })
                             .map(|l| l.path.as_str())
                             .collect(),
@@ -847,13 +843,10 @@ mod tests {
         let f = Fixture::new().await;
         f.remote.mode.store(2, Ordering::SeqCst);
         let mut settings = f.config.read().await.settings().clone();
-        settings
-            .imports
-            .library_dirs
-            .push(crate::config::LibraryDir {
-                path: "/local".into(),
-                arr_path: String::new(),
-            });
+        settings.imports.scan_dirs.push(crate::config::LibraryDir {
+            path: "/local".into(),
+            arr_path: String::new(),
+        });
         settings.plex.servers[0].path_mappings = vec![PathMapping {
             plex_path: "/plex".into(),
             dav_path: None,

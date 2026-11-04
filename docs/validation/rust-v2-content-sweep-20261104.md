@@ -60,3 +60,9 @@ stall. It was fixed with per-import connection lanes; see
 [the isolation receipt](rust-v2-import-isolation-20261104.md). The prior failures
 must not be dismissed as only timing noise. The five repeated complete import-suite
 runs pass after the fix; aggregate workspace qualification remains separate.
+
+Aggregate qualification after the connection-isolation and read-only-library
+increments is green: **463 workspace tests passed, zero failed, six ignored**, with
+SQLite/PostgreSQL, all-target Clippy, schema/UI/native builds and separate actual
+C# writer coverage. See [the aggregate receipt](rust-v2-readonly-library-20261104.md).
+The first two stopped runs remain recorded above and in the isolation receipt.

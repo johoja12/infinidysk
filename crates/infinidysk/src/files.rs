@@ -385,6 +385,8 @@ pub struct FileDetails {
     cache_warning: Option<String>,
     library_links: Vec<crate::library::catalogue::FileView>,
     regrab: Option<crate::regrabs::Status>,
+    /// None when authority could not be read.
+    repair_allowed: Option<bool>,
     playback: Vec<crate::library::playback::Burst>,
     plex: crate::library::metadata::Classification,
     entry: FileEntry,
@@ -608,6 +610,7 @@ pub async fn get_file(
         library_links,
         plex,
         regrab,
+        repair_allowed: admin.health.repair_allowed(item.id, None).await.ok(),
         playback,
         entry,
         checks: checks.into_iter().map(Into::into).collect(),
@@ -697,6 +700,7 @@ fn request(done: Result<bool, infinidysk_health::Error>, item: &Item) -> Result<
     match done {
         Ok(true) => Ok(StatusCode::ACCEPTED),
         Ok(false) => Err(Fail::NotFound),
+        Err(infinidysk_health::Error::Regrab(reason)) => Err(Fail::Bad(reason.into())),
         Err(error) => {
             tracing::warn!(path = %item.path, reason = %error, "health request failed");
             Err(Fail::Internal)

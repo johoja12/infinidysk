@@ -37,6 +37,7 @@ use crate::confined::{Entry, Root};
 use crate::handoff::{self, MAX_STRM_BYTES, MAX_SUBTITLE_BYTES};
 use crate::upgrade::{LEGACY_STRM_KEY, LegacyStrm};
 
+pub(crate) mod authority;
 pub(crate) mod catalogue;
 pub(crate) mod metadata;
 pub(crate) mod playback;
@@ -708,6 +709,7 @@ impl Library {
     /// Saves replaced-key use and retires keys and C#'s earlier form when due.
     async fn tick(&self) {
         let now = now_ms();
+        let scan_roots_present = !self.settings().await.imports.scan_dirs.is_empty();
         let mut keys: Vec<PreviousKey> = self.stored(KEYS_KEY).await.unwrap_or_default();
         let mut changed = false;
         {
@@ -729,7 +731,7 @@ impl Library {
             }
         }
         let before = keys.len();
-        keys.retain(|k| k.retires_ms().is_none_or(|at| at > now));
+        keys.retain(|k| scan_roots_present || k.retires_ms().is_none_or(|at| at > now));
         if keys.len() != before {
             info!(
                 keys = before - keys.len(),
@@ -741,7 +743,8 @@ impl Library {
             self.store(KEYS_KEY, &keys).await;
             self.publish_keys(&keys);
         }
-        if let Some(view) = self.legacy_view().await
+        if !scan_roots_present
+            && let Some(view) = self.legacy_view().await
             && view.retires_ms.is_some_and(|at| at <= now)
         {
             info!(
@@ -791,7 +794,12 @@ impl Library {
         let confirmed: Confirmed = self.stored(FORM_KEY).await.unwrap_or_default();
         let keys: Vec<PreviousKey> = self.stored(KEYS_KEY).await.unwrap_or_default();
         let pending_remaps = self.parts.db.remap_pending(None).await?;
-        let legacy = self.legacy_view().await;
+        let mut legacy = self.legacy_view().await;
+        if !settings.imports.scan_dirs.is_empty()
+            && let Some(view) = &mut legacy
+        {
+            view.retires_ms = None;
+        }
         let job = self.lock();
         Ok(LibraryView {
             state: job.state,
@@ -811,7 +819,12 @@ impl Library {
                     added_ms: k.added_ms,
                     uses: k.uses,
                     last_used_ms: k.last_used_ms,
-                    retires_ms: k.retires_ms(),
+                    retires_ms: settings
+                        .imports
+                        .scan_dirs
+                        .is_empty()
+                        .then(|| k.retires_ms())
+                        .flatten(),
                 })
                 .collect(),
             legacy,

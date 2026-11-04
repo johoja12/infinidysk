@@ -349,3 +349,87 @@ async fn plex_classification_settings_preserve_defaults_selection_and_environmen
     drop(db);
     let _ = std::fs::remove_file(path);
 }
+
+#[tokio::test]
+async fn additional_scan_roots_are_separate_validated_and_environment_owned() {
+    let path = std::env::temp_dir().join(format!(
+        "infinidysk-scan-config-{}.sqlite",
+        uuid::Uuid::now_v7()
+    ));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("db");
+    let mut store = ConfigStore::load(
+        db.clone(),
+        [(
+            "INFINIDYSK__IMPORTS__SCAN_DIRS".into(),
+            r#"[{"path":"/readonly/","arr_path":"/arr/readonly/"}]"#.into(),
+        )],
+    )
+    .await
+    .expect("env");
+    assert_eq!(
+        store.settings().imports.library_dirs,
+        Vec::<LibraryDir>::new()
+    );
+    assert_eq!(store.settings().imports.scan_dirs[0].path, "/readonly");
+    let mut changed = store.settings().clone();
+    changed.imports.scan_dirs.clear();
+    assert!(
+        matches!(store.save(changed).await,Err(Error::Locked(path))if path=="imports.scan_dirs")
+    );
+    assert_eq!(
+        ConfigStore::load(db.clone(), [])
+            .await
+            .expect("stored")
+            .settings()
+            .imports
+            .scan_dirs,
+        Vec::<LibraryDir>::new()
+    );
+    let defaults = Settings::default();
+    for bad in [
+        "/".to_owned(),
+        "relative".into(),
+        "/a/../b".into(),
+        defaults.mount.dir,
+        defaults.imports.strm_dir,
+        defaults.native_cache.metadata_path,
+    ] {
+        let mut settings = Settings::default();
+        settings.imports.scan_dirs.push(LibraryDir {
+            path: bad.clone(),
+            arr_path: String::new(),
+        });
+        assert!(
+            matches!(
+                settings.validate(),
+                Err(Error::Invalid {
+                    path: "imports.scan_dirs",
+                    ..
+                })
+            ),
+            "{bad}"
+        );
+    }
+    let mut settings = Settings::default();
+    settings.imports.library_dirs.push(LibraryDir {
+        path: "/managed".into(),
+        arr_path: "/arr/primary".into(),
+    });
+    settings.imports.scan_dirs.push(LibraryDir {
+        path: "/scan".into(),
+        arr_path: "/arr/primary/sub".into(),
+    });
+    assert!(settings.validate().is_err());
+    settings.imports.scan_dirs[0].arr_path = "/arr/scan".into();
+    assert!(settings.validate().is_ok());
+    assert_eq!(settings.imports.catalogue_dirs().count(), 2);
+    settings.imports.scan_dirs.push(LibraryDir {
+        path: "/scan/sub".into(),
+        arr_path: "/other".into(),
+    });
+    assert!(settings.validate().is_err());
+    db.close().await;
+    let _ = std::fs::remove_file(path);
+}

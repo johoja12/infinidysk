@@ -375,6 +375,102 @@ async fn converts_a_library_both_ways_and_rewrites_on_key_rotation() {
     assert_eq!(owners[0].1.path, "/tv/Show/Season 1/e.mkv");
     assert_eq!(owners[0].1.file_id, Some(9));
 
+    // Additional roots are discovery-only. An otherwise importable source is
+    // browsable there, but no local conversion or Arr replacement gains authority.
+    let scan = root.join("scan");
+    fs::create_dir_all(scan.join("Group")).unwrap();
+    let mut readonly = Item::child(&items[0], "readonly.mkv", ItemKind::NzbFile).unwrap();
+    let metadata = infinidysk_core::BlobId::new();
+    readonly.meta_blob = Some(metadata);
+    readonly.size = Some(1);
+    let meta = infinidysk_core::FileMeta::Nzb(infinidysk_core::NzbFile {
+        segments: infinidysk_core::Segments {
+            items: vec![infinidysk_core::Segment {
+                id: "generated@invalid".into(),
+                size: 1,
+                fallbacks: vec![],
+            }],
+            sizes_trusted: true,
+            ..Default::default()
+        },
+        proof: None,
+    });
+    db.insert(
+        std::slice::from_ref(&readonly),
+        &[(
+            metadata,
+            &infinidysk_core::blob::encode_meta(&meta).unwrap(),
+        )],
+    )
+    .await
+    .unwrap();
+    let scan_link = scan.join("Group/readonly.mkv");
+    link(&scan_link, &pointer(&readonly));
+    let (_, view) = admin(addr, "GET", "/api/v1/settings", "").await;
+    let mut settings = view["settings"].clone();
+    settings["imports"]["scan_dirs"] = json!([{ "path":scan,"arr_path":"/readonly" }]);
+    let (code, _) = admin(addr, "PUT", "/api/v1/settings", &settings.to_string()).await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    let (code, _) = admin(
+        addr,
+        "POST",
+        "/api/v1/library/catalogue",
+        &json!({"root":scan}).to_string(),
+    )
+    .await;
+    assert_eq!(code, "HTTP/1.1 200 OK");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, roots) = admin(addr, "GET", "/api/v1/library/catalogue", "").await;
+        if roots.as_array().unwrap().iter().any(|r| {
+            r["root"] == scan.display().to_string() && r["stale"] == false && r["read_only"] == true
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "scan root index: {roots}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (_, details) = admin(addr, "GET", &format!("/api/v1/files/{}", readonly.id), "").await;
+    assert_eq!(details["repair_allowed"], false);
+    assert_eq!(
+        details["library_links"][0]["root"],
+        scan.display().to_string()
+    );
+    let (code, problem) = admin(
+        addr,
+        "POST",
+        &format!("/api/v1/files/{}/repair", readonly.id),
+        "",
+    )
+    .await;
+    assert_eq!(code, "HTTP/1.1 400 Bad Request");
+    assert!(problem.to_string().contains("managed library mapping"));
+    assert!(db.regrab_intent(readonly.id).await.unwrap().is_none());
+    let original = fs::read_link(&scan_link).unwrap();
+    convert(addr, json!({"strategy":"strm"})).await;
+    let scan_strm = scan.join("Group/shared.strm");
+    let signed = fs::read_to_string(season.join("e.strm")).unwrap();
+    fs::write(&scan_strm, &signed).unwrap();
+    convert(addr, json!({"new_key":true})).await;
+    assert_eq!(fs::read_link(&scan_link).unwrap(), original);
+    assert!(!scan.join("Group/readonly.strm").exists());
+    assert_eq!(fs::read_to_string(&scan_strm).unwrap(), signed);
+    let (_, view) = admin(addr, "GET", "/api/v1/library", "").await;
+    assert_ne!(
+        view["previous_keys"].as_array().unwrap().as_slice(),
+        [] as [Value; 0]
+    );
+    assert!(
+        view["previous_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|key| key["retires_ms"].is_null())
+    );
+    convert(addr, json!({"strategy":"symlinks"})).await;
+    assert_eq!(fs::read_link(&scan_link).unwrap(), original);
+    assert_eq!(fs::read_to_string(&scan_strm).unwrap(), signed);
+
     let (code, _) = admin(
         addr,
         "POST",

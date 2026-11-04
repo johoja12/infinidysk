@@ -2129,6 +2129,8 @@ export interface components {
             playback: components["schemas"]["LibraryPlayback"][];
             plex: components["schemas"]["PlexClassification"];
             regrab?: components["schemas"]["RegrabStatus"] | null;
+            /** @description None when authority could not be read. */
+            repair_allowed?: boolean | null;
             segments?: components["schemas"]["SegmentStats"] | null;
             source_revision?: string | null;
         };
@@ -2308,6 +2310,11 @@ export interface components {
              * @default null
              */
             plex_server_ids: string[] | null;
+            /**
+             * @description Additional read-only catalogue roots. Never converted or cleaned.
+             * @default []
+             */
+            scan_dirs: components["schemas"]["LibraryDir"][];
             /** @default symlinks */
             strategy: components["schemas"]["ImportStrategy"];
             /**
@@ -2443,6 +2450,7 @@ export interface components {
             /** Format: int64 */
             completed_generation: number;
             error?: string | null;
+            read_only: boolean;
             /** Format: int64 */
             requested_at: number;
             /** Format: int64 */
@@ -3802,7 +3810,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a3e1-fcbf-7211-890a-e0b6fb3d5590
+             * @default 01a1a408-f853-7542-8e76-24fe7480fc1c
              */
             id: string;
             /**
@@ -4397,6 +4405,7 @@ export interface components {
              *       "library_dirs": [],
              *       "plex_matching": false,
              *       "plex_server_ids": null,
+             *       "scan_dirs": [],
              *       "strategy": "symlinks",
              *       "strm_dir": "/data/completed-downloads",
              *       "strm_key": ""

@@ -463,11 +463,11 @@ function PreviewedInput({
 type LibraryDir = Schemas["LibraryDir"];
 
 /** Library folders as seen here, each with the path the Arrs see it under. */
-function LibraryDirs({ value, locked, onChange }: { value: LibraryDir[]; locked: boolean; onChange: (value: LibraryDir[]) => void }) {
+function LibraryDirs({ value, locked, onChange, empty = "None. Switching changes only new downloads." }: { value: LibraryDir[]; locked: boolean; onChange: (value: LibraryDir[]) => void; empty?: string }) {
   const set = (i: number, dir: Partial<LibraryDir>) => onChange(value.map((d, j) => (j === i ? { ...d, ...dir } : d)));
   return (
     <div className="space-y-2">
-      {value.length === 0 && <p className="text-muted-foreground text-xs">None. Switching changes only new downloads.</p>}
+      {value.length === 0 && <p className="text-muted-foreground text-xs">{empty}</p>}
       {value.length > 0 && (
         <div className="text-muted-foreground hidden grid-cols-[1fr_1fr_2rem] gap-2 text-xs sm:grid" aria-hidden>
           <span>Folder here</span>
@@ -830,6 +830,13 @@ export function Settings() {
                       locked={locked("imports.library_dirs")}
                       onChange={(library_dirs) => patch("imports", { library_dirs })}
                     />
+                  </Field>
+                </SettingsPanel>
+                <SettingsPanel title="Additional scan folders">
+                  <Field label={label("Read-only catalogue roots", "imports.scan_dirs")} hint="Include pointers from these folders in library browsing, Plex matching and warming. Conversion and cleanup use managed library folders. Source replacement requires a managed library mapping. Automatic removal of unowned sources is suspended while scan roots are configured. Signing keys remain accepted while scan roots are configured, because these pointers cannot be rewritten." error={invalid("imports.scan_dirs")}>
+                    <div role="group" aria-label="Additional scan folders">
+                      <LibraryDirs value={draft.imports.scan_dirs} locked={locked("imports.scan_dirs")} onChange={scan_dirs => patch("imports", {scan_dirs})} empty="None. Add separate folders for read-only discovery." />
+                    </div>
                   </Field>
                 </SettingsPanel>
                 {saved.imports.strategy === "strm" && (

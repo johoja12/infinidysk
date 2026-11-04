@@ -38,3 +38,8 @@ Validation:
 This is correctness evidence for independent imports and retained intra-job
 pipelining. It is not a throughput benchmark or a guarantee of progress when every
 usable connection itself is stalled.
+
+The later [aggregate qualification](rust-v2-readonly-library-20261104.md) passes all
+463 workspace tests, including the explicit-gate queue regression. The original
+held-response failure was a real pipeline coupling defect and is no longer an
+unresolved timing exception in the qualification.

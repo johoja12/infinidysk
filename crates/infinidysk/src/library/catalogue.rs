@@ -46,6 +46,7 @@ fn scope(root: &str, settings: &Settings, known: &Known) -> Result<String, serde
         root,
         (
             &settings.imports.library_dirs,
+            &settings.imports.scan_dirs,
             &settings.imports.strm_dir,
             &settings.imports.strm_key,
             settings.imports.strategy,
@@ -156,27 +157,27 @@ impl Library {
     }
     pub(crate) async fn run_catalogue(self: Arc<Self>) {
         loop {
-            self.catalogue_tick().await;
-            tokio::select! {()=self.catalogue_wake.notified()=>{},()=tokio::time::sleep(Duration::from_secs(60))=>{}}
+            let worked = self.catalogue_tick().await;
+            let pause = Duration::from_secs(if worked { 5 } else { 60 });
+            tokio::select! {()=self.catalogue_wake.notified()=>{},()=tokio::time::sleep(pause)=>{}}
         }
     }
-    pub(super) async fn catalogue_tick(&self) {
+    pub(super) async fn catalogue_tick(&self) -> bool {
         if (self.parts.busy)() {
-            return;
+            return false;
         }
         let Ok(_scan) = self.catalogue_scan.try_lock() else {
-            return;
+            return false;
         };
         let settings = self.settings().await;
         let known = self.catalogue_known(&settings).await;
         let Ok(roots) = self.parts.db.catalogue_roots().await else {
-            return;
+            return false;
         };
         let now = now_ms();
         let next = settings
             .imports
-            .library_dirs
-            .iter()
+            .catalogue_dirs()
             .filter_map(|dir| {
                 let expected = scope(&dir.path, &settings, &known).ok()?;
                 let saved = roots.iter().find(|r| r.root == dir.path);
@@ -196,12 +197,13 @@ impl Library {
                         expected,
                         saved.map_or(0, |r| r.attempted_at),
                         saved.map_or(0, |r| r.requested_generation),
+                        saved.is_some_and(|r| r.requested_generation > r.completed_generation),
                     )
                 })
             })
-            .min_by_key(|(_, _, attempted, _)| *attempted);
-        let Some((root, expected, _, generation)) = next else {
-            return;
+            .min_by_key(|(_, _, attempted, _, requested)| (!*requested, *attempted));
+        let Some((root, expected, _, generation, _)) = next else {
+            return false;
         };
         let cancel = CancellationToken::new();
         let _cancel_on_drop = cancel.clone().drop_guard();
@@ -223,6 +225,7 @@ impl Library {
                 )
                 .await;
         }
+        true
     }
     async fn catalogue_scan_root(
         &self,
@@ -294,6 +297,7 @@ impl Library {
 #[schema(as=LibraryCatalogueRoot)]
 pub struct RootView {
     pub root: String,
+    pub read_only: bool,
     pub scanned_at: Option<i64>,
     pub requested_at: i64,
     pub requested_generation: i64,
@@ -307,13 +311,17 @@ pub(crate) async fn roots(admin: &Admin) -> Result<Vec<RootView>, Fail> {
     let stored = admin.vfs.db().catalogue_roots().await?;
     Ok(settings
         .imports
-        .library_dirs
-        .iter()
+        .catalogue_dirs()
         .map(|d| {
             let saved = stored.iter().find(|r| r.root == d.path);
             let expected = scope(&d.path, &settings, &known).ok();
             RootView {
                 root: d.path.clone(),
+                read_only: settings
+                    .imports
+                    .scan_dirs
+                    .iter()
+                    .any(|scan| scan.path == d.path),
                 scanned_at: saved.and_then(|r| r.scanned_at),
                 requested_at: saved.map_or(0, |r| r.requested_at),
                 requested_generation: saved.map_or(0, |r| r.requested_generation),
@@ -346,19 +354,16 @@ pub async fn refresh(
 ) -> Result<(), Fail> {
     let settings = admin.library.settings().await;
     let known = admin.library.catalogue_known(&settings).await;
-    if request.root.as_ref().is_some_and(|root| {
-        !settings
-            .imports
-            .library_dirs
-            .iter()
-            .any(|d| d.path == *root)
-    }) {
+    if request
+        .root
+        .as_ref()
+        .is_some_and(|root| !settings.imports.catalogue_dirs().any(|d| d.path == *root))
+    {
         return Err(Fail::Bad("Choose a configured library root".into()));
     }
     for dir in settings
         .imports
-        .library_dirs
-        .iter()
+        .catalogue_dirs()
         .filter(|d| request.root.as_ref().is_none_or(|r| r == &d.path))
     {
         let expected = scope(&dir.path, &settings, &known).map_err(|_| Fail::Internal)?;

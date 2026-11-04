@@ -54,7 +54,7 @@ export function Catalogue() {
         <div className="mb-4 flex flex-wrap items-center gap-2">
           <Select value={root.root} onValueChange={(v) => { setSelected(v); setGroup(undefined); reset(); }}>
             <SelectTrigger className="w-full min-w-0 sm:w-96" aria-label="Library folder"><SelectValue /></SelectTrigger>
-            <SelectContent>{roots.data?.map((r) => <SelectItem key={r.root} value={r.root}>{r.root}</SelectItem>)}</SelectContent>
+            <SelectContent>{roots.data?.map((r) => <SelectItem key={r.root} value={r.root}>{r.root}{r.read_only ? " · read only" : ""}</SelectItem>)}</SelectContent>
           </Select>
           <Button variant="outline" size="sm" onClick={() => refresh.mutate()} disabled={refresh.isPending}><RefreshCw />Refresh index</Button>
           {group !== undefined && <Button variant="ghost" size="sm" onClick={() => { setGroup(undefined); reset(); }}>All groups</Button>}
@@ -62,6 +62,7 @@ export function Catalogue() {
         {refresh.isError && <Failure error={refresh.error} className="mb-3" />}
         <p className="text-muted-foreground mb-4 text-sm break-words" role="status">
           {root.error ?? (root.stale ? "Index needs a complete scan. Existing results may be stale." : "Index is current.")}
+          {root.read_only && <> Read-only discovery: replacement authority requires a managed library mapping.</>}
           {root.scanned_at != null && <> Last complete scan {ago(root.scanned_at)}.</>}
         </p>
         {group !== undefined && <h2 className="mb-3 break-words font-medium">{group}</h2>}
