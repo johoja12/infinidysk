@@ -1060,6 +1060,17 @@ async fn fetch(
             .await
             .map(|body| body.data)
             .map_err(Arc::new),
+        Source::Shared(cache) if background == Some(Workload::Warm) => {
+            match cache.retained(client, id, begin, probe) {
+                Ok(Some(data)) => Ok(data),
+                Ok(None) => client
+                    .body_with(id, Workload::Warm, probe, None, begin)
+                    .await
+                    .map(|body| body.data)
+                    .map_err(Arc::new),
+                Err(error) => Err(error),
+            }
+        }
         Source::Shared(cache) => cache.body(client, id, begin, probe, progress).await,
         Source::Hedge(Some(cache)) => cache.hedge(client, id, begin, probe).await,
         Source::Hedge(None) => client

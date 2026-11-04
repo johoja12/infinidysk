@@ -691,3 +691,37 @@ async fn warming_history_keeps_prior_attempt_bytes_and_does_not_change_the_block
     let resumed = Queue::load(db, vfs).await.unwrap();
     assert_eq!(resumed.status().await.history.len(), 2);
 }
+
+#[tokio::test]
+async fn retained_verified_articles_warm_final_media_without_provider_or_wire_reservations() {
+    let t = Temp::new();
+    let (vfs, item, cache, corpus, server, client) = fixture(&t, false).await;
+    let decoded = Arc::new(infinidysk_stream::Cache::new(true, 16_000_000));
+    for (article, data) in corpus.articles.iter().zip(corpus.data.chunks(256 * 1024)) {
+        decoded.insert_revision(
+            &article.message_id,
+            infinidysk_nntp::RepairRevision::Base,
+            bytes::Bytes::copy_from_slice(data),
+        );
+    }
+    client.replace([]);
+    let vfs = Arc::new(Arc::try_unwrap(vfs).ok().unwrap().with_cache(decoded));
+    let queue = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
+    let _ = enqueue(&queue, &item).await;
+    for _ in 0..4 {
+        let _ = queue.tick(&settings()).await.unwrap();
+    }
+    let status = queue.status().await;
+    assert_eq!(status.jobs[0].state, State::Complete);
+    assert_eq!(server.body_commands(), 0);
+    assert_eq!(status.received_wire_bytes, 0);
+    assert_eq!(status.reserved_wire_bytes, Some(0));
+    assert_eq!(
+        cache
+            .coverage(&vfs.cache_key(&item).await.unwrap())
+            .await
+            .unwrap()[0]
+            .end,
+        2 * BLOCK
+    );
+}

@@ -262,7 +262,9 @@ pub async fn serve(
         // stream's abandoned read-ahead arrives anyway, and seeks often come back to it.
         let cache = Arc::clone(&cache);
         client.set_sink(Box::new(move |id, workload, body, drained, revision| {
-            if workload == Workload::Queue || (drained && workload == Workload::Stream) {
+            if matches!(workload, Workload::Queue | Workload::Warm)
+                || (drained && workload == Workload::Stream)
+            {
                 cache.insert_revision(id, revision, body.data.clone());
             }
         }));

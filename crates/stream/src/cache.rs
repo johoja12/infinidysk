@@ -353,6 +353,33 @@ impl Cache {
         }
     }
 
+    /// Verified retained memory only: maintenance must not join/start a playback
+    /// provider flight, which would bypass its own workload and wire admission.
+    pub(crate) fn retained(
+        &self,
+        client: &Client,
+        id: &str,
+        begin: Option<u64>,
+        probe: Option<&Probe>,
+    ) -> Result<Option<bytes::Bytes>, Arc<Error>> {
+        let revision = client.repair_revision(id);
+        let key = cache_key(id, revision).ok_or_else(|| Arc::new(Error::Unavailable))?;
+        let data = self
+            .enabled
+            .load(Ordering::Relaxed)
+            .then(|| self.memory.get(key.as_ref()))
+            .flatten();
+        if let Some(data) = &data {
+            if client.repair_revision(id) != revision {
+                return Err(Arc::new(Error::Unavailable));
+            }
+            client
+                .check_cached_repair(id, revision, begin, data.len())
+                .map_err(Arc::new)?;
+            self.served(&self.memory_hits, data, Tier::Memory, probe);
+        }
+        Ok(data)
+    }
     /// The article's body from memory, another reader's fetch in flight, or providers.
     /// Only a fetch this call starts sends to `progress`.
     pub(crate) async fn body(

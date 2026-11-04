@@ -772,7 +772,7 @@ impl Vfs {
             &meta,
             &self.client,
             &self.budget,
-            None,
+            self.cache.as_ref(),
             0,
             None,
             report.as_ref(),

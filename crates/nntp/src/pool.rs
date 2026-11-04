@@ -466,16 +466,17 @@ impl Pool {
         message_id: &str,
         tag: &Tag,
     ) -> Result<Option<Body>, Failure> {
-        if tag.wire.as_ref().is_some_and(|b| b.blocked()) {
-            return Err(Failure::Request(Error::Io(crate::wire::Denied.into())));
-        }
         let (mut failed, mut unanswered) = (0, 0);
         let provider = tag.provider;
         let stream = tag.workload == Workload::Stream;
         let deadline = tokio::time::Instant::now() + self.stream_wait;
         loop {
-            if tag.wire.as_ref().is_some_and(|b| b.blocked()) {
-                return Err(Failure::Request(Error::Io(crate::wire::Denied.into())));
+            if let Some(budget) = &tag.wire {
+                budget
+                    .clone()
+                    .ready()
+                    .await
+                    .map_err(|error| Failure::Request(Error::Io(error.into())))?;
             }
             let wait = async {
                 let download = self
