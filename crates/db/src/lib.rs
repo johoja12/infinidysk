@@ -2146,6 +2146,16 @@ impl Db {
         )
     }
 
+    /// Read a compressed blob only when it fits the caller's metadata allowance.
+    /// Oversized/missing blobs return None without materializing their payload.
+    pub async fn blob_limited(&self, id: BlobId, maximum: u64) -> Result<Option<Vec<u8>>, Error> {
+        let maximum =
+            i64::try_from(maximum).map_err(|_| Error::Corrupt("invalid blob read allowance"))?;
+        Ok(
+            on!(self,pool=>sqlx::query_scalar("SELECT data FROM blobs WHERE id=$1 AND LENGTH(data)<=$2").bind(id.0).bind(maximum).fetch_optional(pool).await?),
+        )
+    }
+
     /// Replaces a blob's bytes, e.g. after health checks record missing segments.
     pub async fn update_blob(&self, id: BlobId, data: &[u8]) -> Result<(), Error> {
         on!(self, pool => {

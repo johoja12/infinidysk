@@ -23,6 +23,7 @@
 //! the data, so unencrypted files stay readable by v1 readers.
 
 use serde::{Deserialize, Serialize};
+use std::io::Read as _;
 
 use crate::{FileMeta, FilePart, MultipartFile, NzbFile};
 
@@ -51,6 +52,8 @@ pub enum Error {
     WrongKind { expected: Kind, found: Kind },
     #[error("unsupported {kind:?} blob version {version}")]
     UnsupportedVersion { kind: Kind, version: u16 },
+    #[error("blob exceeds its decoded size allowance")]
+    TooLarge,
     #[error("zstd failed")]
     Zstd(#[from] std::io::Error),
     #[error("metadata payload is malformed")]
@@ -83,6 +86,31 @@ impl<'a> Blob<'a> {
         })
     }
 
+    fn expect_limited(&self, kind: Kind, maximum: usize) -> Result<Vec<u8>, Error> {
+        if self.kind != kind {
+            return Err(Error::WrongKind {
+                expected: kind,
+                found: self.kind,
+            });
+        }
+        let limit = u64::try_from(maximum)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or(Error::TooLarge)?;
+        let mut output = Vec::with_capacity(maximum.min(64 * 1024));
+        let mut decoder = zstd::stream::read::Decoder::new(self.payload)?;
+        // Bound the decoder's history as well as returned bytes. Output limits
+        // alone do not stop a small frame from requesting a huge zstd window.
+        // Existing streaming writers declare a window larger than tiny payloads.
+        // Keep an 8 MB-scale floor for their frames, independently of output size.
+        let window = maximum.saturating_sub(1).bit_width().clamp(23, 31);
+        decoder.window_log_max(window)?;
+        decoder.take(limit).read_to_end(&mut output)?;
+        if output.len() > maximum {
+            return Err(Error::TooLarge);
+        }
+        Ok(output)
+    }
     fn expect(&self, kind: Kind) -> Result<Vec<u8>, Error> {
         if self.kind != kind {
             return Err(Error::WrongKind {
@@ -121,19 +149,60 @@ pub fn encode_meta(meta: &FileMeta) -> Result<Vec<u8>, Error> {
 pub fn decode_meta(bytes: &[u8]) -> Result<FileMeta, Error> {
     let blob = Blob::parse(bytes)?;
     let payload = blob.expect(Kind::Meta)?;
-    match blob.version {
-        1 => Ok(match postcard::from_bytes(&payload)? {
+    decode_meta_payload(blob.version, &payload)
+}
+fn decode_meta_payload(version: u16, payload: &[u8]) -> Result<FileMeta, Error> {
+    match version {
+        1 => Ok(match postcard::from_bytes(payload)? {
             MetaV1::Nzb(f) => FileMeta::Nzb(f),
             MetaV1::Multipart { parts } => {
                 FileMeta::Multipart(MultipartFile { parts, crypt: None })
             }
         }),
-        2 | 3 => Ok(postcard::from_bytes(&payload)?),
+        2 | 3 => Ok(postcard::from_bytes(payload)?),
         version => Err(Error::UnsupportedVersion {
             kind: Kind::Meta,
             version,
         }),
     }
+}
+
+/// Bounded metadata decoding for background repair/import workflows. Future layouts
+/// and foreign kinds are rejected before decompressing their payload.
+pub fn decode_meta_limited(bytes: &[u8], maximum: usize) -> Result<FileMeta, Error> {
+    let blob = Blob::parse(bytes)?;
+    if blob.kind != Kind::Meta {
+        return Err(Error::WrongKind {
+            expected: Kind::Meta,
+            found: blob.kind,
+        });
+    }
+    if !(1..=META_VERSION).contains(&blob.version) {
+        return Err(Error::UnsupportedVersion {
+            kind: Kind::Meta,
+            version: blob.version,
+        });
+    }
+    let payload = blob.expect_limited(Kind::Meta, maximum)?;
+    decode_meta_payload(blob.version, &payload)
+}
+/// Bounded original-NZB decoding. The bytes are preserved exactly; parsing and any
+/// source authorization remain the caller's responsibility.
+pub fn decode_nzb_limited(bytes: &[u8], maximum: usize) -> Result<Vec<u8>, Error> {
+    let blob = Blob::parse(bytes)?;
+    if blob.kind != Kind::Nzb {
+        return Err(Error::WrongKind {
+            expected: Kind::Nzb,
+            found: blob.kind,
+        });
+    }
+    if blob.version != NZB_VERSION {
+        return Err(Error::UnsupportedVersion {
+            kind: Kind::Nzb,
+            version: blob.version,
+        });
+    }
+    blob.expect_limited(Kind::Nzb, maximum)
 }
 
 pub fn encode_nzb(xml: &[u8]) -> Result<Vec<u8>, Error> {
@@ -261,5 +330,49 @@ mod tests {
             Err(Error::UnsupportedVersion { version: 9, .. })
         ));
         assert!(matches!(decode_meta(b"ID"), Err(Error::Header)));
+    }
+    #[test]
+    fn bounded_readers_stop_compressed_expansion_and_keep_kind_version_guards() {
+        let plain = vec![b'x'; 100_000];
+        let nzb = encode_nzb(&plain).expect("encode");
+        assert!(
+            nzb.len() < 1000,
+            "a small compressed frame can expand far beyond a repair metadata allowance"
+        );
+        assert!(matches!(
+            decode_nzb_limited(&nzb, 99_999),
+            Err(Error::TooLarge)
+        ));
+        assert_eq!(
+            decode_nzb_limited(&nzb, 100_000).expect("exact allowance"),
+            plain
+        );
+        assert!(matches!(
+            decode_meta_limited(&nzb, 100_000),
+            Err(Error::WrongKind { .. })
+        ));
+        let mut future = nzb;
+        future[4] = 9;
+        future.truncate(6);
+        assert!(
+            matches!(
+                decode_nzb_limited(&future, 0),
+                Err(Error::UnsupportedVersion { version: 9, .. })
+            ),
+            "future layouts fail before decompression"
+        );
+        let meta = FileMeta::Nzb(NzbFile {
+            segments: segments(4),
+            proof: None,
+        });
+        let encoded = encode_meta(&meta).expect("metadata");
+        assert!(matches!(
+            decode_meta_limited(&encoded, 1),
+            Err(Error::TooLarge)
+        ));
+        assert_eq!(
+            decode_meta_limited(&encoded, 1 << 20).expect("bounded metadata"),
+            meta
+        );
     }
 }

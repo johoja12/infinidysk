@@ -1966,6 +1966,24 @@ async fn repair_observations(db: &Db) {
     db.insert(std::slice::from_ref(&item), &[(blob, b"current")])
         .await
         .expect("insert");
+    assert!(
+        db.blob_limited(blob, 6)
+            .await
+            .expect("bounded blob")
+            .is_none()
+    );
+    assert_eq!(
+        db.blob_limited(blob, 7)
+            .await
+            .expect("exact byte allowance"),
+        Some(b"current".to_vec())
+    );
+    assert!(
+        db.blob_limited(BlobId::new(), 7)
+            .await
+            .expect("missing blob")
+            .is_none()
+    );
     let generation = db
         .health(item.id)
         .await
