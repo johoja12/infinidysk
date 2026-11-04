@@ -1,0 +1,10 @@
+[Unit]
+Description=Observe and resume sealed InfiniDysk Rust imports (%i)
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=30s
+Unit=infinidysk-rust-import@%i.service
+
+[Install]
+WantedBy=timers.target
