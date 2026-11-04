@@ -33,36 +33,13 @@ pub(super) fn bind(path: &Path, suffix: &str, id: [u8; 16], epoch: u64) -> io::R
     }
     let _lock = Flock::lock(lock, FlockArg::LockExclusiveNonblock)
         .map_err(|(_, error)| io::Error::from(error))?;
-    match openat(
-        &root,
-        FILE,
-        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
-        Mode::empty(),
-    ) {
-        Ok(fd) => {
-            let mut file = File::from(fd);
-            let meta = file.metadata()?;
-            if !meta.is_file() || meta.nlink() != 1 || meta.len() != 64 {
-                return Err(invalid());
-            }
-            let mut record = [0; 64];
-            file.read_exact(&mut record)?;
-            if &record[..8] != MAGIC
-                || record[8..24] != id
-                || <[u8; 32]>::from(Sha256::digest(&record[..32])) != record[32..]
-            {
-                return Err(invalid());
-            }
-            let old = u64::from_le_bytes(record[24..32].try_into().expect("fixed epoch"));
-            if old > epoch {
-                return Err(invalid());
-            }
-            if old == epoch {
-                return Ok(());
-            }
+    if let Some((old_id, old_epoch)) = read_root(&root)? {
+        if old_id != id || old_epoch > epoch {
+            return Err(invalid());
         }
-        Err(nix::errno::Errno::ENOENT) => {}
-        Err(error) => return Err(error.into()),
+        if old_epoch == epoch {
+            return Ok(());
+        }
     }
     let mut record = Vec::with_capacity(64);
     record.extend(MAGIC);
@@ -86,4 +63,39 @@ pub(super) fn bind(path: &Path, suffix: &str, id: [u8; 16], epoch: u64) -> io::R
         let _ = unlinkat(&root, temp.as_str(), UnlinkatFlags::NoRemoveDir);
     }
     result
+}
+
+/// Reads an atomic marker without creating/updating a binding or a lock file.
+pub(super) fn inspect(path: &Path) -> io::Result<Option<([u8; 16], u64)>> {
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW).bits())
+        .open(path)?;
+    read_root(&root)
+}
+fn read_root(root: &File) -> io::Result<Option<([u8; 16], u64)>> {
+    let fd = match openat(
+        root,
+        FILE,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(nix::errno::Errno::ENOENT) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut file = File::from(fd);
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.nlink() != 1 || meta.len() != 64 {
+        return Err(invalid());
+    }
+    let mut record = [0; 64];
+    file.read_exact(&mut record)?;
+    if &record[..8] != MAGIC || <[u8; 32]>::from(Sha256::digest(&record[..32])) != record[32..] {
+        return Err(invalid());
+    }
+    Ok(Some((
+        record[8..24].try_into().expect("fixed identity"),
+        u64::from_le_bytes(record[24..32].try_into().expect("fixed epoch")),
+    )))
 }

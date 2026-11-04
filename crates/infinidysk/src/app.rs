@@ -240,6 +240,23 @@ pub async fn serve(
         u64::from(tuning.memory_cache_mb) * MB,
     ));
     cache.configure(&cache_config(&tuning)).await;
+    // Existing repaired articles stay authoritative even without new attempts.
+    // Creation is enabled by the separate background-repair workflow, not by cache
+    // retention. A fresh default install does not create repair state here.
+    let repair_store = crate::repair::open(
+        &boot.config_dir,
+        db.clone(),
+        Arc::clone(&cache),
+        native_cache.clone(),
+        false,
+    )
+    .await?;
+    if let Some(repairs) = &repair_store
+        && !client.set_repairs(repairs.clone())
+    {
+        anyhow::bail!("the authoritative article repair source is already installed");
+    }
+
     {
         // Imports read a release's first segments; playback usually starts there. A
         // stream's abandoned read-ahead arrives anyway, and seeks often come back to it.
@@ -399,6 +416,12 @@ pub async fn serve(
         }));
     }
     let health = Arc::new(health);
+    if let Some(repairs) = &repair_store
+        && !repairs.set_mutation_gate(health.mutation_gate())
+    {
+        anyhow::bail!("repair publication coordination is already installed");
+    }
+
     let weak_health = Arc::downgrade(&health);
     vfs.sessions().on_last_close(Arc::new(move |item| {
         if let Some(health) = weak_health.upgrade()
@@ -526,6 +549,7 @@ pub async fn serve(
         epoch_times: settings.mount.epoch_times,
         tuning,
         native_settings: settings.native_cache.clone(),
+        repair_store,
         native_cache_error,
         experiments: settings.experiments.clone(),
         handoff: Arc::clone(&handoff),
@@ -884,6 +908,7 @@ pub struct Live {
     /// Tuning at startup, for the parts that need a restart.
     tuning: Tuning,
     native_settings: infinidysk_native_cache::Settings,
+    repair_store: Option<Arc<infinidysk_native_cache::repair::Store>>,
     native_cache_error: Option<String>,
     experiments: Vec<String>,
     handoff: Arc<crate::handoff::Writer>,
@@ -969,6 +994,10 @@ impl Live {
             || tuning.fuse_max_readahead_kb != self.tuning.fuse_max_readahead_kb
             || tuning.fuse_max_background != self.tuning.fuse_max_background
             || settings.experiments != self.experiments
+    }
+
+    pub const fn repair_store(&self) -> Option<&Arc<infinidysk_native_cache::repair::Store>> {
+        self.repair_store.as_ref()
     }
 
     pub fn native_cache_error(&self) -> Option<&str> {

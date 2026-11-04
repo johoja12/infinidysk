@@ -11,8 +11,9 @@ It groups related changes into capabilities; it is not a promise of complete par
 completed-pointer removal, and a first shared final-media cache implementation are in
 Rust. Cache settings and basic browsing/pinning/eviction are wired into the UI. The
 full fork port is **not complete**. Plex connections and viewer-safe transport are now implemented; Smart Prefetch,
-PAR2 execution, legacy migration adapters and several repair
-scheduler behaviors are still pending. A durable warming lane and Plex current/history prediction snapshots now run in Rust.
+Automatic PAR2 discovery/publication and worker scheduling, legacy migration
+adapters and the remaining Smart Prefetch policies are still pending. Bounded PAR2
+execution, revision-safe repair storage and startup integration are implemented. A durable warming lane and Plex current/history prediction snapshots now run in Rust.
 The full warming governor and library/source catalogue policies remain open. The draft must not be treated as a cutover.
 
 The 1.x source and production deployment remain unchanged. Port behavior into the
@@ -706,8 +707,9 @@ for exact source, limits, qualification and remaining automatic-repair gaps.
 ### Durable article repair ledger
 
 C03 now has an independently tested storage primitive in
-`native_cache::repair::Store`. It shares the local final-media catalogue and works
-without final-media payload folders. A repair record binds message ID, complete
+`native_cache::repair::Store`. The storage primitive can share a local final-media catalogue and works
+without final-media payload folders. Application bootstrap uses a separate stable
+`/config/repair-v2` directory so moving a cache does not move authoritative repairs. A repair record binds message ID, complete
 article geometry, source PAR2 proof, payload hash and a deterministic content revision.
 Evicting patch bytes retains the revision and proof; a missing patch cannot silently
 become an unversioned provider/cache lookup.
@@ -811,3 +813,31 @@ and the background worker still need to install and use these witnesses.
 
 No setup-wizard setting is introduced by these internal contracts. Migration 0017
 is additive: **back up `/config` and any external cache metadata before upgrading**.
+
+
+### Authoritative repair bootstrap and health publication barrier
+
+Startup now opens existing repair data from the stable config-directory path before
+attaching the article source to NNTP. Existing repairs remain authoritative when new
+attempts are disabled. A fresh default installation does not create a repair ledger.
+The automatic PAR2 setting and worker are not enabled by this increment.
+
+Main-database, native-cache and decoded-cache witnesses are read before any binding
+write. A missing bound ledger, a different identity or a witness newer than the
+available ledger stops startup with a recovery message. Startup does not manufacture
+an empty replacement or poison fresh main metadata before detecting an external
+cache mismatch. Publication updates every active witness before activation.
+
+Health and publication share a mutation barrier. A repair publication queued before
+an Arr/deletion step must be observed before that step proceeds. Pending publication
+defers replacement. When repairs cover all recorded holes, health requests a fresh
+urgent check; coverage alone never marks the file healthy. Partial coverage does not
+suppress the existing replacement policy. Changes during health I/O defer stale
+verdict publication. Existing repairs receive this readback even with new automatic
+repair attempts disabled.
+
+Five application startup tests and four health integration tests cover these paths.
+The full qualification receipt will be recorded after the workspace run completes.
+Automatic discovery, full-article patch assembly, durable attempt outcomes and the
+separate PAR2 worker are still open. No API/UI setting or setup-wizard branch is
+introduced here. Back up `/config` and external cache metadata before upgrading.

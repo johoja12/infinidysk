@@ -235,6 +235,27 @@ impl Cache {
         drop(lineage); // Publish a configured disk only after its lineage check.
     }
 
+    /// Read-only startup preflight. A failed adoption must not first write a new
+    /// main-database identity and make restoration of the original ledger harder.
+    pub async fn repair_lineage(&self) -> std::io::Result<Option<([u8; 16], u64)>> {
+        let lineage = self.lineage.lock().await;
+        let disk = if let Some(disk) = self.disk() {
+            disk.repair_lineage().await?
+        } else {
+            None
+        };
+        match (*lineage, disk) {
+            (Some((id, epoch)), Some((other, later))) if id == other => {
+                Ok(Some((id, epoch.max(later))))
+            }
+            (Some(_), Some(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decoded cache repair lineage changed",
+            )),
+            (memory, disk) => Ok(memory.or(disk)),
+        }
+    }
+
     /// Must succeed before attaching a repair source or activating newer repairs.
     /// Settings changes bind any replacement disk before it can serve bytes.
     pub async fn bind_repair_lineage(&self, id: [u8; 16], epoch: u64) -> std::io::Result<()> {

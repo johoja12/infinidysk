@@ -28,6 +28,7 @@ uuid.workspace = true
 utoipa.workspace = true
 
 [dev-dependencies]
+infinidysk-native-cache.workspace = true
 md-5.workspace = true
 axum = { workspace = true, features = ["http1", "json", "query", "tokio"] }
 infinidysk-queue.workspace = true

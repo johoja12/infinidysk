@@ -23,7 +23,7 @@ use infinidysk_db::{
     Db, Defect, FirstCheck, HealthCheck, HealthResult, HealthState, HealthStatus, Item, MediaProbe,
     ProbeAttempt, ProbeOutcome, Recheck, Repair, now_ms,
 };
-use infinidysk_nntp::{Articles, Client};
+use infinidysk_nntp::{Articles, Client, RepairRevision};
 use tokio::sync::{Notify, watch};
 
 use check::Outcome;
@@ -162,6 +162,7 @@ pub struct Health {
     wake: Notify,
     sweep_gate: tokio::sync::Mutex<()>,
     publication_gate: tokio::sync::Mutex<()>,
+    mutation_gate: Arc<tokio::sync::RwLock<()>>,
     sweep_cancel: watch::Sender<u64>,
     priority_cancel: watch::Sender<u64>,
     priority_streak: AtomicU64,
@@ -232,6 +233,7 @@ impl Health {
             wake: Notify::new(),
             sweep_gate: tokio::sync::Mutex::new(()),
             publication_gate: tokio::sync::Mutex::new(()),
+            mutation_gate: Arc::new(tokio::sync::RwLock::new(())),
             sweep_cancel: watch::channel(0).0,
             priority_cancel: watch::channel(0).0,
             priority_streak: AtomicU64::new(0),
@@ -275,6 +277,13 @@ impl Health {
     pub fn with_cached_copy(mut self, check: CachedCopy) -> Self {
         self.cached_copy = Some(check);
         self
+    }
+
+    /// Source publication takes this barrier exclusively; replacement/unowned
+    /// deletion holds a reader, then checks newly published repairs again.
+    #[must_use]
+    pub fn mutation_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.mutation_gate)
     }
 
     #[must_use]
@@ -638,6 +647,7 @@ impl Health {
                 .await?;
             return Ok(());
         };
+        let repair_generation = self.client.repair_generation();
         let opts = check::Options {
             percent: settings.sample_percent,
             tolerant: settings.degraded_tolerance,
@@ -662,6 +672,12 @@ impl Health {
             .await?
             .is_none_or(|(_, current)| current.recheck_generation != status.recheck_generation)
         {
+            return Ok(());
+        }
+        if self.client.repair_generation() != repair_generation {
+            self.db
+                .postpone_health(item.id, now_ms() + 5_000, status.recheck_generation)
+                .await?;
             return Ok(());
         }
         let current = if changed {
@@ -855,6 +871,69 @@ impl Health {
         Ok(if settled { 7 * DAY_MS } else { DAY_MS })
     }
 
+    /// Publication can outlive the process that queued it. Never delete the source
+    /// while its repair is pending, or before checking repairs that cover its recorded
+    /// holes. Current bytes still need a fresh check; this does not declare health.
+    async fn observe_overlay(&self, item: &Item, status: HealthStatus) -> Result<bool, Error> {
+        if self.client.repair_generation() == 0 {
+            return Ok(false);
+        }
+        let Some((blob_id, raw, meta)) = self.meta_snapshot(item).await? else {
+            return Ok(false);
+        };
+        let runs = match &meta {
+            FileMeta::Nzb(file) => vec![&file.segments],
+            FileMeta::Multipart(file) => file.parts.iter().map(|p| &p.segments).collect(),
+        };
+        let mut pending = false;
+        let mut holes = 0usize;
+        let mut covered = true;
+        for run in runs {
+            pending |= run
+                .items
+                .iter()
+                .any(|s| self.client.repair_revision(&s.id) == RepairRevision::Pending);
+            for index in run.missing.iter().chain(&run.corrupt) {
+                holes += 1;
+                covered &= run.items.get(*index as usize).is_some_and(|s| {
+                    matches!(
+                        self.client.repair_revision(&s.id),
+                        RepairRevision::Repaired(_)
+                    )
+                });
+            }
+        }
+        if !pending && (holes == 0 || !covered) {
+            return Ok(false);
+        }
+        let _publication = self.publication_gate.lock().await;
+        if !self.db.metadata_is_current(item.id, blob_id, &raw).await?
+            || self.db.health(item.id).await?.is_none_or(|(_, current)| {
+                current.recheck_generation != status.recheck_generation
+                    || current.state != status.state
+            })
+        {
+            return Ok(true);
+        }
+        let next = HealthStatus {
+            state: if pending {
+                status.state
+            } else {
+                HealthState::Unchecked
+            },
+            next_check: Some(now_ms() + if pending { 5_000 } else { 0 }),
+            ..status
+        };
+        self.db.set_health(item.id, &next, status.recheck).await?;
+        if !pending {
+            self.db.request_recheck(item.id, Recheck::Playback).await?;
+        }
+        self.record(item, HealthResult::Inconclusive, Repair::None,
+            if pending { "verified article repair is awaiting durable publication; replacement deferred" }
+            else { "verified repairs cover recorded source damage; checking current bytes before replacement" }).await?;
+        Ok(true)
+    }
+
     /// One step of §7.1 for a `repairing` file.
     async fn repair(
         &self,
@@ -862,8 +941,15 @@ impl Health {
         status: HealthStatus,
         settings: &Settings,
     ) -> Result<(), Error> {
+        if self.observe_overlay(item, status).await? {
+            return Ok(());
+        }
         if !settings.auto_repair {
             return self.give_up(item, status, "automatic repair is off").await;
+        }
+        let _source_mutation = Arc::clone(&self.mutation_gate).read_owned().await;
+        if self.observe_overlay(item, status).await? {
+            return Ok(());
         }
         if status.repair_attempts >= REPAIR_BUDGET {
             return self

@@ -183,6 +183,7 @@ pub struct Store {
     index: RwLock<BTreeMap<String, Entry>>,
     writer: Arc<Mutex<()>>,
     witness: OnceLock<Witness>,
+    publication_gate: OnceLock<Arc<tokio::sync::RwLock<()>>>,
 }
 impl Store {
     /// Opens the same local metadata directory used by the final-media cache. This
@@ -306,7 +307,19 @@ impl Store {
             index: RwLock::new(index),
             writer: Arc::new(Mutex::new(())),
             witness: OnceLock::new(),
+            publication_gate: OnceLock::new(),
         }))
+    }
+    /// Coordinates final publication with automatic replacement. Acquired before
+    /// opening a write transaction, so shared catalogue readers cannot deadlock it.
+    pub fn set_mutation_gate(&self, gate: Arc<tokio::sync::RwLock<()>>) -> bool {
+        self.publication_gate.set(gate).is_ok()
+    }
+    async fn publication_guard(&self) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        match self.publication_gate.get() {
+            Some(gate) => Some(Arc::clone(gate).write_owned().await),
+            None => None,
+        }
     }
     /// Install during application bootstrap before attaching the article source.
     pub fn set_witness(&self, witness: Witness) -> bool {
@@ -427,6 +440,7 @@ impl Store {
         .await
         .map_err(|_| Error::Invalid("repair preparation worker failed"))?;
         let prepared = prepared?;
+        let _publication = self.publication_guard().await;
         let mut tx = self.db.begin_with("BEGIN IMMEDIATE").await?;
         let mut bytes: i64 =
             sqlx::query_scalar("SELECT COALESCE(SUM(LENGTH(payload)),0) FROM article_repairs")
@@ -548,6 +562,7 @@ impl Store {
         }
         check_anchor(self.root.anchor()?.as_ref(), self.id, epoch.cast_unsigned())?;
         let index = load(&self.db).await?;
+        let _publication = self.publication_guard().await;
         let (root, id) = (Arc::clone(&self.root), self.id);
         let (_writer, anchored) = tokio::task::spawn_blocking(move || {
             (writer, root.write_anchor(id, epoch.cast_unsigned()))

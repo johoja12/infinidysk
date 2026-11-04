@@ -519,6 +519,22 @@ impl Cache {
             failed: AtomicU64::new(0),
         }))
     }
+    pub async fn repair_lineage(&self) -> Result<Option<(Uuid, u64)>, Error> {
+        let row: Option<(String, i64)> =
+            sqlx::query_as("SELECT ledger_id,epoch FROM repair_lineage WHERE slot=1")
+                .fetch_optional(&self.db)
+                .await?;
+        row.map(|(id, epoch)| {
+            let id = Uuid::parse_str(&id)
+                .map_err(|_| Error::Invalid("invalid native cache repair identity"))?;
+            if id.is_nil() || epoch < 0 {
+                return Err(Error::Invalid("invalid native cache repair lineage"));
+            }
+            Ok((id, epoch.cast_unsigned()))
+        })
+        .transpose()
+    }
+
     /// Witnesses repair state before its new revisions become readable. Refuses
     /// replacement and rollback even when cache payload retention was disabled.
     pub async fn bind_repair_lineage(&self, id: Uuid, epoch: u64) -> Result<(), Error> {

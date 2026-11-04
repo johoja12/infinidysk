@@ -171,6 +171,17 @@ impl Disk {
         Ok(disk)
     }
 
+    pub(crate) async fn repair_lineage(&self) -> io::Result<Option<([u8; 16], u64)>> {
+        let guard = Arc::clone(&self.lineage).lock_owned().await;
+        let path = self.dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            lineage::inspect(&path)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
     pub(crate) async fn bind_repair_lineage(&self, id: [u8; 16], epoch: u64) -> io::Result<()> {
         let guard = Arc::clone(&self.lineage).lock_owned().await;
         let (path, suffix) = (self.dir.clone(), self.tmp_suffix.clone());

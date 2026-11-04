@@ -1283,6 +1283,7 @@ dependencies = [
  "infinidysk-arr",
  "infinidysk-core",
  "infinidysk-db",
+ "infinidysk-native-cache",
  "infinidysk-nntp",
  "infinidysk-par2",
  "infinidysk-queue",
