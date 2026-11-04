@@ -1,3 +1,4 @@
+use sha2::{Digest as _, Sha256};
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::pin::{Pin, pin};
@@ -118,6 +119,7 @@ pub(crate) struct Tag {
     /// Expected `=ypart` offset; see [`Connection::read_body_with`].
     pub(crate) begin: Option<u64>,
     pub(crate) expected: Option<crate::BodyExpectation>,
+    pub(crate) expected_hash: Option<[u8; 32]>,
     /// Gets bodies whose caller left before they arrived.
     pub(crate) sink: Option<Arc<OnceLock<BodySink>>>,
     /// Waits for a connection with nothing in flight rather than pipeline behind
@@ -136,6 +138,7 @@ impl Tag {
         progress: None,
         begin: None,
         expected: None,
+        expected_hash: None,
         sink: None,
         fresh: false,
         lane: None,
@@ -868,9 +871,14 @@ async fn run(
         } else {
             Phase::Reply
         });
+        let progress = if request.tag.expected_hash.is_some() {
+            None
+        } else {
+            request.tag.progress.as_ref()
+        };
         let result = match request.command {
             Command::Body => conn
-                .read_body_with(request.tag.progress.as_ref(), request.tag.begin, || {
+                .read_body_with(progress, request.tag.begin, || {
                     request.tag.step(Step::Receiving { provider });
                 })
                 .await
@@ -881,6 +889,21 @@ async fn run(
                     Ok(Some(body))
                 }),
             Command::Stat => conn.read_stat().await.map(|()| None),
+        };
+        let result = match (result, request.tag.expected_hash) {
+            (Ok(Some(body)), Some(expected)) => {
+                let data = body.data.clone();
+                match tokio::task::spawn_blocking(move || <[u8; 32]>::from(Sha256::digest(&data)))
+                    .await
+                {
+                    Ok(actual) if actual == expected => Ok(Some(body)),
+                    Ok(_) => Err(Error::Yenc(
+                        "provider body does not match the retained repair checksum",
+                    )),
+                    Err(_) => Err(Error::Unavailable),
+                }
+            }
+            (result, _) => result,
         };
         let timing = match request.command {
             Command::Body => conn.timing(),

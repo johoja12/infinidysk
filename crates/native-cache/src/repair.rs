@@ -746,16 +746,25 @@ impl infinidysk_nntp::ArticleRepairs for Store {
             total: info.geometry.total,
         })
     }
+    fn expected_hash(
+        &self,
+        id: &str,
+        revision: [u8; 32],
+    ) -> Result<[u8; 32], infinidysk_nntp::Error> {
+        self.info(id, revision)
+            .map(|info| info.hash)
+            .map_err(|_| infinidysk_nntp::Error::Unavailable)
+    }
     fn body<'a>(
         &'a self,
         id: &'a str,
         revision: [u8; 32],
     ) -> infinidysk_nntp::ArticleFuture<'a, infinidysk_nntp::Body> {
         Box::pin(async move {
-            let article = self
-                .get(id, revision)
-                .await
-                .map_err(|_| infinidysk_nntp::Error::Unavailable)?;
+            let article = self.get(id, revision).await.map_err(|error| match error {
+                Error::PayloadMissing => infinidysk_nntp::Error::NotFound,
+                _ => infinidysk_nntp::Error::Unavailable,
+            })?;
             Ok(infinidysk_nntp::Body {
                 data: article.data,
                 offset: article.geometry.offset,

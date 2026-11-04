@@ -1357,6 +1357,7 @@ dependencies = [
  "infinidysk-testkit",
  "infinidysk-yenc",
  "rustls",
+ "sha2 0.11.1",
  "socket2",
  "thiserror",
  "tokio",

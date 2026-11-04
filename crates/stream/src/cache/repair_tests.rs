@@ -27,8 +27,12 @@ fn patch(id: &str) -> Patch {
         data: Bytes::from_static(b"restored"),
     }
 }
-fn client(server: &LoopbackServer) -> (Arc<Client>, Arc<Downloads>) {
-    let downloads = Downloads::new(8);
+fn provider(
+    server: &LoopbackServer,
+    downloads: &Arc<Downloads>,
+    key: &str,
+    priority: u32,
+) -> Provider {
     let endpoint = Endpoint::new(
         "127.0.0.1",
         server.addr().port(),
@@ -48,14 +52,18 @@ fn client(server: &LoopbackServer) -> (Arc<Client>, Arc<Downloads>) {
         downloads.clone(),
     )
     .expect("pool");
+    Provider {
+        pool,
+        key: key.into(),
+        name: key.into(),
+        priority,
+        backbone: None,
+    }
+}
+fn client(server: &LoopbackServer) -> (Arc<Client>, Arc<Downloads>) {
+    let downloads = Downloads::new(8);
     (
-        Arc::new(Client::new([Provider {
-            pool,
-            key: "fixture".into(),
-            name: "fixture".into(),
-            priority: 0,
-            backbone: None,
-        }])),
+        Arc::new(Client::new([provider(server, &downloads, "fixture", 0)])),
         downloads,
     )
 }
@@ -320,5 +328,177 @@ async fn external_disk_lineage_rejects_forgotten_repairs_and_checks_runtime_path
     drop(first);
     drop(fresh);
     drop(foreign);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+
+#[tokio::test]
+async fn evicted_repair_falls_back_only_to_full_hash_matching_bodies_without_progress_leaks() {
+    let path = directory();
+    let store = Store::open(&path.join("metadata")).await.expect("store");
+    let bad = post("fallback", "fixture.bin", b"original", 8);
+    let id = bad[0].message_id.clone();
+    store.publish(vec![patch(&id)]).await.expect("repair");
+    store.evict_payload(&id).await.expect("evict");
+    let revision = store.revision(&id);
+    let bad = LoopbackServer::start(bad).await.expect("bad server");
+    let good = LoopbackServer::start(post("fallback", "fixture.bin", b"restored", 8))
+        .await
+        .expect("good server");
+    let downloads = Downloads::new(8);
+    let client = Arc::new(Client::new([
+        provider(&bad, &downloads, "bad", 0),
+        provider(&good, &downloads, "good", 1),
+    ]));
+    assert!(client.set_repairs(store.clone()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    client.set_sink(Box::new({
+        let seen = seen.clone();
+        move |_, _, body, _, stamp| {
+            seen.lock().expect("sink").push((body.data.clone(), stamp));
+        }
+    }));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let progress = infinidysk_nntp::Progress {
+        tx,
+        wanted: Arc::new(AtomicBool::new(true)),
+    };
+    assert_eq!(
+        client
+            .body_with(&id, Workload::Stream, None, Some(&progress), Some(0))
+            .await
+            .expect("matching fallback")
+            .data
+            .as_ref(),
+        b"restored"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "unverified provider progress cannot escape"
+    );
+    client
+        .stat(&id, Workload::Health, None)
+        .await
+        .expect("STAT proves the full repaired body too");
+    assert_eq!(bad.body_commands(), 2);
+    assert_eq!(good.body_commands(), 2);
+    let seen = seen.lock().expect("sink");
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0], (Bytes::from_static(b"restored"), revision));
+    drop(seen);
+    assert_eq!(
+        store.revision(&id),
+        revision,
+        "retention does not reset the revision"
+    );
+    assert_eq!(downloads.available_permits(), 8);
+    drop(client);
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+#[tokio::test]
+async fn abandoned_repaired_fallbacks_validate_before_the_cache_sink() {
+    for bytes in [b"original", b"restored"] {
+        let path = directory();
+        let store = Store::open(&path.join("metadata")).await.expect("store");
+        let articles = post("abandoned-fallback", "fixture.bin", bytes, 8);
+        let id = articles[0].message_id.clone();
+        store.publish(vec![patch(&id)]).await.expect("repair");
+        store.evict_payload(&id).await.expect("evict");
+        let revision = store.revision(&id);
+        let (server, mut gate) = LoopbackServer::start_gated(articles).await.expect("server");
+        let (client, downloads) = client(&server);
+        assert!(client.set_repairs(store.clone()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        client.set_sink(Box::new({
+            let seen = seen.clone();
+            move |_, _, body, drained, stamp| {
+                seen.lock()
+                    .expect("sink")
+                    .push((body.data.clone(), drained, stamp));
+            }
+        }));
+        let task = {
+            let client = client.clone();
+            let id = id.clone();
+            tokio::spawn(async move { client.body(&id, Workload::Stream, None).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), gate.blocked())
+            .await
+            .expect("admitted");
+        task.abort();
+        assert!(task.await.expect_err("aborted").is_cancelled());
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while downloads.available_permits() != 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("permits returned");
+        let seen = seen.lock().expect("sink");
+        if bytes == b"restored" {
+            assert_eq!(
+                seen.as_slice(),
+                &[(Bytes::from_static(b"restored"), true, revision)]
+            );
+        } else {
+            assert!(
+                seen.is_empty(),
+                "wrong original bytes must not poison the repaired namespace"
+            );
+        }
+        drop(seen);
+        drop(client);
+        drop(store);
+        std::fs::remove_dir_all(path).expect("cleanup");
+    }
+}
+#[tokio::test]
+async fn explicit_patch_eviction_distinguishes_confirmed_provider_absence_from_no_providers() {
+    let path = directory();
+    let store = Store::open(&path.join("metadata")).await.expect("store");
+    let id = "missing-fallback@fixture";
+    store.publish(vec![patch(id)]).await.expect("repair");
+    store.evict_payload(id).await.expect("evict");
+    let server = LoopbackServer::start([]).await.expect("server");
+    let (client, _) = client(&server);
+    assert!(client.set_repairs(store.clone()));
+    assert!(matches!(
+        client.body(id, Workload::Health, None).await,
+        Err(Error::NotFound)
+    ));
+    client.replace([]);
+    assert!(matches!(
+        client.body(id, Workload::Health, None).await,
+        Err(Error::Unavailable)
+    ));
+    drop(client);
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+#[tokio::test]
+async fn an_unavailable_repair_directory_does_not_authorize_provider_fallback() {
+    let path = directory();
+    let store = Store::open(&path.join("metadata")).await.expect("store");
+    let articles = post("uncertain-fallback", "fixture.bin", b"restored", 8);
+    let id = articles[0].message_id.clone();
+    store.publish(vec![patch(&id)]).await.expect("repair");
+    let server = LoopbackServer::start(articles).await.expect("server");
+    let (client, _) = client(&server);
+    assert!(client.set_repairs(store.clone()));
+    std::fs::rename(path.join("metadata"), path.join("unavailable"))
+        .expect("directory unavailable");
+    assert!(matches!(
+        client.body(&id, Workload::Health, None).await,
+        Err(Error::Unavailable)
+    ));
+    assert_eq!(
+        server.body_commands(),
+        0,
+        "I/O uncertainty is not intentional payload eviction"
+    );
+    std::fs::rename(path.join("unavailable"), path.join("metadata")).expect("restore");
+    drop(client);
+    drop(store);
     std::fs::remove_dir_all(path).expect("cleanup");
 }

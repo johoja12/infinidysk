@@ -51,6 +51,9 @@ pub trait ArticleRepairs: Send + Sync {
     fn revision(&self, id: &str) -> RepairRevision;
     fn generation(&self) -> u64;
     fn expectation(&self, id: &str, revision: [u8; 32]) -> Result<crate::BodyExpectation, Error>;
+    /// Immutable repaired-payload checksum, retained after intentional eviction.
+    fn expected_hash(&self, id: &str, revision: [u8; 32]) -> Result<[u8; 32], Error>;
+    /// `NotFound` means known payload absence. I/O uncertainty is `Unavailable`.
     fn body<'a>(&'a self, id: &'a str, revision: [u8; 32]) -> crate::ArticleFuture<'a, Body>;
 }
 
@@ -650,22 +653,8 @@ impl Client {
                     let Some(source) = self.repairs.get() else {
                         return Err(Error::Unavailable);
                     };
-                    match source.body(message_id, stamp).await {
-                        Ok(body) => {
-                            if body.data.len() > crate::article::MAX_DECODED_LEN {
-                                return Err(Error::TooLarge);
-                            }
-                            if let Some(expected) = tag.expected {
-                                expected.validate(&body)?;
-                            } else if tag.begin.is_some_and(|begin| body.offset != begin) {
-                                return Err(Error::Yenc(
-                                    "repair does not match expected article offset",
-                                ));
-                            }
-                            Ok((command == Command::Body).then_some(body))
-                        }
-                        Err(error) => Err(error),
-                    }
+                    self.repaired_request(command, message_id, &tag, source.as_ref(), stamp)
+                        .await
                 }
             };
             if self.repair_revision(message_id) == revision {
@@ -673,6 +662,42 @@ impl Client {
             }
         }
         Err(Error::Unavailable)
+    }
+
+    async fn repaired_request(
+        &self,
+        command: Command,
+        id: &str,
+        tag: &Tag,
+        source: &dyn ArticleRepairs,
+        revision: [u8; 32],
+    ) -> Result<Option<Body>, Error> {
+        let body = match source.body(id, revision).await {
+            Ok(body) => body,
+            Err(Error::NotFound) => {
+                let expected = source.expectation(id, revision)?;
+                let mut fallback = tag.clone();
+                fallback.expected = Some(expected);
+                fallback.expected_hash = Some(source.expected_hash(id, revision)?);
+                // Full hash proof must precede every delivery, including abandoned
+                // sinks. STAT also needs a BODY; mere article presence is no proof.
+                fallback.progress = None;
+                fallback.begin = expected.offset;
+                self.provider_request(Command::Body, id, fallback)
+                    .await?
+                    .ok_or(Error::Protocol)?
+            }
+            Err(error) => return Err(error),
+        };
+        if body.data.len() > crate::article::MAX_DECODED_LEN {
+            return Err(Error::TooLarge);
+        }
+        if let Some(expected) = tag.expected {
+            expected.validate(&body)?;
+        } else if tag.begin.is_some_and(|begin| body.offset != begin) {
+            return Err(Error::Yenc("repair does not match expected article offset"));
+        }
+        Ok((command == Command::Body).then_some(body))
     }
 
     #[allow(clippy::significant_drop_tightening)] // False positive: `order` holds only references.
@@ -715,7 +740,7 @@ impl Client {
                     skipped = true;
                     continue;
                 }
-                if self.missing.contains(group, message_id) {
+                if base.expected_hash.is_none() && self.missing.contains(group, message_id) {
                     missed.extend(backbone);
                     first_miss.get_or_insert((entry.id, trace::Outcome::NotFound));
                     continue;
