@@ -956,3 +956,26 @@ New cases cover shared sources, unknown opens, unrelated reads, target mutation
 exclusion, wakeups, metadata retention, queued-source changes and cancelled checks.
 The worker still needs to acquire these guards, write its intent and invoke the
 checked publisher. This increment does not activate automatic reconstruction.
+
+### Durable PAR2 attempt admission and transitions
+
+The main database now journals attempts by exact item/source digest. Concurrent
+admission returns one accepted identity and does not overwrite its payload. Pending
+work is capped at 128 and retained history at 1,024; full capacity never prevents
+readback of an existing accepted intent. Count/eviction/admission serialize through
+a singleton row on SQLite and PostgreSQL. Only terminal history can be evicted.
+
+Updates compare the original identity, source and revision. Recovery changes running
+work to deferred while leaving publishing intents intact for acceptance readback.
+Publishing readback precedes new queued work, including urgent work. Rows deliberately
+outlive item deletion so replacement cannot erase an uncertain publication intent.
+Payloads are bounded to 1 MB-scale and states are validated. The application worker
+must write publishing before mutation and recover only while holding the exclusive
+repair ledger writer; the journal itself performs no provider or Arr operations.
+
+Seven database tests pass with actual SQLite/PostgreSQL, including concurrent
+idempotent admission, competing requests for the last capacity slot, stale/wrong-source
+CAS refusal, interrupted-running recovery, preserved publishing payloads, priority
+and capacity release. Database all-target warnings-denied Clippy passes. Migration
+0019 is additive: back up the config directory and external cache metadata before
+upgrading. No setting or setup-wizard control is introduced by the journal.
