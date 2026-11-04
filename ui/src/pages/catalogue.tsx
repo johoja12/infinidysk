@@ -64,6 +64,7 @@ export function Catalogue() {
           {root.error ?? (root.stale ? "Index needs a complete scan. Existing results may be stale." : "Index is current.")}
           {root.read_only && <> Read-only discovery: replacement authority requires a managed library mapping.</>}
           {root.scanned_at != null && <> Last complete scan {ago(root.scanned_at)}.</>}
+          {root.scan_entries != null && <> Scan progress: {root.scan_entries.toLocaleString()} entries checked · {(root.scan_links ?? 0).toLocaleString()} links found. The last complete index stays visible.{root.scan_updated_at != null && <> Last progress {ago(root.scan_updated_at)}.</>}</>}
         </p>
         {group !== undefined && <h2 className="mb-3 break-words font-medium">{group}</h2>}
         {loading ? <Loading /> : error ? <Failure error={error} /> : rows?.length === 0 ?

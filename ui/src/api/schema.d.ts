@@ -2500,6 +2500,14 @@ export interface components {
             requested_generation: number;
             root: string;
             /** Format: int64 */
+            scan_entries?: number | null;
+            /** Format: int64 */
+            scan_links?: number | null;
+            /** Format: int64 */
+            scan_started_at?: number | null;
+            /** Format: int64 */
+            scan_updated_at?: number | null;
+            /** Format: int64 */
             scanned_at?: number | null;
             stale: boolean;
         };
@@ -4041,7 +4049,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a6eb-9766-7107-a81d-ab2ba1f93e4a
+             * @default 01a1a72d-05b9-72b8-a898-6065e082b479
              */
             id: string;
             /**
