@@ -38,9 +38,57 @@ def proof_request(package,leaf,release,source):
 
 def same_proof(previous,current):
     names=('version','package_digest','legacy_item','current_item','identity_kind','identity_digest',
-           'payload_sha256','size','source_revision','ids_path','record_digest','payload_validated')
+           'payload_sha256','size','source_revision','ids_path','record_digest','payload_validated',
+           'submission_intent','job_id','download_dir')
     if any(previous.get(name)!=current.get(name) for name in names) or current.get('payload_validated') is not False:
         raise ValueError('Current source proof changed; preserve the plan and validate again')
+
+
+def load_mapping(path,expected,package,commit):
+    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd,'rb') as stream:
+        info=os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink!=1 or info.st_mode&0o077 or info.st_size>16_000_000:
+            raise ValueError('Reimport map must be a bounded owner-only regular file')
+        raw=stream.read(16_000_001)
+    if not runner.lower_digest(expected) or runner.sha(raw)!=expected:
+        raise ValueError('Reimport map differs from its retained digest')
+    value=runner.unique_json(raw)
+    if set(value)!={'version','packageDigest','serverCommit','bindings'} or value['version']!=1 \
+            or value['packageDigest']!=package.digest or value['serverCommit']!=commit:
+        raise ValueError('Reimport map belongs to a different package or Rust source')
+    selected={link['legacyDavItemId'] for link in package.manifest['selectedLinks']}
+    releases={leaf['legacyDavItemId']:release['sourceReleaseId'] for release in package.manifest['releases'] for leaf in release['leaves']}
+    result={};current=set()
+    if not isinstance(value['bindings'],list) or len(value['bindings'])>1000:
+        raise ValueError('Reimport map exceeds member bound')
+    for row in value['bindings']:
+        if set(row)!={'legacyItem','currentItem','submissionIntent','sourceReleaseId'}:
+            raise ValueError('Invalid reimport map binding')
+        old=row['legacyItem'];new=row['currentItem'];links.ids_path(new)
+        if old not in selected or old in result or new in current \
+                or row['sourceReleaseId']!=releases[old] \
+                or row['submissionIntent']!=runner.intent(package.digest,releases[old]):
+            raise ValueError('Duplicate or mismatched reimport member binding')
+        result[old]=row;current.add(new)
+    if set(result)!=selected:
+        raise ValueError('Reimport map does not cover every selected member')
+    return result
+
+
+def fetch_proof(client,request,entry=None):
+    if entry is None:
+        return client.json('/api/v1/migration/legacy-proof',request)
+    receipt=client.call('/api/v1/migration/submissions/'+entry['submissionIntent'])
+    if not receipt or receipt.get('state')!='completed' or receipt.get('intent')!=entry['submissionIntent'] \
+            or receipt.get('payload_sha256')!=request['payload_sha256']:
+        raise ValueError('Reimport has no exact completed acceptance; validation remains pending')
+    proof=client.json('/api/v1/migration/reimport-proof',{'source':request,'current_item':entry['currentItem'],
+                     'submission_intent':entry['submissionIntent'],'source_release_id':entry['sourceReleaseId']})
+    if proof.get('submission_intent')!=entry['submissionIntent'] or proof.get('job_id')!=receipt.get('job_id') \
+            or proof.get('download_dir')!=receipt.get('download_dir'):
+        raise ValueError('Reimport proof differs from its durable accepted job')
+    return proof
 
 
 def read_worker():
@@ -100,6 +148,8 @@ def main():
     for name in ('package','manifest-digest','url','server-commit','api-key-file','legacy-config',
                  'original-library','canary-mount','canary-library','plan-file'):
         parser.add_argument('--'+name,required=name in ('canary-library','plan-file'))
+    parser.add_argument('--reimport-map')
+    parser.add_argument('--reimport-map-digest')
     parser.add_argument('--max-members',type=int,default=50)
     parser.add_argument('--apply',action='store_true',help='Create links only in the separate owned canary directory')
     parser.add_argument('--rollback',action='store_true',help='Conditionally remove links owned by the saved canary plan')
@@ -118,6 +168,8 @@ def main():
         return
     if any(not getattr(args,name) for name in ('package','manifest_digest','url','server_commit','api_key_file','legacy_config','original_library','canary_mount')):
         parser.error('Validation requires a sealed package, exact Rust source, private key, offline config and explicit library/mount roots')
+    if bool(args.reimport_map)!=bool(args.reimport_map_digest):
+        parser.error('Reimport mapping requires its independently retained digest')
     package=runner.Package(args.package,args.manifest_digest)
     try:
         source=Path(args.legacy_config).absolute();mount=Path(args.canary_mount).resolve(strict=True)
@@ -127,8 +179,10 @@ def main():
         if not (len(args.server_commit)==40 and all(c in '0123456789abcdef' for c in args.server_commit)) \
                 or status.get('commit')!=args.server_commit or status.get('source_repository')!='johoja12/infinidysk':
             raise ValueError('Rust source identity differs from this canary plan')
+        mapping=load_mapping(args.reimport_map,args.reimport_map_digest,package,args.server_commit) if args.reimport_map else {}
         scope=runner.digest({'version':1,'manifest':package.digest,'server':client.url,'commit':args.server_commit,
-                             'sourceConfig':str(source),'mount':str(mount),'original':str(original),'destination':str(destination)})
+                             'sourceConfig':str(source),'mount':str(mount),'original':str(original),'destination':str(destination),
+                             'reimportMap':args.reimport_map_digest})
         path=Path(args.plan_file).absolute()
         protected=[original,mount,source.resolve(strict=True),Path(args.package).resolve(strict=True)]
         if any(links.contained(root,path) or links.contained(root,destination) for root in protected):
@@ -146,17 +200,19 @@ def main():
                 request=proof_request(package,leaf,release,source)
                 validation.append(key,'validation_pending')
                 try:
-                    proof=client.json('/api/v1/migration/legacy-proof',request)
+                    entry=mapping.get(key)
+                    current=entry['currentItem'] if entry else key
+                    proof=fetch_proof(client,request,entry)
                     if any(proof.get(name)!=expected for name,expected in {
-                        'version':1,'package_digest':package.digest,'legacy_item':key,'current_item':key,
+                        'version':1,'package_digest':package.digest,'legacy_item':key,'current_item':current,
                         'identity_kind':leaf['identityKind'],'identity_digest':leaf['identityDigest'],
                         'payload_sha256':request['payload_sha256'],'size':leaf['fileSize'],
-                        'ids_path':links.ids_path(key),'payload_validated':False}.items()) \
-                            or not runner.lower_digest(proof.get('source_revision')) or not runner.lower_digest(proof.get('record_digest')):
+                        'ids_path':links.ids_path(current),'payload_validated':False}.items()) \
+                            or proof.get('payload_validated') is not False or not runner.lower_digest(proof.get('source_revision')) or not runner.lower_digest(proof.get('record_digest')):
                         raise ValueError('Member proof does not bind the selected sealed identity')
                     challenge=client.call('/api/v1/migration/mount-probe',b'')
                     read=sample_mount(mount,challenge,proof,Path(link['libraryRelativePath']).suffix)
-                    fresh=client.json('/api/v1/migration/legacy-proof',request);same_proof(proof,fresh)
+                    fresh=fetch_proof(client,request,entry);same_proof(proof,fresh)
                     sample_mount(mount,client.call('/api/v1/migration/mount-probe',b''))
                     binding={'link':link,'proof':proof,'sampledValidation':read['sampledValidation']}
                     validation.append(key,'sampled_validation_passed',binding)
@@ -176,7 +232,7 @@ def main():
                 journal=runner.Journal(str(path)+'.links.jsonl',plan['planDigest'])
                 def recheck(previous):
                     leaf,release=release_by_leaf[previous['legacy_item']]
-                    current=client.json('/api/v1/migration/legacy-proof',proof_request(package,leaf,release,source))
+                    current=fetch_proof(client,proof_request(package,leaf,release,source),mapping.get(previous['legacy_item']))
                     same_proof(previous,current)
                     sample_mount(mount,client.call('/api/v1/migration/mount-probe',b''))
                 try:

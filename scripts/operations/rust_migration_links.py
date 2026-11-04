@@ -150,8 +150,16 @@ def plan(original_root,mount_root,destination,bindings,scope):
         for binding in bindings:
             link=binding['link'];proof=binding['proof']
             relative=link['libraryRelativePath'];parts(relative)
-            if relative in seen or proof['current_item']!=link['legacyDavItemId'] or proof['ids_path']!=ids_path(proof['current_item']):
+            if relative in seen or proof['legacy_item']!=link['legacyDavItemId'] or proof['ids_path']!=ids_path(proof['current_item']):
                 raise ValueError('Canary plan has ambiguous source bindings')
+            if proof['current_item']!=proof['legacy_item']:
+                intent=proof.get('submission_intent')
+                if not isinstance(intent,str) or len(intent)!=64 or any(c not in '0123456789abcdef' for c in intent):
+                    raise ValueError('New source IDs require durable import proof')
+                for field in ('job_id','download_dir'):
+                    value=proof.get(field)
+                    if not isinstance(value,str) or str(uuid.UUID(value))!=value or uuid.UUID(value).int==0:
+                        raise ValueError('New source IDs require exact accepted job/directory identities')
             seen.add(relative)
             witness=source_link(source,relative,link['originalTarget'])
             rows.append({'relative':relative,'target':str(mount)+proof['ids_path'],'original':witness,
