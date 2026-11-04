@@ -16,15 +16,38 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let root = std::env::temp_dir().join(format!("infinidysk-fork-local-{}", ItemId::new()));
-    std::fs::create_dir_all(root.join("payload"))?;
-    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    let resuming = arguments.first().is_some_and(|a| a == "--resume");
+    anyhow::ensure!(
+        arguments.is_empty() || resuming && arguments.len() == 2,
+        "usage: fork_local [--resume GENERATED_ROOT]"
+    );
+    let root = if resuming {
+        let root = std::fs::canonicalize(&arguments[1])?;
+        anyhow::ensure!(
+            root.starts_with(std::env::temp_dir())
+                && root
+                    .file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("infinidysk-fork-local-"))
+                && std::fs::read_to_string(root.join(".fork-local-fixture"))?
+                    == "generated-seed-1025-v1",
+            "resume accepts only a generated fork fixture"
+        );
+        let _ = std::fs::remove_file(root.join("stop"));
+        root
+    } else {
+        let root = std::env::temp_dir().join(format!("infinidysk-fork-local-{}", ItemId::new()));
+        std::fs::create_dir_all(root.join("payload"))?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::write(root.join(".fork-local-fixture"), "generated-seed-1025-v1")?;
+        root
+    };
     let database_url = format!("sqlite:{}", root.join("infinidysk.sqlite").display());
     let corpus = Corpus::generate(1025, 32, 256 * 1024);
     let expected_hash = sha2::Sha256::digest(&corpus.data);
     let server = LoopbackServer::start(corpus.articles.clone()).await?;
     let db = Db::connect(&database_url).await?;
-    if let Ok(config) = std::env::var("INFINIDYSK_LEGACY_FIXTURE_CONFIG") {
+    if !resuming && let Ok(config) = std::env::var("INFINIDYSK_LEGACY_FIXTURE_CONFIG") {
         // This explicit opt-in accepts only a generated local fixture, never production.
         let config = std::path::Path::new(&config);
         anyhow::ensure!(
@@ -39,51 +62,69 @@ async fn main() -> anyhow::Result<()> {
         anyhow::ensure!(imported.skipped_count == 0, "fixture import skipped files");
     }
 
-    let content = db.item(ItemId::CONTENT).await?.context("content root")?;
-    let category = Item::child(&content, "fixture", ItemKind::Directory)?;
-    let job = Item::child(&category, "job", ItemKind::Directory)?;
-    let mut file = Item::child(&job, "fixture.bin", ItemKind::NzbFile)?;
-    let blob_id = BlobId::new();
-    file.meta_blob = Some(blob_id);
-    file.size = Some(corpus.data.len() as u64);
-    let meta = FileMeta::Nzb(NzbFile {
-        segments: Segments {
-            items: corpus
-                .articles
-                .iter()
-                .map(|a| Segment {
-                    id: a.message_id.clone(),
-                    size: 256 * 1024,
-                    fallbacks: vec![],
-                })
-                .collect(),
-            sizes_trusted: true,
-            ..Segments::default()
-        },
-        proof: None,
-    });
-    db.insert(std::slice::from_ref(&category), &[]).await?;
-    let history = HistoryEntry {
-        id: JobId::new(),
-        created_at: 1,
-        file_name: "fixture.nzb".to_owned(),
-        job_name: "job".to_owned(),
-        category: "fixture".to_owned(),
-        status: JobStatus::Completed,
-        total_bytes: file.size.unwrap_or(0),
-        download_seconds: 0,
-        fail_message: None,
-        download_dir: Some(job.id),
-        nzb_blob: None,
-        storage: None,
+    let file = if resuming {
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(root.join("receipt.json"))?)?;
+        let id = receipt["item"]
+            .as_str()
+            .context("fixture item id")?
+            .parse()?;
+        db.item(ItemId(id)).await?.context("fixture source")?
+    } else {
+        let content = db.item(ItemId::CONTENT).await?.context("content root")?;
+        let category = Item::child(&content, "fixture", ItemKind::Directory)?;
+        let job = Item::child(&category, "job", ItemKind::Directory)?;
+        let mut file = Item::child(&job, "fixture.bin", ItemKind::NzbFile)?;
+        let blob_id = BlobId::new();
+        file.meta_blob = Some(blob_id);
+        file.size = Some(corpus.data.len() as u64);
+        let meta = FileMeta::Nzb(NzbFile {
+            segments: Segments {
+                items: corpus
+                    .articles
+                    .iter()
+                    .map(|a| Segment {
+                        id: a.message_id.clone(),
+                        size: 256 * 1024,
+                        fallbacks: vec![],
+                    })
+                    .collect(),
+                sizes_trusted: true,
+                ..Segments::default()
+            },
+            proof: None,
+        });
+        db.insert(std::slice::from_ref(&category), &[]).await?;
+        let history = HistoryEntry {
+            id: JobId::new(),
+            created_at: 1,
+            file_name: "fixture.nzb".to_owned(),
+            job_name: "job".to_owned(),
+            category: "fixture".to_owned(),
+            status: JobStatus::Completed,
+            total_bytes: file.size.unwrap_or(0),
+            download_seconds: 0,
+            fail_message: None,
+            download_dir: Some(job.id),
+            nzb_blob: None,
+            storage: None,
+        };
+        db.add_history(
+            &history,
+            &[job, file.clone()],
+            &[(blob_id, &blob::encode_meta(&meta)?)],
+        )
+        .await?;
+        file
     };
-    db.add_history(
-        &history,
-        &[job, file.clone()],
-        &[(blob_id, &blob::encode_meta(&meta)?)],
-    )
-    .await?;
-    let mut settings = Settings::default();
+    let mut settings = if resuming {
+        ConfigStore::load(db.clone(), std::iter::empty())
+            .await?
+            .settings()
+            .clone()
+    } else {
+        Settings::default()
+    };
     settings.auth.mode = AuthMode::Disabled;
     settings.mount.dir = root.join("mount").to_string_lossy().into_owned();
     "fixture".clone_into(&mut settings.webdav.user);
@@ -100,18 +141,44 @@ async fn main() -> anyhow::Result<()> {
         pipeline_depth: 4,
         ..Provider::default()
     }];
-    settings.native_cache = NativeSettings {
-        enabled: true,
-        min_file_mb: 0,
-        metadata_path: root.join("cache-metadata").to_string_lossy().into_owned(),
-        folders: vec![FolderSettings {
-            id: ItemId::new().0,
-            path: root.join("payload").to_string_lossy().into_owned(),
-            min_free_bytes: 0,
-            ..FolderSettings::default()
-        }],
-        ..NativeSettings::default()
-    };
+    if resuming {
+        anyhow::ensure!(
+            std::path::Path::new(&settings.native_cache.metadata_path).starts_with(&root)
+                && !std::path::Path::new(&settings.native_cache.metadata_path)
+                    .components()
+                    .any(|c| c == std::path::Component::ParentDir)
+                && settings
+                    .native_cache
+                    .folders
+                    .iter()
+                    .all(|f| std::path::Path::new(&f.path).starts_with(&root)
+                        && !std::path::Path::new(&f.path)
+                            .components()
+                            .any(|c| c == std::path::Component::ParentDir)),
+            "fixture cache must stay inside its generated root"
+        );
+        settings.prefetch.enabled = false;
+        settings.prefetch.plex.enabled = false;
+        settings.prefetch.plex.sources.clear();
+        settings.plex.accounts.clear();
+        settings.plex.servers.clear();
+        settings.arr_instances.clear();
+        settings.imports.library_dirs.clear();
+        settings.imports.scan_dirs.clear();
+    } else {
+        settings.native_cache = NativeSettings {
+            enabled: true,
+            min_file_mb: 0,
+            metadata_path: root.join("cache-metadata").to_string_lossy().into_owned(),
+            folders: vec![FolderSettings {
+                id: ItemId::new().0,
+                path: root.join("payload").to_string_lossy().into_owned(),
+                min_free_bytes: 0,
+                ..FolderSettings::default()
+            }],
+            ..NativeSettings::default()
+        };
+    }
     ConfigStore::load(db.clone(), std::iter::empty())
         .await?
         .save(settings)
