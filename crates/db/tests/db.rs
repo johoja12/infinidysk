@@ -2132,6 +2132,42 @@ async fn repair_attempts(db: &Db) {
             .id,
         publication.id
     );
+    assert_eq!(
+        db.next_repair_attempt_fair(now + 1, true)
+            .await
+            .expect("publication before fairness")
+            .expect("due")
+            .id,
+        publication.id
+    );
+    assert!(
+        db.update_repair_attempt(
+            &publishing,
+            "publishing",
+            2,
+            now + 1000,
+            now,
+            &publishing.payload
+        )
+        .await
+        .expect("delay readback")
+    );
+    assert_eq!(
+        db.next_repair_attempt_fair(now + 1, false)
+            .await
+            .expect("urgent ordering")
+            .expect("due")
+            .priority,
+        0
+    );
+    assert_eq!(
+        db.next_repair_attempt_fair(now + 1, true)
+            .await
+            .expect("routine turn")
+            .expect("due")
+            .priority,
+        2
+    );
     assert!(
         db.update_repair_attempt(&publishing, "invented-state", 0, now, now, "invalid")
             .await

@@ -121,9 +121,18 @@ impl Db {
         )
     }
     pub async fn next_repair_attempt(&self, now: i64) -> Result<Option<Attempt>, Error> {
-        let sql = "SELECT id,item_id,source,state,priority,next_attempt,updated_at,revision,payload FROM par2_attempts WHERE state IN ('queued','deferred','publishing') AND next_attempt<=$1 ORDER BY CASE WHEN state='publishing' THEN 0 ELSE 1 END,priority,next_attempt,id LIMIT 1";
+        self.next_repair_attempt_fair(now, false).await
+    }
+    /// Publication readback always comes first. After an urgent burst, prefer one
+    /// due routine attempt; retain priority ordering when none is due.
+    pub async fn next_repair_attempt_fair(
+        &self,
+        now: i64,
+        routine: bool,
+    ) -> Result<Option<Attempt>, Error> {
+        let sql = "SELECT id,item_id,source,state,priority,next_attempt,updated_at,revision,payload FROM par2_attempts WHERE state IN ('queued','deferred','publishing') AND next_attempt<=$1 ORDER BY CASE WHEN state='publishing' THEN 0 ELSE 1 END,CASE WHEN $2 AND priority>0 THEN 0 ELSE 1 END,priority,next_attempt,id LIMIT 1";
         let row: Option<Attempt> =
-            on!(self,pool=>sqlx::query_as(sql).bind(now).fetch_optional(pool).await?);
+            on!(self,pool=>sqlx::query_as(sql).bind(now).bind(routine).fetch_optional(pool).await?);
         row.map(Attempt::validate).transpose()
     }
     /// Called only after acquiring the authoritative ledger's exclusive writer.
