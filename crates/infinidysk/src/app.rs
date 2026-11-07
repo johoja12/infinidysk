@@ -396,7 +396,11 @@ async fn serve_inner(
         .await
         .context("legacy cache ownership handover timed out")??;
         cache.set_legacy_reader(reader)?;
-        info!("legacy native cache enabled for read-only in-place reuse");
+        if legacy.write.is_some() {
+            info!("legacy native cache enabled with compatible writes");
+        } else {
+            info!("legacy native cache enabled for read-only in-place reuse");
+        }
     }
     let cache = Arc::new(Cache::new(
         tuning.memory_cache_enabled,

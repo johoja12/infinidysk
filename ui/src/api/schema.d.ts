@@ -2972,6 +2972,8 @@ export interface components {
         };
         LegacyCacheFolder: {
             id: string;
+            /** @description Optional read/write bind of the same owner inode, for read-only NFS payload mounts. */
+            owner_lock_path?: string | null;
             path: string;
         };
         LegacyCacheImport: {
@@ -2995,6 +2997,24 @@ export interface components {
         LegacyCacheSettings: {
             folders: components["schemas"]["LegacyCacheFolder"][];
             metadata_path: string;
+            write?: components["schemas"]["LegacyCacheWriteSettings"] | null;
+        };
+        LegacyCacheWriteFolder: {
+            id: string;
+            /** Format: int64 */
+            min_free_bytes: number;
+            /** Format: int32 */
+            priority: number;
+            /** Format: int64 */
+            quota_bytes: number;
+        };
+        LegacyCacheWriteSettings: {
+            /**
+             * Format: int32
+             * @description Zero selects a sparse file; other values select bounded chunk files.
+             */
+            chunk_mb: number;
+            folders: components["schemas"]["LegacyCacheWriteFolder"][];
         };
         LegacyRepairStatus: {
             evidence_id: string;
@@ -3927,6 +3947,8 @@ export interface components {
             io: components["schemas"]["NativeCacheIo"];
             /** Format: int64 */
             legacy_hits: number;
+            /** Format: int64 */
+            legacy_written_bytes: number;
             /** Format: int64 */
             misses: number;
             /** Format: int64 */

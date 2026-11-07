@@ -31,3 +31,22 @@ markers, live owner locks and refusal of mismatched generations/sizes.
 The encrypted fixture describes padded ciphertext but stores the final plaintext in
 native cache, as 1.x does. These checks qualify cache reuse; they do not qualify a live
 media decoder or unknown archive layouts.
+
+## Rust writes read by the original C# implementation
+
+Export new disposable sparse/chunked stores from the Rust writer, using a new
+absolute receipt filename:
+
+```sh
+ID_COMPATIBLE_CACHE_EXPORT=/tmp/id-rust-cache-receipt.json cargo test -p infinidysk-native-cache --lib legacy::writer::tests::export_original_csharp_readback_fixtures --locked -- --ignored --exact
+dotnet run --project scripts/fixtures/legacy-native-cache -- verify-rust /tmp/id-rust-cache-receipt.json
+```
+
+The verifier only accepts marked generated fixture roots. It reads every block
+using the unmodified original C# reader, checks SHA256, deletes only disposable
+catalogue coverage, and reconstructs coverage using the original scanner and the
+Rust-written manifests/journals. It never targets production paths or providers.
+Keep each fixture at its original absolute path and device/inode, including inside
+a container. This qualifies storage readability; it does not migrate v2 jobs back
+into a v1 application database. The explicit export retains its generated roots
+for inspection; routine tests clean only their own disposable roots.

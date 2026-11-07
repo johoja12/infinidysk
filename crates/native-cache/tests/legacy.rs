@@ -134,6 +134,7 @@ impl Fixture {
             root,
             catalogue,
             folder: Folder {
+                owner_lock_path: None,
                 id: "disk".into(),
                 path: source.to_str().unwrap().into(),
             },
@@ -367,6 +368,7 @@ async fn legacy_settings_reject_aliases_before_creating_destination_files() {
         enabled: true,
         metadata_path: alias.join("must-not-create").to_string_lossy().into_owned(),
         legacy: Some(infinidysk_native_cache::legacy::Settings {
+            write: None,
             metadata_path: fixture
                 .root
                 .join("source-meta")
@@ -422,7 +424,23 @@ fn cancelled_direct_read_keeps_physical_ownership_until_queued_io_finishes() {
         assert!(Flock::lock(File::open(&owner).unwrap(), FlockArg::LockExclusiveNonblock).is_err());
         release_tx.send(()).unwrap();
         blocker.await.unwrap();
-        tokio::task::spawn_blocking(|| {}).await.unwrap();
+        // The owned read also finishes metadata work on Tokio after physical I/O.
+        // A blocking-pool barrier alone does not prove that lifecycle has ended.
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let permit = slots.clone().acquire_owned().await.unwrap();
+            drop(permit);
+            loop {
+                if let Ok(owner) =
+                    Flock::lock(File::open(&owner).unwrap(), FlockArg::LockExclusiveNonblock)
+                {
+                    return owner;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(finished);
         assert_eq!(slots.available_permits(), 1);
         assert!(Flock::lock(File::open(owner).unwrap(), FlockArg::LockExclusiveNonblock).is_ok());
     });
@@ -437,6 +455,7 @@ async fn real_csharp_writer_payloads_are_reused_and_partial_coverage_stays_parti
     for receipt in receipts {
         let dir = PathBuf::from(receipt["metadata_path"].as_str().unwrap());
         let folder = Folder {
+            owner_lock_path: None,
             id: receipt["folder_id"].as_str().unwrap().into(),
             path: receipt["folder_path"].as_str().unwrap().into(),
         };

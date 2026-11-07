@@ -14,7 +14,10 @@ required; they are distinct from copying cache payloads.
 verified v1 payloads in place through the shared playback/warming lookup.
 See [compatibility validation and setup](validation/rust-v2-in-place-cache-20261107.md).
 Actual production NAS handover, performance and rollback still need qualification.
-Compatible writes to the original v1 format remain separate work. A cold-cache
+Opt-in compatible writes are now implemented locally; see the
+[writer qualification report](validation/rust-v2-compatible-cache-writes-20261107.md)
+and [NAS handover runbook](rust-v2-cache-handover-runbook.md). Actual live writes
+remain gated on that rehearsal. A cold-cache
 start or verified-copy migration is not an accepted fallback.
 
 ## Source and upstream sync

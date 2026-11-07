@@ -531,6 +531,9 @@ mod recovery_tests {
         let settings = Settings {
             enabled: true,
             min_file_mb: 0,
+            // These cases verify recovery state, not throughput. Debug hashing on
+            // shared CI can exceed the production one-second storage deadline.
+            io_timeout_ms: 10_000,
             metadata_path: root.join("metadata").to_string_lossy().into_owned(),
             folders: vec![FolderSettings {
                 id: Uuid::new_v4(),

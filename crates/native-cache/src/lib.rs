@@ -339,6 +339,7 @@ pub struct Stats {
     pub bytes: u64,
     pub hits: u64,
     pub legacy_hits: u64,
+    pub legacy_written_bytes: u64,
     pub misses: u64,
     pub skipped: u64,
     pub failed: u64,
@@ -689,7 +690,8 @@ impl Cache {
     pub fn can_fill(&self, key: &Key) -> bool {
         !self.settings.recovery_mode
             && key.size >= u64::from(self.settings.min_file_mb) * MB
-            && self.folders.iter().any(|f| !f.settings.read_only)
+            && (self.folders.iter().any(|f| !f.settings.read_only)
+                || self.legacy.get().is_some_and(|r| r.writable()))
     }
     async fn read(&self, lease: &Lease, block: u64) -> Result<Option<Bytes>, Error> {
         let key = &lease.key;
@@ -806,6 +808,16 @@ impl Cache {
         };
         if data.len() as u64 != BLOCK.min(key.size - start) {
             return Ok(false);
+        }
+        if let Some(legacy) = self.legacy.get().filter(|r| r.writable()) {
+            return if let Ok(result) =
+                tokio::time::timeout(self.deadline(), legacy.write(key, block, data, permit)).await
+            {
+                result
+            } else {
+                self.failed.fetch_add(1, Ordering::Relaxed);
+                Ok(false)
+            };
         }
         let Ok(guard) = self.entry_lock(key, Some(block)).try_lock_owned() else {
             self.skipped.fetch_add(1, Ordering::Relaxed);
@@ -1032,6 +1044,12 @@ impl Cache {
             self.release_protection(key).await?;
             return Ok(Some(false));
         }
+        let native_contributes = !self.native_coverage(key).await?.is_empty();
+        let legacy_contributes = if let Some(legacy) = self.legacy.get() {
+            !legacy.coverage(key).await?.is_empty()
+        } else {
+            false
+        };
         let protected = sqlx::query(
             "UPDATE entries SET pinned=CASE WHEN pinned=0 THEN 2 ELSE pinned END WHERE key=$1",
         )
@@ -1040,7 +1058,13 @@ impl Cache {
         .await?
         .rows_affected()
             > 0;
-        if !protected {
+        if native_contributes && !protected {
+            return Ok(None);
+        }
+        if legacy_contributes
+            && let Some(legacy) = self.legacy.get()
+            && !legacy.protect(key).await?
+        {
             return Ok(None);
         }
         let result = self.verify_complete(key).await?;
@@ -1052,17 +1076,38 @@ impl Cache {
     /// Release stale health protection after source removal or revision change.
     /// A manual pin is never cleared by this maintenance operation.
     pub async fn release_protection(&self, key: &Key) -> Result<bool, Error> {
-        Ok(
-            sqlx::query("UPDATE entries SET pinned=0 WHERE key=$1 AND pinned=2")
-                .bind(key.id())
-                .execute(&self.db)
-                .await?
-                .rows_affected()
-                > 0,
-        )
+        let native = sqlx::query("UPDATE entries SET pinned=0 WHERE key=$1 AND pinned=2")
+            .bind(key.id())
+            .execute(&self.db)
+            .await?
+            .rows_affected()
+            > 0;
+        let legacy = if let Some(legacy) = self.legacy.get() {
+            legacy.release(key).await?
+        } else {
+            false
+        };
+        Ok(native || legacy)
     }
 
     pub async fn coverage(&self, key: &Key) -> Result<Vec<Coverage>, Error> {
+        let mut ranges = self.native_coverage(key).await?;
+        if let Some(legacy) = self.legacy.get() {
+            ranges.extend(legacy.coverage(key).await?);
+        }
+        ranges.retain(|r| r.start < r.end && r.end <= key.size);
+        ranges.sort_by_key(|r| r.start);
+        let mut merged: Vec<Coverage> = Vec::new();
+        for range in ranges {
+            if let Some(last) = merged.last_mut().filter(|r| r.end >= range.start) {
+                last.end = last.end.max(range.end);
+            } else {
+                merged.push(range);
+            }
+        }
+        Ok(merged)
+    }
+    async fn native_coverage(&self, key: &Key) -> Result<Vec<Coverage>, Error> {
         let blocks: Vec<(i64, i64)> =
             sqlx::query_as("SELECT block,len FROM blocks WHERE key=$1 AND valid=1 ORDER BY block")
                 .bind(key.id())
@@ -1113,6 +1158,7 @@ impl Cache {
             bytes: bytes.cast_unsigned(),
             hits: self.hits.load(Ordering::Relaxed),
             legacy_hits: self.legacy_hits.load(Ordering::Relaxed),
+            legacy_written_bytes: self.legacy.get().map_or(0, |r| r.written_bytes()),
             misses: self.misses.load(Ordering::Relaxed),
             skipped: self.skipped.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),

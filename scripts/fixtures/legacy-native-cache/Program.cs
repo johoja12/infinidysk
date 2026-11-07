@@ -6,6 +6,44 @@ using NzbWebDAV.Models;
 using NzbWebDAV.Services.NativeCache;
 using ZstdSharp;
 
+if (args.Length == 2 && args[0] == "verify-rust") {
+    using var receipt = JsonDocument.Parse(File.ReadAllBytes(args[1]));
+    var checkedCases = 0;
+    foreach (var row in receipt.RootElement.EnumerateArray()) {
+        var fixtureRoot = Path.GetFullPath(row.GetProperty("fixture_root").GetString()!);
+        if (!Path.GetFileName(fixtureRoot).StartsWith("id-compatible-cache-", StringComparison.Ordinal)
+            || File.ReadAllText(Path.Combine(fixtureRoot,"fixture-owner")) != "generated-native-cache-write-tests") throw new Exception("Not an owned generated fixture.");
+        var metadata = Path.GetFullPath(row.GetProperty("metadata_path").GetString()!);
+        var payload = Path.GetFullPath(row.GetProperty("folder_path").GetString()!);
+        if (!metadata.StartsWith(fixtureRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            || !payload.StartsWith(fixtureRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)) throw new Exception("Fixture path escaped its owned root.");
+        var folder = new NativeCacheFolder { Id=row.GetProperty("folder_id").GetString()!,Path=payload,MinFreeBytes=0,MaxBytes=1_000_000_000 };
+        var identity = new NativeCacheIdentity(row.GetProperty("item").GetString()!,row.GetProperty("generation").GetString()!,row.GetProperty("length").GetInt64());
+        var database = Path.Combine(metadata,"catalogue.db");
+        async Task Verify(NativeCacheStore store) {
+            using var digest = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            var buffer = new byte[NativeCacheStore.BlockSize];
+            for (long offset=0;offset<identity.Length;offset+=buffer.Length) {
+                var expected=(int)Math.Min(buffer.Length,identity.Length-offset);
+                var count=await store.ReadBlockAsync(identity,offset,buffer.AsMemory(0,expected));
+                if (count!=expected) throw new Exception("Original C# reader could not read a Rust-written committed block.");
+                digest.AppendData(buffer,0,count);
+            }
+            if (!string.Equals(Convert.ToHexString(digest.GetHashAndReset()),row.GetProperty("sha256").GetString(),StringComparison.OrdinalIgnoreCase)) throw new Exception("Rust-written bytes differ in the original C# reader.");
+        }
+        await using (var store = new NativeCacheStore(database,[folder])) { await Verify(store); }
+        // Destroy only disposable catalogue coverage, then prove the original C# scanner
+        // reconstructs it from Rust-written manifests and journals without changing payloads.
+        using (var db = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={database}")) {
+            db.Open();using var command=db.CreateCommand();command.CommandText="DELETE FROM Blocks; UPDATE Entries SET Dirty=1,PendingBytes=0";command.ExecuteNonQuery();
+        }
+        await using (var store = new NativeCacheStore(database,[folder])) { await store.ScanAsync(folder.Id); await Verify(store); }
+        checkedCases++;
+    }
+    Console.WriteLine(JsonSerializer.Serialize(new { passed=true,cases=checkedCases,reader="original C#",journal_reconstruction=true }));
+    return;
+}
+
 if (args.Length != 1 || !Path.IsPathFullyQualified(args[0])) throw new ArgumentException("Provide a new absolute fixture directory.");
 var root = args[0];
 if (Directory.Exists(root)) throw new ArgumentException("Fixture directory must not exist.");

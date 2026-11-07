@@ -6,6 +6,7 @@ use infinidysk_db::{Db, HealthStatus, Item};
 use infinidysk_import::native::{Ledger, Source};
 use infinidysk_native_cache::{BLOCK, BLOCK_BYTES, Cache, Key, Settings, legacy};
 use infinidysk_nntp::Client;
+use infinidysk_testkit::{Corpus, LoopbackServer};
 use infinidysk_vfs::{Delivery, Node, Origin, Vfs};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::SqliteConnectOptions;
@@ -61,8 +62,12 @@ impl Fixture {
         let catalogue = sqlx::SqlitePool::connect_with(options("catalogue.db"))
             .await
             .unwrap();
-        sqlx::raw_sql("CREATE TABLE FolderIdentity(Folder TEXT PRIMARY KEY,Volume TEXT,RootIdentity TEXT); CREATE TABLE Entries(Key TEXT PRIMARY KEY,Folder TEXT,ItemId TEXT,Length INTEGER,Pinned INTEGER,Generation TEXT,ChunkSize INTEGER); CREATE TABLE Blocks(Key TEXT,Offset INTEGER,Count INTEGER,Hash BLOB,PRIMARY KEY(Key,Offset));")
-            .execute(&catalogue).await.unwrap();
+        sqlx::raw_sql(include_str!(
+            "../../../../scripts/fixtures/legacy-native-cache/catalogue-schema.sql"
+        ))
+        .execute(&catalogue)
+        .await
+        .unwrap();
         let revisions = sqlx::SqlitePool::connect_with(options("repair-revisions.db"))
             .await
             .unwrap();
@@ -72,9 +77,8 @@ impl Fixture {
         let ledger = Ledger::open(&temp.0.join("legacy-meta/repair-revisions.db"))
             .await
             .unwrap();
-        let bytes: Vec<u8> = (0..2 * BLOCK_BYTES + 37)
-            .map(|i| u8::try_from(i % 251).unwrap())
-            .collect();
+        let corpus = Corpus::generate(1025, 33, 256 * 1024);
+        let bytes = corpus.data.clone();
         let parent = db.item(ItemId::CONTENT).await.unwrap().unwrap();
         let mut folders = Vec::new();
         let mut items = Vec::new();
@@ -99,6 +103,7 @@ impl Fixture {
                 .await
                 .unwrap();
             folders.push(legacy::Folder {
+                owner_lock_path: None,
                 id: folder.clone(),
                 path: root.to_string_lossy().into_owned(),
             });
@@ -106,11 +111,15 @@ impl Fixture {
                 Item::child(&parent, &format!("fixture-{index}.dat"), ItemKind::NzbFile).unwrap();
             let meta = FileMeta::Nzb(NzbFile {
                 segments: Segments {
-                    items: vec![Segment {
-                        id: "fixture@unavailable".into(),
-                        size: u32::try_from(bytes.len()).unwrap(),
-                        fallbacks: vec![],
-                    }],
+                    items: corpus
+                        .articles
+                        .iter()
+                        .map(|a| Segment {
+                            id: a.message_id.clone(),
+                            size: 256 * 1024,
+                            fallbacks: vec![],
+                        })
+                        .collect(),
                     sizes_trusted: true,
                     ..Segments::default()
                 },
@@ -142,7 +151,7 @@ impl Fixture {
             std::fs::create_dir_all(&directory).unwrap();
             let chunk = if index == 0 { 0 } else { 2 * BLOCK };
             std::fs::write(directory.join("manifest.json"), serde_json::to_vec(&serde_json::json!({"Version":if chunk==0 {1}else{2},"Identity":{"ItemId":id,"Generation":generation,"Length":bytes.len()},"ChunkSize":chunk})).unwrap()).unwrap();
-            sqlx::query("INSERT INTO Entries VALUES($1,$2,$3,$4,1,$5,$6)")
+            sqlx::query("INSERT INTO Entries(Key,Folder,ItemId,Length,Pinned,Generation,ChunkSize,Bytes,Access) VALUES($1,$2,$3,$4,1,$5,$6,$4+65536,0)")
                 .bind(&entry)
                 .bind(folder)
                 .bind(id)
@@ -199,6 +208,7 @@ impl Fixture {
             io_timeout_ms: 10_000,
             metadata_path: temp.0.join("rust-meta").to_string_lossy().into_owned(),
             legacy: Some(legacy::Settings {
+                write: None,
                 metadata_path: temp.0.join("legacy-meta").to_string_lossy().into_owned(),
                 folders,
             }),
@@ -389,6 +399,401 @@ async fn handover_refuses_uncheckpointed_catalogue_and_repair_ledger() {
 }
 
 #[tokio::test]
+async fn compatible_warming_fills_partial_and_new_sources_then_reuses_them_without_providers() {
+    use infinidysk_nntp::{Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode};
+    use std::time::Duration;
+    let mut f = Fixture::new(true).await;
+    let source = f.settings.legacy.as_ref().unwrap();
+    let catalogue = sqlx::SqlitePool::connect_with(
+        SqliteConnectOptions::new().filename(Path::new(&source.metadata_path).join("catalogue.db")),
+    )
+    .await
+    .unwrap();
+    let key: String = sqlx::query_scalar("SELECT Key FROM Entries WHERE ItemId=$1")
+        .bind(f.items[0].id.0.simple().to_string())
+        .fetch_one(&catalogue)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM Blocks WHERE Key=$1 AND Offset=$2")
+        .bind(key)
+        .bind(BLOCK.cast_signed())
+        .execute(&catalogue)
+        .await
+        .unwrap();
+    catalogue.close().await;
+    let original: Vec<_> = f
+        .legacy_inventory()
+        .into_iter()
+        .filter(|(p, _, _)| {
+            p.extension().is_some_and(|e| e == "data") || p.file_name().unwrap() == "manifest.json"
+        })
+        .collect();
+    f.settings.min_file_mb = 0;
+    let source = f.settings.legacy.as_mut().unwrap();
+    source.write = Some(legacy::WriteSettings {
+        chunk_mb: 8,
+        folders: source
+            .folders
+            .iter()
+            .map(|folder| legacy::WriteFolder {
+                id: folder.id.clone(),
+                priority: 0,
+                quota_bytes: 1_000_000_000,
+                min_free_bytes: 0,
+            })
+            .collect(),
+    });
+    let corpus = Corpus::generate(1025, 33, 256 * 1024);
+    assert_eq!(f.bytes, corpus.data);
+    let server = LoopbackServer::start(corpus.articles).await.unwrap();
+    let pool = Pool::new(
+        Endpoint::new(
+            "127.0.0.1",
+            server.addr().port(),
+            TlsMode::Plain,
+            None,
+            Duration::from_secs(3),
+        )
+        .unwrap(),
+        PoolConfig {
+            max_connections: 4,
+            pipeline_depth: 4,
+            min_connections: 0,
+            idle_timeout: Duration::from_secs(5),
+        },
+        Downloads::new(8),
+    )
+    .unwrap();
+    let cache = f.cache().await;
+    let vfs = Arc::new(
+        Vfs::new(
+            f.db.clone(),
+            Arc::new(Client::new([Provider {
+                pool,
+                key: "fixture".into(),
+                name: "fixture".into(),
+                priority: 0,
+                backbone: None,
+            }])),
+            infinidysk_stream::Budget::new(8 * 1024 * 1024),
+            1024 * 1024,
+            "/unused",
+        )
+        .with_native_cache(Some(cache.clone())),
+    );
+    let root = f.db.item(ItemId::CONTENT).await.unwrap().unwrap();
+    let mut new = Item::child(&root, "new-fixture.dat", ItemKind::NzbFile).unwrap();
+    new.size = Some(f.bytes.len() as u64);
+    new.meta_blob = Some(BlobId::new());
+    let metadata =
+        f.db.blob(f.items[0].meta_blob.unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+    f.db.insert(
+        std::slice::from_ref(&new),
+        &[(new.meta_blob.unwrap(), &metadata)],
+    )
+    .await
+    .unwrap();
+    let warming = infinidysk_prefetch::Queue::load(f.db.clone(), vfs.clone())
+        .await
+        .unwrap();
+    for (item, expected_source) in [(&f.items[0], BLOCK), (&new, f.bytes.len() as u64)] {
+        let job = warming
+            .enqueue(
+                item.id,
+                &[infinidysk_prefetch::Range {
+                    start: 0,
+                    end: f.bytes.len() as u64,
+                }],
+                40,
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        for _ in 0..10 {
+            warming
+                .tick(&infinidysk_prefetch::Settings {
+                    enabled: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let job = warming
+            .status()
+            .await
+            .jobs
+            .into_iter()
+            .find(|j| j.id == job.id)
+            .unwrap();
+        assert_eq!(
+            job.state,
+            infinidysk_prefetch::State::Complete,
+            "{:?}",
+            job.reason
+        );
+        assert_eq!(job.source_bytes, expected_source);
+        assert_eq!(job.cached_bytes + job.source_bytes, f.bytes.len() as u64);
+        let key = vfs.cache_key(item).await.unwrap();
+        let intent = Uuid::new_v4();
+        let scope = "a".repeat(64);
+        let ranges = [infinidysk_prefetch::Range {
+            start: 0,
+            end: f.bytes.len() as u64,
+        }];
+        let request = || infinidysk_prefetch::Automatic {
+            item: item.id,
+            ranges: &ranges,
+            priority: 40,
+            intent,
+            revision: key.revision(),
+            scope: &scope,
+        };
+        let automatic = warming.enqueue_automatic(request()).await.unwrap();
+        let before = server.body_commands();
+        for _ in 0..5 {
+            warming
+                .tick(&infinidysk_prefetch::Settings {
+                    enabled: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
+        let repeated = warming.enqueue_automatic(request()).await.unwrap();
+        assert_eq!(automatic.id, repeated.id);
+        assert_eq!(repeated.state, infinidysk_prefetch::State::Complete);
+        assert_eq!(repeated.source_bytes, 0);
+        assert_eq!(server.body_commands(), before);
+    }
+    assert_eq!(
+        cache.stats().await.unwrap().legacy_written_bytes,
+        BLOCK + f.bytes.len() as u64
+    );
+    for (path, hash, blocks) in original {
+        assert_eq!(Sha256::digest(std::fs::read(&path).unwrap()).to_vec(), hash);
+        assert_eq!(
+            path.metadata().unwrap().blocks(),
+            blocks,
+            "existing payload must not be copied or reallocated"
+        );
+    }
+    assert!(server.body_commands() > 0);
+    drop(warming);
+    drop(vfs);
+    drop(cache);
+    drop(server);
+    let cache = f.cache().await;
+    let vfs = f.vfs(cache);
+    for item in [&f.items[0], &new] {
+        let mut reader = vfs
+            .open(
+                &Node::Item(item.clone()),
+                Origin {
+                    delivery: Delivery::WebDav,
+                    client: "fixture".into(),
+                    player: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, f.bytes);
+    }
+}
+
+async fn pins(f: &Fixture, value: Option<i64>) -> Vec<i64> {
+    let db = sqlx::SqlitePool::connect_with(
+        SqliteConnectOptions::new().filename(f.temp.0.join("legacy-meta/catalogue.db")),
+    )
+    .await
+    .unwrap();
+    if let Some(value) = value {
+        sqlx::query("UPDATE Entries SET Pinned=$1")
+            .bind(value)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+    let result = sqlx::query_scalar("SELECT Pinned FROM Entries ORDER BY ItemId")
+        .fetch_all(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    result
+}
+fn enable_writes(f: &mut Fixture) {
+    f.settings.min_file_mb = 0;
+    let source = f.settings.legacy.as_mut().unwrap();
+    source.write = Some(legacy::WriteSettings {
+        chunk_mb: 8,
+        folders: source
+            .folders
+            .iter()
+            .map(|folder| legacy::WriteFolder {
+                id: folder.id.clone(),
+                priority: 0,
+                quota_bytes: 1_000_000_000,
+                min_free_bytes: 0,
+            })
+            .collect(),
+    });
+}
+
+#[tokio::test]
+async fn legacy_coverage_protects_complete_copies_and_preserves_pins_during_storage_uncertainty() {
+    let mut f = Fixture::new(true).await;
+    pins(&f, Some(0)).await;
+    enable_writes(&mut f);
+    let cache = f.cache().await;
+    let vfs = f.vfs(cache.clone());
+    let key = vfs.cache_key(&f.items[0]).await.unwrap();
+    let ranges = cache.coverage(&key).await.unwrap();
+    assert_eq!(ranges.len(), 1);
+    assert_eq!(ranges[0].end, f.bytes.len() as u64);
+    assert_eq!(cache.verify_and_protect(&key).await.unwrap(), Some(true));
+    assert!(pins(&f, None).await.contains(&2));
+    let marker =
+        Path::new(&f.settings.legacy.as_ref().unwrap().folders[0].path).join(".infinidysk-volume");
+    let original = std::fs::read(&marker).unwrap();
+    std::fs::write(&marker, b"unavailable volume").unwrap();
+    assert_eq!(cache.verify_and_protect(&key).await.unwrap(), None);
+    assert!(pins(&f, None).await.contains(&2));
+    std::fs::write(marker, original).unwrap();
+    let payload = inventory(Path::new(
+        &f.settings.legacy.as_ref().unwrap().folders[0].path,
+    ))
+    .into_iter()
+    .find(|(p, _, _)| p.file_name().unwrap() == "content.data")
+    .unwrap()
+    .0;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&payload)
+        .unwrap()
+        .write_all_at(b"corrupt", 0)
+        .unwrap();
+    assert_eq!(cache.verify_and_protect(&key).await.unwrap(), Some(false));
+    assert!(!pins(&f, None).await.contains(&2));
+    assert!(
+        cache
+            .put(
+                &cache.lease(key.clone()).unwrap(),
+                0,
+                axum::body::Bytes::copy_from_slice(&f.bytes[..BLOCK_BYTES])
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(cache.verify_and_protect(&key).await.unwrap(), Some(true));
+    pins(&f, Some(1)).await;
+    assert!(!cache.release_protection(&key).await.unwrap());
+    assert_eq!(pins(&f, None).await, vec![1, 1]);
+}
+
+#[tokio::test]
+async fn read_only_copies_need_existing_durable_pins_before_destructive_recovery() {
+    let f = Fixture::new(true).await;
+    pins(&f, Some(0)).await;
+    let before = f.legacy_inventory();
+    let cache = f.cache().await;
+    let vfs = f.vfs(cache.clone());
+    let key = vfs.cache_key(&f.items[0]).await.unwrap();
+    assert_eq!(cache.verify_and_protect(&key).await.unwrap(), None);
+    assert_eq!(f.legacy_inventory(), before);
+}
+
+#[tokio::test]
+async fn unresolved_publications_hold_retained_copy_decisions_without_hiding_committed_hits() {
+    let f = Fixture::new(true).await;
+    pins(&f, Some(2)).await;
+    let db = sqlx::SqlitePool::connect_with(
+        SqliteConnectOptions::new().filename(f.temp.0.join("legacy-meta/catalogue.db")),
+    )
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM Blocks WHERE Offset=$1")
+        .bind(BLOCK.cast_signed())
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE Entries SET PendingBytes=$1,Dirty=1")
+        .bind((BLOCK + 4096).cast_signed())
+        .execute(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    let cache = f.cache().await;
+    let vfs = f.vfs(cache.clone());
+    let key = vfs.cache_key(&f.items[0]).await.unwrap();
+    assert!(cache.verify_and_protect(&key).await.is_err());
+    assert_eq!(pins(&f, None).await, vec![2, 2]);
+    assert_eq!(
+        cache
+            .get(&cache.lease(key).unwrap(), 0)
+            .await
+            .unwrap()
+            .as_ref(),
+        &f.bytes[..BLOCK_BYTES]
+    );
+}
+
+#[tokio::test]
+async fn mixed_rust_and_legacy_coverage_requires_both_copies_to_be_protected() {
+    let mut f = Fixture::new(true).await;
+    pins(&f, Some(0)).await;
+    enable_writes(&mut f);
+    let db = sqlx::SqlitePool::connect_with(
+        SqliteConnectOptions::new().filename(f.temp.0.join("legacy-meta/catalogue.db")),
+    )
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM Blocks WHERE Offset=0")
+        .execute(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    let path = f.temp.0.join("rust-payload");
+    std::fs::create_dir(&path).unwrap();
+    f.settings
+        .folders
+        .push(infinidysk_native_cache::FolderSettings {
+            id: Uuid::new_v4(),
+            path: path.to_string_lossy().into_owned(),
+            quota_bytes: 1_000_000_000,
+            min_free_bytes: 0,
+            ..Default::default()
+        });
+    let cache = Cache::open(f.settings.clone()).await.unwrap();
+    let vfs = f.vfs(cache.clone());
+    let key = vfs.cache_key(&f.items[0]).await.unwrap();
+    assert!(
+        cache
+            .put(
+                &cache.lease(key.clone()).unwrap(),
+                0,
+                axum::body::Bytes::copy_from_slice(&f.bytes[..BLOCK_BYTES])
+            )
+            .await
+            .unwrap()
+    );
+    cache
+        .set_legacy_reader(
+            LegacyReader::open(f.db.clone(), f.settings.legacy.as_ref().unwrap())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(cache.verify_and_protect(&key).await.unwrap(), Some(true));
+    assert!(cache.entries(0, 10).await.unwrap()[0].pinned);
+    assert!(pins(&f, None).await.contains(&2));
+}
+
+#[tokio::test]
 async fn legacy_handover_refuses_a_live_owner_and_releases_ownership_on_shutdown() {
     use nix::fcntl::{Flock, FlockArg};
     let f = Fixture::new(true).await;
@@ -483,8 +888,10 @@ async fn actual_csharp_payloads_serve_in_place_after_import_without_providers() 
     assert_eq!(imported.fetched, 0);
     for row in &rows {
         let legacy = legacy::Settings {
+            write: None,
             metadata_path: row["metadata_path"].as_str().unwrap().into(),
             folders: vec![legacy::Folder {
+                owner_lock_path: None,
                 id: row["folder_id"].as_str().unwrap().into(),
                 path: row["folder_path"].as_str().unwrap().into(),
             }],

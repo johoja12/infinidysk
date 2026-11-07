@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
-/// Runtime read-only bridge. It never imports payloads or updates either legacy ledger.
+/// Shared compatibility bridge. The original repair ledger stays immutable; cache writes are opt-in.
 pub(crate) struct LegacyReader {
     db: infinidysk_db::Db,
-    legacy: infinidysk_native_cache::legacy::Legacy,
+    legacy: Arc<infinidysk_native_cache::legacy::Legacy>,
+    writer: Option<Arc<infinidysk_native_cache::legacy::Writer>>,
     revisions: infinidysk_import::native::Ledger,
 }
 impl LegacyReader {
@@ -20,19 +21,86 @@ impl LegacyReader {
         settings: &infinidysk_native_cache::legacy::Settings,
     ) -> anyhow::Result<Arc<Self>> {
         let path = std::path::Path::new(&settings.metadata_path);
-        let legacy = infinidysk_native_cache::legacy::Legacy::open_in_place(
-            &path.join("catalogue.db"),
-            &settings.folders,
-        )
-        .await?;
+        let legacy = Arc::new(if settings.write.is_some() {
+            infinidysk_native_cache::legacy::Legacy::open_for_writes(
+                &path.join("catalogue.db"),
+                &settings.folders,
+            )
+            .await?
+        } else {
+            infinidysk_native_cache::legacy::Legacy::open_in_place(
+                &path.join("catalogue.db"),
+                &settings.folders,
+            )
+            .await?
+        });
+        let writer = settings
+            .write
+            .clone()
+            .map(|settings| infinidysk_native_cache::legacy::Writer::new(legacy.clone(), settings))
+            .transpose()?;
         let revisions =
             infinidysk_import::native::Ledger::open_in_place(&path.join("repair-revisions.db"))
                 .await?;
         Ok(Arc::new(Self {
             db,
             legacy,
+            writer,
             revisions,
         }))
+    }
+}
+impl LegacyReader {
+    async fn entry(
+        &self,
+        key: &infinidysk_native_cache::Key,
+    ) -> Result<Option<infinidysk_native_cache::legacy::Entry>, infinidysk_native_cache::Error>
+    {
+        if let Some(generation) = self.original_generation(key).await?
+            && let Some(entry) = self
+                .legacy
+                .find(key.item(), &generation, key.size())
+                .await?
+        {
+            return Ok(Some(entry));
+        }
+        self.legacy
+            .find(
+                key.item(),
+                &format!("rust-v2:{}", key.revision()),
+                key.size(),
+            )
+            .await
+    }
+    async fn original_generation(
+        &self,
+        key: &infinidysk_native_cache::Key,
+    ) -> Result<Option<String>, infinidysk_native_cache::Error> {
+        use infinidysk_native_cache::{Error, Key};
+        let Some(raw) = self
+            .db
+            .import_source(infinidysk_core::ItemId(key.item()))
+            .await
+            .map_err(|_| Error::Invalid("cannot read legacy source provenance"))?
+        else {
+            return Ok(None);
+        };
+        let Ok(source) = serde_json::from_str::<infinidysk_import::native::Source>(&raw) else {
+            return Ok(None);
+        };
+        let Ok(fingerprint) = <[u8; 32]>::try_from(source.fingerprint.as_slice()) else {
+            return Ok(None);
+        };
+        if source.version != 1
+            || Key::from_fingerprint(key.item(), fingerprint, source.size) != *key
+        {
+            return Ok(None);
+        }
+        source
+            .generation(&self.revisions)
+            .await
+            .map(Some)
+            .map_err(|_| Error::Invalid("cannot verify legacy repair generation"))
     }
 }
 impl infinidysk_native_cache::legacy::Reader for LegacyReader {
@@ -43,38 +111,69 @@ impl infinidysk_native_cache::legacy::Reader for LegacyReader {
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> infinidysk_native_cache::legacy::ReadFuture<'a> {
         Box::pin(async move {
-            use infinidysk_native_cache::{Error, Key};
-            let Some(raw) = self
-                .db
-                .import_source(infinidysk_core::ItemId(key.item()))
-                .await
-                .map_err(|_| Error::Invalid("cannot read legacy source provenance"))?
-            else {
-                return Ok(None);
-            };
-            let Ok(source) = serde_json::from_str::<infinidysk_import::native::Source>(&raw) else {
-                return Ok(None);
-            };
-            let Ok(fingerprint) = <[u8; 32]>::try_from(source.fingerprint.as_slice()) else {
-                return Ok(None);
-            };
-            if source.version != 1
-                || Key::from_fingerprint(key.item(), fingerprint, source.size) != *key
-            {
-                return Ok(None);
-            }
-            let generation = source
-                .generation(&self.revisions)
-                .await
-                .map_err(|_| Error::Invalid("cannot verify legacy repair generation"))?;
-            let Some(entry) = self
-                .legacy
-                .find(key.item(), &generation, source.size)
-                .await?
-            else {
+            let Some(entry) = self.entry(key).await? else {
                 return Ok(None);
             };
             self.legacy.read_block(&entry, block, permit).await
+        })
+    }
+    fn coverage<'a>(
+        &'a self,
+        key: &'a infinidysk_native_cache::Key,
+    ) -> infinidysk_native_cache::legacy::CoverageFuture<'a> {
+        Box::pin(async move {
+            let Some(entry) = self.entry(key).await? else {
+                return Ok(vec![]);
+            };
+            self.legacy.coverage(&entry).await
+        })
+    }
+    fn protect<'a>(
+        &'a self,
+        key: &'a infinidysk_native_cache::Key,
+    ) -> infinidysk_native_cache::legacy::WriteFuture<'a> {
+        Box::pin(async move {
+            let Some(entry) = self.entry(key).await? else {
+                return Ok(false);
+            };
+            self.legacy.protect(&entry).await
+        })
+    }
+    fn release<'a>(
+        &'a self,
+        key: &'a infinidysk_native_cache::Key,
+    ) -> infinidysk_native_cache::legacy::WriteFuture<'a> {
+        Box::pin(async move {
+            let Some(entry) = self.entry(key).await? else {
+                return Ok(false);
+            };
+            self.legacy.release(&entry).await
+        })
+    }
+    fn writable(&self) -> bool {
+        self.writer.is_some()
+    }
+    fn written_bytes(&self) -> u64 {
+        self.writer.as_ref().map_or(0, |w| w.written_bytes())
+    }
+    fn write<'a>(
+        &'a self,
+        key: &'a infinidysk_native_cache::Key,
+        block: u64,
+        data: axum::body::Bytes,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> infinidysk_native_cache::legacy::WriteFuture<'a> {
+        Box::pin(async move {
+            let Some(writer) = &self.writer else {
+                return Ok(false);
+            };
+            let generation = self
+                .original_generation(key)
+                .await?
+                .unwrap_or_else(|| format!("rust-v2:{}", key.revision()));
+            writer
+                .put(key.item(), generation, key.size(), block, data, permit)
+                .await
         })
     }
 }

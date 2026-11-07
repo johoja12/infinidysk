@@ -3491,6 +3491,7 @@ mod tests {
             let legacy = Legacy::open(
                 &dir.join("catalogue.db"),
                 &[Folder {
+                    owner_lock_path: None,
                     id: row["folder_id"].as_str().unwrap().into(),
                     path: row["folder_path"].as_str().unwrap().into(),
                 }],
