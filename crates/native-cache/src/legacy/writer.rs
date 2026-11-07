@@ -333,7 +333,8 @@ impl Writer {
         // No catalogue-wide gate is held over this storage I/O.
         let create = entry.clone();
         let volume = root.clone();
-        tokio::task::spawn_blocking(move || create_entry(&volume, &create))
+        let prepare = self.clone();
+        tokio::task::spawn_blocking(move || create_entry(&prepare, &volume, &create))
             .await
             .map_err(|_| Error::Invalid("cache entry preparation failed"))??;
         drop(placement);
@@ -467,7 +468,7 @@ impl Writer {
         self.point("payload_synced")?;
         let journal_lock = self.lock(format!("{}:journal", entry.key));
         let _journal = journal_lock.blocking_lock();
-        let (journal, created) = writable(&dir, "ranges.journal", root.device)?;
+        let (journal, _) = writable(&dir, "ranges.journal", root.device)?;
         let length = journal.metadata()?.len();
         if length
             > (entry.size.cast_unsigned() / BLOCK + 1)
@@ -506,9 +507,10 @@ impl Writer {
         self.point("journal_written")?;
         self.point("before_journal_sync")?;
         journal.sync_all()?;
-        if created {
-            dir.sync_all()?;
-        }
+        // Another failed writer may have created either leaf without durably
+        // publishing its name. Flush the directory even when both leaves exist.
+        self.point("before_entry_sync")?;
+        dir.sync_all()?;
         root.validate()?;
         Ok(OVERHEAD
             .saturating_add(file.metadata()?.blocks().saturating_mul(512))
@@ -560,7 +562,7 @@ impl Writer {
         Ok(())
     }
     async fn reconcile(
-        &self,
+        self: &Arc<Self>,
         entry: &Entry,
         root: Arc<Root>,
         start: u64,
@@ -569,11 +571,13 @@ impl Writer {
     ) -> Result<bool, Error> {
         let entry_copy = entry.clone();
         let expected = hash.to_vec();
-        let writer = self.clone_lock(&entry.key);
+        let journal_lock = self.clone_lock(&entry.key);
+        let writer = self.clone();
         let proof = tokio::task::spawn_blocking(move || {
-            let _journal = writer.blocking_lock();
+            let _journal = journal_lock.blocking_lock();
             let dir = root.entry(&entry_copy.key)?;
             verify_manifest(&root, &dir, &entry_copy)?;
+            create_entry(&writer, &root, &entry_copy)?;
             let journal = leaf(&dir, "ranges.journal", root.device)?;
             if journal.metadata()?.len() > 128 * 1024 * 1024 {
                 return Ok::<_, Error>(None);
@@ -747,10 +751,9 @@ struct Journal {
     count: i32,
     hash: String,
 }
-fn directory(parent: &File, name: &str, device: u64) -> Result<File, Error> {
+fn directory(writer: &Writer, parent: &File, name: &str, device: u64) -> Result<File, Error> {
     match mkdirat(parent, name, Mode::S_IRWXU) {
-        Ok(()) => parent.sync_all()?,
-        Err(nix::errno::Errno::EEXIST) => {}
+        Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
         Err(e) => return Err(e.into()),
     }
     let dir = File::from(openat(
@@ -762,13 +765,17 @@ fn directory(parent: &File, name: &str, device: u64) -> Result<File, Error> {
     if dir.metadata()?.dev() != device {
         return Err(Error::Invalid("cache entry crossed devices"));
     }
+    // An earlier mkdir can be visible after a failed parent flush. EEXIST
+    // proves visibility, not durability, including for another entry's shard.
+    writer.point("before_directory_sync")?;
+    parent.sync_all()?;
     Ok(dir)
 }
-fn create_entry(root: &Root, entry: &Entry) -> Result<(), Error> {
+fn create_entry(writer: &Writer, root: &Root, entry: &Entry) -> Result<(), Error> {
     root.validate()?;
-    let version = directory(&root.file, "v1", root.device)?;
-    let shard = directory(&version, &entry.key[..2], root.device)?;
-    let dir = directory(&shard, &entry.key, root.device)?;
+    let version = directory(writer, &root.file, "v1", root.device)?;
+    let shard = directory(writer, &version, &entry.key[..2], root.device)?;
+    let dir = directory(writer, &shard, &entry.key, root.device)?;
     match openat(
         &dir,
         "manifest.json",

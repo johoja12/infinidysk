@@ -299,12 +299,14 @@ async fn quota_and_free_space_declines_do_not_copy_or_relocate_existing_entries(
 async fn journal_readback_recovers_only_durable_matching_data_and_never_double_reserves() {
     for stage in [
         "reserved",
+        "before_directory_sync",
         "before_write",
         "written",
         "before_payload_sync",
         "payload_synced",
         "journal_written",
         "before_journal_sync",
+        "before_entry_sync",
         "journal_synced",
         "before_catalogue",
         "catalogue_committed",
@@ -328,6 +330,7 @@ async fn journal_readback_recovers_only_durable_matching_data_and_never_double_r
             stage,
             "journal_written"
                 | "before_journal_sync"
+                | "before_entry_sync"
                 | "journal_synced"
                 | "before_catalogue"
                 | "catalogue_committed"
@@ -492,6 +495,8 @@ fn crash_child() {
     let stage = std::env::var("ID_COMPATIBLE_CACHE_CHILD_STAGE").unwrap();
     let stage = match stage.as_str() {
         "reserved" => "reserved",
+        "before_directory_sync" => "before_directory_sync",
+        "before_entry_sync" => "before_entry_sync",
         "written" => "written",
         "journal_synced" => "journal_synced",
         "before_catalogue" => "before_catalogue",
@@ -526,7 +531,9 @@ async fn process_death_at_publication_boundaries_preserves_old_data_and_recovers
     use std::os::unix::process::ExitStatusExt;
     for stage in [
         "reserved",
+        "before_directory_sync",
         "written",
+        "before_entry_sync",
         "journal_synced",
         "before_catalogue",
         "catalogue_committed",
@@ -556,7 +563,7 @@ async fn process_death_at_publication_boundaries_preserves_old_data_and_recovers
             put(&writer, 1).await.unwrap_or(false),
             matches!(
                 stage,
-                "journal_synced" | "before_catalogue" | "catalogue_committed"
+                "before_entry_sync" | "journal_synced" | "before_catalogue" | "catalogue_committed"
             )
         );
         assert_eq!(read(&writer.legacy, 0).await.unwrap(), bytes(0));

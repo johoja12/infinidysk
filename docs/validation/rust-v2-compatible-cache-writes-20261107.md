@@ -1,7 +1,7 @@
 # v1-format cache writes from fork v2
 
 Prepared 2026-11-07. Source: the commit containing this report, based on
-`87dd4901`. This is local implementation and qualification, not a production
+`71a1ab5f`. This is local implementation and qualification, not a production
 cutover. Production cache payloads and services were not changed.
 
 Tracking: [compatible writes #236](https://github.com/johoja12/infinidysk/issues/236),
@@ -48,7 +48,11 @@ of already cached smaller files remain eligible.
 
 The publication order is reservation in SQLite, complete synced manifest, payload
 write and sync, journal append and sync, then committed block coverage in SQLite
-WAL with FULL synchronous mode. New directory entries are synced. Parallel blocks
+WAL with FULL synchronous mode. Every directory link is synced before publication, including pre-existing
+directories: visibility after an earlier failed flush is not proof of durability.
+Payload/journal names are also flushed when already present, and recovery
+re-establishes the directory chain before committing coverage. These additional
+barriers apply to fills and need actual NAS performance measurement. Parallel blocks
 share manifest preparation and serialize journal appends. No payload file is opened
 with truncation. Per-block reader/writer guards prevent a stale failed read from
 invalidating a newly healed block. Caller cancellation cannot release the buffer
@@ -155,7 +159,7 @@ assertions remain. The final workspace rerun uses
 The local fault suite uses disposable generated directories only. It covers sparse
 and chunked parallel publication, duplicate/conflicting blocks, restart, quota and
 reserve refusal, multiple folders, no relocation, short payload/journal writes,
-injected ENOSPC/EIO, ten error boundaries, five subprocess-death boundaries,
+injected ENOSPC/EIO, twelve error boundaries, seven subprocess-death boundaries,
 request cancellation, owner replacement, symlink refusal and changed volumes.
 Application cases cover provider-backed missing/new-source warming, providerless
 restart reuse, automatic warming re-admission without refetch, retained-copy pins,
