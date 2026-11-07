@@ -11,13 +11,33 @@ use crate::csharp::{LongRange, MultipartFile};
 pub struct Ledger(sqlx::SqlitePool);
 impl Ledger {
     pub async fn open(path: &std::path::Path) -> Result<Self, sqlx::Error> {
+        Self::open_inner(path, false).await
+    }
+    /// In-place reuse requires a stopped, checkpointed source and creates no SQLite sidecars.
+    pub async fn open_in_place(path: &std::path::Path) -> Result<Self, sqlx::Error> {
+        let mut wal = path.as_os_str().to_os_string();
+        wal.push("-wal");
+        match std::fs::metadata(std::path::Path::new(&wal)) {
+            Ok(meta) if meta.len() != 0 => {
+                return Err(sqlx::Error::Protocol(
+                    "legacy repair ledger must be stopped and WAL checkpointed".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(sqlx::Error::Io(error)),
+        }
+        Self::open_inner(path, true).await
+    }
+    async fn open_inner(path: &std::path::Path, immutable: bool) -> Result<Self, sqlx::Error> {
         Ok(Self(
             sqlx::sqlite::SqlitePoolOptions::new()
                 .max_connections(1)
                 .connect_with(
                     sqlx::sqlite::SqliteConnectOptions::new()
                         .filename(path)
-                        .read_only(true),
+                        .read_only(true)
+                        .immutable(immutable),
                 )
                 .await?,
         ))

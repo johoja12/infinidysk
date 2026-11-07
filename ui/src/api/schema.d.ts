@@ -2991,6 +2991,11 @@ export interface components {
             /** Format: int32 */
             rejected_entries: number;
         };
+        /** @description Explicit opt-in to an offline, read-only 1.x store. Payloads stay in place. */
+        LegacyCacheSettings: {
+            folders: components["schemas"]["LegacyCacheFolder"][];
+            metadata_path: string;
+        };
         LegacyRepairStatus: {
             evidence_id: string;
             /** Format: uuid */
@@ -3895,6 +3900,8 @@ export interface components {
              * @default 1000
              */
             io_timeout_ms: number;
+            /** @default null */
+            legacy: components["schemas"]["LegacyCacheSettings"] | null;
             /** @default /config/native-cache-v2 */
             metadata_path: string;
             /**
@@ -3918,6 +3925,8 @@ export interface components {
             /** Format: int64 */
             hits: number;
             io: components["schemas"]["NativeCacheIo"];
+            /** Format: int64 */
+            legacy_hits: number;
             /** Format: int64 */
             misses: number;
             /** Format: int64 */
@@ -5536,6 +5545,7 @@ export interface components {
              *       "enabled": false,
              *       "folders": [],
              *       "io_timeout_ms": 1000,
+             *       "legacy": null,
              *       "metadata_path": "/config/native-cache-v2",
              *       "min_file_mb": 100,
              *       "recovery_mode": false

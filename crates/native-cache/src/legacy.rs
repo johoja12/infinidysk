@@ -2,9 +2,11 @@
 //! An exclusive 1.x owner lock prevents racing its writer or eviction process.
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::io::{self, Read};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -20,11 +22,117 @@ use uuid::Uuid;
 
 use crate::{BLOCK, Cache, Error, Key, hex};
 
-#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(as = LegacyCacheFolder)]
 pub struct Folder {
     pub id: String,
     pub path: String,
+}
+/// Explicit opt-in to an offline, read-only 1.x store. Payloads stay in place.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = LegacyCacheSettings)]
+pub struct Settings {
+    pub metadata_path: String,
+    pub folders: Vec<Folder>,
+}
+impl Settings {
+    pub(crate) fn validate(&self, target: &crate::Settings) -> Result<(), Error> {
+        if !Path::new(&self.metadata_path).is_absolute()
+            || self.folders.is_empty()
+            || self.folders.len() > 64
+        {
+            return Err(Error::Invalid(
+                "legacy cache needs an absolute metadata path and 1-64 folders",
+            ));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for folder in &self.folders {
+            let path = Path::new(&folder.path);
+            if folder.id.is_empty()
+                || folder.id.len() > 256
+                || !ids.insert(&folder.id)
+                || !path.is_absolute()
+                || self
+                    .folders
+                    .iter()
+                    .any(|other| other.id != folder.id && overlaps(path, Path::new(&other.path)))
+            {
+                return Err(Error::Invalid(
+                    "legacy cache requires unique folder identities and non-overlapping absolute paths",
+                ));
+            }
+        }
+        self.check_paths(target, |p| Ok(p.to_path_buf()))
+    }
+    pub(crate) fn check_isolation(&self, target: &crate::Settings) -> Result<(), Error> {
+        self.check_paths(target, resolve)
+    }
+    fn check_paths(
+        &self,
+        target: &crate::Settings,
+        resolve: impl Fn(&Path) -> io::Result<std::path::PathBuf>,
+    ) -> Result<(), Error> {
+        let sources = std::iter::once(self.metadata_path.as_str())
+            .chain(self.folders.iter().map(|f| f.path.as_str()));
+        for source in sources {
+            let source = resolve(Path::new(source))?;
+            for destination in std::iter::once(target.metadata_path.as_str())
+                .chain(target.folders.iter().map(|f| f.path.as_str()))
+            {
+                if overlaps(&source, &resolve(Path::new(destination))?) {
+                    return Err(Error::Invalid(
+                        "Rust cache metadata and writable roots must be separate from legacy storage",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+fn checkpointed(path: &Path) -> Result<(), Error> {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    match std::fs::metadata(Path::new(&wal)) {
+        Ok(meta) if meta.len() != 0 => Err(Error::Invalid(
+            "legacy cache must be stopped and WAL checkpointed before in-place handover",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+// Resolve existing ancestors before creating anything, including symlink aliases.
+fn resolve(path: &Path) -> io::Result<std::path::PathBuf> {
+    let mut ancestor = path;
+    let mut tail = Vec::new();
+    loop {
+        match std::fs::canonicalize(ancestor) {
+            Ok(mut path) => {
+                for component in tail.iter().rev() {
+                    path.push(component);
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let Some(name) = ancestor.file_name() else {
+                    return Err(error);
+                };
+                tail.push(name.to_owned());
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The application verifies imported provenance before asking the store for bytes.
+pub type ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Option<Bytes>, Error>> + Send + 'a>>;
+pub trait Reader: Send + Sync {
+    fn read<'a>(&'a self, key: &'a Key, block: u64, permit: OwnedSemaphorePermit)
+    -> ReadFuture<'a>;
 }
 struct Root {
     path: String,
@@ -126,10 +234,24 @@ struct Identity {
 
 impl Legacy {
     pub async fn open(catalogue: &Path, folders: &[Folder]) -> Result<Self, Error> {
-        if !catalogue.is_absolute() || folders.is_empty() || folders.len() > 32 {
+        Self::open_inner(catalogue, folders, false).await
+    }
+    /// A checkpointed store can be read without creating or updating SQLite sidecars.
+    pub async fn open_in_place(catalogue: &Path, folders: &[Folder]) -> Result<Self, Error> {
+        Self::open_inner(catalogue, folders, true).await
+    }
+    async fn open_inner(
+        catalogue: &Path,
+        folders: &[Folder],
+        immutable: bool,
+    ) -> Result<Self, Error> {
+        if !catalogue.is_absolute() || folders.is_empty() || folders.len() > 64 {
             return Err(Error::Invalid(
-                "legacy import requires an absolute catalogue path and 1-32 folders",
+                "legacy access requires an absolute catalogue path and 1-64 folders",
             ));
+        }
+        if immutable {
+            checkpointed(catalogue)?;
         }
         let db = SqlitePoolOptions::new()
             .max_connections(1)
@@ -137,6 +259,7 @@ impl Legacy {
                 SqliteConnectOptions::new()
                     .filename(catalogue)
                     .read_only(true)
+                    .immutable(immutable)
                     .busy_timeout(std::time::Duration::from_secs(1)),
             )
             .await?;
@@ -196,11 +319,68 @@ impl Legacy {
             .map_err(|_| Error::Invalid("legacy folder validation task failed"))??;
             roots.insert(folder.id.clone(), Arc::new(root));
         }
+        if immutable {
+            checkpointed(catalogue)?;
+        }
         Ok(Self { db, roots })
     }
     pub async fn entries(&self, after: &str, limit: u32) -> Result<Vec<Entry>, Error> {
         Ok(sqlx::query_as("SELECT Key AS key,Folder AS folder,ItemId AS item,Length AS size,Pinned AS pinned,Generation AS generation,ChunkSize AS chunk FROM Entries WHERE Key>$1 ORDER BY Key LIMIT $2")
             .bind(after).bind(limit.clamp(1,64)).fetch_all(&self.db).await?)
+    }
+    /// Resolve only an exact independently verified identity; never scan or guess.
+    pub async fn find(
+        &self,
+        item: Uuid,
+        generation: &str,
+        size: u64,
+    ) -> Result<Option<Entry>, Error> {
+        let text = item.simple().to_string();
+        let encoded = format!(
+            "{}:{text}{}:{generation}:{size}",
+            text.len(),
+            generation.len()
+        );
+        let entry: Option<Entry> = sqlx::query_as("SELECT Key AS key,Folder AS folder,ItemId AS item,Length AS size,Pinned AS pinned,Generation AS generation,ChunkSize AS chunk FROM Entries WHERE Key=$1")
+            .bind(hex(&Sha256::digest(encoded.as_bytes())))
+            .fetch_optional(&self.db).await?;
+        Ok(entry.filter(|e| Self::matches(e, item, generation, size)))
+    }
+
+    /// Verify a committed block and return its bytes without publishing or modifying files.
+    /// The physical task retains the volume lock and buffer after cancellation/timeout.
+    pub async fn read_block(
+        &self,
+        entry: &Entry,
+        block: u64,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<Option<Bytes>, Error> {
+        let Some(start) = block
+            .checked_mul(BLOCK)
+            .filter(|s| *s < entry.size.cast_unsigned())
+        else {
+            return Ok(None);
+        };
+        let Some(record): Option<Block> = sqlx::query_as("SELECT Offset AS offset,Count AS count,Hash AS hash FROM Blocks WHERE Key=$1 AND Offset=$2")
+            .bind(&entry.key).bind(i64::try_from(start).map_err(|_| Error::Invalid("legacy offset is too large"))?)
+            .fetch_optional(&self.db).await? else { return Ok(None); };
+        if entry.size <= 0
+            || u64::try_from(record.count) != Ok(BLOCK.min(entry.size.cast_unsigned() - start))
+            || record.hash.len() != 32
+        {
+            return Err(Error::Invalid("invalid legacy integrity block"));
+        }
+        let root = Arc::clone(
+            self.roots
+                .get(&entry.folder)
+                .ok_or(Error::Invalid("legacy folder is not configured"))?,
+        );
+        let entry = entry.clone();
+        let (bytes, _permit) =
+            tokio::task::spawn_blocking(move || read(&root, &entry, &record, permit))
+                .await
+                .map_err(|_| Error::Invalid("legacy cache read task failed"))??;
+        Ok(Some(bytes))
     }
     pub async fn blocks(&self, entry: &Entry, after: i64, limit: u32) -> Result<Vec<Block>, Error> {
         Ok(sqlx::query_as("SELECT Offset AS offset,Count AS count,Hash AS hash FROM Blocks WHERE Key=$1 AND Offset>$2 ORDER BY Offset LIMIT $3")

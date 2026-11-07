@@ -160,7 +160,7 @@ pub(super) fn apply(cs: &Config, settings: &mut Settings, notes: &mut Vec<String
         }
     }
     if cs.get("cache.native.folders").is_some() || cs.get("cache.native.metadata-path").is_some() {
-        notes.push("Native cache storage paths remain inactive; preserve them with fork-export. Select separate Rust folders, then use the verified legacy cache-copy importer".into());
+        notes.push("Native cache storage paths remain inactive; preserve them with fork-export. Configure explicit read-only in-place reuse after stopping the legacy owner and checkpointing its ledgers, or use verified copying into separate Rust folders".into());
     }
 }
 #[cfg(test)]

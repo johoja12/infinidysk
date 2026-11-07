@@ -18,7 +18,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -59,6 +59,8 @@ pub struct Settings {
     pub recovery_mode: bool,
     pub metadata_path: String,
     pub folders: Vec<FolderSettings>,
+    /// Offline legacy payloads are read in place; new writes never target these roots.
+    pub legacy: Option<legacy::Settings>,
     pub buffer_mb: u32,
     pub min_file_mb: u32,
     /// New entries retain this layout even after the configured value changes.
@@ -72,6 +74,7 @@ impl Default for Settings {
             recovery_mode: false,
             metadata_path: "/config/native-cache-v2".to_owned(),
             folders: vec![],
+            legacy: None,
             buffer_mb: 32,
             min_file_mb: 100,
             chunk_mb: 64,
@@ -158,7 +161,10 @@ impl Settings {
                 return Err(Error::Invalid("native cache folders must not overlap"));
             }
         }
-        if self.enabled && !self.folders.iter().any(|f| f.enabled) {
+        if let Some(legacy) = &self.legacy {
+            legacy.validate(self)?;
+        }
+        if self.enabled && !self.folders.iter().any(|f| f.enabled) && self.legacy.is_none() {
             return Err(Error::Invalid("enable at least one native cache folder"));
         }
         Ok(())
@@ -309,9 +315,11 @@ pub struct Cache {
     io: Arc<traffic::Counters>,
     maintenance: Notify,
     hits: AtomicU64,
+    legacy_hits: AtomicU64,
     misses: AtomicU64,
     skipped: AtomicU64,
     failed: AtomicU64,
+    legacy: OnceLock<Arc<dyn legacy::Reader>>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 #[schema(as = NativeCacheEntry)]
@@ -330,6 +338,7 @@ pub struct Stats {
     pub files: u64,
     pub bytes: u64,
     pub hits: u64,
+    pub legacy_hits: u64,
     pub misses: u64,
     pub skipped: u64,
     pub failed: u64,
@@ -348,6 +357,9 @@ pub struct Coverage {
 impl Cache {
     pub async fn open(settings: Settings) -> Result<Arc<Self>, Error> {
         settings.validate()?;
+        if let Some(legacy) = &settings.legacy {
+            legacy.check_isolation(&settings)?;
+        }
         tokio::fs::create_dir_all(&settings.metadata_path).await?;
         let metadata = std::fs::canonicalize(&settings.metadata_path)?;
         let kind = nix::sys::statfs::statfs(&metadata)?.filesystem_type().0;
@@ -558,9 +570,11 @@ impl Cache {
             maintenance: Notify::new(),
             io: Arc::default(),
             hits: AtomicU64::new(0),
+            legacy_hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            legacy: OnceLock::new(),
         }))
     }
     pub async fn repair_lineage(&self) -> Result<Option<(Uuid, u64)>, Error> {
@@ -597,7 +611,7 @@ impl Cache {
     }
 
     pub fn lease(&self, key: Key) -> Option<Arc<Lease>> {
-        if key.size < u64::from(self.settings.min_file_mb) * MB
+        if (key.size < u64::from(self.settings.min_file_mb) * MB && self.legacy.get().is_none())
             || key.size > i64::MAX.cast_unsigned()
         {
             return None;
@@ -627,9 +641,23 @@ impl Cache {
         lock
     }
     pub async fn get(&self, lease: &Lease, block: u64) -> Option<Bytes> {
-        let result = if let Ok(result) =
-            tokio::time::timeout(self.deadline(), self.read(lease, block)).await
-        {
+        let lookup = async {
+            if let Some(data) = self.read(lease, block).await? {
+                return Ok(Some(data));
+            }
+            let Some(legacy) = self.legacy.get() else {
+                return Ok(None);
+            };
+            let Ok(permit) = Arc::clone(&self.slots).acquire_owned().await else {
+                return Ok(None);
+            };
+            let bytes = legacy.read(&lease.key, block, permit).await?;
+            if bytes.is_some() {
+                self.legacy_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok::<_, Error>(bytes)
+        };
+        let result = if let Ok(result) = tokio::time::timeout(self.deadline(), lookup).await {
             result
         } else {
             self.read_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -650,6 +678,18 @@ impl Cache {
                 None
             }
         }
+    }
+    /// Install once, before admitting playback. The application owns source-provenance checks.
+    pub fn set_legacy_reader(&self, reader: Arc<dyn legacy::Reader>) -> Result<(), Error> {
+        self.legacy
+            .set(reader)
+            .map_err(|_| Error::Invalid("legacy cache reader is already installed"))
+    }
+    /// Warming must not fetch misses when no destination can retain the result.
+    pub fn can_fill(&self, key: &Key) -> bool {
+        !self.settings.recovery_mode
+            && key.size >= u64::from(self.settings.min_file_mb) * MB
+            && self.folders.iter().any(|f| !f.settings.read_only)
     }
     async fn read(&self, lease: &Lease, block: u64) -> Result<Option<Bytes>, Error> {
         let key = &lease.key;
@@ -758,6 +798,9 @@ impl Cache {
             return Ok(false);
         }
         let key = &lease.key;
+        if key.size < u64::from(self.settings.min_file_mb) * MB {
+            return Ok(false);
+        }
         let Some(start) = block.checked_mul(BLOCK).filter(|at| *at < key.size) else {
             return Ok(false);
         };
@@ -1069,6 +1112,7 @@ impl Cache {
             files: files.cast_unsigned(),
             bytes: bytes.cast_unsigned(),
             hits: self.hits.load(Ordering::Relaxed),
+            legacy_hits: self.legacy_hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             skipped: self.skipped.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),

@@ -125,6 +125,7 @@ impl NativeReader {
             return Poll::Ready(Ok(()));
         }
         if within == 0
+            && self.cache.can_fill(self.lease.key())
             && self.fill.is_none()
             && self.gaps.fill_generation() == generation
             && let Some(permit) = self.cache.try_buffer()

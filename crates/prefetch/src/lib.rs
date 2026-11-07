@@ -936,6 +936,21 @@ impl Queue {
             self.checkpoint(&job, bytes.len() as u64, false).await?;
             return Ok(true);
         }
+        if !cache.can_fill(&key) {
+            let mut current = self.lock_ledger().await?;
+            let mut next = current.clone();
+            if let Some(j) = next
+                .jobs
+                .iter_mut()
+                .find(|j| j.id == job.id && j.state == State::Queued)
+            {
+                j.next_attempt = now_ms() + RETRY_MS;
+                j.reason = Some("Uncached blocks require an eligible writable cache folder".into());
+            }
+            self.save(&mut current, next).await?;
+            drop(current);
+            return Ok(false);
+        }
         let length = BLOCK.min(job.size - job.offset);
         let Some(permit) = cache.try_buffer() else {
             return Ok(false);

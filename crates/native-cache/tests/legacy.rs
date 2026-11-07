@@ -288,6 +288,147 @@ async fn live_owner_or_missing_volume_refuses_legacy_adoption() {
 }
 
 #[tokio::test]
+async fn direct_reads_preserve_sparse_and_chunked_payloads_and_reject_corruption() {
+    for chunk in [0, 2 * BLOCK.cast_signed()] {
+        let fixture = Fixture::new(chunk).await;
+        let legacy = Legacy::open(&fixture.catalogue, std::slice::from_ref(&fixture.folder))
+            .await
+            .unwrap();
+        let entry = legacy
+            .find(
+                fixture.item,
+                &fixture.generation,
+                fixture.bytes.len() as u64,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            legacy
+                .find(fixture.item, "changed", fixture.bytes.len() as u64)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        for block in 0..3 {
+            let bytes = legacy
+                .read_block(&entry, block, slots.clone().acquire_owned().await.unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            let start = usize::try_from(block).unwrap() * BLOCK_BYTES;
+            assert_eq!(
+                bytes.as_ref(),
+                &fixture.bytes[start..(start + BLOCK_BYTES).min(fixture.bytes.len())]
+            );
+        }
+        assert!(
+            legacy
+                .read_block(&entry, 3, slots.clone().acquire_owned().await.unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let payload = if chunk == 0 {
+            fixture.payload()
+        } else {
+            PathBuf::from(&fixture.folder.path)
+                .join("v1")
+                .join(&fixture.entry[..2])
+                .join(&fixture.entry)
+                .join("chunk-0000000000000000.data")
+        };
+        let before = std::fs::read(&payload).unwrap();
+        let mut bad = before.clone();
+        bad[0] ^= 1;
+        std::fs::write(&payload, &bad).unwrap();
+        assert!(
+            legacy
+                .read_block(&entry, 0, slots.acquire_owned().await.unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(&payload).unwrap(),
+            bad,
+            "reader must not repair or rewrite corrupt data"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_settings_reject_aliases_before_creating_destination_files() {
+    let fixture = Fixture::new(0).await;
+    let alias = fixture.root.join("alias");
+    symlink(&fixture.folder.path, &alias).unwrap();
+    std::fs::create_dir(fixture.root.join("source-meta")).unwrap();
+    let settings = Settings {
+        enabled: true,
+        metadata_path: alias.join("must-not-create").to_string_lossy().into_owned(),
+        legacy: Some(infinidysk_native_cache::legacy::Settings {
+            metadata_path: fixture
+                .root
+                .join("source-meta")
+                .to_string_lossy()
+                .into_owned(),
+            folders: vec![fixture.folder.clone()],
+        }),
+        ..Settings::default()
+    };
+    assert!(Cache::open(settings).await.is_err());
+    assert!(!alias.join("must-not-create").exists());
+}
+
+#[test]
+fn cancelled_direct_read_keeps_physical_ownership_until_queued_io_finishes() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let fixture = Fixture::new(0).await;
+        let legacy = Legacy::open(&fixture.catalogue, std::slice::from_ref(&fixture.folder))
+            .await
+            .unwrap();
+        let entry = legacy
+            .find(
+                fixture.item,
+                &fixture.generation,
+                fixture.bytes.len() as u64,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        entered_rx.await.unwrap();
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            legacy.read_block(&entry, 0, slots.clone().acquire_owned().await.unwrap()),
+        )
+        .await;
+        assert!(result.is_err());
+        drop(legacy);
+        assert_eq!(slots.available_permits(), 0);
+        let owner = PathBuf::from(&fixture.folder.path).join(".infinidysk-owner");
+        assert!(Flock::lock(File::open(&owner).unwrap(), FlockArg::LockExclusiveNonblock).is_err());
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
+        assert_eq!(slots.available_permits(), 1);
+        assert!(Flock::lock(File::open(owner).unwrap(), FlockArg::LockExclusiveNonblock).is_ok());
+    });
+}
+
+#[tokio::test]
 #[ignore = "requires the real 1.x C# writer fixture; see scripts/fixtures/legacy-native-cache"]
 async fn real_csharp_writer_payloads_are_reused_and_partial_coverage_stays_partial() {
     let path = std::env::var("INFINIDYSK_LEGACY_CACHE_FIXTURE").expect("fixture receipt path");

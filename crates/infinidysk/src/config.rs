@@ -1519,6 +1519,10 @@ impl Settings {
                     .folders
                     .iter()
                     .any(|f| overlaps(&dir.path, &f.path))
+                || self.native_cache.legacy.as_ref().is_some_and(|legacy| {
+                    overlaps(&dir.path, &legacy.metadata_path)
+                        || legacy.folders.iter().any(|f| overlaps(&dir.path, &f.path))
+                })
                 || self
                     .imports
                     .library_dirs

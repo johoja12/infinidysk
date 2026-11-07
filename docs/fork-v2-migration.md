@@ -17,8 +17,8 @@ This draft is not a production cutover. Live integration, production storage and
 controlled performance acceptance remain distinct from generated local POC results.
 
 The 1.x source and production deployment remain unchanged. Port behavior into the
-Rust architecture; do not copy C# storage formats or add a second cache in front of
-FUSE/WebDAV. Keep 1.x synchronization pointed at upstream `v1`. Rust changes follow
+Rust architecture while preserving existing storage compatibility where required;
+do not add a second cache in front of FUSE/WebDAV. Keep 1.x synchronization pointed at upstream `v1`. Rust changes follow
 upstream `main`. Do not merge this migration into the production branch until the
 acceptance gates below pass.
 
@@ -32,9 +32,11 @@ See [local acceptance](validation/rust-v2-acceptance-0c577cc1-20261107.md) and t
 integration, NAS and matched v1/v2 performance qualification remain open.
 
 Production storage requirement (2026-11-07): reuse existing cache payloads in
-place without copying or removal. The verified-copy bridge does not meet this
-requirement. A direct legacy-cache read path, exclusive ownership handover and
-rollback qualification are additional production blockers; see the plan above.
+place without copying or removal. An explicit read-only legacy adapter now connects
+the original catalogue/payloads to shared playback and warming lookups. See
+[in-place cache compatibility](validation/rust-v2-in-place-cache-20261107.md).
+Actual NAS handover, rollback and compatible-write qualification remain production
+gates; the copy importer is not the required production migration path.
 
 ## Status and order
 
@@ -55,7 +57,7 @@ Later increments supersede pending lists in earlier checkpoint sections.
 | R05 | P0 | Resumable imported-content validation and fair forced rechecks (`ImportedContentSweepService`, `IFileRecheckQueue`) | Rust health sampling/rechecks exist. Compare scheduling fairness, known-hole BODY probes, durable cursor, quotas and cancellation. | Durable sampled-content snapshot, cursor, pause/resume, category and run limits implemented; fair maintenance slots and revision-safe fault publication included |
 | R06 | P0 | Shared regrab intent/outcome tracking, guarded link removal, detached replacement observation (`Services/Regrab`, `ArrRegrab` API) | Rust health states and `arr::replace` exist; add durable reconciliation for partial/uncertain Arr writes and library-root ownership checks. A non-2xx DELETE may already have removed the link; reconcile before retry. | Durable source-bound journal, detached observation, revision-checked controls and current Arr-root authority implemented; read-only scan-root guards at admission and every mutation checkpoint included |
 | R07 | P0 | Bounded PAR2 repair attempts without holding the health worker (`Par2RepairService`, `0a3bba3a`, `42f09136`) | Separate bounded GF16 reconstruction lane with exact original-post proof binding, complete-article assembly, shared-reader/source publication admission and durable intent/outcome recovery. Provider outages defer work without proving permanent damage. | Automatic opt-in worker, durable journal/readback, original-post discovery, shared-reader publication admission and fresh-check completion implemented; runtime qualification below |
-| C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | First implementation in Rust; verified 1.x copy import implemented; broader fork data import remains M01 |
+| C01 | P0 | Native final-media cache with verified block coverage and source revisions (`Services/NativeCache`, `NativeCachedStream`) | `crates/stream/{cache,disk}.rs` caches decoded articles, not the fork's final-media chunks. Design a shared VFS/stream cache interface before implementing final-media retention. | Implemented shared Rust final-media cache, verified 1.x copy import and explicit read-only in-place 1.x playback/warming reuse; actual NAS acceptance remains open |
 | C02 | P0 | Cache folder ownership, mount identity, quota/free-space reserves, watermarks, read-only folders, safe eviction and pinning (`NativeCacheStore`, `NativeFileSystem`) | Rust disk cache has capacity/age eviction; multi-folder placement, file retention and NAS failure behavior need parity. Never reuse legacy cache roots writable during a trial. | Core ownership/quotas/age-pressure eviction/pins, durable retained-copy health protection and bounded block/folder probes implemented; source-bound manifest reconstruction, explicit read-only recovery mode and current-revision verification implemented; live NAS acceptance remains open |
 | C03 | P0 | Repair revisions, generation-safe multipart identity, invalidation after replacement/removal (`ContentRevisionTracker`, `RepairRevisionStore`, `MultipartContentIdentity`) | New Rust metadata/blob versions and article cache identities require explicit mapping. Test stale revision exclusion and concurrent eviction/read behavior. | Durable article ledger, admission stamps, decoded-cache namespaces, final-media keys and dependent-reader guards implemented; startup/lineage checks, later cache attachment guards and retained-hash fallback implemented; automatic PAR2 publication is connected through the opt-in durable worker |
 | C04 | P1 | Progressive cold reads, bounded first-byte fill, coalesced fills, source window reuse (`NativeCachedStream`, `NativeSourceCacheStream`; `c6a70ba8`, `0c3c129f`) | Rust segment cache already coalesces in-flight reads. Benchmark FUSE/WebDAV seeks before adding buffering; preserve foreground priority and bounded memory/I/O under NAS stalls. | Progressive read-through and parallel block commits implemented; generated cold/seek release benchmarks and fresh-process providerless cache POC passed; live performance qualification remains open |

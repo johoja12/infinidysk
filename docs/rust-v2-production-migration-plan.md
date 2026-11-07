@@ -10,11 +10,12 @@ cache as part of migration. Stop v1 before handing cache ownership to v2.
 Concurrent writable ownership is forbidden. Config/database backups remain
 required; they are distinct from copying cache payloads.
 
-**Current blocker:** the implemented legacy bridge verifies and copies blocks
-into Rust-owned cache entries. It does not provide an application read path
-that serves legacy payloads directly in place. That bridge does not meet this
-storage policy. Production migration requires an in-place compatibility read
-path and its qualification first. A cold-cache start is not an accepted fallback.
+**Implementation update:** an explicit read-only legacy adapter now serves
+verified v1 payloads in place through the shared playback/warming lookup.
+See [compatibility validation and setup](validation/rust-v2-in-place-cache-20261107.md).
+Actual production NAS handover, performance and rollback still need qualification.
+Compatible writes to the original v1 format remain separate work. A cold-cache
+start or verified-copy migration is not an accepted fallback.
 
 ## Source and upstream sync
 
@@ -23,7 +24,9 @@ both pointed to `0c577cc1c8bede5116b8ff5ac8b83b6a9de4d3ad`. Latest upstream Rust
 `main`, `e3e0507366d9e17abda275018644d3aa92f069f2`, was already an ancestor.
 `git rev-list --count HEAD..upstream/main` returned zero. Sync required no merge.
 
-Use that application revision as the initial rehearsal baseline. The
+That revision is the pre-adapter validation baseline. It cannot exercise the new
+in-place adapter. Build and validate an exact image from the commit containing
+the adapter before any real-storage rehearsal. The
 [local acceptance report](validation/rust-v2-acceptance-0c577cc1-20261107.md)
 records generated-data, original C# writer, kernel FUSE and release-image checks.
 It does not qualify copied production data, live integrations or production
@@ -79,7 +82,7 @@ bytes. Do not attempt to duplicate this cache onto the local filesystem.
 | --- | --- | --- |
 | Feature usage | Review the fork inventory and actual client usage. Resolve Preflight `standard`; also check Watchtower, Warden, search/indexers/Prowlarr, addon/Stremio and unsupported clients. Agree a replacement or explicitly accepted loss for each used feature. | Product owner and operator |
 | Migration fidelity | Copied real installation imports successfully, with accepted carried/skipped/unsupported report, exact ID/path/account/category checks and all unresolved repair/regrab work accounted for. | Migration operator |
-| In-place cache compatibility | Implement and qualify direct reads from the existing roots without payload copying/removal or legacy metadata rewrites. Prove lock handover, volume identity, generation/checksum validation and rollback. | Cache engineer and storage operator |
+| In-place cache compatibility | Qualify the implemented direct reader on the actual roots without payload copying/removal or legacy metadata rewrites. Prove lock handover, volume identity, generation/checksum validation and rollback. | Cache engineer and storage operator |
 | Client compatibility | Prove real SAB, WebDAV, native FUSE, authentication, Plex and Arr behavior using isolated clients and generic canaries. | Application operator |
 | Performance | Matched v1/v2 measurements on the same host and corpus, with cold/warm status, concurrency and provider budget recorded. | Validation operator |
 | Recovery | Restore the v1 backup into a disposable environment and rehearse mount/service rollback. Define how post-cutover imports are reconciled. | Application and database operators |
@@ -176,19 +179,22 @@ Legacy cache paths currently import inactive. Existing
 qualifies a copy workflow, which is excluded by the required storage policy.
 `crates/native-cache/src/legacy.rs` opens the catalogue read-only and validates
 volume identity, provenance, manifests and checksums, but its `copy_block` method
-publishes bytes into a different cache entry. Production integration currently
-uses that copy method; the VFS does not directly read this legacy store.
+publishes bytes into a different cache entry. The new explicit in-place adapter
+instead validates imported provenance and repair generation on shared cache misses
+and returns checksummed legacy bytes directly. It creates no payload copies.
 
-Required engineering work before a real-storage trial:
+Implementation and remaining qualification before a real-storage trial:
 
-1. Add a bounded, cancellation-safe legacy block read interface and integrate it
-   into the shared VFS/cache read path used by FUSE and WebDAV. Serve verified
-   existing bytes directly without a second persistent copy or payload rewrite.
+1. The bounded legacy read interface and shared playback/warming integration are
+   implemented. Qualify them on the actual NAS with unchanged payloads and an
+   exact newly built image; previous images do not contain this adapter.
 2. Preserve original catalogue, manifests, sparse/chunked layout, repair ledger,
    pins and retained generations. Bind reads to imported source provenance and
    the independently derived generation. Do not silently replace legacy files.
    Define safe missing/corrupt-block behavior.
-3. Transfer ownership only after all v1 writers stop. Require the original
+3. Transfer ownership only after all v1 writers stop and both SQLite ledgers are
+   checkpointed. The adapter rejects nonempty WALs and uses immutable read-only
+   SQLite connections to avoid sidecar writes. Require the original
    device/inode registration, volume marker and exclusive owner lock. Reject a
    changed/unavailable mount. Never edit identity records to force acceptance.
 4. Keep v2 metadata separate and additive. If new fills are needed, specify a
@@ -346,7 +352,8 @@ is recorded above. Local document links
 and `git diff --check` passed. These checks did not exercise production storage.
 
 - [ ] Feature gaps accepted; actual consumer/writer inventory complete.
-- [ ] In-place cache compatibility implemented and qualified; no cache copying/removal.
+- [x] Read-only in-place adapter implemented and locally qualified without cache copying/removal.
+- [ ] Actual NAS ownership handover, performance, rollback and write policy qualified.
 - [ ] Rehearsal snapshot, restore receipt and final migration report accepted.
 - [ ] Isolated real-data, integration, NAS failure and matched performance gates passed.
 - [ ] Exact deliverable image and CI status recorded; private first-start config reviewed.

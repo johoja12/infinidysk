@@ -235,6 +235,15 @@ pub async fn serve(
     vars: impl IntoIterator<Item = (String, String)>,
     cancel: CancellationToken,
 ) -> anyhow::Result<Exit> {
+    // Startup retains several configuration snapshots; keep that state off caller stacks.
+    Box::pin(serve_inner(listener, boot, vars, cancel)).await
+}
+async fn serve_inner(
+    listener: TcpListener,
+    boot: &Boot,
+    vars: impl IntoIterator<Item = (String, String)>,
+    cancel: CancellationToken,
+) -> anyhow::Result<Exit> {
     let pending = crate::backup::boot::apply_pending(boot)?;
     let vars: Vec<(String, String)> = vars.into_iter().collect();
     let default_cache_dir = boot.home.join("cache").display().to_string();
@@ -374,6 +383,21 @@ pub async fn serve(
     } else {
         (None, None)
     };
+    if let Some(legacy) = &settings.native_cache.legacy
+        && settings.native_cache.enabled
+    {
+        let cache = native_cache.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("legacy cache handover requires an available native cache")
+        })?;
+        let reader = tokio::time::timeout(
+            Duration::from_secs(5),
+            Box::pin(crate::native_cache::LegacyReader::open(db.clone(), legacy)),
+        )
+        .await
+        .context("legacy cache ownership handover timed out")??;
+        cache.set_legacy_reader(reader)?;
+        info!("legacy native cache enabled for read-only in-place reuse");
+    }
     let cache = Arc::new(Cache::new(
         tuning.memory_cache_enabled,
         u64::from(tuning.memory_cache_mb) * MB,

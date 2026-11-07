@@ -8,6 +8,77 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::{IntoParams, ToSchema};
 
+/// Runtime read-only bridge. It never imports payloads or updates either legacy ledger.
+pub(crate) struct LegacyReader {
+    db: infinidysk_db::Db,
+    legacy: infinidysk_native_cache::legacy::Legacy,
+    revisions: infinidysk_import::native::Ledger,
+}
+impl LegacyReader {
+    pub(crate) async fn open(
+        db: infinidysk_db::Db,
+        settings: &infinidysk_native_cache::legacy::Settings,
+    ) -> anyhow::Result<Arc<Self>> {
+        let path = std::path::Path::new(&settings.metadata_path);
+        let legacy = infinidysk_native_cache::legacy::Legacy::open_in_place(
+            &path.join("catalogue.db"),
+            &settings.folders,
+        )
+        .await?;
+        let revisions =
+            infinidysk_import::native::Ledger::open_in_place(&path.join("repair-revisions.db"))
+                .await?;
+        Ok(Arc::new(Self {
+            db,
+            legacy,
+            revisions,
+        }))
+    }
+}
+impl infinidysk_native_cache::legacy::Reader for LegacyReader {
+    fn read<'a>(
+        &'a self,
+        key: &'a infinidysk_native_cache::Key,
+        block: u64,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> infinidysk_native_cache::legacy::ReadFuture<'a> {
+        Box::pin(async move {
+            use infinidysk_native_cache::{Error, Key};
+            let Some(raw) = self
+                .db
+                .import_source(infinidysk_core::ItemId(key.item()))
+                .await
+                .map_err(|_| Error::Invalid("cannot read legacy source provenance"))?
+            else {
+                return Ok(None);
+            };
+            let Ok(source) = serde_json::from_str::<infinidysk_import::native::Source>(&raw) else {
+                return Ok(None);
+            };
+            let Ok(fingerprint) = <[u8; 32]>::try_from(source.fingerprint.as_slice()) else {
+                return Ok(None);
+            };
+            if source.version != 1
+                || Key::from_fingerprint(key.item(), fingerprint, source.size) != *key
+            {
+                return Ok(None);
+            }
+            let generation = source
+                .generation(&self.revisions)
+                .await
+                .map_err(|_| Error::Invalid("cannot verify legacy repair generation"))?;
+            let Some(entry) = self
+                .legacy
+                .find(key.item(), &generation, source.size)
+                .await?
+            else {
+                return Ok(None);
+            };
+            self.legacy.read_block(&entry, block, permit).await
+        })
+    }
+}
+
 #[derive(Serialize, ToSchema)]
 #[schema(as = NativeCacheStatus)]
 pub struct Status {
@@ -399,3 +470,6 @@ pub async fn recover(
             .map_err(|e| fail(&e))?,
     ))
 }
+
+#[cfg(test)]
+mod legacy_tests;
