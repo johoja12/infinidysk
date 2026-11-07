@@ -24,10 +24,17 @@ acceptance gates below pass.
 
 ## Latest upstream sync
 
-On 2026-11-05 the migration branch incorporated upstream Rust `main` through
-`d4f5daf5991447d2726a5b22d9232c5d9c265c94`, including OIDC, backup/restore and database
-transfer. Fork database transfer covers all 38 application tables. See
-[upstream sync validation](validation/rust-v2-upstream-sync-20261105.md).
+On 2026-11-07 both remotes were refreshed. The migration branch at
+`0c577cc1c8bede5116b8ff5ac8b83b6a9de4d3ad` already contained upstream Rust `main`
+through `e3e0507366d9e17abda275018644d3aa92f069f2`; no additional merge was needed.
+See [local acceptance](validation/rust-v2-acceptance-0c577cc1-20261107.md) and the
+[production migration plan](rust-v2-production-migration-plan.md). Live migration,
+integration, NAS and matched v1/v2 performance qualification remain open.
+
+Production storage requirement (2026-11-07): reuse existing cache payloads in
+place without copying or removal. The verified-copy bridge does not meet this
+requirement. A direct legacy-cache read path, exclusive ownership handover and
+rollback qualification are additional production blockers; see the plan above.
 
 ## Status and order
 
