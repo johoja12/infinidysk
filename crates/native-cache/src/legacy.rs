@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::{BLOCK, Cache, Error, Key, hex};
 mod writer;
-pub use writer::{WriteFolder, WriteSettings, Writer};
+pub use writer::{EvictionPolicy, WriteFolder, WriteSettings, Writer};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(as = LegacyCacheFolder)]
@@ -33,7 +33,7 @@ pub struct Folder {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_lock_path: Option<String>,
 }
-/// Explicit opt-in to an offline, read-only 1.x store. Payloads stay in place.
+/// Explicit bridge to an exclusively owned 1.x store. Read-only unless writes are configured.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(as = LegacyCacheSettings)]
 pub struct Settings {
@@ -155,6 +155,41 @@ pub type ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Option<Bytes>, Erro
 pub type WriteFuture<'a> = Pin<Box<dyn Future<Output = Result<bool, Error>> + Send + 'a>>;
 pub type CoverageFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<crate::Coverage>, Error>> + Send + 'a>>;
+pub type MaintenanceFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>;
+/// Admission and private recovery ledger for compatible-cache maintenance.
+pub struct Maintenance {
+    pub(crate) cache: Arc<Cache>,
+}
+impl Maintenance {
+    fn claim(&self, item: Uuid) -> Option<ItemGuard> {
+        let mut live = self
+            .cache
+            .live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if live.readers.keys().any(|key| key.item() == item) || !live.legacy_evicting.insert(item) {
+            return None;
+        }
+        drop(live);
+        Some(ItemGuard {
+            item,
+            live: self.cache.live.clone(),
+        })
+    }
+}
+struct ItemGuard {
+    item: Uuid,
+    live: Arc<Mutex<crate::Live>>,
+}
+impl Drop for ItemGuard {
+    fn drop(&mut self) {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .legacy_evicting
+            .remove(&self.item);
+    }
+}
 pub trait Reader: Send + Sync {
     fn read<'a>(&'a self, key: &'a Key, block: u64, permit: OwnedSemaphorePermit)
     -> ReadFuture<'a>;
@@ -163,6 +198,12 @@ pub trait Reader: Send + Sync {
     }
     fn written_bytes(&self) -> u64 {
         0
+    }
+    fn maintain(&self, _context: Maintenance) -> MaintenanceFuture<'_> {
+        Box::pin(async { Ok(()) })
+    }
+    fn flush_recency(&self) -> MaintenanceFuture<'_> {
+        Box::pin(async { Ok(()) })
     }
     fn coverage<'a>(&'a self, _key: &'a Key) -> CoverageFuture<'a> {
         Box::pin(async { Ok(vec![]) })
@@ -258,8 +299,10 @@ pub struct Legacy {
     invalid: Arc<Mutex<HashSet<(String, u64)>>>,
     block_locks: Arc<BlockLocks>,
     has_pending: bool,
+    recency: Option<Arc<crate::recency::Updates>>,
+    access_buckets: Arc<Mutex<HashMap<String, i64>>>,
 }
-#[derive(Clone, Debug, FromRow)]
+#[derive(Clone, Debug, FromRow, Serialize, Deserialize)]
 pub struct Entry {
     pub key: String,
     pub folder: String,
@@ -327,6 +370,9 @@ impl Legacy {
             )
             .await?;
         legacy.writable = true;
+        legacy.recency = Some(Arc::new(crate::recency::Updates::start_legacy(
+            legacy.db.clone(),
+        )));
         Ok(legacy)
     }
     async fn open_inner(
@@ -435,6 +481,8 @@ impl Legacy {
             invalid: Arc::default(),
             block_locks: Arc::default(),
             has_pending,
+            recency: None,
+            access_buckets: Arc::default(),
         })
     }
     pub async fn entries(&self, after: &str, limit: u32) -> Result<Vec<Entry>, Error> {
@@ -516,6 +564,7 @@ impl Legacy {
         Ok(ranges)
     }
     pub async fn protect(&self, entry: &Entry) -> Result<bool, Error> {
+        let _entry = self.entry_lock(&entry.key).read_owned().await;
         if !self.writable {
             return Ok(entry.pinned != 0);
         }
@@ -530,6 +579,7 @@ impl Legacy {
         Ok(pinned.is_some_and(|p| p != 0))
     }
     pub async fn release(&self, entry: &Entry) -> Result<bool, Error> {
+        let _entry = self.entry_lock(&entry.key).read_owned().await;
         if !self.writable {
             return Ok(false);
         }
@@ -573,6 +623,48 @@ impl Legacy {
         locks.insert(id, Arc::downgrade(&lock));
         lock
     }
+    fn entry_lock(&self, key: &str) -> Arc<tokio::sync::RwLock<()>> {
+        // Valid block indices are bounded by i64::MAX / BLOCK; reserve this index.
+        self.block_lock(key, u64::MAX)
+    }
+    fn touch(&self, key: &str) {
+        if let Some(recency) = &self.recency {
+            let bucket = crate::now() / 300_000;
+            let mut seen = self
+                .access_buckets
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if seen.get(key).is_some_and(|at| *at >= bucket) {
+                return;
+            }
+            // Bounded memoization avoids a telemetry transaction per block. Clearing
+            // the memo can only enqueue duplicate monotonic updates, never lose one.
+            if seen.len() >= 4096 {
+                seen.clear();
+            }
+            seen.insert(key.into(), bucket);
+            drop(seen);
+            recency.touch(key.into(), bucket);
+        }
+    }
+    pub async fn flush_recency(&self) -> Result<(), Error> {
+        let Some(recency) = &self.recency else {
+            return Ok(());
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while recency.pending() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| Error::Invalid("compatible cache recency is still pending"))?;
+        if recency.dropped() != 0 {
+            return Err(Error::Invalid(
+                "compatible cache recency was lost; eviction remains held",
+            ));
+        }
+        Ok(())
+    }
     async fn record(&self, entry: &Entry, block: u64) -> Result<Option<Block>, Error> {
         let Some(start) = block
             .checked_mul(BLOCK)
@@ -580,7 +672,10 @@ impl Legacy {
         else {
             return Ok(None);
         };
-        let record:Option<Block>=sqlx::query_as("SELECT Offset AS offset,Count AS count,Hash AS hash FROM Blocks WHERE Key=$1 AND Offset=$2").bind(&entry.key).bind(start.cast_signed()).fetch_optional(&self.db).await?;
+        // The same generation may be refilled in a different folder after eviction.
+        // A stale entry handle must not read/invalidate that new copy using its old path.
+        let record:Option<Block>=sqlx::query_as("SELECT b.Offset AS offset,b.Count AS count,b.Hash AS hash FROM Blocks b JOIN Entries e ON e.Key=b.Key WHERE b.Key=$1 AND b.Offset=$2 AND e.Folder=$3 AND e.Length=$4 AND e.ChunkSize=$5 AND e.Generation IS $6")
+            .bind(&entry.key).bind(start.cast_signed()).bind(&entry.folder).bind(entry.size).bind(entry.chunk).bind(&entry.generation).fetch_optional(&self.db).await?;
         if record.as_ref().is_some_and(|r| {
             u64::try_from(r.count) != Ok(BLOCK.min(entry.size.cast_unsigned() - start))
                 || r.hash.len() != 32
@@ -608,6 +703,7 @@ impl Legacy {
         block: u64,
         permit: OwnedSemaphorePermit,
     ) -> Result<Option<Bytes>, Error> {
+        let _entry_guard = self.entry_lock(&entry.key).read_owned().await;
         let lock = self.block_lock(&entry.key, block);
         let read_guard = if let Ok(guard) = lock.clone().try_read_owned() {
             guard
@@ -630,6 +726,7 @@ impl Legacy {
         let (first, permit) = Self::fetch(root.clone(), entry.clone(), record, permit).await?;
         let error = match first {
             Ok(bytes) => {
+                self.touch(&entry.key);
                 self.invalid
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -651,6 +748,7 @@ impl Legacy {
         let (second, _permit) = Self::fetch(root.clone(), entry.clone(), record, permit).await?;
         match second {
             Ok(bytes) => {
+                self.touch(&entry.key);
                 self.invalid
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)

@@ -280,6 +280,7 @@ impl Folder {
 struct Live {
     readers: HashMap<Key, usize>,
     evicting: HashSet<Key>,
+    legacy_evicting: HashSet<Uuid>,
 }
 /// Protects an entry from eviction for the whole read/warm, including client pauses.
 pub struct Lease {
@@ -395,6 +396,7 @@ impl Cache {
             "CREATE TABLE IF NOT EXISTS blocks(key TEXT NOT NULL REFERENCES entries(key) ON DELETE CASCADE,block BIGINT NOT NULL,len BIGINT NOT NULL,hash TEXT NOT NULL,valid INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(key,block))",
             "CREATE INDEX IF NOT EXISTS cache_entries_eviction ON entries(folder,pinned,used)",
             "CREATE TABLE IF NOT EXISTS evictions(item TEXT NOT NULL,revision TEXT NOT NULL,bytes BIGINT NOT NULL,at BIGINT NOT NULL,reason TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS legacy_evictions_v1(key TEXT NOT NULL,folder TEXT NOT NULL,volume TEXT NOT NULL,identity TEXT NOT NULL,bytes BIGINT NOT NULL,nonce TEXT NOT NULL,attempted BIGINT NOT NULL DEFAULT 0,PRIMARY KEY(key,folder))",
             "CREATE TABLE IF NOT EXISTS repair_lineage(slot INTEGER PRIMARY KEY CHECK(slot=1),ledger_id TEXT NOT NULL,epoch BIGINT NOT NULL CHECK(epoch>=0))",
             "PRAGMA user_version=1",
         ] {
@@ -618,7 +620,7 @@ impl Cache {
             return None;
         }
         let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        if live.evicting.contains(&key) {
+        if live.evicting.contains(&key) || live.legacy_evicting.contains(&key.item()) {
             return None;
         }
         *live.readers.entry(key.clone()).or_default() += 1;
@@ -941,7 +943,7 @@ impl Cache {
         self.maintenance.notified().await;
     }
     /// Bounded whole-entry LRU/age eviction. Active leases and pins are always checked.
-    pub async fn maintain(&self) -> Result<(), Error> {
+    pub async fn maintain(self: &Arc<Self>) -> Result<(), Error> {
         type Row = (String, String, i64, i64, i64);
         if self.settings.recovery_mode {
             return Ok(());
@@ -980,6 +982,20 @@ impl Cache {
                     used = used.saturating_sub(bytes);
                 }
             }
+        }
+        if let Some(legacy) = self.legacy.get() {
+            legacy
+                .maintain(legacy::Maintenance {
+                    cache: self.clone(),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn flush_legacy_recency(&self) -> Result<(), Error> {
+        if let Some(legacy) = self.legacy.get() {
+            legacy.flush_recency().await?;
         }
         Ok(())
     }

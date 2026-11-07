@@ -6,6 +6,43 @@ using NzbWebDAV.Models;
 using NzbWebDAV.Services.NativeCache;
 using ZstdSharp;
 
+if (args.Length == 2 && args[0] == "verify-eviction") {
+    using var receipt = JsonDocument.Parse(File.ReadAllBytes(args[1]));
+    var cases = 0;
+    foreach (var row in receipt.RootElement.EnumerateArray()) {
+        var fixtureRoot = Path.GetFullPath(row.GetProperty("fixture_root").GetString()!);
+        if (!Path.GetFileName(fixtureRoot).StartsWith("id-compatible-cache-", StringComparison.Ordinal)
+            || File.ReadAllText(Path.Combine(fixtureRoot,"fixture-owner")) != "generated-native-cache-write-tests") throw new Exception("Not an owned generated fixture.");
+        var metadata = Path.GetFullPath(row.GetProperty("metadata_path").GetString()!);
+        var payload = Path.GetFullPath(row.GetProperty("folder_path").GetString()!);
+        if (!metadata.StartsWith(fixtureRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            || !payload.StartsWith(fixtureRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)) throw new Exception("Fixture path escaped its owned root.");
+        var folder = new NativeCacheFolder { Id=row.GetProperty("folder_id").GetString()!,Path=payload,MinFreeBytes=0,MaxBytes=1_000_000_000 };
+        var generation = row.GetProperty("generation").GetString()!;
+        var length = row.GetProperty("length").GetInt64();
+        var removed = new NativeCacheIdentity(row.GetProperty("removed").GetString()!,generation,length);
+        var remaining = new NativeCacheIdentity(row.GetProperty("remaining").GetString()!,generation,length);
+        var database = Path.Combine(metadata,"catalogue.db");
+        await using (var store = new NativeCacheStore(database,[folder])) {
+            var buffer = new byte[NativeCacheStore.BlockSize];
+            if (await store.ReadBlockAsync(removed,0,buffer) != 0) throw new Exception("A staged eviction was still advertised.");
+            await store.ScanAsync(folder.Id);
+            if (await store.ReadBlockAsync(removed,0,buffer) != 0) throw new Exception("Original C# scanner resurrected a staged eviction.");
+            var count = await store.ReadBlockAsync(remaining,0,buffer);
+            if (count != buffer.Length || !string.Equals(Convert.ToHexString(SHA256.HashData(buffer)),row.GetProperty("sha256").GetString(),StringComparison.OrdinalIgnoreCase)) throw new Exception("Eviction changed an unrelated cached entry.");
+        }
+        using (var db = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={database}")) {
+            db.Open();using var command=db.CreateCommand();
+            command.CommandText="SELECT COUNT(*) FROM RetiredEntries WHERE Key=$key";
+            command.Parameters.AddWithValue("$key",removed.Key);
+            if ((long)command.ExecuteScalar()! != 1) throw new Exception("Staged ownership was lost.");
+        }
+        cases++;
+    }
+    Console.WriteLine(JsonSerializer.Serialize(new { passed=true,cases,reader="original C#",eviction_resurrection=false,unrelated_bytes_unchanged=true }));
+    return;
+}
+
 if (args.Length == 2 && args[0] == "verify-rust") {
     using var receipt = JsonDocument.Parse(File.ReadAllBytes(args[1]));
     var checkedCases = 0;

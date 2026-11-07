@@ -2,6 +2,7 @@
 use super::*;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
+mod eviction;
 
 struct Fixture {
     path: PathBuf,
@@ -71,6 +72,7 @@ impl Fixture {
                 .iter()
                 .enumerate()
                 .map(|(i, f)| WriteFolder {
+                    eviction: None,
                     id: f.id.clone(),
                     priority: -i32::try_from(i).unwrap(),
                     quota_bytes: 100 * BLOCK,
@@ -287,9 +289,10 @@ async fn quota_and_free_space_declines_do_not_copy_or_relocate_existing_entries(
     let before = accounting(&legacy).await;
     drop(writer);
     let mut settings = f.settings(8);
-    for folder in &mut settings.folders {
-        folder.min_free_bytes = u64::MAX;
-    }
+    assert_eq!(legacy.roots["a"].device, legacy.roots["b"].device);
+    // A shared filesystem must honour its strictest peer reserve, including fills
+    // in the other logical folder. Quota fallback above remains per folder.
+    settings.folders[0].min_free_bytes = u64::MAX;
     let writer = Writer::new(legacy.clone(), settings).unwrap();
     assert!(!put(&writer, 1).await.unwrap());
     assert_eq!(accounting(&legacy).await, before);

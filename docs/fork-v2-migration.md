@@ -22,6 +22,19 @@ do not add a second cache in front of FUSE/WebDAV. Keep 1.x synchronization poin
 upstream `main`. Do not merge this migration into the production branch until the
 acceptance gates below pass.
 
+## Fork-specific parity follow-up
+
+The [fork-only audit](rust-v2-fork-parity-audit-20261107.md) checks the net v1 fork
+delta and all capability rows below. It excludes unrelated upstream-only v1
+features from implementation scope. The remaining concrete fork follow-ups are
+safe legacy eviction #240, legacy administration #249, reconciliation/lifecycle
+#250 and failed-import replacement recovery visibility #247. Implemented modules
+still need the existing live integration/NAS/performance/restore gates.
+
+Opt-in legacy eviction and access accounting are now implemented locally; see
+[eviction qualification](validation/rust-v2-legacy-eviction-20261107.md). Keep its
+policy absent during initial in-place migration. No production policy was enabled.
+
 ## Latest upstream sync
 
 On 2026-11-07 both remotes were refreshed. The migration branch at

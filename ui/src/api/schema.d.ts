@@ -2970,6 +2970,14 @@ export interface components {
             /** Format: int64 */
             offset?: number;
         };
+        LegacyCacheEvictionPolicy: {
+            /** Format: int32 */
+            high_percent: number;
+            /** Format: int32 */
+            low_percent: number;
+            /** Format: int32 */
+            max_age_days: number;
+        };
         LegacyCacheFolder: {
             id: string;
             /** @description Optional read/write bind of the same owner inode, for read-only NFS payload mounts. */
@@ -2993,13 +3001,14 @@ export interface components {
             /** Format: int32 */
             rejected_entries: number;
         };
-        /** @description Explicit opt-in to an offline, read-only 1.x store. Payloads stay in place. */
+        /** @description Explicit bridge to an exclusively owned 1.x store. Read-only unless writes are configured. */
         LegacyCacheSettings: {
             folders: components["schemas"]["LegacyCacheFolder"][];
             metadata_path: string;
             write?: components["schemas"]["LegacyCacheWriteSettings"] | null;
         };
         LegacyCacheWriteFolder: {
+            eviction?: components["schemas"]["LegacyCacheEvictionPolicy"] | null;
             id: string;
             /** Format: int64 */
             min_free_bytes: number;

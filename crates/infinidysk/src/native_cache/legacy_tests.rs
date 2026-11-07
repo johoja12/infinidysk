@@ -255,6 +255,71 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn application_maintenance_evicts_only_opted_in_idle_legacy_entries() {
+    let mut f = Fixture::new(true).await;
+    let legacy = f.settings.legacy.as_mut().unwrap();
+    legacy.write = Some(legacy::WriteSettings {
+        chunk_mb: 8,
+        folders: legacy
+            .folders
+            .iter()
+            .map(|folder| legacy::WriteFolder {
+                id: folder.id.clone(),
+                priority: 0,
+                quota_bytes: 100 * BLOCK,
+                min_free_bytes: 0,
+                eviction: Some(legacy::EvictionPolicy {
+                    max_age_days: 1,
+                    high_percent: 90,
+                    low_percent: 80,
+                }),
+            })
+            .collect(),
+    });
+    let catalogue = sqlx::SqlitePool::connect_with(
+        SqliteConnectOptions::new().filename(f.temp.0.join("legacy-meta/catalogue.db")),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE Entries SET Pinned=0 WHERE ItemId=$1")
+        .bind(f.items[0].id.0.simple().to_string())
+        .execute(&catalogue)
+        .await
+        .unwrap();
+    let cache = f.cache().await;
+    let vfs = f.vfs(cache.clone());
+    let key = vfs.cache_key(&f.items[0]).await.unwrap();
+    let lease = cache.lease(key.clone()).unwrap();
+    cache.maintain().await.unwrap();
+    assert!(!cache.coverage(&key).await.unwrap().is_empty());
+    drop(lease);
+    cache.maintain().await.unwrap();
+    assert!(cache.coverage(&key).await.unwrap().is_empty());
+    let entries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM Entries")
+        .fetch_one(&catalogue)
+        .await
+        .unwrap();
+    assert_eq!(entries, 1);
+    let mut reader = vfs
+        .open(
+            &Node::Item(f.items[1].clone()),
+            Origin {
+                delivery: Delivery::WebDav,
+                client: "fixture".into(),
+                player: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, f.bytes);
+    cache.flush_legacy_recency().await.unwrap();
+    assert_eq!(cache.evictions(None, 100).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn playback_and_warming_reuse_multiple_legacy_roots_without_copying_after_restart() {
     let f = Fixture::new(true).await;
     let before = f.legacy_inventory();
@@ -427,6 +492,10 @@ async fn compatible_warming_fills_partial_and_new_sources_then_reuses_them_witho
         .filter(|(p, _, _)| {
             p.extension().is_some_and(|e| e == "data") || p.file_name().unwrap() == "manifest.json"
         })
+        .map(|(path, hash, _)| {
+            let metadata = path.metadata().unwrap();
+            (path, hash, (metadata.dev(), metadata.ino(), metadata.len()))
+        })
         .collect();
     f.settings.min_file_mb = 0;
     let source = f.settings.legacy.as_mut().unwrap();
@@ -436,6 +505,7 @@ async fn compatible_warming_fills_partial_and_new_sources_then_reuses_them_witho
             .folders
             .iter()
             .map(|folder| legacy::WriteFolder {
+                eviction: None,
                 id: folder.id.clone(),
                 priority: 0,
                 quota_bytes: 1_000_000_000,
@@ -572,12 +642,13 @@ async fn compatible_warming_fills_partial_and_new_sources_then_reuses_them_witho
         cache.stats().await.unwrap().legacy_written_bytes,
         BLOCK + f.bytes.len() as u64
     );
-    for (path, hash, blocks) in original {
+    for (path, hash, identity) in original {
         assert_eq!(Sha256::digest(std::fs::read(&path).unwrap()).to_vec(), hash);
+        let metadata = path.metadata().unwrap();
         assert_eq!(
-            path.metadata().unwrap().blocks(),
-            blocks,
-            "existing payload must not be copied or reallocated"
+            (metadata.dev(), metadata.ino(), metadata.len()),
+            identity,
+            "existing payload must keep its inode, device and length"
         );
     }
     assert!(server.body_commands() > 0);
@@ -635,6 +706,7 @@ fn enable_writes(f: &mut Fixture) {
             .folders
             .iter()
             .map(|folder| legacy::WriteFolder {
+                eviction: None,
                 id: folder.id.clone(),
                 priority: 0,
                 quota_bytes: 1_000_000_000,

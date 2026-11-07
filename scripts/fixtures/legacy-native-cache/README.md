@@ -50,3 +50,18 @@ Keep each fixture at its original absolute path and device/inode, including insi
 a container. This qualifies storage readability; it does not migrate v2 jobs back
 into a v1 application database. The explicit export retains its generated roots
 for inspection; routine tests clean only their own disposable roots.
+
+## Interrupted eviction and v1 scanner behavior
+
+Export new disposable sparse/chunked stores interrupted after v1 coverage is
+withdrawn into `RetiredEntries`, with payloads still at their original paths:
+
+```sh
+ID_EVICTION_EXPORT=/tmp/id-eviction-receipt.json cargo test -p infinidysk-native-cache --lib legacy::writer::tests::eviction::export_eviction_interop_fixtures --locked -- --ignored --exact
+dotnet run --project scripts/fixtures/legacy-native-cache -- verify-eviction /tmp/id-eviction-receipt.json
+```
+
+The original C# reader/scanner must not resurrect the retired entry. An unrelated
+entry must retain its exact bytes. The verifier accepts only marked generated roots
+and does not open production paths. The export retains its generated roots for
+inspection. Rust process-death tests separately exercise eviction recovery.

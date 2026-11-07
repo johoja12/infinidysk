@@ -156,6 +156,20 @@ impl infinidysk_native_cache::legacy::Reader for LegacyReader {
     fn written_bytes(&self) -> u64 {
         self.writer.as_ref().map_or(0, |w| w.written_bytes())
     }
+    fn maintain(
+        &self,
+        context: infinidysk_native_cache::legacy::Maintenance,
+    ) -> infinidysk_native_cache::legacy::MaintenanceFuture<'_> {
+        Box::pin(async move {
+            if let Some(writer) = &self.writer {
+                writer.maintain(context).await?;
+            }
+            Ok(())
+        })
+    }
+    fn flush_recency(&self) -> infinidysk_native_cache::legacy::MaintenanceFuture<'_> {
+        Box::pin(self.legacy.flush_recency())
+    }
     fn write<'a>(
         &'a self,
         key: &'a infinidysk_native_cache::Key,

@@ -496,7 +496,12 @@ async fn serve_inner(
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut offset = 0;
             loop {
-                tokio::select! {()=stop.cancelled()=>break, _=tick.tick()=>{}, ()=cache.maintenance_requested()=>{}}
+                tokio::select! {()=stop.cancelled()=>{
+                    if let Err(error) = cache.flush_legacy_recency().await {
+                        warn!(reason=%error,"compatible cache recency handover deferred");
+                    }
+                    break;
+                }, _=tick.tick()=>{}, ()=cache.maintenance_requested()=>{}}
                 if let Err(error) = cache.maintain().await {
                     warn!(reason=%error,"native cache maintenance deferred");
                 }

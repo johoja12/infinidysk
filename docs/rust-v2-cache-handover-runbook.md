@@ -8,6 +8,13 @@ application/database/mount transition and
 [compatible writer report](validation/rust-v2-compatible-cache-writes-20261107.md)
 for the storage protocol and limits.
 
+The optional [eviction policy](validation/rust-v2-legacy-eviction-20261107.md)
+remains disabled during initial handover. Its source requires a newly qualified
+image; the earlier `b9220aa8` image predates eviction. If policy has ever been
+enabled in a rehearsal, preserve the private Rust catalogue with the original
+metadata and settle all `legacy_evictions_v1` intents and recency before handback.
+Disabling policy alone does not settle an interrupted deletion.
+
 ## Already checked
 
 The four registered payload roots are NFS. Read-only inspection matched the current

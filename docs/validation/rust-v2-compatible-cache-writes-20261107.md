@@ -14,8 +14,9 @@ Tracking: [compatible writes #236](https://github.com/johoja12/infinidysk/issues
 The shared playback and Smart Prefetch cache can now fill the original v1 store.
 Read-only remains the default. Opt-in writes use its existing SQLite catalogue,
 folder identities, sparse/chunked payload layout, manifests and newline JSON
-SHA256 journals. No cache conversion, payload copy, relocation, automatic eviction
-or payload deletion is performed. Committed matching blocks are verified and
+SHA256 journals. Cache fills perform no conversion, payload copy, relocation or payload deletion.
+Automatic policy eviction is a separate explicit opt-in; see
+[eviction qualification](rust-v2-legacy-eviction-20261107.md). Committed matching blocks are verified and
 reused; committed different bytes are refused. Confirmed corrupt coverage is
 invalidated under a shared reader/writer lock before a fresh fill can heal it.
 Unknown I/O failures do not invalidate coverage.

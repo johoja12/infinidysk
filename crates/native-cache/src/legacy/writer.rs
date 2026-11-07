@@ -18,6 +18,15 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 const OVERHEAD: u64 = 65_536;
+mod eviction;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = LegacyCacheEvictionPolicy)]
+pub struct EvictionPolicy {
+    pub max_age_days: u32,
+    pub high_percent: u8,
+    pub low_percent: u8,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(as = LegacyCacheWriteFolder)]
@@ -26,6 +35,9 @@ pub struct WriteFolder {
     pub priority: i32,
     pub quota_bytes: u64,
     pub min_free_bytes: u64,
+    /// Explicit permission for policy eviction. Omission preserves all payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eviction: Option<EvictionPolicy>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(as = LegacyCacheWriteSettings)]
@@ -50,6 +62,9 @@ impl WriteSettings {
                 || !roots.iter().any(|r| r.id == f.id)
                 || f.quota_bytes < BLOCK
                 || f.quota_bytes > i64::MAX.cast_unsigned()
+                || f.eviction.as_ref().is_some_and(|p| {
+                    p.low_percent == 0 || p.low_percent >= p.high_percent || p.high_percent > 100
+                })
             {
                 return Err(Error::Invalid(
                     "compatible write folders require unique registered identities and bounded quotas",
@@ -64,10 +79,14 @@ pub(super) async fn validate_schema(db: &SqlitePool) -> Result<(), Error> {
     for (table, columns) in [
         (
             "Entries",
-            "Key Folder Length Bytes Access Pinned Dirty ItemId VerifiedBytes PendingBytes ChunkSize Generation DisplayName",
+            "Key Folder Length Bytes Access Pinned Dirty ItemId VerifiedBytes PendingBytes ChunkSize Generation DisplayName AccessCount",
         ),
         ("Blocks", "Key Offset Count Hash"),
         ("FolderTotals", "Folder Bytes"),
+        (
+            "RetiredEntries",
+            "Key Folder Bytes ItemId DisplayName Length VerifiedBytes AccessCount LastAccessUnix",
+        ),
     ] {
         let rows = sqlx::query("SELECT name FROM pragma_table_info($1)")
             .bind(table)
@@ -113,6 +132,7 @@ pub struct Writer {
     state: Mutex<State>,
     written: AtomicU64,
     probes: HashMap<String, Arc<Semaphore>>,
+    eviction: Arc<AsyncMutex<eviction::State>>,
     #[cfg(test)]
     fault: Option<Fault>,
 }
@@ -145,12 +165,27 @@ impl Writer {
             state: Mutex::default(),
             written: AtomicU64::new(0),
             probes,
+            eviction: Arc::default(),
             #[cfg(test)]
             fault: None,
         }))
     }
     pub fn written_bytes(&self) -> u64 {
         self.written.load(Ordering::Relaxed)
+    }
+    fn device_reserve(&self, device: u64) -> u64 {
+        self.settings
+            .folders
+            .iter()
+            .filter(|f| {
+                self.legacy
+                    .roots
+                    .get(&f.id)
+                    .is_some_and(|r| r.device == device)
+            })
+            .map(|f| f.min_free_bytes)
+            .max()
+            .unwrap_or(0)
     }
     fn lock(&self, key: String) -> Arc<AsyncMutex<()>> {
         let mut locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
@@ -203,6 +238,7 @@ impl Writer {
         let id = item.simple().to_string();
         let encoded = format!("{}:{id}{}:{generation}:{size}", id.len(), generation.len());
         let key = hex(&Sha256::digest(encoded.as_bytes()));
+        let _entry_guard = self.legacy.entry_lock(&key).read_owned().await;
         let block_guard = self.legacy.block_lock(&key, block).write_owned().await;
         let placement = self.lock(key.clone()).lock_owned().await;
         let hash = Sha256::digest(&data).to_vec();
@@ -385,6 +421,16 @@ impl Writer {
             if !entry.folder.is_empty() && entry.folder != option.id {
                 continue;
             }
+            let retired: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM RetiredEntries WHERE Key=$1 AND Folder=$2)",
+            )
+            .bind(&entry.key)
+            .bind(&option.id)
+            .fetch_one(&self.legacy.db)
+            .await?;
+            if retired {
+                continue;
+            }
             let Some(root) = self.legacy.roots.get(&option.id).cloned() else {
                 continue;
             };
@@ -413,8 +459,8 @@ impl Writer {
                     .saturating_add(overhead)
                     > option.quota_bytes
                 || free
-                    < option
-                        .min_free_bytes
+                    < self
+                        .device_reserve(root.device)
                         .saturating_add(reserved)
                         .saturating_add(allocation)
                         .saturating_add(overhead)

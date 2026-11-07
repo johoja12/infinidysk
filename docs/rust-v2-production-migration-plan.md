@@ -20,6 +20,13 @@ and [NAS handover runbook](rust-v2-cache-handover-runbook.md). Actual live write
 remain gated on that rehearsal. A cold-cache
 start or verified-copy migration is not an accepted fallback.
 
+The [fork-specific audit](rust-v2-fork-parity-audit-20261107.md) is the current
+feature follow-up scope. Do not turn unchanged upstream-only v1 omissions into
+new fork port requirements. Existing production configuration/consumer changes
+still need disposition. [Optional policy eviction](validation/rust-v2-legacy-eviction-20261107.md)
+is a separate management feature: keep it disabled during initial migration,
+include its private recovery ledger in backups, and settle intents before handback.
+
 ## Source and upstream sync
 
 After fetching both remotes, `feat/rust-v2-fork-migration` and its origin branch
