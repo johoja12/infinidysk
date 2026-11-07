@@ -158,10 +158,10 @@ function Attention({ live }: { live?: Live }) {
     items.push({ to: "/settings/providers", tone: "destructive", text: `${p.name} is paused for ${Math.ceil((p.open_for_ms ?? 0) / 1000)} s after errors` });
   }
   if (paused) items.push({ to: "/queue", tone: "warning", text: "The queue is paused" });
-  if (status && !status.mount.mounted) {
+  if (status?.mount.enabled && !status.mount.mounted) {
     items.push({ to: "/system", tone: "warning", text: `Not mounted${status.mount.reason ? `: ${status.mount.reason}` : ""}` });
   }
-  if (status?.backup_warning) items.push({ to: "/settings/maintenance", tone: "warning", text: status.backup_warning });
+  if (status?.backup_warning) items.push({ to: "/settings/backups", tone: "warning", text: status.backup_warning });
   if (items.length === 0) return null;
   return (
     <section aria-labelledby="attention" className="mb-6">
@@ -762,9 +762,10 @@ const Reads = memo(function Reads({ reads }: { reads: Read[] }) {
                   <span className="inline-flex items-center gap-1">
                     Stalls
                     <InfoTip label="About stalls">
-                      A stall is a read that waited 50 ms or more for data after the first byte arrived, including reads right after a
-                      seek. Shown as the number of stalls and their total wait. 0 is ideal. A few short stalls around seeks are normal.
-                      Many stalls, or several seconds in total, likely means the player paused to buffer.
+                      A stall is a read that waited 1 s or more for data after the first byte arrived. The wait for the first byte
+                      after a seek is not a stall. Shown as the number of stalls and their total wait. 0 is ideal. Several stalls
+                      likely means the player paused to buffer. Reads from older versions may also count shorter waits
+                      and waits after a seek.
                     </InfoTip>
                   </span>
                 </TableHead>

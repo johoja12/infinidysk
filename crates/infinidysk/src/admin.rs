@@ -601,8 +601,8 @@ struct SettingsView {
     settings: Settings,
     /// Dotted paths fixed by environment variables.
     locked: Vec<String>,
-    /// Saved changes that apply only after a restart (mount directory, read-ahead memory,
-    /// FUSE tuning, experiments).
+    /// Saved changes that apply only after a restart (mount directory, built-in FUSE
+    /// mount on or off, read-ahead memory, FUSE tuning, experiments).
     restart_required: bool,
     /// What `settings.experiments` may name.
     experiments: &'static [config::Experiment],
@@ -1466,6 +1466,9 @@ struct Status {
 #[derive(Serialize, ToSchema)]
 struct MountStatus {
     dir: String,
+    /// This process serves the built-in FUSE mount (on in the settings it started with,
+    /// and Linux). Off means nothing to warn about.
+    enabled: bool,
     mounted: bool,
     /// Why it is not mounted.
     reason: Option<String>,
@@ -1658,6 +1661,7 @@ async fn get_status(State(admin): State<Arc<Admin>>) -> Json<Status> {
         update: admin.updates.get(),
         mount: MountStatus {
             dir: admin.live.mount_dir().to_owned(),
+            enabled: admin.live.fuse_enabled(),
             mounted: mount.is_ok(),
             reason: mount.err(),
         },
@@ -1733,7 +1737,11 @@ async fn get_performance(
     State(admin): State<Arc<Admin>>,
     Query(query): Query<PerformanceQuery>,
 ) -> Json<PerformanceView> {
-    let effective = admin.config.read().await.settings().performance.effective();
+    let default_cache_dir = admin.live.default_cache_dir();
+    let effective = crate::app::effective_tuning(
+        &admin.config.read().await.settings().performance,
+        default_cache_dir,
+    );
     let dir = query
         .dir
         .unwrap_or_else(|| effective.disk_cache_dir.clone());
@@ -1748,7 +1756,10 @@ async fn get_performance(
             .into_iter()
             .map(|preset| PresetView {
                 preset,
-                tuning: preset.tuning(),
+                tuning: config::Tuning {
+                    disk_cache_dir: default_cache_dir.to_owned(),
+                    ..preset.tuning()
+                },
             })
             .collect(),
         effective,
@@ -1822,7 +1833,8 @@ struct ReadView {
     player: Option<String>,
     /// From open to the first byte served.
     first_byte_ms: Option<u64>,
-    /// Waits for data of at least 50 ms after the first byte.
+    /// Waits for data of at least 1 s, other than for the first byte and the first byte
+    /// after a seek.
     stalls: u64,
     stall_ms: u64,
     seeks: u64,
@@ -2019,7 +2031,19 @@ async fn trace_body(admin: &Admin, id: u64, redact: bool) -> Result<String, Fail
             *name = format!("provider-{}", i + 1);
         }
         header["version"] = json!(crate::update::VERSION);
-        header["tuning"] = json!(admin.config.read().await.settings().performance.effective());
+        let default_cache_dir = admin.live.default_cache_dir();
+        let mut tuning = crate::app::effective_tuning(
+            &admin.config.read().await.settings().performance,
+            default_cache_dir,
+        );
+        // Folder names can carry a user name; whether it is the default is what helps.
+        let shown = if tuning.disk_cache_dir == default_cache_dir {
+            "<config>/cache"
+        } else {
+            "<custom>"
+        };
+        shown.clone_into(&mut tuning.disk_cache_dir);
+        header["tuning"] = json!(tuning);
     }
     header["read"] = json!(read);
     header["providers"] = json!(providers);

@@ -548,7 +548,14 @@ impl Maintenance {
         };
         match (&report.outcome, &report.reason) {
             (RunOutcome::Stopped, Some(reason)) => {
-                warn!(reason, duration_ms, "maintenance job stopped");
+                warn!(
+                    files,
+                    bytes,
+                    dry_run = run.dry_run,
+                    reason,
+                    duration_ms,
+                    "maintenance job stopped"
+                );
             }
             (RunOutcome::Held, _) => warn!(
                 files,
@@ -1197,7 +1204,8 @@ impl Pointers {
     fn add(&mut self, target: &str) {
         let target = target.split(['?', '#']).next().unwrap_or_default();
         if let Some((_, rest)) = target.rsplit_once("/.ids/")
-            && let Some(Ok(id)) = rest.rsplit('/').next().map(str::parse)
+            && let Some(name) = Path::new(rest).file_stem().and_then(|name| name.to_str())
+            && let Ok(id) = name.parse()
         {
             self.ids.insert(id);
         }
@@ -1525,6 +1533,29 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn a_database_stop_says_what_the_database_reported() {
+        let reason = |e: sqlx::Error| match Stop::from(infinidysk_db::Error::from(e)) {
+            Stop::Reason(r) => r,
+            _ => unreachable!("a database error is a reason"),
+        };
+        let timeout = reason(sqlx::Error::PoolTimedOut);
+        let closed = reason(sqlx::Error::PoolClosed);
+        assert!(timeout.contains("pool timed out"), "{timeout}");
+        assert!(closed.contains("closed pool"), "{closed}");
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("open");
+        let missing = sqlx::query("SELECT * FROM missing")
+            .execute(&pool)
+            .await
+            .expect_err("no such table");
+        let missing = reason(missing);
+        assert!(missing.contains("(code: 1)"), "{missing}");
+        assert!(missing.contains("no such table"), "{missing}");
+    }
+
     #[test]
     fn windows_cross_midnight_and_find_the_next() {
         let tz = TimeZone::UTC;
@@ -1585,6 +1616,12 @@ mod tests {
 
     #[test]
     fn library_pointers_keep_their_files() {
+        let item = ItemId(Uuid::new_v4());
+        for suffix in ["", ".mkv", ".strm?k=1", ".mkv#fragment"] {
+            let mut pointers = Pointers::default();
+            pointers.add(&format!("/mnt/x/.ids/a/b/c/d/e/{}{suffix}", item.0));
+            assert!(pointers.keep(item, "/content/job/file.mkv"), "{suffix}");
+        }
         let root = std::env::temp_dir().join(format!("infinidysk-maint-{}", Uuid::new_v4()));
         let (library, mount) = (root.join("library"), root.join("library/mount"));
         fs::create_dir_all(library.join("show")).unwrap();
@@ -1595,7 +1632,7 @@ mod tests {
             ItemId(Uuid::new_v4()),
         );
         symlink(
-            format!("/mnt/x/.ids/a/b/c/d/e/{}", linked.0),
+            format!("/mnt/x/.ids/a/b/c/d/e/{}.mkv", linked.0),
             library.join("show/a.mkv"),
         )
         .unwrap();
@@ -1606,7 +1643,7 @@ mod tests {
         .unwrap();
         fs::write(
             library.join("show/c.STRM"),
-            format!("https://h/view/.ids/a/b/c/d/e/{}?k=1", streamed.0),
+            format!("https://h/view/.ids/a/b/c/d/e/{}.strm?k=1", streamed.0),
         )
         .unwrap();
         fs::write(

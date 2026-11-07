@@ -34,6 +34,7 @@ infinidysk-native-cache.workspace = true
 infinidysk-stream.workspace = true
 infinidysk-vfs.workspace = true
 infinidysk-testkit.workspace = true
+tokio = { workspace = true, features = ["io-util", "net"] }
 
 [lints]
 workspace = true

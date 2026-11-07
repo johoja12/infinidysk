@@ -35,15 +35,27 @@ ARG SOURCE_REPOSITORY="johoja12/infinidysk"
 RUN INFINIDYSK_COMMIT="$COMMIT" INFINIDYSK_SOURCE_REPOSITORY="$SOURCE_REPOSITORY" cargo build --release --locked -p infinidysk \
     && cp target/release/infinidysk /usr/local/bin/infinidysk
 
+# Only the binary, for the release archives (`--target binary --output type=local,dest=<dir>`).
+FROM scratch AS binary
+COPY --from=build /usr/local/bin/infinidysk /infinidysk
+
 FROM ubuntu:26.04
-ARG COMMIT=""
-ARG SOURCE_REPOSITORY="johoja12/infinidysk"
-LABEL org.opencontainers.image.revision="$COMMIT" \
-      org.opencontainers.image.source="https://github.com/$SOURCE_REPOSITORY"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg fuse3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /usr/local/bin/infinidysk /usr/local/bin/infinidysk
+# Declared after the layers above so a new commit does not rebuild them.
+ARG COMMIT=""
+ARG VERSION=""
+ARG SOURCE_REPOSITORY="johoja12/infinidysk"
+LABEL org.opencontainers.image.title="infinidysk" \
+      org.opencontainers.image.description="Usenet-backed virtual filesystem with a SABnzbd-compatible API, FUSE and WebDAV" \
+      org.opencontainers.image.source="https://github.com/$SOURCE_REPOSITORY" \
+      org.opencontainers.image.url="https://www.infinidysk.com/" \
+      org.opencontainers.image.documentation="https://www.infinidysk.com/v2/" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.revision="$COMMIT" \
+      org.opencontainers.image.version="$VERSION"
 VOLUME /config
 EXPOSE 3000
 # Healthy once the database, the FUSE mount (when /dev/fuse is there) and the import worker

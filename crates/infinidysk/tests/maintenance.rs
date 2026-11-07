@@ -65,6 +65,24 @@ async fn run(addr: SocketAddr, path: &str, body: Value) -> Value {
     }
 }
 
+/// A one-minute maintenance window half a day away, so a scheduled job never holds the slot.
+fn closed_window() -> [(String, String); 2] {
+    let start = jiff::Zoned::now()
+        .time()
+        .wrapping_add(jiff::Span::new().hours(12));
+    let end = start.wrapping_add(jiff::Span::new().minutes(1));
+    [
+        (
+            "INFINIDYSK__MAINTENANCE__WINDOW__START".to_owned(),
+            start.strftime("%H:%M").to_string(),
+        ),
+        (
+            "INFINIDYSK__MAINTENANCE__WINDOW__END".to_owned(),
+            end.strftime("%H:%M").to_string(),
+        ),
+    ]
+}
+
 /// Serves an install whose database is `root/infinidysk.sqlite` and mount `root/mnt`.
 async fn start(
     root: &Path,
@@ -85,6 +103,7 @@ async fn start(
         trace_minutes: 0,
         metrics_path: root.join("metrics.sqlite"),
         log_dir: root.join("logs"),
+        home: root.join("config"),
         config_dir: root.join("config"),
         ffprobe: "ffprobe".to_owned(),
     };
@@ -98,6 +117,7 @@ async fn start(
             root.join("mnt").display().to_string(),
         ),
     ];
+    vars.extend(closed_window());
     vars.extend(
         extra
             .iter()
@@ -183,7 +203,12 @@ async fn removes_only_files_no_library_link_points_to() {
     let pointer = |item: &Item| format!("{}/{}", mount.display(), item.id.ids_path());
     for (index, item) in old[..6].iter().enumerate() {
         let folder = if index == 0 { &scan } else { &lib };
-        std::os::unix::fs::symlink(pointer(item), folder.join(&item.name)).unwrap();
+        let target = if index == 0 {
+            format!("{}.mkv", pointer(item))
+        } else {
+            pointer(item)
+        };
+        std::os::unix::fs::symlink(target, folder.join(&item.name)).unwrap();
     }
     let exists = async |item: &Item| db.item_by_path(&item.path).await.unwrap().is_some();
 

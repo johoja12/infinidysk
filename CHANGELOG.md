@@ -1,5 +1,85 @@
 # Changelog
 
+## [2.0.0-beta.6](https://github.com/infinidysk/infinidysk/compare/v2.0.0-beta.5...v2.0.0-beta.6) (2026-11-06)
+
+
+### Features
+
+* **db:** choose where infinidysk keeps its database and files ([#1858](https://github.com/infinidysk/infinidysk/issues/1858)) ([c1f6f93](https://github.com/infinidysk/infinidysk/commit/c1f6f936462bd2e2a003971ff67c88dd28e331fe))
+* **ui:** the Queue link shows when a download needs you in the Arr ([#1849](https://github.com/infinidysk/infinidysk/issues/1849)) ([2c1a095](https://github.com/infinidysk/infinidysk/commit/2c1a0953d2aa2a3c06f1044a8255c07dad959b22))
+
+
+### Bug Fixes
+
+* **api:** link the update notice to the release notes of the newer tag ([#1860](https://github.com/infinidysk/infinidysk/issues/1860)) ([005812a](https://github.com/infinidysk/infinidysk/commit/005812a4248f4d5685257dd76dbb429181e4aff2))
+* **ui:** open tabs no longer flood the server with refreshes during large cleanups ([#1850](https://github.com/infinidysk/infinidysk/issues/1850)) ([ae1b19c](https://github.com/infinidysk/infinidysk/commit/ae1b19ca39a4d3abddc81484a7fadd74177393c5))
+
+
+### Performance Improvements
+
+* **db:** index the health summary count ([#1851](https://github.com/infinidysk/infinidysk/issues/1851)) ([ca5c4d0](https://github.com/infinidysk/infinidysk/commit/ca5c4d03437eb343890301a542ec8d17d3932675))
+* **queue:** imports into large categories no longer read every existing folder ([#1856](https://github.com/infinidysk/infinidysk/issues/1856)) ([3402409](https://github.com/infinidysk/infinidysk/commit/340240947b71cd7f5c99e8fb5fd66dfa8c1b4e88))
+
+
+### Build System
+
+* publish Linux binary archives with each release ([#1859](https://github.com/infinidysk/infinidysk/issues/1859)) ([cdedc4b](https://github.com/infinidysk/infinidysk/commit/cdedc4b4deb7fef5abed4b15c907cddda8870759))
+
+## [2.0.0-beta.5](https://github.com/infinidysk/infinidysk/compare/v2.0.0-beta.4...v2.0.0-beta.5) (2026-11-06)
+
+
+### Features
+
+* **api:** better Lidarr support: more audio formats, faster cleanup after album deletes, and a tagging warning ([#1838](https://github.com/infinidysk/infinidysk/issues/1838)) ([e138a06](https://github.com/infinidysk/infinidysk/commit/e138a062aa1df9f9a85a0aaecf532a2e060fbc98))
+* **arr:** support Sonarr v5 ([#1833](https://github.com/infinidysk/infinidysk/issues/1833)) ([b743f54](https://github.com/infinidysk/infinidysk/commit/b743f544313a0ad447687c8bcd7a678abab56a63))
+* **auth:** show your identity provider's name on the SSO sign-in button ([#1835](https://github.com/infinidysk/infinidysk/issues/1835)) ([1845fe8](https://github.com/infinidysk/infinidysk/commit/1845fe8182b8f084da671ca399a12bff028500d0))
+* **mount:** turn off the built-in FUSE mount when you do not need it, without warnings ([#1841](https://github.com/infinidysk/infinidysk/issues/1841)) ([d721677](https://github.com/infinidysk/infinidysk/commit/d721677513bc8f0e23005450114a2a6f93ea7379))
+
+
+### Bug Fixes
+
+* **db:** cleanup runs on SQLite no longer stop when other work writes to the database ([#1840](https://github.com/infinidysk/infinidysk/issues/1840)) ([6d676ab](https://github.com/infinidysk/infinidysk/commit/6d676ab28a308139bcf8c3d12e3446c91fd11837))
+* **db:** failed maintenance runs and API errors now say what the database reported ([#1839](https://github.com/infinidysk/infinidysk/issues/1839)) ([43ac7fd](https://github.com/infinidysk/infinidysk/commit/43ac7fd1f399ef79ae9032c01e4276ef487a3924))
+* **deps:** Bump the npm-minor-patch group in /ui with 3 updates ([#1844](https://github.com/infinidysk/infinidysk/issues/1844)) ([ba17029](https://github.com/infinidysk/infinidysk/commit/ba17029c9e28fd63a39ec257dbbed551f71c31cb))
+* **health:** broken files from an Arr that cannot repair them are kept for you instead of deleted ([#1837](https://github.com/infinidysk/infinidysk/issues/1837)) ([c3bd0ba](https://github.com/infinidysk/infinidysk/commit/c3bd0baf90b13846da6aca35e26f945b106385e4))
+
+## [2.0.0-beta.4](https://github.com/infinidysk/infinidysk/compare/v2.0.0-beta.3...v2.0.0-beta.4) (2026-11-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **api:** infinidysk no longer starts while a Readarr Arr instance is configured. Before upgrading, remove Readarr instances or change them to Chaptarr in Settings > Arr instances. If already upgraded, start the previous version to do so, or override the list with INFINIDYSK__ARR_INSTANCES.
+
+### Features
+
+* **api:** support Chaptarr instead of the abandoned Readarr ([#1827](https://github.com/infinidysk/infinidysk/issues/1827)) ([24e55b5](https://github.com/infinidysk/infinidysk/commit/24e55b51b6843a7df13364c2a310d77cf36a999c))
+* **nntp:** add the news-central.giganews.com server to the Giganews profile ([#1824](https://github.com/infinidysk/infinidysk/issues/1824)) ([028d6fb](https://github.com/infinidysk/infinidysk/commit/028d6fb3663d9a266396ecd39cf7cc17e94bb98d))
+* **ui:** backups get their own settings page ([#1826](https://github.com/infinidysk/infinidysk/issues/1826)) ([343cd7f](https://github.com/infinidysk/infinidysk/commit/343cd7f3340c5a0b3320cdec91f65c8e6a54d058))
+
+
+### Bug Fixes
+
+* **health:** a provider outage no longer marks good files as damaged ([#1829](https://github.com/infinidysk/infinidysk/issues/1829)) ([e8963ed](https://github.com/infinidysk/infinidysk/commit/e8963edac9355be750a6073988403993cd3986a9))
+* **health:** repairs no longer replace a newer file the Arr imported from another download ([#1832](https://github.com/infinidysk/infinidysk/issues/1832)) ([107cabe](https://github.com/infinidysk/infinidysk/commit/107cabe2704dcb0ad23e703c4a36fc816ed64b57))
+* **mount:** keep files referenced by legacy library links ([#1828](https://github.com/infinidysk/infinidysk/issues/1828)) ([4e1c914](https://github.com/infinidysk/infinidysk/commit/4e1c914b7ad927bbf205126199ff9955981ef2bc))
+* **ui:** stalls on the overview count only pauses a viewer would notice ([#1830](https://github.com/infinidysk/infinidysk/issues/1830)) ([317497d](https://github.com/infinidysk/infinidysk/commit/317497d5cc93c013315f95b24172db5f271533e5))
+* **webdav:** completed downloads no longer reappear right after an Arr import deletes them ([#1821](https://github.com/infinidysk/infinidysk/issues/1821)) ([41fb2f0](https://github.com/infinidysk/infinidysk/commit/41fb2f0d1878b80a2197dafe332e0d7a11a4bdf4))
+
+## [2.0.0-beta.3](https://github.com/infinidysk/infinidysk/compare/v2.0.0-beta.2...v2.0.0-beta.3) (2026-11-05)
+
+
+### Features
+
+* **auth:** sign in with single sign-on (OIDC), carried over from 1.x ([#1812](https://github.com/infinidysk/infinidysk/issues/1812)) ([4fc3b6a](https://github.com/infinidysk/infinidysk/commit/4fc3b6a4e834c478313466e1af95aa9bbf0b7350))
+* **import:** upgrade 1.x installs that keep their data in PostgreSQL ([#1815](https://github.com/infinidysk/infinidysk/issues/1815)) ([6ee6cbf](https://github.com/infinidysk/infinidysk/commit/6ee6cbfc686a4be55d4f04afcc4ce74af634d35a))
+
+
+### Bug Fixes
+
+* **arr:** skip the automatic-search wait when no release was blocklisted ([#1817](https://github.com/infinidysk/infinidysk/issues/1817)) ([23be919](https://github.com/infinidysk/infinidysk/commit/23be9194448dbb028bee7cb4c21378f2357610c2))
+* **ui:** memory overview no longer counts reclaimable kernel cache as app memory ([#1813](https://github.com/infinidysk/infinidysk/issues/1813)) ([d4f5daf](https://github.com/infinidysk/infinidysk/commit/d4f5daf5991447d2726a5b22d9232c5d9c265c94))
+* **ui:** season packs no longer repeat the same Arr import message per episode ([#1811](https://github.com/infinidysk/infinidysk/issues/1811)) ([c141857](https://github.com/infinidysk/infinidysk/commit/c1418571699a19c0ac9c60c2b60ba3353aa24c25))
+
 ## [2.0.0-beta.2](https://github.com/infinidysk/infinidysk/compare/v2.0.0-beta.1...v2.0.0-beta.2) (2026-11-04)
 
 

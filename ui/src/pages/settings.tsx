@@ -19,6 +19,7 @@ import { api, body, HttpError, type Schemas } from "../api/client";
 import { useAuth } from "../auth";
 import { copyText, MASK, notAPassword, type Settings as Doc, useRestart, useSaveSettings, useSettings } from "../settings";
 import { LibraryPanel, PreviewDialog, type PreviewRequest, previewTitle } from "../library";
+import { BackupsPanel } from "../backups";
 import { MaintenancePanel } from "../maintenance";
 import { DatabasePanel } from "../database";
 import { Alert, AlertAction, AlertDescription } from "@/components/ui/alert";
@@ -217,6 +218,12 @@ const categories = [
     slug: "database",
     title: "Database",
     description: "Where infinidysk keeps its library, queue and history, and moving it to PostgreSQL",
+  },
+  {
+    group: "System",
+    slug: "backups",
+    title: "Backups",
+    description: "Copies of the library database you can download, upload and restore",
   },
   {
     group: "System",
@@ -654,9 +661,10 @@ export function Settings() {
   const saved = view.settings;
   const ssoSaved = saved.auth.oidc.issuer !== "";
   const proven = auth.data?.method === "sso" && auth.data.sso_current;
-  // What the SSO proof covers: the public URL only while it supplies the redirect URI.
+  // What the SSO proof covers: not the display name, and the public URL only while it supplies the redirect URI.
+  const proofFields = ({ display_name: _, ...rest }: Schemas["Oidc"]) => rest;
   const ssoEdited =
-    !same(draft.auth.oidc, saved.auth.oidc) ||
+    !same(proofFields(draft.auth.oidc), proofFields(saved.auth.oidc)) ||
     (!saved.auth.oidc.redirect_uri && draft.network.public_url !== saved.network.public_url);
   // Only saved-on → off needs proof; with password sign-in already off, SSO stays editable.
   const passwordOff =
@@ -837,11 +845,11 @@ export function Settings() {
                 </div>
                 <LibraryPanel onPreview={previewChange} />
                 {saved.imports.strategy === "strm" &&
-                  draft.arr_instances.some((a) => a.enabled && (a.profile === "lidarr" || a.profile === "readarr")) && (
+                  draft.arr_instances.some((a) => a.enabled && (a.profile === "lidarr" || a.profile === "chaptarr")) && (
                     <Alert>
                       <TriangleAlert className="text-warning-text" />
                       <AlertDescription>
-                        Lidarr and Readarr cannot import STRM files, so their downloads still arrive as symlinks, which need the
+                        Lidarr and Chaptarr cannot import STRM files, so their downloads still arrive as symlinks, which need the
                         mount.
                       </AlertDescription>
                     </Alert>
@@ -1135,6 +1143,16 @@ export function Settings() {
               </Section>
             )}
 
+            {category.slug === "backups" && (
+              <BackupsPanel
+                title={category.title}
+                description={category.description}
+                value={draft.maintenance}
+                locked={locked}
+                onChange={(maintenance) => setDraft((d) => (d ? { ...d, maintenance } : d))}
+              />
+            )}
+
             {category.slug === "maintenance" && (
               <Section category={category}>
                 <MaintenancePanel
@@ -1232,12 +1250,22 @@ export function Settings() {
                 <SettingsPanel>
                   {status && (
                     <div className="space-y-0.5">
-                      <Status tone={status.mount.mounted ? "success" : "warning"}>
-                        <span className="font-medium">{status.mount.mounted ? "Mounted" : "Not mounted"}</span>
+                      <Status tone={!status.mount.enabled ? "muted" : status.mount.mounted ? "success" : "warning"}>
+                        <span className="font-medium">
+                          {!status.mount.enabled ? "Built-in FUSE mount off" : status.mount.mounted ? "Mounted" : "Not mounted"}
+                        </span>
                       </Status>
                       {status.mount.reason && <p className="text-muted-foreground text-xs">{status.mount.reason}</p>}
                     </div>
                   )}
+                  <Toggle
+                    id="mount-fuse"
+                    label={label("Built-in FUSE mount", "mount.fuse")}
+                    hint="Turn off if you do not use the built-in FUSE mount. Takes effect after a restart."
+                    disabled={locked("mount.fuse")}
+                    checked={draft.mount.fuse}
+                    onChange={(fuse) => patch("mount", { fuse })}
+                  />
                   <Field
                     id="mount-dir"
                     label={label("Directory", "mount.dir")}
@@ -1316,6 +1344,21 @@ export function Settings() {
                   <Password />
                 </SettingsPanel>
                 <SettingsPanel title="Single sign-on">
+                  <Field
+                    id="oidc-display-name"
+                    label={label("Display name", "auth.oidc.display_name")}
+                    hint="Shown on the sign-in page as Sign in with this name."
+                    error={invalid("auth.oidc.display_name")}
+                  >
+                    <Input
+                      id="oidc-display-name"
+                      autoComplete="off"
+                      placeholder="SSO"
+                      disabled={locked("auth.oidc.display_name")}
+                      value={draft.auth.oidc.display_name}
+                      onChange={(e) => oidc({ display_name: e.target.value })}
+                    />
+                  </Field>
                   <Field
                     id="oidc-issuer"
                     label={label(

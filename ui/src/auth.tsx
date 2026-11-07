@@ -77,12 +77,14 @@ export function Gate({ children }: { children: ReactNode }) {
 
 type CountedStage = Exclude<Schemas["UpgradeStage"], "finishing">;
 const upgradeStages: Record<CountedStage, { phase: string; done: string; total: string }> = {
+  copying: { phase: "Copying 1.x PostgreSQL data", done: "Rows copied", total: "Rows to copy" },
   checking: { phase: "Checking 1.x files", done: "Files checked", total: "Files to check" },
   directories: { phase: "Writing folders", done: "Folders written", total: "Total folders" },
   nzbs: { phase: "Storing NZBs", done: "NZBs processed", total: "Total NZBs" },
   files: { phase: "Importing files", done: "Files written", total: "Total files" },
 };
-const upgradeSteps = Object.keys(upgradeStages) as CountedStage[];
+// SQLite installs skip the copy, so it is not a numbered step.
+const upgradeSteps: CountedStage[] = ["checking", "directories", "nzbs", "files"];
 
 function UpgradeProgress({ status, reconnecting }: { status: Schemas["UpgradeStatus"]; reconnecting: boolean }) {
   useTitle("Upgrading");
@@ -296,6 +298,7 @@ function Credentials({ setup, status }: { setup: boolean; status?: Schemas["Auth
   }, [params, setParams]);
   const passwordLogin = setup || !!status?.password_login;
   const sso = !setup && !!status?.sso;
+  const ssoName = status?.sso_name || "SSO";
   const [username, setUsername] = useState(setup ? "admin" : "");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -333,7 +336,7 @@ function Credentials({ setup, status }: { setup: boolean; status?: Schemas["Auth
               {setup
                 ? "Create the admin account to finish setting up."
                 : sso && passwordLogin
-                  ? "Use single sign-on or the admin account."
+                  ? `Use ${ssoName} or the admin account.`
                   : sso
                     ? "Use your identity provider."
                     : "Use the admin account created during setup."}
@@ -345,7 +348,7 @@ function Credentials({ setup, status }: { setup: boolean; status?: Schemas["Auth
             <Alert variant="destructive">
               <CircleAlert />
               <AlertDescription>
-                SSO sign-in failed. Try again{passwordLogin ? ", or use your password" : ""}. The server log says why.
+                {ssoName} sign-in failed. Try again{passwordLogin ? ", or use your password" : ""}. The server log says why.
               </AlertDescription>
             </Alert>
           )}
@@ -436,7 +439,9 @@ function Credentials({ setup, status }: { setup: boolean; status?: Schemas["Auth
                 </div>
               )}
               <Button asChild className="w-full" variant={passwordLogin ? "outline" : "default"}>
-                <a href="/auth/oidc/login">Sign in with SSO</a>
+                <a href="/auth/oidc/login" title={`Sign in with ${ssoName}`}>
+                  <span className="min-w-0 truncate">Sign in with {ssoName}</span>
+                </a>
               </Button>
             </>
           )}

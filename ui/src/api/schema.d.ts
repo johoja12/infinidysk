@@ -2102,7 +2102,7 @@ export interface components {
         ArrBinding: "verified" | "unverified" | "other";
         ArrClientStatus: {
             binding: components["schemas"]["ArrBinding"];
-            category?: string | null;
+            categories: string[];
             name: string;
         };
         ArrCount: {
@@ -2141,6 +2141,8 @@ export interface components {
             /** @description Downloads in its queue whose import only the user can settle. */
             queue_issues: components["schemas"]["ArrQueueIssue"][];
             version?: string | null;
+            /** @description Settings of this Arr that work against this app. */
+            warnings: string[];
             /** @description Why registering the webhook failed. */
             webhook_error?: string | null;
             /**
@@ -2161,7 +2163,7 @@ export interface components {
          * @description Arr-specific behavior hangs off this, so new Arr types are additive.
          * @enum {string}
          */
-        ArrProfile: "sonarr" | "radarr" | "lidarr" | "readarr" | "whisparr" | "sportarr";
+        ArrProfile: "sonarr" | "radarr" | "lidarr" | "chaptarr" | "whisparr" | "sportarr";
         /** @description A download the Arr will not import for a reason only the user can settle. */
         ArrQueueIssue: {
             messages: string[];
@@ -2218,6 +2220,7 @@ export interface components {
              * @default {
              *       "client_id": "",
              *       "client_secret": "",
+             *       "display_name": "",
              *       "issuer": "",
              *       "redirect_uri": "",
              *       "scopes": "openid profile email",
@@ -2247,6 +2250,8 @@ export interface components {
             sso: boolean;
             /** @description The SSO session was started under the saved SSO settings, so it proves they work. */
             sso_current: boolean;
+            /** @description Identity provider name for the SSO button; `SSO` unless `auth.oidc.display_name` is set. */
+            sso_name: string;
             /** @description The signed-in username. */
             user?: string | null;
         };
@@ -2565,6 +2570,8 @@ export interface components {
             /** @description `INFINIDYSK_DATABASE_URL` selects the database; it cannot be moved here. */
             env_managed: boolean;
             migration?: components["schemas"]["MigrationView"] | null;
+            /** @description The SQLite file in use; absent on PostgreSQL. */
+            sqlite_path?: string | null;
             /** @description `user@host:port/database` of the PostgreSQL database in use or being copied to. */
             target?: string | null;
         };
@@ -3668,6 +3675,11 @@ export interface components {
              * @default false
              */
             epoch_times: boolean;
+            /**
+             * @description Serve the built-in FUSE mount at `dir`. Off leaves `dir` to an external mount.
+             * @default true
+             */
+            fuse: boolean;
         };
         MountProof: {
             /** Format: int64 */
@@ -3679,6 +3691,11 @@ export interface components {
         };
         MountStatus: {
             dir: string;
+            /**
+             * @description This process serves the built-in FUSE mount (on in the settings it started with,
+             *     and Linux). Off means nothing to warn about.
+             */
+            enabled: boolean;
             mounted: boolean;
             /** @description Why it is not mounted. */
             reason?: string | null;
@@ -3961,6 +3978,11 @@ export interface components {
             client_id: string;
             /** @default  */
             client_secret: components["schemas"]["Secret"];
+            /**
+             * @description Shown on the sign-in page as "Sign in with <name>"; empty shows `SSO`.
+             * @default
+             */
+            display_name: string;
             /**
              * @description Issuer URL exactly as the provider publishes it; empty turns SSO off.
              * @default
@@ -4819,7 +4841,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1a74d-e58b-76b0-a945-727187b91b00
+             * @default 01a1b48a-610d-7559-befc-ad5a41c05bbc
              */
             id: string;
             /**
@@ -5076,7 +5098,8 @@ export interface components {
             stall_ms: number;
             /**
              * Format: int64
-             * @description Waits for data of at least 50 ms after the first byte.
+             * @description Waits for data of at least 1 s, other than for the first byte and the first byte
+             *     after a seek.
              */
             stalls: number;
             traced: boolean;
@@ -5432,6 +5455,7 @@ export interface components {
              *       "oidc": {
              *         "client_id": "",
              *         "client_secret": "",
+             *         "display_name": "",
              *         "issuer": "",
              *         "redirect_uri": "",
              *         "scopes": "openid profile email",
@@ -5500,7 +5524,8 @@ export interface components {
             /**
              * @default {
              *       "dir": "/mnt/infinidysk",
-             *       "epoch_times": false
+             *       "epoch_times": false,
+             *       "fuse": true
              *     }
              */
             mount: components["schemas"]["Mount"];
@@ -5634,8 +5659,8 @@ export interface components {
             /** @description Dotted paths fixed by environment variables. */
             locked: string[];
             /**
-             * @description Saved changes that apply only after a restart (mount directory, read-ahead memory,
-             *     FUSE tuning, experiments).
+             * @description Saved changes that apply only after a restart (mount directory, built-in FUSE
+             *     mount on or off, read-ahead memory, FUSE tuning, experiments).
              */
             restart_required: boolean;
             /** @description Secrets are masked; send the mask back to keep them. */
@@ -5836,7 +5861,7 @@ export interface components {
         /** @enum {string} */
         UnownedAction: "delete" | "action_needed";
         Update: {
-            /** @description The image's package page. */
+            /** @description The GitHub release notes of that release. */
             url: string;
             /** @description Image tag of the newer release. */
             version: string;
@@ -5866,7 +5891,7 @@ export interface components {
             total?: number | null;
         };
         /** @enum {string} */
-        UpgradeStage: "checking" | "directories" | "nzbs" | "files" | "finishing";
+        UpgradeStage: "copying" | "checking" | "directories" | "nzbs" | "files" | "finishing";
         /** @enum {string} */
         UpgradeState: "none" | "importing" | "done" | "failed";
         UpgradeStatus: {

@@ -30,6 +30,9 @@ static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/s
 
 /// Buffered change notices per subscriber before it lags.
 const CHANGES: usize = 256;
+/// Files per health state; `items_health_summary` covers it.
+const HEALTH_SUMMARY: &str = "SELECT health_state, CAST(COUNT(*) AS BIGINT) FROM items \
+                              WHERE kind <> $1 AND meta_blob IS NOT NULL GROUP BY health_state";
 /// Searches we may ask an Arr to run for one piece of media per [`SEARCH_WINDOW_MS`],
 /// shared by health repair and queue management.
 pub const SEARCH_LIMIT: i64 = 3;
@@ -131,7 +134,9 @@ fn under(folder: &str) -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("database error")]
+    /// Shows what the driver reported (e.g. `(code: 517) database is locked`,
+    /// `pool timed out …`); a fixed text hid the cause from logs and run reports.
+    #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
     #[error("database migration failed")]
     Migrate(#[from] sqlx::migrate::MigrateError),
@@ -1195,6 +1200,15 @@ impl Db {
         on!(self, pool => pool.close().await);
     }
 
+    /// Starts a transaction that reads, then writes. A deferred SQLite one fails with
+    /// `SQLITE_BUSY_SNAPSHOT` (517) when another writer commits between the two.
+    const fn begin_write(&self) -> &'static str {
+        match self.pool {
+            Pool::Sqlite(_) => "BEGIN IMMEDIATE",
+            Pool::Postgres(_) => "BEGIN",
+        }
+    }
+
     pub async fn item(&self, id: ItemId) -> Result<Option<Item>, Error> {
         let sql = select_items!("WHERE id = $1");
         let row: Option<ItemRow> =
@@ -1235,6 +1249,11 @@ impl Db {
         on!(self,pool=>sqlx::query("WITH RECURSIVE sub(id) AS (SELECT id FROM items WHERE id=$1 UNION ALL SELECT i.id FROM items i JOIN sub ON i.parent_id=sub.id) INSERT INTO completed_link_removals(item_id,removed_at) SELECT id,$2 FROM sub WHERE 1=1 ON CONFLICT(item_id) DO NOTHING")
             .bind(item.0).bind(now_ms()).execute(pool).await?.rows_affected());
         Ok(())
+    }
+    /// Names of the children of `parent`, in no particular order.
+    pub async fn child_names(&self, parent: ItemId) -> Result<Vec<String>, Error> {
+        let sql = "SELECT name FROM items WHERE parent_id = $1";
+        Ok(on!(self, pool => sqlx::query_scalar(sql).bind(parent.0).fetch_all(pool).await?))
     }
 
     /// Files (not directories) with ids in `start..end`, ordered by id.
@@ -2189,7 +2208,15 @@ impl Db {
     /// Returns whether it went.
     pub async fn delete_unlinked(&self, id: ItemId, before: i64) -> Result<bool, Error> {
         let deleted = on!(self, pool => {
-            let mut tx = pool.begin().await?;
+            let still: Option<i32> = sqlx::query_scalar(STILL_OUTSIDE_HISTORY)
+                .bind(id.0)
+                .bind(before)
+                .fetch_optional(pool)
+                .await?;
+            if still.is_none() {
+                return Ok(false);
+            }
+            let mut tx = pool.begin_with(self.begin_write()).await?;
             let still: Option<i32> = sqlx::query_scalar(STILL_OUTSIDE_HISTORY)
                 .bind(id.0)
                 .bind(before)
@@ -2211,7 +2238,14 @@ impl Db {
     /// same transaction. Returns whether it went.
     pub async fn delete_without_files(&self, id: ItemId) -> Result<bool, Error> {
         let deleted = on!(self, pool => {
-            let mut tx = pool.begin().await?;
+            let holds: Option<i32> = sqlx::query_scalar(HOLDS_FILES)
+                .bind(id.0)
+                .fetch_optional(pool)
+                .await?;
+            if holds.is_some() {
+                return Ok(false);
+            }
+            let mut tx = pool.begin_with(self.begin_write()).await?;
             let holds: Option<i32> = sqlx::query_scalar(HOLDS_FILES)
                 .bind(id.0)
                 .fetch_optional(&mut *tx)
@@ -2239,7 +2273,14 @@ impl Db {
                                AND NOT EXISTS (SELECT 1 FROM arr_owners WHERE item_id = $1)";
         let postgres = matches!(self.pool, Pool::Postgres(_));
         let deleted = on!(self, pool => {
-            let mut tx = pool.begin().await?;
+            let unowned: Option<i32> = sqlx::query_scalar(UNOWNED)
+                .bind(id.0)
+                .fetch_optional(pool)
+                .await?;
+            if unowned.is_none() {
+                return Ok(false);
+            }
+            let mut tx = pool.begin_with(self.begin_write()).await?;
             if postgres {
                 sqlx::query(ISOLATION).execute(&mut *tx).await?;
                 sqlx::query(LOCK).bind(id.0).execute(&mut *tx).await?;
@@ -2267,16 +2308,24 @@ impl Db {
         let mut removed = 0;
         loop {
             let found = on!(self, pool => {
-                let mut tx = pool.begin().await?;
-                let dirs: Vec<Uuid> = sqlx::query_scalar(EMPTY_DIRS_OUTSIDE_HISTORY)
+                let any: Vec<Uuid> = sqlx::query_scalar(EMPTY_DIRS_OUTSIDE_HISTORY)
                     .bind(before)
-                    .fetch_all(&mut *tx)
+                    .fetch_all(pool)
                     .await?;
-                for &dir in &dirs {
-                    delete_subtree!(self, tx, dir);
+                if any.is_empty() {
+                    0
+                } else {
+                    let mut tx = pool.begin_with(self.begin_write()).await?;
+                    let dirs: Vec<Uuid> = sqlx::query_scalar(EMPTY_DIRS_OUTSIDE_HISTORY)
+                        .bind(before)
+                        .fetch_all(&mut *tx)
+                        .await?;
+                    for &dir in &dirs {
+                        delete_subtree!(self, tx, dir);
+                    }
+                    tx.commit().await?;
+                    dirs.len() as u64
                 }
-                tx.commit().await?;
-                dirs.len() as u64
             });
             if found == 0 {
                 break;
@@ -2565,9 +2614,7 @@ impl Db {
 
     /// Files per health state.
     pub async fn health_summary(&self) -> Result<Vec<(HealthState, u64)>, Error> {
-        let sql = "SELECT health_state, CAST(COUNT(*) AS BIGINT) FROM items \
-                   WHERE kind <> $1 AND meta_blob IS NOT NULL GROUP BY health_state";
-        let rows: Vec<(i16, i64)> = on!(self, pool => sqlx::query_as(sql)
+        let rows: Vec<(i16, i64)> = on!(self, pool => sqlx::query_as(HEALTH_SUMMARY)
             .bind(ItemKind::Directory as i16)
             .fetch_all(pool)
             .await?);
@@ -3732,5 +3779,105 @@ impl Db {
     pub async fn item_descends_from(&self, item: ItemId, root: ItemId) -> Result<bool, Error> {
         let sql = "WITH RECURSIVE chain(id,parent_id,depth) AS (SELECT id,parent_id,0 FROM items WHERE id=$1 UNION ALL SELECT i.id,i.parent_id,c.depth+1 FROM items i JOIN chain c ON i.id=c.parent_id WHERE c.depth<64) SELECT EXISTS(SELECT 1 FROM chain WHERE id=$2)";
         Ok(on!(self,pool=>sqlx::query_scalar(sql).bind(item.0).bind(root.0).fetch_one(pool).await?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Reads in a transaction while another connection writes, then writes.
+    async fn read_then_write(
+        pool: &sqlx::SqlitePool,
+        begin: &'static str,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = pool.begin_with(begin).await?;
+        sqlx::query("SELECT COUNT(*) FROM t")
+            .execute(&mut *tx)
+            .await?;
+        let other = pool.clone();
+        let mut writer = Some(tokio::spawn(async move {
+            sqlx::query("INSERT INTO t VALUES (1)")
+                .execute(&other)
+                .await
+        }));
+        if begin == "BEGIN" {
+            // A deferred read holds no write lock, so the other writer commits first.
+            writer
+                .take()
+                .expect("spawned")
+                .await
+                .expect("writer task")?;
+        } else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let wrote = sqlx::query("INSERT INTO t VALUES (2)")
+            .execute(&mut *tx)
+            .await;
+        if wrote.is_ok() {
+            tx.commit().await?;
+        }
+        if let Some(writer) = writer {
+            writer.await.expect("writer task")?;
+        }
+        wrote.map(drop)
+    }
+
+    #[tokio::test]
+    async fn the_health_summary_reads_its_index() {
+        let path = std::env::temp_dir().join(format!("infinidysk-db-{}.sqlite", ItemId::new()));
+        let db = Db::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .expect("connect");
+        let Pool::Sqlite(pool) = &db.pool else {
+            unreachable!("the test opens SQLite")
+        };
+        let plan: Vec<(i64, i64, i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "EXPLAIN QUERY PLAN {HEALTH_SUMMARY}"
+        )))
+        .bind(ItemKind::Directory as i16)
+        .fetch_all(pool)
+        .await
+        .expect("plan");
+        let plan: Vec<_> = plan.into_iter().map(|row| row.3).collect();
+        assert_eq!(plan, ["SCAN items USING INDEX items_health_summary"]);
+
+        db.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_then_write_survives_a_concurrent_sqlite_writer() {
+        let path = std::env::temp_dir().join(format!("infinidysk-db-{}.sqlite", ItemId::new()));
+        let db = Db::connect(&format!("sqlite:{}", path.display()))
+            .await
+            .expect("connect");
+        let Pool::Sqlite(pool) = &db.pool else {
+            unreachable!("the test opens SQLite")
+        };
+        sqlx::query("CREATE TABLE t (x INTEGER)")
+            .execute(pool)
+            .await
+            .expect("create");
+
+        let deferred = read_then_write(pool, "BEGIN")
+            .await
+            .expect_err("snapshot is stale");
+        let code = deferred
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code);
+        assert_eq!(code.as_deref(), Some("517"), "{deferred}");
+        read_then_write(pool, db.begin_write())
+            .await
+            .expect("an immediate transaction waits for the other writer");
+
+        db.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 }

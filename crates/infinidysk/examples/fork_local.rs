@@ -316,6 +316,7 @@ async fn main() -> anyhow::Result<()> {
     println!("{}", receipt_path.display());
     let owner = std::fs::metadata(&root)?;
     let boot = Boot {
+        home: root.clone(),
         database_source: infinidysk::database::Source::Env,
         listen: address,
         database_url,

@@ -260,8 +260,13 @@ async fn kernel(native: bool) {
         std::fs::set_permissions(&link, std::os::unix::fs::PermissionsExt::from_mode(0o644))
             .unwrap();
 
-        // Filesystem credentials stay confined to this disposable thread.
+        // Arr apps move a link by linking the new path, then unlinking the old one; then
+        // they delete the emptied job folder. A PGID group member may.
+        let library = mount.parent().unwrap().join("library.mkv");
+        std::os::unix::fs::symlink(&target, &library).unwrap();
         let job_dir = mount.join("completed-symlinks/tv/my job");
+        let category = mount.join("completed-symlinks/tv");
+        // Filesystem credentials stay confined to this disposable thread.
         std::thread::spawn(move || {
             let group = nix::unistd::Gid::from_raw(5678);
             let user = nix::unistd::Uid::from_raw(4321);
@@ -270,14 +275,24 @@ async fn kernel(native: bool) {
             assert_eq!(nix::unistd::setfsgid(group), group, "fsgid must change");
             assert_eq!(nix::unistd::setfsuid(user), user, "fsuid must change");
             std::fs::remove_file(&link)?;
+            assert!(std::fs::symlink_metadata(&link).is_err(), "link is gone");
+            assert!(std::fs::remove_file(&link).is_err(), "already gone");
+            assert_eq!(std::fs::read_dir(&job_dir)?.count(), 0);
             std::fs::remove_dir(&job_dir)?;
             assert!(std::fs::symlink_metadata(&link).is_err());
             assert!(!job_dir.exists(), "removed completed pointers disappear");
+            assert_eq!(std::fs::read_dir(&category)?.count(), 0);
             Ok::<(), std::io::Error>(())
         })
         .join()
         .unwrap()
         .expect("a PGID group member can delete links and job folders");
+        assert_eq!(
+            std::fs::read(&library).unwrap(),
+            data,
+            "the moved link still plays"
+        );
+        assert!(std::fs::remove_dir(mount.join("completed-symlinks/tv")).is_err());
 
         // Reads on an open file must not need the database: once its attributes expire,
         // the next buffered read refreshes them with a GETATTR on its handle before serving

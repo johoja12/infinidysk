@@ -88,6 +88,7 @@ async fn answer(State(s): State<Scenario>, req: Request) -> impl IntoResponse {
     }
     let imported = req.uri().query().is_some_and(|q| q.contains("eventType=3"));
     let data = match path {
+        "/api" => json!({"current":"v3", "deprecated":[]}),
         "/api/v3/system/status" => json!({"appName": "Whisparr", "version": "3.0.0"}),
         "/api/v3/history" if imported => json!({"records": [{
             "id": 22, "movieId": 3, "episodeId": 5,

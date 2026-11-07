@@ -1,7 +1,7 @@
 //! Mutation checkpoints are persisted before dispatch. A lost response is observed,
 //! never permission to replay a blocklist, deletion or search blindly.
 use super::{Episode, GRABBED, Media, MediaFile, Movie, Owner, Page, replacing};
-use crate::{Arr, Error, call, fetch, send};
+use crate::{Arr, Error, Session, fetch, send};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -76,7 +76,7 @@ fn now() -> i64 {
         .try_into()
         .unwrap_or(i64::MAX)
 }
-async fn target(http: &reqwest::Client, arr: &Arr, owner: &Owner) -> Result<Target, Error> {
+async fn target(s: &Session<'_>, owner: &Owner) -> Result<Target, Error> {
     let old = owner.current.as_ref().map(|f| f.id).or(owner.recorded_file);
     let path = owner
         .current
@@ -84,7 +84,7 @@ async fn target(http: &reqwest::Client, arr: &Arr, owner: &Owner) -> Result<Targ
         .map_or(owner.imported_path.as_str(), |f| f.path.as_str());
     let current = match &owner.media {
         Media::Movie(id) => {
-            fetch::<Movie>(call(http, arr, Method::GET, &format!("movie/{id}")))
+            fetch::<Movie>(s.call(Method::GET, &format!("movie/{id}")))
                 .await?
                 .movie_file
         }
@@ -96,8 +96,7 @@ async fn target(http: &reqwest::Client, arr: &Arr, owner: &Owner) -> Result<Targ
             }
             let mut files = std::collections::HashSet::new();
             for id in ids {
-                let episode: Episode =
-                    fetch(call(http, arr, Method::GET, &format!("episode/{id}"))).await?;
+                let episode: Episode = fetch(s.call(Method::GET, &format!("episode/{id}"))).await?;
                 if episode.episode_file_id != 0 {
                     files.insert(episode.episode_file_id);
                 }
@@ -108,24 +107,21 @@ async fn target(http: &reqwest::Client, arr: &Arr, owner: &Owner) -> Result<Targ
                 return Err(Error::Unexpected("episode ownership changed during regrab"));
             } else {
                 let file = *files.iter().next().expect("one file was checked");
-                Some(
-                    fetch::<MediaFile>(call(
-                        http,
-                        arr,
-                        Method::GET,
-                        &format!("episodefile/{file}"),
-                    ))
-                    .await?,
-                )
+                Some(fetch::<MediaFile>(s.call(Method::GET, &format!("episodefile/{file}"))).await?)
             }
+        }
+        Media::Book(id) => {
+            let files: Vec<MediaFile> =
+                fetch(s.call(Method::GET, "bookfile").query(&[("bookId", *id)])).await?;
+            let last_import = owner.imported_at.as_deref().and_then(|d| d.parse().ok());
+            super::current_book_file(files, path, last_import, old)
         }
         Media::Album(_) => {
             // An album may contain multiple tracks; only inspect the exact recorded file.
             let Some(id) = old else {
                 return Err(Error::Unexpected("track regrab needs an exact file id"));
             };
-            match fetch::<MediaFile>(call(http, arr, Method::GET, &format!("trackfile/{id}"))).await
-            {
+            match fetch::<MediaFile>(s.call(Method::GET, &format!("trackfile/{id}"))).await {
                 Err(Error::Rejected {
                     status: reqwest::StatusCode::NOT_FOUND,
                     ..
@@ -148,7 +144,7 @@ async fn target(http: &reqwest::Client, arr: &Arr, owner: &Owner) -> Result<Targ
 }
 /// Arr owns the filesystem operation. Require its current root-folder authority
 /// before dispatch; display/catalogue filename matches never authorize mutation.
-async fn library_authority(http: &reqwest::Client, arr: &Arr, owner: &Owner) -> Result<(), Error> {
+async fn library_authority(s: &Session<'_>, owner: &Owner) -> Result<(), Error> {
     fn normalized(path: &str) -> Option<String> {
         if path.len() > 4096 || path.chars().any(char::is_control) {
             return None;
@@ -177,7 +173,7 @@ async fn library_authority(http: &reqwest::Client, arr: &Arr, owner: &Owner) -> 
     .ok_or(Error::Unexpected(
         "regrab path is not normalized and absolute",
     ))?;
-    let roots: Vec<Value> = fetch(call(http, arr, Method::GET, "rootfolder")).await?;
+    let roots: Vec<Value> = fetch(s.call(Method::GET, "rootfolder")).await?;
     if roots.len() > 1000 {
         return Err(Error::Unexpected("Arr root-folder list exceeds its bound"));
     }
@@ -218,10 +214,11 @@ fn search(owner: &Owner) -> Value {
         Media::Movie(id) => json!({"name":"MoviesSearch","movieIds":[id]}),
         Media::Episodes(ids) => json!({"name":"EpisodeSearch","episodeIds":ids}),
         Media::Album(id) => json!({"name":"AlbumSearch","albumIds":[id]}),
+        Media::Book(id) => json!({"name":"BookSearch","bookIds":[id]}),
     }
 }
-async fn commands(http: &reqwest::Client, arr: &Arr) -> Result<Vec<Value>, Error> {
-    let rows: Vec<Value> = fetch(call(http, arr, Method::GET, "command")).await?;
+async fn commands(s: &Session<'_>) -> Result<Vec<Value>, Error> {
+    let rows: Vec<Value> = fetch(s.call(Method::GET, "command")).await?;
     let mut ids = std::collections::HashSet::new();
     if rows.iter().any(|row| {
         row.get("id")
@@ -254,6 +251,8 @@ fn matches_command(value: &Value, expected: &Value) -> bool {
         "movieIds"
     } else if expected.get("episodeIds").is_some() {
         "episodeIds"
+    } else if expected.get("bookIds").is_some() {
+        "bookIds"
     } else {
         "albumIds"
     };
@@ -294,7 +293,8 @@ where
         save(progress, next, &checkpoint).await?;
         return Ok(());
     }
-    let observed = target(http, arr, &progress.owner).await?;
+    let s = Session::open(http, arr).await?;
+    let observed = target(&s, &progress.owner).await?;
     if observed == Target::Replaced {
         let mut next = progress.clone();
         next.stage = RegrabStage::Replaced;
@@ -315,9 +315,9 @@ where
         ));
     }
     if progress.stage == RegrabStage::Prepared {
-        library_authority(http, arr, &progress.owner).await?;
+        library_authority(&s, &progress.owner).await?;
     }
-    if replacing(http, arr, progress.owner.download_id(), &progress.owner).await? {
+    if replacing(&s, progress.owner.download_id(), &progress.owner).await? {
         let mut next = progress.clone();
         next.stage = RegrabStage::Submitted;
         save(progress, next, &checkpoint).await?;
@@ -327,7 +327,7 @@ where
         let Some(job) = progress.owner.download_id() else {
             return Err(Error::Unexpected("blocklist journal lacks provenance"));
         };
-        let failed: Page = fetch(call(http, arr, Method::GET, "history").query(&[
+        let failed: Page = fetch(s.call(Method::GET, "history").query(&[
             ("downloadId", job),
             ("eventType", "4"),
             ("pageSize", "1"),
@@ -348,7 +348,7 @@ where
     }
     if progress.stage == RegrabStage::Prepared {
         if let Some(job) = progress.owner.download_id() {
-            let grabbed: Page = fetch(call(http, arr, Method::GET, "history").query(&[
+            let grabbed: Page = fetch(s.call(Method::GET, "history").query(&[
                 ("downloadId", job),
                 ("eventType", GRABBED),
                 ("pageSize", "1"),
@@ -368,16 +368,11 @@ where
                 next.stage = RegrabStage::BlocklistPending;
                 next.wait_until =
                     now().saturating_add(wait.as_millis().try_into().unwrap_or(i64::MAX));
-                library_authority(http, arr, &progress.owner).await?;
+                library_authority(&s, &progress.owner).await?;
                 save(progress, next, &checkpoint).await?;
                 send(
-                    call(
-                        http,
-                        arr,
-                        Method::POST,
-                        &format!("history/failed/{}", grab.id),
-                    )
-                    .json(&json!({})),
+                    s.call(Method::POST, &format!("history/failed/{}", grab.id))
+                        .json(&json!({})),
                 )
                 .await?;
                 let mut next = progress.clone();
@@ -397,13 +392,13 @@ where
                 "blocklist accepted; automatic search observation pending",
             ));
         }
-        if replacing(http, arr, progress.owner.download_id(), &progress.owner).await? {
+        if replacing(&s, progress.owner.download_id(), &progress.owner).await? {
             let mut next = progress.clone();
             next.stage = RegrabStage::Submitted;
             save(progress, next, &checkpoint).await?;
             return Ok(());
         }
-        let observed = target(http, arr, &progress.owner).await?;
+        let observed = target(&s, &progress.owner).await?;
         if observed == Target::Replaced {
             let mut next = progress.clone();
             next.stage = RegrabStage::Replaced;
@@ -417,7 +412,7 @@ where
             RegrabStage::DeletePending
         };
         if next.stage == RegrabStage::DeletePending {
-            library_authority(http, arr, &progress.owner).await?;
+            library_authority(&s, &progress.owner).await?;
         }
         save(progress, next, &checkpoint).await?;
         if progress.stage == RegrabStage::DeletePending {
@@ -434,15 +429,16 @@ where
                 Media::Movie(_) => "moviefile",
                 Media::Episodes(_) => "episodefile",
                 Media::Album(_) => "trackfile",
+                Media::Book(_) => "bookfile",
             };
-            let result = send(call(http, arr, Method::DELETE, &format!("{kind}/{file}"))).await;
+            let result = send(s.call(Method::DELETE, &format!("{kind}/{file}"))).await;
             // Even a successful response must be verified before progressing. Any failure
             // is uncertain until the next read-only observation of the same target.
             result?;
         }
     }
     if progress.stage == RegrabStage::DeletePending {
-        match target(http, arr, &progress.owner).await? {
+        match target(&s, &progress.owner).await? {
             Target::Same => {
                 return Err(Error::Uncertain(
                     "deletion outcome is unknown; original target still visible",
@@ -463,7 +459,7 @@ where
     }
     let expected = search(&progress.owner);
     if progress.stage == RegrabStage::SearchPending {
-        if let Some(command) = commands(http, arr).await?.iter().find(|v| {
+        if let Some(command) = commands(&s).await?.iter().find(|v| {
             v.get("id")
                 .and_then(Value::as_i64)
                 .is_some_and(|id| id > progress.before_command)
@@ -480,7 +476,7 @@ where
         ));
     }
     if progress.stage == RegrabStage::Deleted {
-        let before = commands(http, arr)
+        let before = commands(&s)
             .await?
             .iter()
             .filter_map(|v| v.get("id").and_then(Value::as_i64))
@@ -489,12 +485,11 @@ where
         let mut next = progress.clone();
         next.stage = RegrabStage::SearchPending;
         next.before_command = before;
-        library_authority(http, arr, &progress.owner).await?;
+        library_authority(&s, &progress.owner).await?;
         save(progress, next, &checkpoint).await?;
         // A 2xx body may be malformed after the command was accepted. Keep SearchPending
         // in that case and reconcile by command id/arguments on the next pass.
-        let command: Value =
-            fetch(call(http, arr, Method::POST, "command").json(&expected)).await?;
+        let command: Value = fetch(s.call(Method::POST, "command").json(&expected)).await?;
         let id = command
             .get("id")
             .and_then(Value::as_i64)
@@ -521,7 +516,8 @@ pub async fn observe_tracked(
     if progress.version != 1 {
         return Err(Error::Unexpected("unsupported regrab journal version"));
     }
-    let current = target(http, arr, &progress.owner).await?;
+    let s = Session::open(http, arr).await?;
+    let current = target(&s, &progress.owner).await?;
     if current == Target::Replaced {
         progress.stage = RegrabStage::Replaced;
         return Ok(());
@@ -531,7 +527,7 @@ pub async fn observe_tracked(
             progress.stage = RegrabStage::Deleted;
         }
         RegrabStage::SearchPending => {
-            if let Some(command) = commands(http, arr).await?.iter().find(|v| {
+            if let Some(command) = commands(&s).await?.iter().find(|v| {
                 v.get("id")
                     .and_then(Value::as_i64)
                     .is_some_and(|id| id > progress.before_command)
@@ -543,7 +539,7 @@ pub async fn observe_tracked(
         }
         RegrabStage::BlocklistPending => {
             if let Some(job) = progress.owner.download_id() {
-                let failed: Page = fetch(call(http, arr, Method::GET, "history").query(&[
+                let failed: Page = fetch(s.call(Method::GET, "history").query(&[
                     ("downloadId", job),
                     ("eventType", "4"),
                     ("pageSize", "1"),
@@ -569,7 +565,8 @@ pub async fn regrab_replaced(
     arr: &Arr,
     progress: &Regrab,
 ) -> Result<bool, Error> {
-    Ok(target(http, arr, &progress.owner).await? == Target::Replaced)
+    let s = Session::open(http, arr).await?;
+    Ok(target(&s, &progress.owner).await? == Target::Replaced)
 }
 
 /// Read-only bridge for a recorded 1.x request. It cannot return an Owner or a
@@ -612,5 +609,6 @@ pub async fn legacy_replacement_observed(
         current: None,
         download_id: None,
     };
-    Ok(target(http, arr, &owner).await? == Target::Replaced)
+    let s = Session::open(http, arr).await?;
+    Ok(target(&s, &owner).await? == Target::Replaced)
 }

@@ -5,7 +5,7 @@
 use reqwest::Method;
 use serde_json::Value;
 
-use crate::{Arr, Error, Profile, call, fetch, version};
+use crate::{Arr, Error, Profile, Session, fetch, version};
 
 /// Media per `moviefile` request.
 const BATCH: usize = 100;
@@ -25,28 +25,27 @@ pub async fn files(http: &reqwest::Client, arr: &Arr) -> Result<Option<Vec<Libra
     let movies = match arr.profile {
         Profile::Radarr => true,
         Profile::Whisparr => crate::whisparr_has_movies(&version),
-        Profile::Sonarr | Profile::Lidarr | Profile::Readarr => false,
+        Profile::Sonarr | Profile::Lidarr | Profile::Chaptarr => false,
         Profile::Sportarr => return Ok(None),
     };
+    let s = Session::open(http, arr).await?;
     let mut files = Vec::new();
     if movies {
-        let ids = ids(&fetch::<Vec<Value>>(call(http, arr, Method::GET, "movie")).await?)?;
+        let ids = ids(&fetch::<Vec<Value>>(s.call(Method::GET, "movie")).await?)?;
         for batch in ids.chunks(BATCH) {
             let query: Vec<(&str, i64)> = batch.iter().map(|id| ("movieId", *id)).collect();
-            let found =
-                fetch::<Vec<Value>>(call(http, arr, Method::GET, "moviefile").query(&query));
+            let found = fetch::<Vec<Value>>(s.call(Method::GET, "moviefile").query(&query));
             files.extend(parse(&found.await?)?);
         }
         return Ok(Some(files));
     }
     let (parents, param, endpoint) = match arr.profile {
         Profile::Lidarr => ("artist", "artistId", "trackfile"),
-        Profile::Readarr => ("author", "authorId", "bookfile"),
+        Profile::Chaptarr => ("author", "authorId", "bookfile"),
         _ => ("series", "seriesId", "episodefile"),
     };
-    for id in ids(&fetch::<Vec<Value>>(call(http, arr, Method::GET, parents)).await?)? {
-        let found =
-            fetch::<Vec<Value>>(call(http, arr, Method::GET, endpoint).query(&[(param, id)]));
+    for id in ids(&fetch::<Vec<Value>>(s.call(Method::GET, parents)).await?)? {
+        let found = fetch::<Vec<Value>>(s.call(Method::GET, endpoint).query(&[(param, id)]));
         files.extend(parse(&found.await?)?);
     }
     Ok(Some(files))

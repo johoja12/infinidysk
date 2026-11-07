@@ -27,12 +27,12 @@ import {
 type Arr = Schemas["ArrInstance"];
 type ArrStatus = Schemas["ArrInstanceStatus"];
 
-const profiles: Schemas["ArrProfile"][] = ["sonarr", "radarr", "lidarr", "readarr", "whisparr", "sportarr"];
+const profiles: Schemas["ArrProfile"][] = ["sonarr", "radarr", "lidarr", "chaptarr", "whisparr", "sportarr"];
 const ports: Record<Schemas["ArrProfile"], number> = {
   sonarr: 8989,
   radarr: 7878,
   lidarr: 8686,
-  readarr: 8787,
+  chaptarr: 8789,
   whisparr: 6969,
   sportarr: 1867,
 };
@@ -157,12 +157,13 @@ function Summary({ status }: { status?: ArrStatus }) {
     );
   const here = status.clients.filter((c) => c.binding === "verified").length;
   const webhook = status.webhook_error ? "webhook not registered" : status.delivery_error ? "last webhook delivery failed" : null;
+  const issue = webhook ?? (status.warnings.length > 0 ? "a setting needs changing" : null);
   return (
     <div className="flex min-w-0 items-center gap-2 text-xs">
-      <Status tone={webhook || here === 0 ? "warning" : "success"}>Connected</Status>
+      <Status tone={issue || here === 0 ? "warning" : "success"}>Connected</Status>
       <span className="text-muted-foreground truncate">
         {here === 0 ? "add InfiniDysk as a SABnzbd download client in this Arr" : `sends to InfiniDysk through ${here} download client${here === 1 ? "" : "s"}`}
-        {webhook && ` · ${webhook}`}
+        {issue && ` · ${issue}`}
       </span>
     </div>
   );
@@ -366,9 +367,9 @@ function Discovered({ status }: { status: ArrStatus }) {
         <ul className="divide-y rounded-md border">
           {status.clients.map((c) => (
             <li key={c.name} className="flex items-center justify-between gap-2 px-3 py-2">
-              <span className="min-w-0 truncate">
+              <span className="min-w-0 break-words">
                 {c.name}
-                <span className="text-muted-foreground ml-2 font-mono">{c.category ?? "no category"}</span>
+                <span className="text-muted-foreground ml-2 font-mono break-all">{c.categories.join(", ") || "no category"}</span>
               </span>
               <span className="flex shrink-0 items-center gap-1.5">
                 <Badge variant={bindings[c.binding].variant}>{bindings[c.binding].label}</Badge>
@@ -378,6 +379,12 @@ function Discovered({ status }: { status: ArrStatus }) {
           ))}
         </ul>
       )}
+      {status.warnings.map((w) => (
+        <p key={w} className="flex items-start gap-2 text-warning-text">
+          <TriangleAlert className="mt-0.5 size-4 shrink-0" />
+          {w}
+        </p>
+      ))}
       <Webhook status={status} />
     </div>
   );

@@ -39,6 +39,7 @@ import { api, body } from "./api/client";
 import { authKey, useAuth, Wordmark } from "./auth";
 import { bytes } from "./format";
 import { LibraryBanner } from "./library";
+import { liveRefresh } from "./live";
 import { MaintenanceNow } from "./maintenance";
 import { setTheme, type Theme, useTheme } from "./theme";
 import { Loading } from "./ui";
@@ -60,17 +61,18 @@ function useLiveUpdates() {
   useEffect(() => {
     let source: EventSource;
     let retry: number | undefined;
+    const refresh = liveRefresh(client);
     const connect = () => {
       source = new EventSource("/api/v1/events");
-      for (const list of ["queue", "history", "health"]) {
-        source.addEventListener(list, () => void client.invalidateQueries({ queryKey: [list] }));
+      for (const name of ["queue", "history", "health", "resync"]) {
+        source.addEventListener(name, () => refresh.change(name));
       }
-      // Deleting a file reports a history change only.
-      source.addEventListener("history", () => void client.invalidateQueries({ queryKey: ["health", "summary"] }));
-      source.addEventListener("resync", () => void client.invalidateQueries());
       source.addEventListener("live", (e) => client.setQueryData(["live"], JSON.parse((e as MessageEvent<string>).data)));
-      // Reconnecting usually means the server restarted, perhaps on a new version.
-      source.onopen = () => void client.invalidateQueries({ queryKey: ["status"] });
+      source.onopen = () => {
+        // Reconnecting usually means the server restarted, perhaps on a new version.
+        void client.invalidateQueries({ queryKey: ["status"] });
+        refresh.opened();
+      };
       source.onerror = () => {
         // The browser retries dropped streams itself, but gives up on HTTP errors.
         if (source.readyState !== EventSource.CLOSED) return;
@@ -82,6 +84,7 @@ function useLiveUpdates() {
     return () => {
       source.close();
       window.clearTimeout(retry);
+      refresh.dispose();
     };
   }, [client]);
 }
@@ -273,22 +276,34 @@ function Account() {
   );
 }
 
-function useNavCounts(): Record<string, { count: number; label: string; warning?: boolean } | undefined> {
+type NavCount = { count: number; label: string; warning?: boolean };
+
+function useNavCounts(): Record<string, NavCount[]> {
   const queue = useQuery({ queryKey: ["queue"], queryFn: () => body(api.GET("/api/v1/queue")) }).data;
   const summary = useQuery({
     queryKey: ["health", "summary"],
     queryFn: () => body(api.GET("/api/v1/health/summary")),
   }).data;
+  const arr = useQuery({
+    queryKey: ["arr-status"],
+    queryFn: () => body(api.GET("/api/v1/arr/status")),
+    refetchInterval: 30_000,
+  }).data;
   const actionNeeded = summary?.find((s) => s.state === "action_needed")?.files ?? 0;
+  const arrIssues = arr?.instances.reduce((n, i) => n + i.queue_issues.length, 0) ?? 0;
+  const queueCounts: NavCount[] = [];
+  if (queue?.length) queueCounts.push({ count: queue.length, label: `${queue.length.toLocaleString()} in queue` });
+  if (arrIssues) {
+    const label = arrIssues === 1 ? "1 download needs" : `${arrIssues.toLocaleString()} downloads need`;
+    queueCounts.push({ count: arrIssues, label: `${label} you in the Arr`, warning: true });
+  }
   return {
-    "/queue": queue?.length ? { count: queue.length, label: `${queue.length} in queue` } : undefined,
-    "/health": actionNeeded
-      ? { count: actionNeeded, label: `${actionNeeded} need action`, warning: true }
-      : undefined,
+    "/queue": queueCounts,
+    "/health": actionNeeded ? [{ count: actionNeeded, label: `${actionNeeded} need action`, warning: true }] : [],
   };
 }
 
-function Nav() {
+export function Nav() {
   const counts = useNavCounts();
   return (
     <nav aria-label="Main" className="flex flex-col gap-0.5">
@@ -309,20 +324,20 @@ function Nav() {
             <>
               <Icon className={cn("size-4", isActive && "text-primary")} />
               <span className="flex-1">{label}</span>
-              {counts[to] && (
-                <>
+              {counts[to]?.map((c) => (
+                <span key={c.label} className="contents">
                   <span
                     aria-hidden
                     className={cn(
                       "min-w-5 rounded-full px-1.5 text-center text-xs leading-5 tabular-nums",
-                      counts[to].warning ? "bg-warning/15 text-warning-text" : "bg-foreground/10 text-muted-foreground",
+                      c.warning ? "bg-warning/15 text-warning-text" : "bg-foreground/10 text-muted-foreground",
                     )}
                   >
-                    {counts[to].count.toLocaleString()}
+                    {c.count.toLocaleString()}
                   </span>
-                  <span className="sr-only">, {counts[to].label}</span>
-                </>
-              )}
+                  <span className="sr-only">, {c.label}</span>
+                </span>
+              ))}
             </>
           )}
         </NavLink>

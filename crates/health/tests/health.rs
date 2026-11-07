@@ -214,6 +214,7 @@ async fn sonarr(State(state): State<Log>, req: Request) -> Json<Value> {
     let replaced = state.1.load(Ordering::Relaxed);
     Json(match req.uri().path() {
         "/api/v3/rootfolder" => json!([{ "path":"/tv" }]),
+        "/api" => json!({ "current": "v3", "deprecated": [] }),
         "/api/v3/history" if event => json!({ "records": [{
             "id": 21, "episodeId": 5,
             "data": { "droppedPath": "/data/strm/tv/job/job.strm", "importedPath": "/tv/Show/a.strm" },
@@ -601,7 +602,7 @@ async fn carried_over_file_is_repaired_through_its_recorded_download() {
     let (_, status) = db.health(item.id).await.unwrap().unwrap();
     assert_eq!(status.state, HealthState::Hidden);
     assert_eq!(
-        log.0.lock().unwrap()[0],
+        log.0.lock().unwrap()[1],
         format!("GET /api/v3/history?downloadId={job}&eventType=3&pageSize=1000")
     );
 }
@@ -674,8 +675,11 @@ async fn other_arr(State(log): State<Log>, req: Request) -> axum::response::Resp
     let query = parts.uri.query().unwrap_or_default();
     let dropped = "/data/completed/tv/job/job.mkv";
     let path = parts.uri.path();
+    if path == "/api" {
+        return Json(json!({ "current": "v3", "deprecated": [] })).into_response();
+    }
     let (root, path) = path.split_at(7);
-    let lidarr = root == "/api/v1";
+    let v1 = root == "/api/v1";
     if parts.method == axum::http::Method::DELETE {
         log.1.store(true, Ordering::SeqCst);
     }
@@ -686,9 +690,9 @@ async fn other_arr(State(log): State<Log>, req: Request) -> axum::response::Resp
     Json(match path {
         "/rootfolder" => json!([{ "path":"/music" },{ "path":"/movies" }]),
         "/system/status" => json!({ "appName": "Whisparr", "version": "3.0.0.1" }),
-        "/history" if query.contains("eventType=3") && lidarr => json!({ "records": [{
-            "id": 22, "trackId": 31, "albumId": 9,
-            "data": { "droppedPath": dropped, "importedPath": "/music/A/01.mkv" },
+        "/history" if query.contains("eventType=3") && v1 => json!({ "records": [{
+            "id": 22, "trackId": 31, "albumId": 9, "bookId": 5,
+            "data": { "droppedPath": dropped, "importedPath": "/music/A/01.mp4" },
         }]}),
         "/history" if query.contains("eventType=3") => json!({ "records": [{
             "id": 22, "movieId": 3,
@@ -696,10 +700,15 @@ async fn other_arr(State(log): State<Log>, req: Request) -> axum::response::Resp
         }]}),
         "/history" => json!({ "records": [{ "id": 12, "data": {} }] }),
         "/track/31" => json!({ "trackFileId": 41 }),
-        "/trackfile/41" => json!({ "id": 41, "albumId": 9, "path": "/music/A/01.mkv" }),
+        "/trackfile/41" => json!({ "id": 41, "albumId": 9, "path": "/music/A/01.mp4" }),
         "/movie/3" => json!({ "movieFile": if gone {Value::Null}else{json!({ "id": 7, "path": "/movies/A/a.mkv" })} }),
         "/command" if parts.method==axum::http::Method::GET=>json!([]),
         "/command"=>json!({"id":17}),
+        // An ebook of the same book does not stand in for the broken file.
+        "/bookfile" => json!(if gone { vec![] } else { vec![
+            json!({ "id": 52, "bookId": 5, "path": "/music/A/a.epub", "dateAdded": "2030-01-01T00:00:00Z" }),
+            json!({ "id": 51, "bookId": 5, "path": "/music/A/01.mp4" }),
+        ] }),
         "/queue/details" => json!([]),
         _ => json!({}),
     }).into_response()
@@ -756,6 +765,24 @@ async fn a_broken_track_gets_its_album_searched_through_lidarr() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_broken_book_file_gets_its_book_searched_through_chaptarr() {
+    let (calls, _) = repair_through(Profile::Chaptarr).await;
+    let mutations: Vec<_> = calls
+        .iter()
+        .filter(|call| !call.starts_with("GET "))
+        .cloned()
+        .collect();
+    assert_eq!(
+        mutations,
+        [
+            "POST /api/v1/history/failed/12 {}",
+            "DELETE /api/v1/bookfile/51",
+            r#"POST /api/v1/command {"bookIds":[5],"name":"BookSearch"}"#,
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn whisparr_v3_repairs_like_radarr() {
     let (calls, job) = repair_through(Profile::Whisparr).await;
     let _ = job;
@@ -769,6 +796,85 @@ async fn whisparr_v3_repairs_like_radarr() {
             "DELETE /api/v3/moviefile/7",
             r#"POST /api/v3/command {"movieIds":[3],"name":"MoviesSearch"}"#
         ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_an_arr_owns_but_cannot_repair_is_kept() {
+    let (articles, len) = mkv("s");
+    let server = LoopbackServer::start(articles.clone()).await.unwrap();
+    let (db, item, job) = import(&server, &articles, len).await;
+    let sportarr = uuid::Uuid::from_u128(1);
+    db.record_owner(sportarr, item.id, None, "/sports/a.mkv", Some(job))
+        .await
+        .unwrap();
+    // Nothing listens; any call would leave the file waiting on a retry.
+    let (_tx, arr) = watch::channel(vec![Arr {
+        id: sportarr,
+        name: "sportarr".to_owned(),
+        profile: Profile::Sportarr,
+        url: "http://127.0.0.1:9".to_owned(),
+        api_key: "k".to_owned(),
+    }]);
+    let (_settings_tx, settings) = watch::channel(Settings::default());
+    let health = Health::new(db.clone(), client(&server), arr, settings).unwrap();
+
+    assert!(health.request_repair(item.id).await.unwrap());
+    assert!(health.step().await.unwrap());
+    let (_, status) = db.health(item.id).await.unwrap().unwrap();
+    assert_eq!(status.state, HealthState::ActionNeeded);
+    assert!(db.item(item.id).await.unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_co_owner_that_cannot_repair_does_not_stop_one_that_can() {
+    let (articles, len) = mkv("m");
+    let server = LoopbackServer::start(articles.clone()).await.unwrap();
+    let (db, item, job) = import(&server, &articles, len).await;
+    let sportarr = uuid::Uuid::from_u128(1);
+    db.record_owner(sportarr, item.id, None, "/sports/a.mkv", Some(job))
+        .await
+        .unwrap();
+    db.record_owner(
+        uuid::Uuid::nil(),
+        item.id,
+        Some(7),
+        "/tv/Show/S01E01.strm",
+        Some(job),
+    )
+    .await
+    .unwrap();
+    let (log, sonarr) = fake_sonarr().await;
+    let mut instances = vec![Arr {
+        id: sportarr,
+        name: "sportarr".to_owned(),
+        profile: Profile::Sportarr,
+        url: "http://127.0.0.1:9".to_owned(),
+        api_key: "k".to_owned(),
+    }];
+    instances.extend(sonarr.borrow().iter().cloned());
+    let (_tx, arr) = watch::channel(instances);
+    let (_settings_tx, settings) = watch::channel(Settings::default());
+    let health = Health::new(db.clone(), client(&server), arr, settings)
+        .unwrap()
+        .with_arr_wait(Duration::ZERO);
+
+    assert!(health.request_repair(item.id).await.unwrap());
+    assert!(health.step().await.unwrap());
+    let (_, status) = db.health(item.id).await.unwrap().unwrap();
+    assert_eq!(status.state, HealthState::Hidden);
+    let calls = log.0.lock().unwrap().clone();
+    assert!(
+        calls.iter().any(|c| c == "DELETE /api/v3/episodefile/7"),
+        "{calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| c == "GET /api/v3/episodefile/8"),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|c| c == "POST /api/v3/command"),
+        "an observed replacement needs no second search"
     );
 }
 

@@ -1,519 +1,1300 @@
-//! Read-only C# PostgreSQL snapshots for the existing SQLite-based importer.
-//! Textual source rows and PostgreSQL types are retained beside the translated
-//! adapter. This is migration evidence, not a PostgreSQL disaster-recovery backup.
-use std::fs::{self, File};
-use std::io::{Read as _, Write as _};
-use std::os::unix::fs::DirBuilderExt as _;
-use std::path::Path;
+//! A 1.x install on PostgreSQL: where its connection string points, and a copy of the
+//! tables the import reads into a SQLite file shaped like 1.x's own `db.sqlite`.
+//!
+//! The connection string is resolved as Npgsql 10.0.3 (the client 1.x shipped with) resolves
+//! it. The string, the resolved settings and the connect options are never logged or
+//! `Debug`-printed: they hold the password.
+
+use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io;
+use std::os::unix::fs::OpenOptionsExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::TryStreamExt as _;
-use jiff::tz::TimeZone;
-use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgConnectOptions;
-use sqlx::sqlite::SqliteConnectOptions;
-use sqlx::{ConnectOptions as _, Connection as _, Row as _};
-use uuid::Uuid;
+use sqlx::postgres::{PgArguments, PgConnectOptions, PgConnection, PgSslMode};
+use sqlx::query::Query;
+use sqlx::sqlite::{SqliteArguments, SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+use sqlx::{AssertSqlSafe, ConnectOptions as _, Connection as _, Postgres, Row as _, Sqlite};
 
-use crate::fork::{Error, Incomplete, hash, hex, input, output};
-use sha2::{Digest as _, Sha256};
+use crate::{Error, Progress, Stage};
 
-const MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const MAX_CELL: usize = 16 * 1024 * 1024;
-const MARKER: &str = "postgres-source.json";
-const PENDING: &str = "postgres-snapshot.pending";
-const FILES: [&str; 3] = ["db.sqlite", "postgres-schema.json", "postgres-rows.jsonl"];
+pub(crate) use crate::postgres_snapshot::source_timezone;
+pub use crate::postgres_snapshot::{Receipt, snapshot, verify};
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Receipt {
-    pub version: u8,
-    pub id: Uuid,
-    pub timezone: String,
-    pub files: Vec<crate::fork::Entry>,
-    pub digest: String,
-}
-#[derive(Debug, Serialize, Deserialize)]
-struct Table {
-    name: String,
-    columns: Vec<Column>,
-}
-#[derive(Debug, Serialize, Deserialize)]
-struct Column {
-    name: String,
-    postgres_type: String,
-}
-fn ident(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-fn receipt_digest(receipt: &Receipt) -> Result<String, Error> {
-    Ok(hex(&Sha256::digest(serde_json::to_vec(&(
-        receipt.version,
-        receipt.id,
-        &receipt.timezone,
-        &receipt.files,
-    ))?)))
+/// The copy, inside the C# `/config`. While it exists, the importer reads it in place of
+/// `db.sqlite`; it exists only while an import from PostgreSQL runs.
+pub const STAGED: &str = "v1-postgres-import.sqlite";
+const STAGED_TMP: &str = "v1-postgres-import.sqlite.tmp";
+/// The tables the import reads.
+const TABLES: [&str; 7] = [
+    "__EFMigrationsHistory",
+    "Accounts",
+    "ConfigItems",
+    "DavItems",
+    "HistoryItems",
+    "QueueItems",
+    "QueueNzbContents",
+];
+/// Npgsql's default `Timeout`; covers every connect attempt together.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const PROGRESS_ROWS: u64 = 1000;
+/// Copied text between progress reports, so large NZB rows still give a heartbeat.
+const PROGRESS_BYTES: usize = 16_000_000;
+/// The relation an unqualified name resolves to through `search_path`, fully qualified.
+const RELATION: &str = "SELECT quote_ident(n.nspname) || '.' || quote_ident(c.relname) \
+                        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                        WHERE c.oid = to_regclass(quote_ident($1))";
+const COLUMNS: &str = "SELECT a.attname::text, format_type(a.atttypid, NULL) \
+                       FROM pg_attribute a WHERE a.attrelid = to_regclass(quote_ident($1)) \
+                       AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum";
+/// The planner's row estimate for a table: instant, where `count(*)` scans the whole
+/// table and can outlast the stall watchdog. 0 when never analyzed; progress then
+/// grows the total with the rows copied.
+const ESTIMATE: &str = "SELECT greatest(c.reltuples, 0)::bigint FROM pg_class c \
+                        WHERE c.oid = to_regclass(quote_ident($1))";
+
+/// Why `DATABASE_CONNECTION_STRING` cannot be used. Never carries a value from it.
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectionError {
+    #[error("DATABASE_CONNECTION_STRING is malformed: check its quotes and '=' signs")]
+    Malformed,
+    #[error("DATABASE_CONNECTION_STRING: entry {0} has a key Npgsql does not know")]
+    UnknownKey(usize),
+    #[error("DATABASE_CONNECTION_STRING has no {0}; add the value 1.x used")]
+    Missing(&'static str),
+    #[error("DATABASE_CONNECTION_STRING: {0} has a value the import cannot read")]
+    Invalid(&'static str),
+    /// `fix` says what to change instead; see `CHECKS` and the Host forms.
+    #[error("DATABASE_CONNECTION_STRING: {setting} is not supported by the import from 1.x; {fix}")]
+    Unsupported {
+        setting: &'static str,
+        fix: &'static str,
+    },
+    #[error(
+        "the PostgreSQL password file cannot be read ({0}); fix it, or remove Passfile and PGPASSFILE"
+    )]
+    PassfileUnreadable(#[source] io::Error),
+    #[error(
+        "line {0} of the PostgreSQL password file is malformed; fix it, or remove Passfile and PGPASSFILE"
+    )]
+    PassfileMalformed(usize),
+    #[error(
+        "DATABASE_CONNECTION_STRING: SSL Mode VerifyCA and VerifyFull are not supported by the import \
+         from 1.x yet: it cannot limit trust to your root certificate the way 1.x did. Keep running \
+         1.x for now, or run the import with SSL Mode=Require over a network you trust"
+    )]
+    CertificateCheck,
+    #[error(
+        "the import cannot send the PostgreSQL options 1.x sent (Options, PGOPTIONS); unset PGOPTIONS for the import"
+    )]
+    OptionsMismatch,
 }
 
-/// Writes a private, bounded snapshot of all public base tables in one read-only
-/// repeatable-read transaction. The stopped source's blobs/journals must be copied
-/// separately into this new configuration directory before running the importer.
-/// `connection` is supplied through stdin by the CLI, never printed or stored.
-pub async fn snapshot(
-    connection: &str,
-    destination: &Path,
-    timezone: &str,
-) -> Result<Receipt, Error> {
-    snapshot_inner(connection, destination, timezone)
-        .await
-        .map_err(|error| match error {
-            Error::Database(_) => Error::Invalid(
-                "legacy PostgreSQL snapshot query or conversion failed; no snapshot was accepted",
-            ),
-            other => other,
-        })
+/// A setting of Npgsql 10.0.3's connection string, aliases folded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Setting {
+    Host,
+    Port,
+    Database,
+    Username,
+    Password,
+    Passfile,
+    SslMode,
+    RootCertificate,
+    SslCertificate,
+    SslKey,
+    SearchPath,
+    RequireAuth,
+    ChannelBinding,
+    GssEncryptionMode,
+    SslNegotiation,
+    SslPassword,
+    KerberosServiceName,
+    IncludeRealm,
+    TargetSessionAttributes,
+    Options,
+    ReplicationMode,
+    /// Tunes only the .NET client, or (Check Certificate Revocation) takes effect only in
+    /// the refused `VerifyCA`/`VerifyFull`.
+    Ignored,
 }
-async fn snapshot_inner(
-    connection: &str,
-    destination: &Path,
-    timezone: &str,
-) -> Result<Receipt, Error> {
-    TimeZone::get(timezone)
-        .map_err(|_| Error::Invalid("source timezone must be an IANA timezone"))?;
-    let options: PgConnectOptions = connection
-        .trim()
-        .parse()
-        .map_err(|_| Error::Invalid("invalid PostgreSQL connection settings"))?;
-    // Deliberately erase driver errors at this credential-bearing boundary.
-    let mut source = options
-        .disable_statement_logging()
-        .connect()
-        .await
-        .map_err(|_| Error::Invalid("could not connect to the legacy PostgreSQL source"))?;
-    let mut transaction = source.begin().await?;
-    sqlx::raw_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout='60s'; SET LOCAL DateStyle='ISO, YMD'; SET LOCAL TIME ZONE 'UTC'; SET LOCAL bytea_output='hex'; SET LOCAL extra_float_digits=3")
-        .execute(&mut *transaction).await?;
-    let foreign: i64 = sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('public','information_schema') AND table_schema NOT LIKE 'pg_%'")
-        .fetch_one(&mut *transaction).await?;
-    if foreign != 0 {
-        return Err(Error::Invalid(
-            "legacy PostgreSQL has non-public tables; preserve them with a native backup before migration",
-        ));
-    }
-    let names: Vec<String> = sqlx::query_scalar("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name")
-        .fetch_all(&mut *transaction).await?;
-    if names.is_empty() || names.len() > 512 {
-        return Err(Error::Invalid(
-            "legacy PostgreSQL table count is outside the snapshot bound",
-        ));
-    }
-    fs::DirBuilder::new().mode(0o700).create(destination)?;
-    let mut incomplete = Incomplete(destination.to_path_buf());
-    output(&destination.join(PENDING))?.sync_all()?;
-    File::open(destination)?.sync_all()?;
-    let sqlite_path = destination.join(FILES[0]);
-    output(&sqlite_path)?.sync_all()?;
-    let mut adapter = SqliteConnectOptions::new()
-        .filename(&sqlite_path)
-        .connect()
-        .await?;
-    let mut write = adapter.begin().await?;
-    let mut raw = output(&destination.join(FILES[2]))?;
-    let mut raw_bytes = 0_u64;
-    let mut tables = Vec::new();
-    for name in names {
-        let columns: Vec<(String,String)> = sqlx::query_as("SELECT a.attname, pg_catalog.format_type(a.atttypid,a.atttypmod) FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=$1 AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum")
-            .bind(&name).fetch_all(&mut *transaction).await?;
-        if columns.is_empty() || columns.len() > 1600 {
-            return Err(Error::Invalid(
-                "legacy PostgreSQL column count is outside the snapshot bound",
-            ));
+
+/// The setting a lowercased keyword names: each setting's display name, property name and
+/// synonyms in Npgsql 10.0.3. `None` when Npgsql rejects the keyword.
+fn setting(keyword: &str) -> Option<Setting> {
+    Some(match keyword {
+        "host" | "server" => Setting::Host,
+        "port" => Setting::Port,
+        "database" | "db" => Setting::Database,
+        "username" | "user name" | "userid" | "user id" | "uid" => Setting::Username,
+        "password" | "psw" | "pwd" => Setting::Password,
+        "passfile" => Setting::Passfile,
+        "ssl mode" | "sslmode" => Setting::SslMode,
+        "root certificate" | "rootcertificate" => Setting::RootCertificate,
+        "ssl certificate" | "sslcertificate" => Setting::SslCertificate,
+        "ssl key" | "sslkey" => Setting::SslKey,
+        "search path" | "searchpath" => Setting::SearchPath,
+        "require auth" | "requireauth" => Setting::RequireAuth,
+        "channel binding" | "channelbinding" => Setting::ChannelBinding,
+        "gss encryption mode" | "gssencryptionmode" => Setting::GssEncryptionMode,
+        "ssl negotiation" | "sslnegotiation" => Setting::SslNegotiation,
+        "ssl password" | "sslpassword" => Setting::SslPassword,
+        "kerberos service name" | "kerberosservicename" | "krbsrvname" => {
+            Setting::KerberosServiceName
         }
-        let table = Table {
-            name,
-            columns: columns
-                .into_iter()
-                .map(|(name, postgres_type)| Column {
-                    name,
-                    postgres_type,
-                })
-                .collect(),
-        };
-        let definitions = table
-            .columns
-            .iter()
-            .map(|c| format!("{} {}", ident(&c.name), affinity(&c.postgres_type)))
-            .collect::<Vec<_>>()
-            .join(",");
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE TABLE {} ({definitions})",
-            ident(&table.name)
-        )))
-        .execute(&mut *write)
-        .await?;
-        // A projected row is bounded on the server before crossing the protocol.
-        // Oversize rows fail the snapshot rather than being silently truncated.
-        let row_size = table
-            .columns
-            .iter()
-            .map(|c| format!("coalesce(octet_length({}::text)::bigint,0)", ident(&c.name)))
-            .collect::<Vec<_>>()
-            .join("+");
-        let oversize: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT EXISTS(SELECT 1 FROM public.{} WHERE {row_size}>{MAX_CELL})",
-            ident(&table.name)
-        )))
-        .fetch_one(&mut *transaction)
-        .await?;
-        if oversize {
-            return Err(Error::Invalid("legacy PostgreSQL row exceeds byte bound"));
-        }
-        let expressions = table
-            .columns
-            .iter()
-            .map(|c| format!("{}::text", ident(&c.name)))
-            .collect::<Vec<_>>()
-            .join(",");
-        let select = format!("SELECT {expressions} FROM public.{}", ident(&table.name));
-        let insert = format!(
-            "INSERT INTO {} VALUES ({})",
-            ident(&table.name),
-            (1..=table.columns.len())
-                .map(|i| format!("${i}"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let mut rows = sqlx::query(sqlx::AssertSqlSafe(select)).fetch(&mut *transaction);
-        while let Some(row) = rows.try_next().await? {
-            let values = (0..table.columns.len())
-                .map(|i| row.try_get::<Option<String>, _>(i))
-                .collect::<Result<Vec<_>, _>>()?;
-            let encoded = serde_json::to_vec(&(&table.name, &values))?;
-            raw_bytes = raw_bytes.saturating_add(encoded.len() as u64 + 1);
-            if raw_bytes > MAX_BYTES {
-                return Err(Error::Invalid(
-                    "legacy PostgreSQL snapshot exceeds byte bound",
-                ));
+        "include realm" | "includerealm" => Setting::IncludeRealm,
+        "target session attributes" | "targetsessionattributes" => Setting::TargetSessionAttributes,
+        "options" => Setting::Options,
+        "replication mode" | "replicationmode" => Setting::ReplicationMode,
+        "check certificate revocation"
+        | "checkcertificaterevocation"
+        | "application name"
+        | "applicationname"
+        | "enlist"
+        | "client encoding"
+        | "clientencoding"
+        | "encoding"
+        | "timezone"
+        | "persist security info"
+        | "persistsecurityinfo"
+        | "log parameters"
+        | "logparameters"
+        | "include error detail"
+        | "includeerrordetail"
+        | "include failed batched command"
+        | "includefailedbatchedcommand"
+        | "pooling"
+        | "minimum pool size"
+        | "minpoolsize"
+        | "maximum pool size"
+        | "maxpoolsize"
+        | "connection idle lifetime"
+        | "connectionidlelifetime"
+        | "connection pruning interval"
+        | "connectionpruninginterval"
+        | "connection lifetime"
+        | "connectionlifetime"
+        | "load balance timeout"
+        | "timeout"
+        | "command timeout"
+        | "commandtimeout"
+        | "cancellation timeout"
+        | "cancellationtimeout"
+        | "load balance hosts"
+        | "loadbalancehosts"
+        | "host recheck seconds"
+        | "hostrecheckseconds"
+        | "keepalive"
+        | "tcp keepalive"
+        | "tcpkeepalive"
+        | "tcp keepalive time"
+        | "tcpkeepalivetime"
+        | "tcp keepalive interval"
+        | "tcpkeepaliveinterval"
+        | "read buffer size"
+        | "readbuffersize"
+        | "write buffer size"
+        | "writebuffersize"
+        | "socket receive buffer size"
+        | "socketreceivebuffersize"
+        | "socket send buffer size"
+        | "socketsendbuffersize"
+        | "max auto prepare"
+        | "maxautoprepare"
+        | "auto prepare min usages"
+        | "autoprepareminusages"
+        | "no reset on close"
+        | "noresetonclose"
+        | "array nullability mode"
+        | "arraynullabilitymode"
+        | "multiplexing"
+        | "write coalescing buffer threshold bytes"
+        | "writecoalescingbufferthresholdbytes"
+        | "load table composites"
+        | "loadtablecomposites"
+        | "server compatibility mode"
+        | "servercompatibilitymode"
+        | "trust server certificate"
+        | "trustservercertificate"
+        | "internal command timeout"
+        | "internalcommandtimeout" => Setting::Ignored,
+        _ => return None,
+    })
+}
+
+/// `(setting, name in errors, variable Npgsql falls back to, values the copy honors, fix)`.
+type Check = (
+    Setting,
+    &'static str,
+    Option<&'static str>,
+    &'static [&'static str],
+    &'static str,
+);
+
+/// Security settings sqlx cannot enforce, or mechanisms it does not have.
+const CHECKS: &[Check] = &[
+    (
+        Setting::RequireAuth,
+        "Require Auth",
+        Some("PGREQUIREAUTH"),
+        &[""],
+        "remove it and PGREQUIREAUTH for the import",
+    ),
+    (
+        Setting::ChannelBinding,
+        "Channel Binding",
+        None,
+        &["prefer", "disable"],
+        "set it to Prefer for the import",
+    ),
+    (
+        Setting::GssEncryptionMode,
+        "GSS Encryption Mode",
+        Some("PGGSSENCMODE"),
+        &["prefer", "disable"],
+        "use Prefer, in the string and in PGGSSENCMODE, for the import",
+    ),
+    (
+        Setting::SslNegotiation,
+        "SSL Negotiation",
+        Some("PGSSLNEGOTIATION"),
+        &["postgres"],
+        "use Postgres, in the string and in PGSSLNEGOTIATION, for the import",
+    ),
+    (
+        Setting::SslPassword,
+        "SSL Password",
+        None,
+        &[""],
+        "use an unencrypted client key file for the import",
+    ),
+    (
+        Setting::KerberosServiceName,
+        "Kerberos Service Name",
+        None,
+        &["postgres"],
+        "the import has no Kerberos login; use a password login",
+    ),
+    (
+        Setting::IncludeRealm,
+        "Include Realm",
+        None,
+        &["true"],
+        "the import has no Kerberos login; use a password login",
+    ),
+    (
+        Setting::TargetSessionAttributes,
+        "Target Session Attributes",
+        None,
+        &["any"],
+        "remove it; the import connects to a single server",
+    ),
+    (
+        Setting::Options,
+        "Options",
+        None,
+        &[""],
+        "move its value into PGOPTIONS, which the import passes on unchanged",
+    ),
+    (
+        Setting::ReplicationMode,
+        "Replication Mode",
+        None,
+        &["off"],
+        "remove it",
+    ),
+];
+
+/// Where and how 1.x connected, resolved as Npgsql 10.0.3 does. Holds a password: no `Debug`.
+struct Target {
+    host: String,
+    port: u16,
+    username: String,
+    database: String,
+    password: Option<String>,
+    ssl_mode: PgSslMode,
+    client_cert: Option<PathBuf>,
+    client_key: Option<PathBuf>,
+    search_path: Option<String>,
+    /// What Npgsql would send as `options`: `Settings.Options ?? PGOPTIONS`; empty sends nothing.
+    options: Option<String>,
+}
+
+/// Entries in input order, keys trimmed and lowercased; `None` for an empty value.
+fn entries(s: &str) -> Result<Vec<(String, Option<String>)>, ConnectionError> {
+    fn skip(s: &str) -> &str {
+        s.trim_start_matches(|c: char| c.is_whitespace() || c == ';')
+    }
+    let mut out = Vec::new();
+    let mut rest = skip(s);
+    while !rest.is_empty() {
+        let (key, after) = key(rest)?;
+        let after = after.trim_start();
+        let (value, tail) = if let Some(q @ ('"' | '\'')) = after.chars().next() {
+            let (value, tail) = quoted(&after[1..], q)?;
+            (Some(value), tail)
+        } else {
+            let end = after.find(';').unwrap_or(after.len());
+            let value = after[..end].trim();
+            if value.ends_with(['"', '\'']) || value.contains(char::is_control) {
+                return Err(ConnectionError::Malformed);
             }
-            raw.write_all(&encoded)?;
-            raw.write_all(b"\n")?;
-            let mut query = sqlx::query(sqlx::AssertSqlSafe(insert.clone()));
-            for (value, column) in values.into_iter().zip(&table.columns) {
-                query = match column.postgres_type.as_str() {
-                    "boolean" => query.bind(value.map(|v| i64::from(v == "true"))),
-                    "smallint" | "integer" | "bigint" => query.bind(
-                        value
-                            .map(|v| v.parse::<i64>())
-                            .transpose()
-                            .map_err(|_| Error::Invalid("legacy integer is invalid"))?,
-                    ),
-                    "bytea" => query.bind(value.map(|v| binary(&v)).transpose()?),
-                    kind if kind.starts_with("timestamp") => {
-                        if kind.ends_with("with time zone") {
-                            return Err(Error::Invalid(
-                                "legacy timestamp-with-timezone column requires explicit translation review",
-                            ));
-                        }
-                        // Npgsql maps DateTime.MinValue/MaxValue to infinities.
-                        // Keep original infinities in raw evidence; adapt only to the
-                        // millisecond precision that the importer consumes.
-                        query.bind(value.map(|v| match v.as_str() {
-                            "infinity" => "9999-12-31 23:59:59.999".to_owned(),
-                            "-infinity" => "0001-01-01 00:00:00".to_owned(),
-                            _ => v,
-                        }))
-                    }
-                    _ => query.bind(value),
+            ((!value.is_empty()).then(|| value.to_owned()), &after[end..])
+        };
+        let tail = tail.trim_start();
+        if !(tail.is_empty() || tail.starts_with(';')) {
+            return Err(ConnectionError::Malformed);
+        }
+        out.push((key, value));
+        rest = skip(tail);
+    }
+    Ok(out)
+}
+
+/// The key up to the first single `=` (`==` is a literal `=`), trimmed and lowercased.
+fn key(s: &str) -> Result<(String, &str), ConnectionError> {
+    let mut key = String::new();
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '=' if chars.next_if(|&(_, n)| n == '=').is_some() => key.push('='),
+            '=' => {
+                let key = key.trim().to_lowercase();
+                return if key.is_empty() {
+                    Err(ConnectionError::Malformed)
+                } else {
+                    Ok((key, &s[i + 1..]))
                 };
             }
-            query.execute(&mut *write).await?;
-        }
-        tables.push(table);
-    }
-    write.commit().await?;
-    adapter.close().await?;
-    raw.sync_all()?;
-    let mut schema = output(&destination.join(FILES[1]))?;
-    schema.write_all(&serde_json::to_vec_pretty(&tables)?)?;
-    schema.sync_all()?;
-    // Source transaction never writes. Commit only releases its consistent snapshot.
-    transaction.commit().await?;
-    let mut receipt = Receipt {
-        version: 1,
-        id: Uuid::new_v4(),
-        timezone: timezone.to_owned(),
-        files: Vec::new(),
-        digest: String::new(),
-    };
-    for file in FILES {
-        let (bytes, sha256) = hash(&destination.join(file), MAX_BYTES)?;
-        input(&destination.join(file))?.sync_all()?;
-        receipt.files.push(crate::fork::Entry {
-            file: file.into(),
-            source: "legacy PostgreSQL snapshot".into(),
-            kind: "postgres_snapshot".into(),
-            bytes,
-            sha256,
-        });
-    }
-    receipt.digest = receipt_digest(&receipt)?;
-    let mut marker = output(&destination.join(MARKER))?;
-    marker.write_all(&serde_json::to_vec_pretty(&receipt)?)?;
-    marker.sync_all()?;
-    File::open(destination)?.sync_all()?;
-    fs::remove_file(destination.join(PENDING))?;
-    File::open(destination)?.sync_all()?;
-    incomplete.0.clear();
-    Ok(receipt)
-}
-fn affinity(kind: &str) -> &'static str {
-    match kind {
-        "boolean" | "smallint" | "integer" | "bigint" => "INTEGER",
-        "bytea" => "BLOB",
-        _ => "TEXT",
-    }
-}
-fn binary(value: &str) -> Result<Vec<u8>, Error> {
-    let hex = value
-        .strip_prefix("\\x")
-        .ok_or(Error::Invalid("legacy binary encoding is invalid"))?;
-    if !hex.len().is_multiple_of(2) {
-        return Err(Error::Invalid("legacy binary encoding is invalid"));
-    }
-    hex.as_bytes()
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| {
-            let digit = |b: u8| match b {
-                b'0'..=b'9' => Some(b - b'0'),
-                b'a'..=b'f' => Some(b - b'a' + 10),
-                _ => None,
-            };
-            digit(pair[0])
-                .zip(digit(pair[1]))
-                .map(|(a, b)| a * 16 + b)
-                .ok_or(Error::Invalid("legacy binary encoding is invalid"))
-        })
-        .collect()
-}
-/// Verifies only fixed package-local paths. The caller must compare the returned
-/// digest with its independently retained export receipt before accepting a package.
-pub fn verify(directory: &Path) -> Result<Receipt, Error> {
-    if directory.join(PENDING).try_exists()? {
-        return Err(Error::Invalid("legacy PostgreSQL snapshot is incomplete"));
-    }
-    let mut raw = Vec::new();
-    input(&directory.join(MARKER))?
-        .take(128 * 1024 + 1)
-        .read_to_end(&mut raw)?;
-    if raw.len() > 128 * 1024 {
-        return Err(Error::Invalid("legacy PostgreSQL receipt exceeds bound"));
-    }
-    let receipt: Receipt = serde_json::from_slice(&raw)?;
-    if receipt.version != 1
-        || receipt.files.len() != FILES.len()
-        || receipt.digest != receipt_digest(&receipt)?
-        || TimeZone::get(&receipt.timezone).is_err()
-    {
-        return Err(Error::Invalid("legacy PostgreSQL receipt is invalid"));
-    }
-    for (entry, name) in receipt.files.iter().zip(FILES) {
-        if entry.file != name || entry.kind != "postgres_snapshot" {
-            return Err(Error::Invalid("legacy PostgreSQL snapshot path is invalid"));
-        }
-        let (bytes, sha) = hash(&directory.join(name), MAX_BYTES)?;
-        if bytes != entry.bytes || sha != entry.sha256 {
-            return Err(Error::Invalid(
-                "legacy PostgreSQL snapshot checksum differs",
-            ));
+            c if c.is_control() => return Err(ConnectionError::Malformed),
+            c => key.push(c),
         }
     }
-    Ok(receipt)
-}
-pub(crate) fn timezone(config: &Path) -> Result<TimeZone, Error> {
-    if config.join(PENDING).try_exists()? {
-        return Err(Error::Invalid("legacy PostgreSQL snapshot is incomplete"));
-    }
-    if !config.join(MARKER).try_exists()? {
-        return Ok(TimeZone::system());
-    }
-    let receipt = verify(config)?;
-    TimeZone::get(&receipt.timezone)
-        .map_err(|_| Error::Invalid("legacy source timezone is invalid"))
+    Err(ConnectionError::Malformed)
 }
 
-/// Validation can hash large snapshots; keep this work off the async executor.
-pub(crate) async fn source_timezone(config: &Path) -> Result<TimeZone, crate::Error> {
-    let config = config.to_path_buf();
-    tokio::task::spawn_blocking(move || timezone(&config))
-        .await?
-        .map_err(|error| crate::Error::Source(Box::new(error)))
+/// Reads up to the closing `q`; a doubled `q` is one literal `q`. Returns the value and the rest.
+fn quoted(s: &str, q: char) -> Result<(String, &str), ConnectionError> {
+    let mut value = String::new();
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if c != q {
+            value.push(c);
+        } else if chars.next_if(|&(_, n)| n == q).is_some() {
+            value.push(q);
+        } else {
+            return Ok((value, &s[i + c.len_utf8()..]));
+        }
+    }
+    Err(ConnectionError::Malformed)
+}
+
+/// Resolves `connection` with variables read through `env` (`HOME` included).
+fn target(
+    connection: &str,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
+) -> Result<Target, ConnectionError> {
+    // 1. Fold aliases; the last entry wins and an empty value unsets.
+    let mut settings: HashMap<Setting, Option<String>> = HashMap::new();
+    for (n, (key, value)) in entries(connection)?.into_iter().enumerate() {
+        match setting(&key) {
+            None => return Err(ConnectionError::UnknownKey(n + 1)),
+            Some(Setting::Ignored) => {}
+            Some(s) => {
+                settings.insert(s, value);
+            }
+        }
+    }
+    let get = |s: Setting| settings.get(&s).cloned().flatten();
+    let env = |name: &str| env(name).filter(|v| !v.is_empty());
+
+    // 2. Security checks, before anything else is resolved.
+    for &(setting, name, variable, honored, fix) in CHECKS {
+        let Some(value) = get(setting).or_else(|| variable.and_then(env)) else {
+            continue;
+        };
+        let value = value.trim().to_lowercase();
+        if setting == Setting::IncludeRealm && !matches!(value.as_str(), "true" | "false") {
+            return Err(ConnectionError::Invalid(name));
+        }
+        if !honored.contains(&value.as_str()) {
+            return Err(ConnectionError::Unsupported { setting: name, fix });
+        }
+    }
+
+    // 3. Host and port.
+    let host = get(Setting::Host)
+        .map(|h| h.trim().to_owned())
+        .filter(|h| !h.is_empty())
+        .ok_or(ConnectionError::Missing("Host"))?;
+    if host.starts_with('@') {
+        return Err(ConnectionError::Unsupported {
+            setting: "Host as an abstract socket",
+            fix: "use a host name or a socket directory",
+        });
+    }
+    if host.contains(',') {
+        return Err(ConnectionError::Unsupported {
+            setting: "Host with more than one server",
+            fix: "use a single server",
+        });
+    }
+    let port = match get(Setting::Port) {
+        None => 5432,
+        Some(p) => parse_port(&p).ok_or(ConnectionError::Invalid("Port"))?,
+    };
+    let (host, port) = if host.starts_with('/') {
+        (host, port)
+    } else {
+        split_host_port(&host)?.unwrap_or((host, port))
+    };
+    let host = match host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        Some(bare) => bare.to_owned(),
+        None => host,
+    };
+
+    // 4. Username and database.
+    let username = get(Setting::Username)
+        .filter(|u| !u.is_empty())
+        .or_else(|| env("PGUSER"))
+        .ok_or(ConnectionError::Missing("Username"))?;
+    let database_key = get(Setting::Database).filter(|d| !d.is_empty());
+    let database = database_key.clone().unwrap_or_else(|| username.clone());
+
+    // 5. SSL mode.
+    let ssl_mode = match get(Setting::SslMode)
+        .map(|m| m.trim().to_lowercase())
+        .as_deref()
+    {
+        None | Some("prefer") => PgSslMode::Prefer,
+        Some("disable") => PgSslMode::Disable,
+        Some("allow") => PgSslMode::Allow,
+        Some("require") => PgSslMode::Require,
+        Some("verifyca" | "verifyfull") => return Err(ConnectionError::CertificateCheck),
+        Some(_) => return Err(ConnectionError::Invalid("SSL Mode")),
+    };
+
+    // 6. Password: the key, PGPASSWORD, then the password file.
+    let home = env("HOME").map(PathBuf::from);
+    let mut password = get(Setting::Password).or_else(|| env("PGPASSWORD"));
+    if password.is_none() {
+        let file = get(Setting::Passfile)
+            .or_else(|| env("PGPASSFILE"))
+            .map(PathBuf::from)
+            .or_else(|| {
+                home.as_ref()
+                    .map(|h| h.join(".pgpass"))
+                    .filter(|p| p.is_file())
+            });
+        if let Some(file) = file {
+            let text =
+                std::fs::read_to_string(file).map_err(ConnectionError::PassfileUnreadable)?;
+            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            password = passfile(text, &host, port, database_key.as_deref(), &username)?;
+        }
+    }
+
+    // 7. Client certificate and key.
+    let default = |name: &str| {
+        home.as_ref()
+            .map(|h| h.join(".postgresql").join(name))
+            .filter(|p| p.exists())
+    };
+    let client_cert = get(Setting::SslCertificate)
+        .or_else(|| env("PGSSLCERT"))
+        .map(PathBuf::from)
+        .or_else(|| default("postgresql.crt"));
+    let client_key = get(Setting::SslKey)
+        .or_else(|| env("PGSSLKEY"))
+        .map(PathBuf::from)
+        .or_else(|| default("postgresql.key"));
+
+    // 8. and 9. Search path and options. `Options=""` hides PGOPTIONS; `Options=` does not.
+    let search_path = get(Setting::SearchPath).filter(|s| !s.is_empty());
+    let options = get(Setting::Options).or_else(|| env("PGOPTIONS"));
+
+    Ok(Target {
+        host,
+        port,
+        username,
+        database,
+        password,
+        ssl_mode,
+        client_cert,
+        client_key,
+        search_path,
+        options,
+    })
+}
+
+/// A port as Npgsql's `int.Parse` reads it, limited to 1–65535.
+fn parse_port(s: &str) -> Option<u16> {
+    s.trim().parse::<u16>().ok().filter(|&p| p > 0)
+}
+
+/// Npgsql's `TrySplitHostPort`: `host:port` and `[addr]:port` split; a bare IPv6 address
+/// does not.
+fn split_host_port(host: &str) -> Result<Option<(String, u16)>, ConnectionError> {
+    let Some(colon) = host.rfind(':') else {
+        return Ok(None);
+    };
+    let before = &host[..colon];
+    let other_colon = before.rfind(':');
+    let ipv6_end = before.rfind(']');
+    if other_colon.is_none() || ipv6_end.is_some_and(|end| colon == end + 1) {
+        let port = parse_port(&host[colon + 1..]).ok_or(ConnectionError::Invalid("Host"))?;
+        return Ok(Some((before.to_owned(), port)));
+    }
+    Ok(None)
+}
+
+/// The password of the first `.pgpass` line matching the query; `database: None` matches any.
+fn passfile(
+    text: &str,
+    host: &str,
+    port: u16,
+    database: Option<&str>,
+    username: &str,
+) -> Result<Option<String>, ConnectionError> {
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let malformed = || ConnectionError::PassfileMalformed(n + 1);
+        let [h, p, d, u, password] = fields(line).ok_or_else(malformed)?;
+        let p = p
+            .map(|p| p.trim().parse::<i32>())
+            .transpose()
+            .map_err(|_| malformed())?;
+        if h.as_deref().is_none_or(|h| h == host)
+            && p.is_none_or(|p| p == i32::from(port))
+            && d.as_deref().zip(database).is_none_or(|(d, q)| d == q)
+            && u.as_deref().is_none_or(|u| u == username)
+        {
+            return Ok(password);
+        }
+    }
+    Ok(None)
+}
+
+/// The 5 `:`-separated fields of a line; `\:` and `\\` are literal; `*` is `None`.
+fn fields(line: &str) -> Option<[Option<String>; 5]> {
+    let mut parts = Vec::with_capacity(5);
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let finish = |field: &mut String| {
+        let part = std::mem::take(field);
+        (part != "*").then_some(part)
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek().is_some() => {
+                let next = chars.next()?;
+                if !matches!(next, ':' | '\\') {
+                    field.push('\\');
+                }
+                field.push(next);
+            }
+            ':' => parts.push(finish(&mut field)),
+            c => field.push(c),
+        }
+    }
+    parts.push(finish(&mut field));
+    parts.try_into().ok()
+}
+
+/// The mode of the first attempt: `Allow` starts without TLS (`OpenCore`).
+const fn first(mode: PgSslMode) -> PgSslMode {
+    match mode {
+        PgSslMode::Allow => PgSslMode::Disable,
+        mode => mode,
+    }
+}
+
+/// Npgsql 10's one retry after `error` (`OpenCore`), or `None`.
+fn retry(mode: PgSslMode, error: &sqlx::Error) -> Option<PgSslMode> {
+    match mode {
+        PgSslMode::Allow => Some(PgSslMode::Require),
+        // Only a server error proves the handshake did not fail; Npgsql never drops TLS
+        // after a failed one.
+        PgSslMode::Prefer if matches!(error, sqlx::Error::Database(_)) => Some(PgSslMode::Disable),
+        _ => None,
+    }
+}
+
+impl Target {
+    /// Options with host, port, user, database and SSL mode always set, so sqlx's own reads
+    /// of `PGHOST`, `PGHOSTADDR`, `PGPORT`, `PGDATABASE` and `PGSSLMODE` never decide them.
+    /// `OptionsMismatch` when sqlx would send other `options` than `self.options`.
+    fn options(&self, ssl_mode: PgSslMode) -> Result<PgConnectOptions, ConnectionError> {
+        let mut options = PgConnectOptions::new_without_pgpass()
+            .host(&self.host)
+            .port(self.port)
+            .username(&self.username)
+            .database(&self.database)
+            .ssl_mode(ssl_mode);
+        if let Some(password) = &self.password {
+            options = options.password(password);
+        }
+        if let Some(cert) = &self.client_cert {
+            options = options.ssl_client_cert(cert);
+        }
+        if let Some(key) = &self.client_key {
+            options = options.ssl_client_key(key);
+        }
+        let sent = options.get_options().unwrap_or_default();
+        if sent != self.options.as_deref().unwrap_or_default() {
+            return Err(ConnectionError::OptionsMismatch);
+        }
+        Ok(options)
+    }
+}
+
+/// Connects as Npgsql would: `first`, then at most one `retry`, both within `CONNECT_TIMEOUT`.
+async fn connect(target: &Target) -> Result<PgConnection, Error> {
+    let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    let attempt = |mode| async move {
+        let options = target.options(mode)?;
+        tokio::time::timeout_at(deadline, options.connect())
+            .await
+            .map_err(|_| Error::ConnectTimeout)
+    };
+    let error = match attempt(first(target.ssl_mode)).await? {
+        Ok(conn) => return Ok(conn),
+        Err(error) => error,
+    };
+    match retry(target.ssl_mode, &error) {
+        Some(mode) => attempt(mode).await?.map_err(Error::Connect),
+        None => Err(Error::Connect(error)),
+    }
+}
+
+/// How a column is read from PostgreSQL and stored in the copy.
+#[derive(Clone, Copy)]
+enum Kind {
+    Int,
+    Text,
+}
+
+/// The select expression, the SQLite type and the cell kind EF on SQLite uses.
+fn column(name: &str, data_type: &str) -> (String, &'static str, Kind) {
+    let c = ident(name);
+    match data_type {
+        "uuid" => (format!("upper({c}::text)"), "TEXT", Kind::Text),
+        "boolean" => (format!("{c}::int::int8"), "INTEGER", Kind::Int),
+        "smallint" | "integer" | "bigint" => (format!("{c}::int8"), "INTEGER", Kind::Int),
+        // `timestamp`: with sqlx's `DateStyle=ISO` this is EF's `yyyy-MM-dd HH:mm:ss.FFFFFFF`.
+        _ => (format!("{c}::text"), "TEXT", Kind::Text),
+    }
+}
+
+/// A quoted identifier, `"` doubled. Names come only from `TABLES` and the 1.x catalog.
+fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn dynamic_pg(sql: String) -> Query<'static, Postgres, PgArguments> {
+    sqlx::query(AssertSqlSafe(sql)).persistent(false)
+}
+
+fn dynamic_sqlite(sql: Arc<str>) -> Query<'static, Sqlite, SqliteArguments> {
+    sqlx::query(AssertSqlSafe(sql))
+}
+
+/// One table to copy: its qualified name and its columns.
+struct Table {
+    name: &'static str,
+    relation: String,
+    columns: Vec<(String, String)>,
+}
+
+/// Copies `TABLES` from the 1.x database into `config/STAGED` in one read-only snapshot,
+/// replacing an earlier copy. Reports [`Stage::Copying`] by rows.
+///
+/// `env` and `progress` are borrowed `Sync` trait objects: the returned future holds them
+/// across awaits and runs inside a spawned task, so it must be `Send`, and `&T` is `Send`
+/// only when `T: Sync`.
+pub async fn stage(
+    config: &Path,
+    connection: &str,
+    env: &(dyn Fn(&str) -> Option<String> + Sync),
+    progress: &(dyn Fn(Progress) + Sync),
+) -> Result<(), Error> {
+    progress(Progress::counting(Stage::Copying));
+    let target = target(connection, env)?;
+    remove_staged(config)?;
+
+    let mut pg = connect(&target).await?;
+    sqlx::raw_sql("BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut pg)
+        .await?;
+    sqlx::query("SELECT set_config('lock_timeout', '30s', true)")
+        .execute(&mut pg)
+        .await?;
+    if let Some(search_path) = &target.search_path {
+        sqlx::query("SELECT set_config('search_path', $1, true)")
+            .bind(search_path)
+            .execute(&mut pg)
+            .await?;
+    }
+
+    let mut tables = Vec::with_capacity(TABLES.len());
+    let mut total: u64 = 0;
+    // Preserve fork repair intents; this table is absent in stock 1.x installs.
+    for name in TABLES.into_iter().chain(["ArrRegrabRequests"]) {
+        progress(Progress::counting(Stage::Copying));
+        let relation: Option<String> = sqlx::query_scalar(RELATION)
+            .bind(name)
+            .fetch_optional(&mut pg)
+            .await?;
+        let Some(relation) = relation else {
+            if name == "ArrRegrabRequests" {
+                continue;
+            }
+            return Err(Error::MissingTable(name));
+        };
+        let columns: Vec<(String, String)> = sqlx::query_as(COLUMNS)
+            .bind(name)
+            .fetch_all(&mut pg)
+            .await?;
+        let rows: i64 = sqlx::query_scalar(ESTIMATE)
+            .bind(name)
+            .fetch_one(&mut pg)
+            .await?;
+        total += u64::try_from(rows).unwrap_or_default();
+        tables.push(Table {
+            name,
+            relation,
+            columns,
+        });
+    }
+    progress(Progress::at(Stage::Copying, 0, total));
+
+    let tmp = config.join(STAGED_TMP);
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(Error::Stage)?;
+    let mut copy = SqliteConnectOptions::new()
+        .filename(&tmp)
+        .journal_mode(SqliteJournalMode::Off)
+        .synchronous(SqliteSynchronous::Off)
+        .connect()
+        .await?;
+    sqlx::raw_sql("BEGIN").execute(&mut copy).await?;
+
+    let mut done: u64 = 0;
+    let mut bytes: usize = 0;
+    for table in &tables {
+        let mapped: Vec<_> = table
+            .columns
+            .iter()
+            .map(|(name, data_type)| (name, column(name, data_type)))
+            .collect();
+        let definition = mapped
+            .iter()
+            .map(|(name, (_, sqlite_type, _))| format!("{} {sqlite_type}", ident(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sqlx::raw_sql(AssertSqlSafe(format!(
+            "CREATE TABLE {} ({definition})",
+            ident(table.name)
+        )))
+        .execute(&mut copy)
+        .await?;
+        let placeholders = (1..=mapped.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert: Arc<str> =
+            format!("INSERT INTO {} VALUES ({placeholders})", ident(table.name)).into();
+        let kinds: Vec<Kind> = mapped.iter().map(|(_, (_, _, kind))| *kind).collect();
+        let select = mapped
+            .iter()
+            .map(|(_, (expr, _, _))| expr.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let select = dynamic_pg(format!("SELECT {select} FROM {}", table.relation));
+        let mut rows = select.fetch(&mut pg);
+        while let Some(row) = rows.try_next().await? {
+            let mut insert = dynamic_sqlite(Arc::clone(&insert));
+            for (i, kind) in kinds.iter().enumerate() {
+                insert = match kind {
+                    Kind::Int => insert.bind(row.try_get::<Option<i64>, _>(i)?),
+                    Kind::Text => {
+                        let text: Option<String> = row.try_get(i)?;
+                        bytes += text.as_ref().map_or(0, String::len);
+                        insert.bind(text)
+                    }
+                };
+            }
+            insert.execute(&mut copy).await?;
+            done += 1;
+            if done.is_multiple_of(PROGRESS_ROWS) || bytes >= PROGRESS_BYTES {
+                bytes = 0;
+                progress(Progress::at(Stage::Copying, done, total.max(done)));
+            }
+        }
+    }
+
+    sqlx::raw_sql("COMMIT").execute(&mut copy).await?;
+    copy.close().await?;
+    pg.close().await?;
+    std::fs::rename(&tmp, config.join(STAGED)).map_err(Error::Stage)?;
+    progress(Progress::at(Stage::Copying, done, total.max(done)));
+    tracing::info!(rows = done, "C# import: 1.x PostgreSQL tables copied");
+    Ok(())
+}
+
+/// Deletes the copy and a partial one; nothing when absent.
+pub fn remove_staged(config: &Path) -> Result<(), Error> {
+    for name in [STAGED, STAGED_TMP] {
+        match std::fs::remove_file(config.join(name)) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                return Err(Error::Stage(error));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Generated private snapshot assertions.
 mod tests {
+    use std::process::Command;
+    use std::sync::Mutex;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{TcpListener, TcpStream};
+    use uuid::Uuid;
+
     use super::*;
 
-    #[test]
-    fn identifiers_and_binary_values_are_not_sql_or_paths() {
-        assert_eq!(ident("quoted\"table"), "\"quoted\"\"table\"");
-        assert_eq!(binary("\\x00ff12").unwrap(), [0, 255, 18]);
-        for value in ["00ff", "\\x0", "\\xzz"] {
-            assert!(binary(value).is_err());
+    fn fake(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + Sync {
+        let vars: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+        move |name| vars.get(name).cloned()
+    }
+
+    fn resolve(connection: &str) -> Result<Target, ConnectionError> {
+        target(connection, &fake(&[]))
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("infinidysk-{name}-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn unsupported(result: Result<Target, ConnectionError>) -> &'static str {
+        match result {
+            Err(ConnectionError::Unsupported { setting, .. }) => setting,
+            Err(other) => panic!("expected Unsupported, got {other}"),
+            Ok(_) => panic!("expected Unsupported, got a target"),
         }
     }
-    #[tokio::test]
-    async fn snapshots_postgres_types_unknown_state_and_source_timezone_without_writes() {
-        let Ok(url) = std::env::var("INFINIDYSK_TEST_POSTGRES_URL") else {
-            return;
-        };
-        let options: PgConnectOptions = url.parse().unwrap();
-        let mut admin = options.clone().connect().await.unwrap();
-        let name = format!("legacy_snapshot_{}", Uuid::new_v4().simple());
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE DATABASE {}",
-            ident(&name)
-        )))
-        .execute(&mut admin)
-        .await
-        .unwrap();
-        let options = options.database(&name);
-        let mut source = options.clone().connect().await.unwrap();
-        sqlx::raw_sql("CREATE TABLE \"ConfigItems\"(\"ConfigName\" text,\"ConfigValue\" text);INSERT INTO \"ConfigItems\" VALUES('fork.unknown','private-fixture');CREATE TABLE \"Accounts\"(\"Type\" integer,\"Username\" text,\"PasswordHash\" text,\"RandomSalt\" text);CREATE TABLE \"ForkJournal\"(\"Id\" uuid,\"Pending\" boolean,\"Bytes\" bigint,\"Payload\" bytea,\"Created\" timestamp without time zone,\"Nullable\" text,\"Unknown\" jsonb);INSERT INTO \"ForkJournal\" VALUES('00000000-0000-0000-0000-000000000123',true,9223372036854775807,decode('00ff12','hex'),'2026-07-04 14:23:45.123',NULL,'{\"stage\":\"delete-uncertain\"}');")
-            .execute(&mut source).await.unwrap();
-        sqlx::raw_sql(r#"CREATE TABLE "DavItems"("Id" uuid,"ParentId" uuid,"Name" text,"Path" text,"CreatedAt" timestamp(3) without time zone,"Type" integer,"SubType" integer,"FileSize" bigint,"FileBlobId" uuid,"NzbBlobId" uuid,"ReleaseDate" bigint,"LastHealthCheck" bigint,"NextHealthCheck" bigint,"HealthRepairPending" boolean,"GeneratedStrmPath" text,"GeneratedSymlinkPath" text,"ArrDownloadId" text);
-CREATE TABLE "HistoryItems"("Id" uuid,"CreatedAt" timestamp without time zone,"FileName" text,"JobName" text,"Category" text,"DownloadStatus" integer,"TotalSegmentBytes" bigint,"DownloadTimeSeconds" bigint,"FailMessage" text,"DownloadDirId" uuid,"NzbBlobId" uuid);
-CREATE TABLE "QueueItems"("Id" uuid,"CreatedAt" timestamp without time zone,"FileName" text,"JobName" text,"Category" text,"Priority" integer,"PostProcessing" integer,"TotalSegmentBytes" bigint,"PauseUntil" timestamp without time zone,"SortOrder" bigint);
-CREATE TABLE "QueueNzbContents"("Id" uuid,"NzbContents" text);
-CREATE TABLE "__EFMigrationsHistory"("MigrationId" text);INSERT INTO "__EFMigrationsHistory" VALUES('20261001000000');
-INSERT INTO "DavItems"("Id","ParentId","Name","Path","CreatedAt","Type","SubType") VALUES('00000000-0000-0000-0000-000000000456','00000000-0000-0000-0000-000000000002','fixture','/content/fixture','2026-07-04 14:23:45.123',1,101);
-CREATE TABLE "Sentinels"("Created" timestamp without time zone);INSERT INTO "Sentinels" VALUES('infinity'),('-infinity');"#).execute(&mut source).await.unwrap();
-        let root = std::env::temp_dir().join(format!("infinidysk-pg-snapshot-{}", Uuid::new_v4()));
-        // Connection URI is private input only, never included in receipts/errors.
-        let connection = options.to_url_lossy().to_string();
-        let receipt = snapshot(&connection, &root, "America/New_York")
-            .await
-            .unwrap();
-        assert_eq!(verify(&root).unwrap().digest, receipt.digest);
-        assert_eq!(
-            timezone(&root).unwrap(),
-            TimeZone::get("America/New_York").unwrap()
-        );
-        let cs = crate::Config::read(&root, []).await.unwrap();
-        assert_eq!(cs.get("fork.unknown"), Some("private-fixture"));
-        let mut adapter = crate::open(&root).await.unwrap();
-        let row = sqlx::query("SELECT * FROM ForkJournal")
-            .fetch_one(&mut adapter)
-            .await
-            .unwrap();
-        assert_eq!(
-            row.get::<String, _>("Id"),
-            "00000000-0000-0000-0000-000000000123"
-        );
-        assert!(row.get::<bool, _>("Pending"));
-        assert_eq!(row.get::<i64, _>("Bytes"), i64::MAX);
-        assert_eq!(row.get::<Vec<u8>, _>("Payload"), [0, 255, 18]);
-        assert_eq!(row.get::<String, _>("Created"), "2026-07-04 14:23:45.123");
-        assert_eq!(row.get::<Option<String>, _>("Nullable"), None);
-        let wall = "2026-07-04T14:23:45.123"
-            .parse::<jiff::civil::DateTime>()
-            .unwrap();
-        assert_eq!(
-            wall.to_zoned(timezone(&root).unwrap())
-                .unwrap()
-                .timestamp()
-                .as_millisecond(),
-            "2026-07-04T18:23:45.123Z"
-                .parse::<jiff::Timestamp>()
-                .unwrap()
-                .as_millisecond()
-        );
-        let sentinels: Vec<String> =
-            sqlx::query_scalar("SELECT Created FROM Sentinels ORDER BY Created")
-                .fetch_all(&mut adapter)
-                .await
-                .unwrap();
-        assert_eq!(
-            sentinels,
-            ["0001-01-01 00:00:00", "9999-12-31 23:59:59.999"]
-        );
-        let db = infinidysk_db::Db::connect("sqlite::memory:").await.unwrap();
-        let client = infinidysk_nntp::Client::new(vec![]);
-        assert!(crate::survey(&root).await.unwrap().supported());
-        let done = crate::apply(&root, &db, &client, "/fixture-completed")
-            .await
-            .unwrap();
-        assert_eq!(done.directories, 1);
-        let item = db
-            .item(infinidysk_core::ItemId(Uuid::from_u128(0x456)))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            item.created_at,
-            "2026-07-04T18:23:45.123Z"
-                .parse::<jiff::Timestamp>()
-                .unwrap()
-                .as_millisecond()
-        );
-        db.close().await;
-        let evidence = root.join("fork-evidence");
-        let bundle = crate::fork::export(
-            &root,
-            &evidence,
-            &[],
-            vec![("DATABASE_PROVIDER".into(), "postgres".into())],
+
+    fn error(result: Result<Target, ConnectionError>) -> ConnectionError {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("expected an error, got a target"),
+        }
+    }
+
+    #[test]
+    fn reads_npgsql_keys_aliases_and_quotes() {
+        let t = resolve(
+            r#" server = db.lan ; PORT=5433;DB=dav;User Id=u;Pwd="p;w=""x""";SslMode=require;Search Path='a''b'"#,
         )
-        .await
         .unwrap();
-        assert_eq!(
-            crate::fork::verify(&evidence).unwrap().digest,
-            bundle.digest
-        );
-        assert_eq!(
-            bundle
-                .entries
-                .iter()
-                .filter(|e| e.kind == "postgres_snapshot")
-                .count(),
-            3
-        );
-        output(&root.join(PENDING)).unwrap().sync_all().unwrap();
-        assert!(verify(&root).is_err());
-        assert!(crate::open(&root).await.is_err());
-        fs::remove_file(root.join(PENDING)).unwrap();
-        adapter.close().await.unwrap();
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM \"ForkJournal\"")
-                .fetch_one(&mut source)
-                .await
-                .unwrap(),
-            1
-        );
-        let raw = fs::read_to_string(root.join(FILES[2])).unwrap();
-        assert!(raw.contains("delete-uncertain"));
-        assert!(
-            !fs::read_to_string(root.join(MARKER))
+        assert_eq!(t.host, "db.lan");
+        assert_eq!(t.port, 5433);
+        assert_eq!(t.database, "dav");
+        assert_eq!(t.username, "u");
+        assert_eq!(t.password.as_deref(), Some(r#"p;w="x""#));
+        assert!(matches!(t.ssl_mode, PgSslMode::Require));
+        assert_eq!(t.search_path.as_deref(), Some("a'b"));
+    }
+
+    #[test]
+    fn the_last_alias_wins() {
+        let database = |rest: &str| {
+            resolve(&format!("Host=h;Username=u;{rest}"))
                 .unwrap()
-                .contains(&connection)
+                .database
+        };
+        assert_eq!(database("Database=old;DB=current"), "current");
+        assert_eq!(database("DB=current;Database=old"), "old");
+        assert_eq!(database("Database=a;DB=b;Database=c"), "c");
+        assert_eq!(database("Database=x;DB="), "u");
+    }
+
+    #[test]
+    fn host_forms_follow_npgsql() {
+        let at = |connection: &str| {
+            let t = resolve(&format!("{connection};Username=u")).unwrap();
+            (t.host, t.port)
+        };
+        assert_eq!(at("Host=db:6543;Port=5432"), ("db".to_owned(), 6543));
+        assert_eq!(at("Host=[::1]:6543"), ("::1".to_owned(), 6543));
+        assert_eq!(at("Host=::1"), ("::1".to_owned(), 5432));
+        assert_eq!(
+            at("Host=/run/postgresql"),
+            ("/run/postgresql".to_owned(), 5432)
         );
-        assert!(snapshot(&connection, &root, "UTC").await.is_err());
-        let changed = root.with_extension("rejected");
-        sqlx::raw_sql("ALTER TABLE \"ForkJournal\" ADD COLUMN \"Unsupported\" timestamp with time zone;INSERT INTO \"ForkJournal\"(\"Unsupported\") VALUES(now())").execute(&mut source).await.unwrap();
-        assert!(snapshot(&connection, &changed, "UTC").await.is_err());
-        assert!(!changed.exists());
-        fs::write(root.join(FILES[2]), b"tampered").unwrap();
-        assert!(verify(&root).is_err());
-        assert!(crate::open(&root).await.is_err());
-        source.close().await.unwrap();
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE {}",
-            ident(&name)
-        )))
-        .execute(&mut admin)
-        .await
+        assert_eq!(
+            unsupported(resolve("Host=@sock;Username=u")),
+            "Host as an abstract socket"
+        );
+        let several = resolve("Host=a,b;Username=u");
+        assert!(
+            error(resolve("Host=a,b;Username=u"))
+                .to_string()
+                .contains("use a single server")
+        );
+        assert_eq!(unsupported(several), "Host with more than one server");
+        assert!(matches!(
+            error(resolve("Host=db:x;Username=u")),
+            ConnectionError::Invalid("Host")
+        ));
+        assert!(matches!(
+            error(resolve("Username=u")),
+            ConnectionError::Missing("Host")
+        ));
+    }
+
+    #[test]
+    fn npgsql_ignores_the_variables_sqlx_reads() {
+        let env = fake(&[
+            ("PGHOST", "evil"),
+            ("PGHOSTADDR", "10.9.9.9"),
+            ("PGPORT", "1"),
+            ("PGDATABASE", "other"),
+            ("PGSSLMODE", "disable"),
+            ("PGUSER", "u"),
+        ]);
+        let t = target("Host=db", &env).unwrap();
+        assert_eq!((t.host.as_str(), t.port), ("db", 5432));
+        assert_eq!((t.username.as_str(), t.database.as_str()), ("u", "u"));
+        assert!(matches!(t.ssl_mode, PgSslMode::Prefer));
+        let options = t.options(PgSslMode::Prefer).unwrap();
+        assert_eq!(options.get_host(), "db");
+        assert_eq!(options.get_port(), 5432);
+        assert_eq!(options.get_username(), "u");
+        assert_eq!(options.get_database(), Some("u"));
+        assert!(matches!(options.get_ssl_mode(), PgSslMode::Prefer));
+        assert!(matches!(
+            error(resolve("Host=db")),
+            ConnectionError::Missing("Username")
+        ));
+    }
+
+    #[test]
+    fn the_password_file_is_read_with_the_final_identity() {
+        let dir = temp_dir("pgpass");
+        let home = temp_dir("home");
+        let file = dir.join("pgpass");
+        let home_var = home.to_str().unwrap().to_owned();
+        let password = |lines: &[&str], extra: &str, vars: &[(&str, &str)]| {
+            std::fs::write(&file, lines.join("\n")).unwrap();
+            let mut all = vec![("HOME", home_var.as_str())];
+            all.extend_from_slice(vars);
+            target(
+                &format!(
+                    "Host=db.lan:5433;Username=u;Passfile={}{extra}",
+                    file.display()
+                ),
+                &fake(&all),
+            )
+            .map(|t| t.password)
+        };
+        let lines = [
+            "# 1.x",
+            "localhost:5432:*:u:from-defaults",
+            r"db.lan:5433:*:u:right\:pw",
+        ];
+        assert_eq!(
+            password(&lines, "", &[]).unwrap().as_deref(),
+            Some("right:pw")
+        );
+        assert_eq!(
+            password(&lines, ";Password=given", &[]).unwrap().as_deref(),
+            Some("given")
+        );
+        assert_eq!(
+            password(&lines, "", &[("PGPASSWORD", "env")])
+                .unwrap()
+                .as_deref(),
+            Some("env")
+        );
+        let before = [lines[0], lines[1], "broken", lines[2]];
+        assert!(matches!(
+            password(&before, "", &[]),
+            Err(ConnectionError::PassfileMalformed(3))
+        ));
+        let after = [lines[0], lines[1], lines[2], "broken"];
+        assert_eq!(
+            password(&after, "", &[]).unwrap().as_deref(),
+            Some("right:pw")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn security_requirements_the_copy_cannot_enforce_are_refused() {
+        let base = "Host=h;Username=u;";
+        assert_eq!(
+            unsupported(resolve(&format!("{base}Require Auth=scram-sha-256"))),
+            "Require Auth"
+        );
+        let from_env = target(base, &fake(&[("PGREQUIREAUTH", "md5")]));
+        assert!(
+            error(target(base, &fake(&[("PGREQUIREAUTH", "md5")])))
+                .to_string()
+                .contains("PGREQUIREAUTH")
+        );
+        assert_eq!(unsupported(from_env), "Require Auth");
+        for (entry, name) in [
+            ("Channel Binding=Require", "Channel Binding"),
+            ("GSS Encryption Mode=Require", "GSS Encryption Mode"),
+            ("SSL Negotiation=Direct", "SSL Negotiation"),
+            ("Include Realm=false", "Include Realm"),
+        ] {
+            assert_eq!(unsupported(resolve(&format!("{base}{entry}"))), name);
+        }
+        assert!(matches!(
+            error(resolve(&format!("{base}Include Realm=maybe"))),
+            ConnectionError::Invalid("Include Realm")
+        ));
+        resolve(&format!(
+            "{base}Check Certificate Revocation=true;Require Auth=;Include Realm=True;Channel Binding=Prefer"
+        ))
         .unwrap();
-        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn client_tuning_keys_are_ignored() {
+        resolve(
+            "Host=h;Username=u;Pooling=false;Maximum Pool Size=5;MinPoolSize=1;Load Balance Timeout=5;\
+             Timeout=30;Command Timeout=0;Include Error Detail=true;Trust Server Certificate=true;\
+             Application Name=x;GSS Encryption Mode=Disable",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn unusable_keys_are_named_without_their_values() {
+        let base = "Host=h;Username=u;";
+        let mut texts = Vec::new();
+        let unknown = error(resolve(&format!("{base}Frobnicate=s3cret")));
+        assert!(matches!(unknown, ConnectionError::UnknownKey(3)));
+        texts.push(unknown.to_string());
+        for (entry, name) in [
+            ("SSL Password=s3cret", "SSL Password"),
+            ("Options=-c s3cret=1", "Options"),
+            ("Kerberos Service Name=s3cret", "Kerberos Service Name"),
+            (
+                "Target Session Attributes=primary",
+                "Target Session Attributes",
+            ),
+        ] {
+            let result = resolve(&format!("{base}{entry}"));
+            texts.push(error(resolve(&format!("{base}{entry}"))).to_string());
+            assert_eq!(unsupported(result), name);
+        }
+        for (entry, name) in [("Port=s3cret", "Port"), ("SSL Mode=s3cret", "SSL Mode")] {
+            let error = error(resolve(&format!("{base}{entry}")));
+            assert!(matches!(error, ConnectionError::Invalid(n) if n == name));
+            texts.push(error.to_string());
+        }
+        for entry in [r#"Password="s3cret"#, r#"Password=s3cret""#, "s3cret"] {
+            let error = error(resolve(&format!("{base}{entry}")));
+            assert!(matches!(error, ConnectionError::Malformed));
+            texts.push(error.to_string());
+        }
+        for text in texts {
+            assert!(!text.contains("s3cret"), "{text}");
+        }
+    }
+
+    #[test]
+    fn verify_modes_wait_for_gate_g1() {
+        for mode in ["VerifyCA", "verifyfull"] {
+            assert!(matches!(
+                error(resolve(&format!(
+                    "Host=h;Username=u;SSL Mode={mode};Root Certificate=/ca.pem"
+                ))),
+                ConnectionError::CertificateCheck
+            ));
+        }
+    }
+
+    #[test]
+    fn options_follow_npgsql() {
+        let env = fake(&[("PGOPTIONS", "-c search_path=other")]);
+        let options = |rest: &str| target(&format!("Host=h;Username=u{rest}"), &env);
+        assert_eq!(
+            options(r#";Options="""#).unwrap().options.as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            options(";Options=").unwrap().options.as_deref(),
+            Some("-c search_path=other")
+        );
+        assert_eq!(
+            options("").unwrap().options.as_deref(),
+            Some("-c search_path=other")
+        );
+        let text = error(options(";Options=-c a=b")).to_string();
+        assert!(text.contains("PGOPTIONS"), "{text}");
+        assert_eq!(unsupported(options(";Options=-c a=b")), "Options");
+    }
+
+    #[test]
+    fn an_empty_options_entry_is_refused_while_pgoptions_is_set() {
+        const CHILD: &str = "INFINIDYSK_PGOPTIONS_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "postgres::tests::an_empty_options_entry_is_refused_while_pgoptions_is_set",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("PGOPTIONS", "-c search_path=other")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        let env = |name: &str| std::env::var(name).ok();
+        let hidden = target(r#"Host=h;Username=u;Options="""#, &env).unwrap();
+        assert!(matches!(
+            hidden.options(PgSslMode::Prefer),
+            Err(ConnectionError::OptionsMismatch)
+        ));
+        let inherited = target("Host=h;Username=u;Options=", &env).unwrap();
+        assert!(inherited.options(PgSslMode::Prefer).is_ok());
+    }
+
+    /// The first message of a connection, or of the one after an `N`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Opened {
+        Ssl,
+        Startup,
+    }
+
+    /// What the scripted server answers an `SSLRequest` with.
+    #[derive(Clone, Copy)]
+    enum SslReply {
+        /// `S`, then bytes that are not TLS, then close.
+        BrokenTls,
+        /// `N`: no TLS; the client may go on in plaintext.
+        No,
+    }
+
+    /// Accepts connections until dropped, recording each one's messages. Every startup is
+    /// rejected with a FATAL `ErrorResponse`.
+    async fn scripted(reply: SslReply) -> (u16, Arc<Mutex<Vec<Vec<Opened>>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let index = {
+                    let mut log = log.lock().unwrap();
+                    log.push(Vec::new());
+                    log.len() - 1
+                };
+                tokio::spawn(serve(socket, reply, Arc::clone(&log), index));
+            }
+        });
+        (port, seen)
+    }
+
+    async fn serve(
+        mut socket: TcpStream,
+        reply: SslReply,
+        log: Arc<Mutex<Vec<Vec<Opened>>>>,
+        index: usize,
+    ) {
+        loop {
+            let Ok(len) = socket.read_u32().await else {
+                return;
+            };
+            let mut body = vec![0; usize::try_from(len).unwrap() - 4];
+            if socket.read_exact(&mut body).await.is_err() {
+                return;
+            }
+            let ssl = len == 8 && body[..4] == 80_877_103_u32.to_be_bytes();
+            log.lock().unwrap()[index].push(if ssl { Opened::Ssl } else { Opened::Startup });
+            if !ssl {
+                let fields = b"SFATAL\0VFATAL\0C28000\0Mrejected\0\0";
+                let mut message = vec![b'E'];
+                message.extend_from_slice(&u32::try_from(fields.len() + 4).unwrap().to_be_bytes());
+                message.extend_from_slice(fields);
+                let _ = socket.write_all(&message).await;
+                return;
+            }
+            match reply {
+                SslReply::BrokenTls => {
+                    let _ = socket.write_all(b"Snot tls").await;
+                    return;
+                }
+                SslReply::No => {
+                    if socket.write_all(b"N").await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn attempt(port: u16, mode: &str) -> Result<PgConnection, Error> {
+        let t = resolve(&format!(
+            "Host=127.0.0.1;Port={port};Username=u;SSL Mode={mode}"
+        ))
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), connect(&t))
+            .await
+            .expect("connect gave up within its deadline")
+    }
+
+    #[tokio::test]
+    async fn tls_retries_follow_npgsql() {
+        use Opened::{Ssl, Startup};
+
+        let (port, seen) = scripted(SslReply::BrokenTls).await;
+        assert!(attempt(port, "Prefer").await.is_err());
+        assert_eq!(*seen.lock().unwrap(), vec![vec![Ssl]]);
+
+        let (port, seen) = scripted(SslReply::No).await;
+        assert!(matches!(
+            attempt(port, "Prefer").await,
+            Err(Error::Connect(sqlx::Error::Database(_)))
+        ));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![vec![Ssl, Startup], vec![Startup]]
+        );
+
+        let (port, seen) = scripted(SslReply::No).await;
+        assert!(attempt(port, "Allow").await.is_err());
+        assert_eq!(*seen.lock().unwrap(), vec![vec![Startup], vec![Ssl]]);
     }
 }

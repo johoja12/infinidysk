@@ -40,7 +40,7 @@ pub enum Profile {
     Sonarr,
     Radarr,
     Lidarr,
-    Readarr,
+    Chaptarr,
     Whisparr,
     Sportarr,
 }
@@ -49,7 +49,7 @@ impl Profile {
     /// Root of the endpoints we call; Sportarr's are its native ones.
     const fn root(self) -> &'static str {
         match self {
-            Self::Lidarr | Self::Readarr => "api/v1",
+            Self::Lidarr | Self::Chaptarr => "api/v1",
             Self::Sportarr => "api",
             Self::Sonarr | Self::Radarr | Self::Whisparr => "api/v3",
         }
@@ -61,7 +61,7 @@ impl Profile {
             Self::Sonarr => "Sonarr",
             Self::Radarr => "Radarr",
             Self::Lidarr => "Lidarr",
-            Self::Readarr => "Readarr",
+            Self::Chaptarr => "Chaptarr",
             Self::Whisparr => "Whisparr",
             Self::Sportarr => "Sportarr",
         }
@@ -72,19 +72,19 @@ impl Profile {
     pub const fn media(self) -> &'static [Kind] {
         match self {
             Self::Lidarr => &[Kind::Audio],
-            Self::Readarr => &[Kind::Book, Kind::Audio],
+            Self::Chaptarr => &[Kind::Book, Kind::Audio],
             Self::Sonarr | Self::Radarr | Self::Whisparr | Self::Sportarr => &[Kind::Video],
         }
     }
 
     /// Health repair can ask it for a replacement.
-    // ponytail: Readarr (bookfile + BookSearch, unmaintained upstream) and Sportarr (own
-    // API, no download ids in history) have no repair; add a `repair::Shape` for each.
+    // ponytail: Sportarr (own API, no download ids in history) has no repair; add a
+    // `repair::Shape` for it.
     #[must_use]
     pub const fn repairs(self) -> bool {
         matches!(
             self,
-            Self::Sonarr | Self::Radarr | Self::Lidarr | Self::Whisparr
+            Self::Sonarr | Self::Radarr | Self::Lidarr | Self::Chaptarr | Self::Whisparr
         )
     }
 }
@@ -110,6 +110,8 @@ pub enum Error {
         expected: &'static str,
         found: String,
     },
+    #[error("its API {0} is newer than this version of infinidysk supports")]
+    Unsupported(String),
 }
 
 impl Error {
@@ -122,7 +124,7 @@ impl Error {
                 e.is_connect() || e.is_timeout() || e.status().is_some_and(|s| s.is_server_error())
             }
             Self::Rejected { status, .. } => status.is_server_error(),
-            Self::Unexpected(_) | Self::WrongApp { .. } => false,
+            Self::Unexpected(_) | Self::WrongApp { .. } | Self::Unsupported(_) => false,
         }
     }
 }
@@ -144,7 +146,8 @@ pub struct SabClient {
     pub id: i64,
     pub name: String,
     pub enabled: bool,
-    pub category: Option<String>,
+    /// The categories it downloads into, each with the media the Arr imports from it.
+    pub categories: Vec<(String, &'static [Kind])>,
     pub host: String,
     pub port: u16,
     pub use_ssl: bool,
@@ -197,16 +200,18 @@ fn whisparr_has_movies(version: &str) -> bool {
 
 /// The SABnzbd download clients the instance holds.
 pub async fn sab_clients(http: &reqwest::Client, arr: &Arr) -> Result<Vec<SabClient>, Error> {
-    let clients: Vec<Value> = fetch(call(http, arr, Method::GET, "downloadclient")).await?;
+    let s = Session::open(http, arr).await?;
+    let clients: Vec<Value> = fetch(s.call(Method::GET, "downloadclient")).await?;
     Ok(clients
         .iter()
-        .filter_map(|c| sab_client(c, arr.profile == Profile::Sportarr))
+        .filter_map(|c| sab_client(c, arr.profile))
         .collect())
 }
 
 /// Reads one download client: Servarr resources keep settings in `fields`, Sportarr's
 /// native ones at the top level.
-fn sab_client(client: &Value, native: bool) -> Option<SabClient> {
+fn sab_client(client: &Value, profile: Profile) -> Option<SabClient> {
+    let native = profile == Profile::Sportarr;
     let sab = if native {
         client["type"].as_i64() == Some(5)
             || client["type"]
@@ -231,11 +236,35 @@ fn sab_client(client: &Value, native: bool) -> Option<SabClient> {
         }
     };
     let text = |name: &str| get(name).as_str().unwrap_or_default().to_owned();
-    let category = ["category", "tvCategory", "movieCategory", "musicCategory"]
-        .into_iter()
-        .find_map(|k| get(k).as_str())
-        .filter(|c| !c.is_empty())
-        .map(str::to_owned);
+    let category = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| get(k).as_str())
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned)
+    };
+    let mut categories: Vec<(String, &'static [Kind])> = Vec::new();
+    if profile == Profile::Chaptarr {
+        // Each falls back to the hidden `musicCategory`; one category may serve both.
+        for (key, media) in [
+            ("audiobookCategory", &[Kind::Audio][..]),
+            ("ebookCategory", &[Kind::Book][..]),
+        ] {
+            let Some(name) = category(&[key, "musicCategory"]) else {
+                continue;
+            };
+            match categories
+                .iter_mut()
+                .find(|(c, _)| c.eq_ignore_ascii_case(&name))
+            {
+                Some(both) => both.1 = profile.media(),
+                None => categories.push((name, media)),
+            }
+        }
+    } else if let Some(name) =
+        category(&["category", "tvCategory", "movieCategory", "musicCategory"])
+    {
+        categories.push((name, profile.media()));
+    }
     let api_key = text("apiKey");
     Some(SabClient {
         id: client["id"].as_i64()?,
@@ -243,7 +272,7 @@ fn sab_client(client: &Value, native: bool) -> Option<SabClient> {
         enabled: client[if native { "enabled" } else { "enable" }]
             .as_bool()
             .unwrap_or(false),
-        category,
+        categories,
         host: text("host"),
         port: get("port")
             .as_u64()
@@ -255,17 +284,30 @@ fn sab_client(client: &Value, native: bool) -> Option<SabClient> {
     })
 }
 
+/// Whether Lidarr writes tags into the audio files it imports; files here cannot change.
+/// Always `false` for other profiles.
+pub async fn writes_audio_tags(http: &reqwest::Client, arr: &Arr) -> Result<bool, Error> {
+    if arr.profile != Profile::Lidarr {
+        return Ok(false);
+    }
+    let config: Value = fetch(request(
+        http,
+        arr,
+        Method::GET,
+        "api/v1/config/metadataprovider",
+    ))
+    .await?;
+    Ok(config["writeAudioTags"]
+        .as_str()
+        .is_some_and(|v| !v.eq_ignore_ascii_case("no")))
+}
+
 /// Has the Arr test its download client `id` with `marker` appended to the client's URL
 /// base, so the test's calls arrive at `…/<marker>/api`. The test's verdict is ignored:
 /// whether those calls arrived is the evidence.
 pub async fn probe(http: &reqwest::Client, arr: &Arr, id: i64, marker: &str) -> Result<(), Error> {
-    let mut client: Value = fetch(call(
-        http,
-        arr,
-        Method::GET,
-        &format!("downloadclient/{id}"),
-    ))
-    .await?;
+    let s = Session::open(http, arr).await?;
+    let mut client: Value = fetch(s.call(Method::GET, &format!("downloadclient/{id}"))).await?;
     let base = client["fields"]
         .as_array_mut()
         .and_then(|fields| fields.iter_mut().find(|f| f["name"] == "urlBase"))
@@ -278,7 +320,7 @@ pub async fn probe(http: &reqwest::Client, arr: &Arr, id: i64, marker: &str) -> 
             .trim_end_matches('/')
     );
     base["value"] = Value::String(value);
-    call(http, arr, Method::POST, "downloadclient/test")
+    s.call(Method::POST, "downloadclient/test")
         .json(&client)
         .send()
         .await?;
@@ -291,21 +333,95 @@ pub async fn refresh_downloads(http: &reqwest::Client, arr: &Arr) -> Result<(), 
     if arr.profile == Profile::Sportarr {
         return Ok(());
     }
+    let s = Session::open(http, arr).await?;
     send(
-        call(http, arr, Method::POST, "command")
+        s.call(Method::POST, "command")
             .json(&serde_json::json!({ "name": "RefreshMonitoredDownloads" })),
     )
     .await
 }
 
-fn request(http: &reqwest::Client, arr: &Arr, method: Method, path: &str) -> RequestBuilder {
-    http.request(method, format!("{}/{path}", arr.url.trim_end_matches('/')))
-        .header("X-Api-Key", &arr.api_key)
+/// Which of an instance's APIs an operation talks to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Api {
+    /// The profile's long-standing one (see [`Profile::root`]).
+    Classic,
+    /// Sonarr v5's, which marks v3 deprecated.
+    V5,
 }
 
-/// A call under the profile's API root.
-fn call(http: &reqwest::Client, arr: &Arr, method: Method, path: &str) -> RequestBuilder {
-    request(http, arr, method, &format!("{}/{path}", arr.profile.root()))
+#[derive(Deserialize)]
+struct ApiInfo {
+    current: String,
+    #[serde(default)]
+    deprecated: Vec<String>,
+}
+
+/// The newest API both sides speak, from Sonarr's `GET /api`. Without that answer it is a
+/// Sonarr that only has v3.
+// ponytail: one extra request per operation; cache it per instance if that ever shows up.
+async fn api(http: &reqwest::Client, arr: &Arr) -> Result<Api, Error> {
+    if arr.profile != Profile::Sonarr {
+        return Ok(Api::Classic);
+    }
+    let response = match accepted(request(http, arr, Method::GET, "api")).await {
+        Err(Error::Rejected {
+            status: reqwest::StatusCode::NOT_FOUND,
+            ..
+        }) => return Ok(Api::Classic),
+        other => other?,
+    };
+    let Ok(info) = serde_json::from_slice::<ApiInfo>(&response.bytes().await?) else {
+        return Ok(Api::Classic);
+    };
+    let offered = |v: &str| info.current == v || info.deprecated.iter().any(|d| d == v);
+    if offered("v5") {
+        Ok(Api::V5)
+    } else if offered("v3") {
+        Ok(Api::Classic)
+    } else {
+        Err(Error::Unsupported(info.current))
+    }
+}
+
+/// An instance with its API settled once for one operation, so the calls of an operation
+/// never mix two APIs.
+#[derive(Clone, Copy)]
+struct Session<'a> {
+    http: &'a reqwest::Client,
+    arr: &'a Arr,
+    api: Api,
+}
+
+impl<'a> Session<'a> {
+    async fn open(http: &'a reqwest::Client, arr: &'a Arr) -> Result<Self, Error> {
+        Ok(Self {
+            http,
+            arr,
+            api: api(http, arr).await?,
+        })
+    }
+
+    /// A call under the API root.
+    fn call(&self, method: Method, path: &str) -> RequestBuilder {
+        let root = match self.api {
+            Api::Classic => self.arr.profile.root(),
+            Api::V5 => "api/v5",
+        };
+        request(self.http, self.arr, method, &format!("{root}/{path}"))
+    }
+}
+
+fn request(http: &reqwest::Client, arr: &Arr, method: Method, path: &str) -> RequestBuilder {
+    let request = http
+        .request(method, format!("{}/{path}", arr.url.trim_end_matches('/')))
+        .header("X-Api-Key", &arr.api_key);
+    // Sonarr records this as the source of the blocklist entries we add.
+    if arr.profile == Profile::Sonarr {
+        request.header("X-Sonarr-Client", "infinidysk")
+    } else {
+        request
+    }
 }
 
 async fn fetch<T: DeserializeOwned>(request: RequestBuilder) -> Result<T, Error> {
@@ -386,14 +502,14 @@ mod tests {
             "id": 4, "name": "sab", "type": 5, "enabled": true, "host": "h", "port": 3000,
             "useSsl": true, "urlBase": "/x", "apiKey": "key", "category": "sports",
         });
-        let client = sab_client(&sab, true).unwrap();
+        let client = sab_client(&sab, Profile::Sportarr).unwrap();
         assert_eq!(
             client,
             SabClient {
                 id: 4,
                 name: "sab".to_owned(),
                 enabled: true,
-                category: Some("sports".to_owned()),
+                categories: vec![("sports".to_owned(), &[Kind::Video][..])],
                 host: "h".to_owned(),
                 port: 3000,
                 use_ssl: true,
@@ -401,6 +517,33 @@ mod tests {
                 api_key: Some("key".to_owned()),
             }
         );
-        assert!(sab_client(&json!({ "id": 5, "type": 1 }), true).is_none());
+        assert!(sab_client(&json!({ "id": 5, "type": 1 }), Profile::Sportarr).is_none());
+    }
+
+    #[test]
+    fn chaptarr_clients_split_audiobook_and_ebook_categories() {
+        let sab = |audio: &str, ebook: &str| {
+            let client = json!({
+                "id": 1, "name": "sab", "implementation": "Sabnzbd", "enable": true,
+                "fields": [
+                    { "name": "audiobookCategory", "value": audio },
+                    { "name": "ebookCategory", "value": ebook },
+                    { "name": "musicCategory", "value": "books" },
+                ],
+            });
+            sab_client(&client, Profile::Chaptarr).unwrap().categories
+        };
+        assert_eq!(
+            sab("audiobooks", "ebooks"),
+            [
+                ("audiobooks".to_owned(), &[Kind::Audio][..]),
+                ("ebooks".to_owned(), &[Kind::Book][..]),
+            ]
+        );
+        assert_eq!(
+            sab("books", "Books"),
+            [("books".to_owned(), &[Kind::Book, Kind::Audio][..])]
+        );
+        assert_eq!(sab("", ""), []);
     }
 }

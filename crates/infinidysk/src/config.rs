@@ -17,6 +17,8 @@ use uuid::Uuid;
 /// stored secret.
 pub const MASK: &str = "********";
 const ENV_PREFIX: &str = "INFINIDYSK__";
+/// The disk cache folder when none is saved, for callers that know no config folder.
+pub const DEFAULT_CACHE_DIR: &str = "/config/cache";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -640,6 +642,8 @@ pub struct Oidc {
     pub scopes: String,
     /// ID-token claim shown as the username; then `preferred_username`, `email`, `sub`.
     pub username_claim: String,
+    /// Shown on the sign-in page as "Sign in with <name>"; empty shows `SSO`.
+    pub display_name: String,
 }
 
 impl Default for Oidc {
@@ -651,6 +655,7 @@ impl Default for Oidc {
             redirect_uri: String::new(),
             scopes: "openid profile email".to_owned(),
             username_claim: "preferred_username".to_owned(),
+            display_name: String::new(),
         }
     }
 }
@@ -661,6 +666,16 @@ impl Oidc {
         !self.issuer.is_empty()
     }
 
+    /// The provider name the sign-in page shows.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        if self.display_name.is_empty() {
+            "SSO"
+        } else {
+            &self.display_name
+        }
+    }
+
     /// Trims the fields; checks them only while SSO is on, so clearing the issuer alone
     /// always turns SSO off.
     pub(crate) fn validate(&mut self) -> Result<(), Error> {
@@ -668,7 +683,20 @@ impl Oidc {
         self.client_id = self.client_id.trim().to_owned();
         self.redirect_uri = self.redirect_uri.trim().to_owned();
         self.username_claim = self.username_claim.trim().to_owned();
+        self.display_name = self
+            .display_name
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         self.scopes = self.scopes.split_whitespace().collect::<Vec<_>>().join(" ");
+        if self.display_name.chars().count() > MAX_DISPLAY_NAME
+            || self.display_name.chars().any(char::is_control)
+        {
+            return Err(invalid(
+                "auth.oidc.display_name",
+                format!("Display name must be plain text of at most {MAX_DISPLAY_NAME} characters"),
+            ));
+        }
         if !self.enabled() {
             return Ok(());
         }
@@ -705,6 +733,9 @@ impl Oidc {
         Ok(())
     }
 }
+
+/// Fits the sign-in button on a phone screen.
+const MAX_DISPLAY_NAME: usize = 40;
 
 /// `https://`, or `http://` to this machine ([`crate::oidc::secure`]), with no query or
 /// fragment. The trailing slash stays: discovery compares the issuer exactly.
@@ -758,6 +789,8 @@ pub struct Mount {
     /// Where the tree is mounted, as Sonarr/Radarr see it; completed downloads are reported
     /// under `<dir>/completed-symlinks`.
     pub dir: String,
+    /// Serve the built-in FUSE mount at `dir`. Off leaves `dir` to an external mount.
+    pub fuse: bool,
     /// Media files on the mount report 1970 dates, matching an rclone mount that used
     /// `--no-modtime`, so media servers that stored those dates do not rescan.
     pub epoch_times: bool,
@@ -767,6 +800,7 @@ impl Default for Mount {
     fn default() -> Self {
         Self {
             dir: "/mnt/infinidysk".to_owned(),
+            fuse: true,
             epoch_times: false,
         }
     }
@@ -832,7 +866,7 @@ impl Preset {
             memory_cache_enabled: true,
             memory_cache_mb,
             disk_cache_enabled: false,
-            disk_cache_dir: "/config/cache".to_owned(),
+            disk_cache_dir: DEFAULT_CACHE_DIR.to_owned(),
             disk_cache_gb: 25,
             disk_cache_max_age_hours: 168,
             read_ahead_memory_mb,
@@ -914,7 +948,7 @@ impl Performance {
         );
     }
 
-    fn validate(&self, mount_dir: &str) -> Result<(), Error> {
+    fn validate(&self, mount_dir: &str, default_cache_dir: &str) -> Result<(), Error> {
         let t = self.effective();
         check(
             "performance.read_ahead_mb",
@@ -958,23 +992,18 @@ impl Performance {
             t.fuse_max_background,
             &FUSE_MAX_BACKGROUND,
         )?;
-        let dir = std::path::Path::new(&t.disk_cache_dir);
+        let cache_dir = self.disk_cache_dir.as_deref().unwrap_or(default_cache_dir);
+        let dir = std::path::Path::new(cache_dir);
         if !dir.is_absolute() {
             return Err(invalid(
                 "performance.disk_cache_dir",
-                format!(
-                    "Disk cache dir {:?} must be an absolute path",
-                    t.disk_cache_dir
-                ),
+                format!("Disk cache dir {cache_dir:?} must be an absolute path"),
             ));
         }
         if dir.starts_with(mount_dir) {
             return Err(invalid(
                 "performance.disk_cache_dir",
-                format!(
-                    "Disk cache dir {:?} must be outside the mount dir",
-                    t.disk_cache_dir
-                ),
+                format!("Disk cache dir {cache_dir:?} must be outside the mount dir"),
             ));
         }
         Ok(())
@@ -1074,7 +1103,7 @@ pub enum ArrProfile {
     Sonarr,
     Radarr,
     Lidarr,
-    Readarr,
+    Chaptarr,
     Whisparr,
     Sportarr,
 }
@@ -1239,6 +1268,11 @@ impl Settings {
 
     /// Checks every field and fills the provider fields that come from the catalog.
     pub fn validate(&mut self) -> Result<(), Error> {
+        self.validate_in(DEFAULT_CACHE_DIR)
+    }
+
+    /// [`Self::validate`], with the disk cache in `default_cache_dir` when none is saved.
+    pub(crate) fn validate_in(&mut self, default_cache_dir: &str) -> Result<(), Error> {
         self.prefetch
             .validate()
             .map_err(|e| invalid("prefetch", e.to_string()))?;
@@ -1297,6 +1331,19 @@ impl Settings {
                 format!("Mount dir {:?} must be an absolute path", self.mount.dir),
             ));
         }
+        // A mount over the config folder would hide its files once it mounts.
+        if let Some(config_dir) = std::path::Path::new(default_cache_dir).parent()
+            && config_dir.starts_with(&self.mount.dir)
+        {
+            return Err(invalid(
+                "mount.dir",
+                format!(
+                    "Mount dir {:?} must not contain the config folder {}",
+                    self.mount.dir,
+                    config_dir.display()
+                ),
+            ));
+        }
         if self.webdav.user.trim().is_empty() {
             return Err(invalid(
                 "webdav.user",
@@ -1338,7 +1385,8 @@ impl Settings {
             .map(|g| g.trim().to_owned())
             .filter(|g| !g.is_empty())
             .collect();
-        self.performance.validate(&self.mount.dir)?;
+        self.performance
+            .validate(&self.mount.dir, default_cache_dir)?;
         if self.maintenance.window.minutes().is_none() {
             return Err(invalid(
                 "maintenance.window",
@@ -1690,6 +1738,8 @@ pub struct ConfigStore {
     stored: Map<String, Value>,
     env: Vec<Override>,
     settings: Settings,
+    /// The disk cache folder when none is saved; validation checks it against the mount.
+    default_cache_dir: String,
 }
 
 impl ConfigStore {
@@ -1697,6 +1747,15 @@ impl ConfigStore {
     pub async fn load(
         db: Db,
         vars: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, Error> {
+        Self::load_in(db, vars, DEFAULT_CACHE_DIR.to_owned()).await
+    }
+
+    /// [`Self::load`], checking the disk cache in `default_cache_dir` when none is saved.
+    pub(crate) async fn load_in(
+        db: Db,
+        vars: impl IntoIterator<Item = (String, String)>,
+        default_cache_dir: String,
     ) -> Result<Self, Error> {
         let defaults = serde_json::to_value(Settings::default())?;
         let mut env: Vec<Override> = vars
@@ -1725,7 +1784,7 @@ impl ConfigStore {
         for (key, value) in db.config().await? {
             stored.insert(key, serde_json::from_str(&value)?);
         }
-        let settings = effective(&stored, &env)?;
+        let settings = effective(&stored, &env, &default_cache_dir)?;
         // Freeze generated ids and catalog fields so env-defined lists round-trip through saves.
         let resolved = serde_json::to_value(&settings)?;
         for o in &mut env {
@@ -1738,6 +1797,7 @@ impl ConfigStore {
             stored,
             env,
             settings,
+            default_cache_dir,
         })
     }
 
@@ -1777,7 +1837,7 @@ impl ConfigStore {
     /// Validates and persists `new`. [`MASK`] secrets keep their current value.
     pub async fn save(&mut self, mut new: Settings) -> Result<(), Error> {
         new.restore_secrets(&self.settings);
-        new.validate()?;
+        new.validate_in(&self.default_cache_dir)?;
         let mut tree = serde_json::to_value(&new)?;
         let current = serde_json::to_value(&self.settings)?;
         let stored = Value::Object(self.stored.clone());
@@ -1820,22 +1880,47 @@ impl ConfigStore {
                 next.insert(k.clone(), v.clone());
             }
         }
-        self.settings = effective(&next, &self.env)?;
+        self.settings = effective(&next, &self.env, &self.default_cache_dir)?;
         self.stored = next;
         Ok(())
     }
 }
 
-fn effective(stored: &Map<String, Value>, env: &[Override]) -> Result<Settings, Error> {
+fn effective(
+    stored: &Map<String, Value>,
+    env: &[Override],
+    default_cache_dir: &str,
+) -> Result<Settings, Error> {
     let mut tree = serde_json::to_value(Settings::default())?;
     merge(&mut tree, Value::Object(stored.clone()));
     for o in env {
         set(&mut tree, &o.path, o.value.clone());
     }
+    reject_readarr(&tree)?;
     let mut settings: Settings = serde_json::from_value(tree)?;
     settings.reset_invalid();
-    settings.validate()?;
+    settings.validate_in(default_cache_dir)?;
     Ok(settings)
+}
+
+/// Readarr support was dropped; an instance left from before stops startup with what
+/// to do, not a parse error.
+fn reject_readarr(tree: &Value) -> Result<(), Error> {
+    let Some(arr) = tree["arr_instances"]
+        .as_array()
+        .and_then(|arrs| arrs.iter().find(|a| a["profile"] == "readarr"))
+    else {
+        return Ok(());
+    };
+    Err(invalid(
+        "arr_instances",
+        format!(
+            "Arr instance \"{}\" is a Readarr, which infinidysk no longer supports. Remove \
+             it first: in the previous version under Settings > Automation > Arr \
+             instances, or from INFINIDYSK__ARR_INSTANCES. Then upgrade and add Chaptarr.",
+            arr["name"].as_str().unwrap_or_default()
+        ),
+    ))
 }
 
 fn lookup<'a>(tree: &'a Value, path: &[String]) -> Option<&'a Value> {
