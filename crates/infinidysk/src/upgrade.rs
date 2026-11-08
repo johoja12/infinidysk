@@ -869,6 +869,11 @@ async fn import_with_progress(
     };
     let max_articles = allowance("INFINIDYSK_IMPORT_MAX_ARTICLES", 0)?;
     let max_bytes = allowance("INFINIDYSK_IMPORT_MAX_DECODED_BYTES", 64_000_000)?;
+    let connections = allowance("INFINIDYSK_IMPORT_CONNECTIONS", 1)?;
+    anyhow::ensure!(
+        (1..=8).contains(&connections),
+        "migration sizing connections must be 1-8"
+    );
     anyhow::ensure!(
         max_articles <= 1_000_000 && max_bytes <= 1_000_000_000_000,
         "migration sizing allowance exceeds supported bounds"
@@ -897,7 +902,8 @@ async fn import_with_progress(
         max_bytes,
         previous,
         checkpoint,
-    )?;
+    )?
+    .with_concurrency(usize::try_from(connections)?)?;
     let selected = vars
         .iter()
         .find(|(key, _)| key == "INFINIDYSK_IMPORT_PROVIDER_ID")
@@ -914,7 +920,7 @@ async fn import_with_progress(
             .min_by_key(|p| p.priority)
             .ok_or_else(|| anyhow::anyhow!("migration sizing provider is unavailable"))?;
         let mut provider = provider.clone();
-        provider.max_connections = 1;
+        provider.max_connections = provider.max_connections.min(u16::try_from(connections)?);
         provider.pipeline_depth = 1;
         providers.push(provider);
     }

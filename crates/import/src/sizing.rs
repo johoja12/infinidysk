@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 const ARTICLE: u64 = 32 * 1024 * 1024; // NNTP's maximum decoded body.
 
@@ -25,6 +25,7 @@ pub struct Sizing {
     max_bytes: u64,
     state: Mutex<Usage>,
     gate: Semaphore,
+    checkpoint_gate: AsyncMutex<()>,
 }
 impl Sizing {
     #[must_use]
@@ -35,6 +36,7 @@ impl Sizing {
             max_bytes: max_decoded_bytes,
             state: Mutex::default(),
             gate: Semaphore::new(1),
+            checkpoint_gate: AsyncMutex::new(()),
         }
     }
     pub fn checkpointed(
@@ -54,7 +56,18 @@ impl Sizing {
             max_bytes: max_decoded_bytes,
             state: Mutex::new(initial),
             gate: Semaphore::new(1),
+            checkpoint_gate: AsyncMutex::new(()),
         })
+    }
+    /// Parallel physical reads share one durable allowance. Configure before use.
+    pub fn with_concurrency(mut self, reads: usize) -> Result<Self, Error> {
+        if !(1..=8).contains(&reads) {
+            return Err(Error::InvalidArgument(
+                "migration sizing concurrency must be 1-8",
+            ));
+        }
+        self.gate = Semaphore::new(reads);
+        Ok(self)
     }
     async fn persist(&self, usage: Usage) -> Result<(), Error> {
         if let Some(save) = &self.checkpoint {
@@ -89,8 +102,11 @@ impl Sizing {
     }
     pub(crate) async fn body(&self, client: &Client, id: &str) -> Result<Body, Error> {
         let _permit = self.gate.acquire().await.map_err(|_| Error::Unavailable)?;
-        self.reserve()?;
-        self.persist(self.usage()?).await?;
+        {
+            let _checkpoint = self.checkpoint_gate.lock().await;
+            self.reserve()?;
+            self.persist(self.usage()?).await?;
+        }
         // Never cancel a physical read to admit another one. NNTP owns transport deadlines.
         let result = client.body(id, Workload::Queue, None).await;
         if let Ok(body) = &result {
@@ -98,6 +114,9 @@ impl Sizing {
             if bytes > ARTICLE {
                 return Err(Error::TooLarge);
             }
+            // Serialize reservations and refunds through their durable write, so a
+            // later completion cannot overwrite another request's reservation.
+            let _checkpoint = self.checkpoint_gate.lock().await;
             let mut next = self.usage()?;
             next.charged_bytes -= ARTICLE - bytes;
             next.decoded_bytes += bytes;

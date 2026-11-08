@@ -15,6 +15,9 @@ impl Drop for Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_payload_base(None).await
+    }
+    async fn with_payload_base(nas: Option<&Path>) -> Self {
         let path = std::env::temp_dir().join(format!("id-compatible-cache-{}", Uuid::new_v4()));
         std::fs::create_dir_all(path.join("meta")).unwrap();
         std::fs::write(
@@ -35,9 +38,18 @@ impl Fixture {
         .execute(&db)
         .await
         .unwrap();
+        let payload = nas.map_or_else(|| path.clone(), |base| base.join(path.file_name().unwrap()));
+        if nas.is_some() {
+            std::fs::create_dir(&payload).unwrap();
+            std::fs::write(
+                payload.join("fixture-owner"),
+                b"generated-native-cache-write-tests",
+            )
+            .unwrap();
+        }
         let mut folders = Vec::new();
         for id in ["a", "b"] {
-            let root = path.join(id);
+            let root = payload.join(id);
             std::fs::create_dir(&root).unwrap();
             let volume = Uuid::new_v4().simple().to_string();
             std::fs::write(root.join(".infinidysk-volume"), &volume).unwrap();
@@ -89,6 +101,76 @@ impl Fixture {
         );
         Writer::new(legacy, self.settings(chunk_mb)).unwrap()
     }
+}
+
+#[tokio::test]
+#[ignore = "requires explicitly marked disposable NAS roots and retains fixtures for original C# readback"]
+async fn export_nas_write_readback_fixtures() {
+    let roots: Vec<PathBuf> =
+        serde_json::from_str(&std::env::var("ID_COMPATIBLE_NAS_ROOTS").unwrap()).unwrap();
+    assert!(!roots.is_empty() && roots.len() <= 4);
+    let mut rows = Vec::new();
+    for root in roots {
+        assert!(root.is_absolute());
+        assert_eq!(
+            std::fs::read(root.join("fixture-owner")).unwrap(),
+            b"generated-native-cache-write-tests"
+        );
+        assert_eq!(
+            nix::sys::statfs::statfs(&root).unwrap().filesystem_type().0,
+            0x6969
+        );
+        for chunk in [0, 8] {
+            let f = std::mem::ManuallyDrop::new(Fixture::with_payload_base(Some(&root)).await);
+            let writer = f.open(chunk).await;
+            let (first, second, third, last, duplicate) = tokio::join!(
+                put(&writer, 0),
+                put(&writer, 1),
+                put(&writer, 2),
+                put(&writer, 3),
+                put(&writer, 0)
+            );
+            assert!(
+                first.unwrap()
+                    && second.unwrap()
+                    && third.unwrap()
+                    && last.unwrap()
+                    && duplicate.unwrap()
+            );
+            assert_eq!(accounting(&writer.legacy).await.1, 0);
+            writer.legacy.db.close().await;
+            drop(writer);
+            let reopened = f.open(chunk).await;
+            let mut digest = Sha256::new();
+            for block in 0..4 {
+                let data = read(&reopened.legacy, block).await.unwrap();
+                assert_eq!(data, bytes(block));
+                digest.update(&data);
+            }
+            let entry = reopened
+                .legacy
+                .find(ITEM, GENERATION, SIZE)
+                .await
+                .unwrap()
+                .unwrap();
+            let folder = f
+                .folders
+                .iter()
+                .find(|folder| folder.id == entry.folder)
+                .unwrap();
+            rows.push(serde_json::json!({"fixture_root":f.path,"metadata_path":f.path.join("meta"),"nas_fixture_root":Path::new(&folder.path).parent(),"folder_id":entry.folder,"folder_path":folder.path,"item":ITEM.simple().to_string(),"generation":GENERATION,"length":SIZE,"sha256":hex(&digest.finalize())}));
+            reopened.legacy.db.close().await;
+            drop(reopened);
+        }
+    }
+    let output = PathBuf::from(std::env::var("ID_COMPATIBLE_CACHE_EXPORT").unwrap());
+    assert!(output.is_absolute());
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .unwrap();
+    serde_json::to_writer(file, &rows).unwrap();
 }
 #[tokio::test]
 #[ignore = "explicitly exports generated fixtures for original C# readback qualification"]

@@ -2753,10 +2753,15 @@ mod tests {
     async fn loopback(
         articles: Vec<infinidysk_testkit::Article>,
     ) -> (infinidysk_testkit::LoopbackServer, Client) {
-        use infinidysk_nntp::{Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode};
         let server = infinidysk_testkit::LoopbackServer::start(articles)
             .await
             .unwrap();
+        let client = loopback_client(&server);
+        (server, client)
+    }
+
+    fn loopback_client(server: &infinidysk_testkit::LoopbackServer) -> Client {
+        use infinidysk_nntp::{Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode};
         let endpoint = Endpoint::new(
             "127.0.0.1",
             server.addr().port(),
@@ -2771,14 +2776,13 @@ mod tests {
             idle_timeout: std::time::Duration::from_secs(5),
             min_connections: 0,
         };
-        let client = Client::new([Provider {
+        Client::new([Provider {
             pool: Pool::new(endpoint, config, Downloads::new(4)).unwrap(),
             key: String::new(),
             name: String::new(),
             priority: 0,
             backbone: None,
-        }]);
-        (server, client)
+        }])
     }
 
     fn sizer(client: &Client) -> Sizer<'_> {
@@ -2867,6 +2871,111 @@ mod tests {
         reader.sizing = Some(&held);
         assert!(reader.body(&id).await.is_err());
         assert_eq!(held.usage().unwrap().succeeded, 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_sizing_keeps_durable_limits_and_out_of_order_refunds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let articles = infinidysk_testkit::post("parallel-sizing", "fixture.bin", &[29; 100], 100);
+        let id = articles[0].message_id.clone();
+        let (server, mut gates) = infinidysk_testkit::LoopbackServer::start_gated_many(articles, 2)
+            .await
+            .unwrap();
+        let client = loopback_client(&server);
+        let saved = Arc::new(Mutex::new(crate::sizing::Usage::default()));
+        let storage = saved.clone();
+        let active = Arc::new(AtomicUsize::new(0));
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let checkpoint: crate::sizing::Checkpoint = Arc::new(move |usage| {
+            let (storage, active, sent) = (storage.clone(), active.clone(), sent.clone());
+            Box::pin(async move {
+                assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                tokio::task::yield_now().await;
+                *storage.lock().unwrap() = usage;
+                sent.send(usage).unwrap();
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let allowance = crate::sizing::Sizing::checkpointed(
+            2,
+            2 * 32 * 1024 * 1024,
+            crate::sizing::Usage::default(),
+            checkpoint.clone(),
+        )
+        .unwrap()
+        .with_concurrency(2)
+        .unwrap();
+        let reads = futures_util::future::join_all((0..8).map(|_| allowance.body(&client, &id)));
+        let control = async {
+            for gate in &mut gates {
+                tokio::time::timeout(Duration::from_secs(5), gate.blocked())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(server.body_commands(), 2);
+            assert_eq!(server.peak_connections(), 2);
+            let durable = *saved.lock().unwrap();
+            assert_eq!(durable.attempted, 2);
+            assert_eq!(durable.succeeded, 0);
+            assert_eq!(durable.charged_bytes, 2 * 32 * 1024 * 1024);
+            gates[1].release();
+            loop {
+                let usage = tokio::time::timeout(Duration::from_secs(5), received.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if usage.succeeded == 1 {
+                    assert_eq!(usage.attempted, 2);
+                    assert_eq!(usage.charged_bytes, 32 * 1024 * 1024 + 100);
+                    break;
+                }
+            }
+            gates[0].release();
+        };
+        let (results, ()) = tokio::join!(reads, control);
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 2);
+        assert_eq!(server.body_commands(), 2);
+        let durable = *saved.lock().unwrap();
+        let current = allowance.usage().unwrap();
+        assert_eq!(
+            (
+                durable.attempted,
+                durable.succeeded,
+                durable.decoded_bytes,
+                durable.charged_bytes
+            ),
+            (2, 2, 200, 200)
+        );
+        assert_eq!(
+            (
+                current.attempted,
+                current.succeeded,
+                current.decoded_bytes,
+                current.charged_bytes
+            ),
+            (2, 2, 200, 200)
+        );
+        let restarted = crate::sizing::Sizing::checkpointed(2, 64_000_000, durable, checkpoint)
+            .unwrap()
+            .with_concurrency(8)
+            .unwrap();
+        assert!(restarted.body(&client, &id).await.is_err());
+        assert_eq!(server.body_commands(), 2);
+        assert!(
+            crate::sizing::Sizing::new(1, 64_000_000)
+                .with_concurrency(0)
+                .is_err()
+        );
+        assert!(
+            crate::sizing::Sizing::new(1, 64_000_000)
+                .with_concurrency(9)
+                .is_err()
+        );
     }
 
     #[test]

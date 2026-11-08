@@ -52,8 +52,16 @@ if (args.Length == 2 && args[0] == "verify-rust") {
             || File.ReadAllText(Path.Combine(fixtureRoot,"fixture-owner")) != "generated-native-cache-write-tests") throw new Exception("Not an owned generated fixture.");
         var metadata = Path.GetFullPath(row.GetProperty("metadata_path").GetString()!);
         var payload = Path.GetFullPath(row.GetProperty("folder_path").GetString()!);
+        var payloadRoot = fixtureRoot;
+        if (row.TryGetProperty("nas_fixture_root", out var nasRoot)) {
+            payloadRoot = Path.GetFullPath(nasRoot.GetString()!);
+            if (!Path.GetFileName(payloadRoot).StartsWith("id-compatible-cache-", StringComparison.Ordinal)
+                || File.ReadAllText(Path.Combine(payloadRoot,"fixture-owner")) != "generated-native-cache-write-tests"
+                || (File.GetAttributes(payloadRoot) & FileAttributes.ReparsePoint) != 0)
+                throw new Exception("Not an owned generated NAS fixture.");
+        }
         if (!metadata.StartsWith(fixtureRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)
-            || !payload.StartsWith(fixtureRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)) throw new Exception("Fixture path escaped its owned root.");
+            || !payload.StartsWith(payloadRoot + Path.DirectorySeparatorChar, StringComparison.Ordinal)) throw new Exception("Fixture path escaped its owned root.");
         var folder = new NativeCacheFolder { Id=row.GetProperty("folder_id").GetString()!,Path=payload,MinFreeBytes=0,MaxBytes=1_000_000_000 };
         var identity = new NativeCacheIdentity(row.GetProperty("item").GetString()!,row.GetProperty("generation").GetString()!,row.GetProperty("length").GetInt64());
         var database = Path.Combine(metadata,"catalogue.db");
