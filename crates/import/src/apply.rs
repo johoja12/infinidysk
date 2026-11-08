@@ -677,7 +677,7 @@ async fn convert_files(
     }
     let mut converted = stream::iter(groups)
         .map(|group| convert_dir(group, blobs, client, nzbs, sizing))
-        .buffer_unordered(PARALLEL);
+        .buffer_unordered(sizing.map_or(PARALLEL, |s| PARALLEL.max(s.concurrency())));
     let mut pending: Vec<(Item, HealthStatus)> = Vec::new();
     let mut pending_blobs: Vec<(BlobId, Vec<u8>)> = Vec::new();
     let mut pending_sources = Vec::new();
@@ -2973,7 +2973,7 @@ mod tests {
         );
         assert!(
             crate::sizing::Sizing::new(1, 64_000_000)
-                .with_concurrency(9)
+                .with_concurrency(33)
                 .is_err()
         );
     }

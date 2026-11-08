@@ -53,7 +53,7 @@ Migration sizing is offline by default. To authorize a bounded recovery pass, se
 ```text
 INFINIDYSK_IMPORT_MAX_ARTICLES=4
 INFINIDYSK_IMPORT_MAX_DECODED_BYTES=128000000
-# Optional: 1-8 concurrent reads, also capped by the source provider's connection limit.
+# Optional: 1-32 concurrent reads, also capped by the source provider's connection limit.
 INFINIDYSK_IMPORT_CONNECTIONS=4
 # Optional: select one enabled source provider by its stable UUID.
 INFINIDYSK_IMPORT_PROVIDER_ID=<source-provider-uuid>
@@ -64,7 +64,7 @@ their reservation, and retries/restarts reload consumed allowance; extending it
 requires an explicit limit change. Do not reset the checkpoint to bypass it.
 
 The import client uses one provider and pipeline depth one. It defaults to one
-connection; the explicit concurrency setting permits up to eight, without exceeding
+connection; the explicit concurrency setting permits up to 32, without exceeding
 that provider's source connection limit. Its normal post-import provider settings
 are preserved. Every concurrent read shares the same admission allowance. Reservation
 and refund checkpoints are serialized, including out-of-order responses, so no

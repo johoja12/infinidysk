@@ -26,6 +26,7 @@ pub struct Sizing {
     state: Mutex<Usage>,
     gate: Semaphore,
     checkpoint_gate: AsyncMutex<()>,
+    concurrency: usize,
 }
 impl Sizing {
     #[must_use]
@@ -37,6 +38,7 @@ impl Sizing {
             state: Mutex::default(),
             gate: Semaphore::new(1),
             checkpoint_gate: AsyncMutex::new(()),
+            concurrency: 1,
         }
     }
     pub fn checkpointed(
@@ -57,17 +59,23 @@ impl Sizing {
             state: Mutex::new(initial),
             gate: Semaphore::new(1),
             checkpoint_gate: AsyncMutex::new(()),
+            concurrency: 1,
         })
     }
     /// Parallel physical reads share one durable allowance. Configure before use.
     pub fn with_concurrency(mut self, reads: usize) -> Result<Self, Error> {
-        if !(1..=8).contains(&reads) {
+        if !(1..=32).contains(&reads) {
             return Err(Error::InvalidArgument(
-                "migration sizing concurrency must be 1-8",
+                "migration sizing concurrency must be 1-32",
             ));
         }
         self.gate = Semaphore::new(reads);
+        self.concurrency = reads;
         Ok(self)
+    }
+    #[must_use]
+    pub const fn concurrency(&self) -> usize {
+        self.concurrency
     }
     async fn persist(&self, usage: Usage) -> Result<(), Error> {
         if let Some(save) = &self.checkpoint {

@@ -871,8 +871,8 @@ async fn import_with_progress(
     let max_bytes = allowance("INFINIDYSK_IMPORT_MAX_DECODED_BYTES", 64_000_000)?;
     let connections = allowance("INFINIDYSK_IMPORT_CONNECTIONS", 1)?;
     anyhow::ensure!(
-        (1..=8).contains(&connections),
-        "migration sizing connections must be 1-8"
+        (1..=32).contains(&connections),
+        "migration sizing connections must be 1-32"
     );
     anyhow::ensure!(
         max_articles <= 1_000_000 && max_bytes <= 1_000_000_000_000,
