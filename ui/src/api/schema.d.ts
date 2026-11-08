@@ -3422,6 +3422,16 @@ export interface components {
              */
             backup: components["schemas"]["BackupSettings"];
             /**
+             * @description Run daily cleanup and remote reconciliation; disable for isolated migration.
+             * @default true
+             */
+            cleanup_enabled: boolean;
+            /**
+             * @description Explicit consent to apply retention to history/NZBs imported from C#.
+             * @default false
+             */
+            imported_retention: boolean;
+            /**
              * @description Jobs that run in the window, once each per window.
              * @default [
              *       "remove-dead-links"
@@ -5545,6 +5555,8 @@ export interface components {
              *         "dir": "",
              *         "keep": 3
              *       },
+             *       "cleanup_enabled": true,
+             *       "imported_retention": false,
              *       "scheduled": [
              *         "remove-dead-links"
              *       ],

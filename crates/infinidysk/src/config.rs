@@ -209,6 +209,10 @@ fn known_experiments<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Strin
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct Maintenance {
+    /// Run daily cleanup and remote reconciliation; disable for isolated migration.
+    pub cleanup_enabled: bool,
+    /// Explicit consent to apply retention to history/NZBs imported from C#.
+    pub imported_retention: bool,
     pub window: MaintenanceWindow,
     /// Jobs that run in the window, once each per window.
     #[serde(deserialize_with = "known_jobs")]
@@ -219,6 +223,8 @@ pub struct Maintenance {
 impl Default for Maintenance {
     fn default() -> Self {
         Self {
+            cleanup_enabled: true,
+            imported_retention: false,
             window: MaintenanceWindow::default(),
             scheduled: vec![MaintenanceJob::RemoveDeadLinks],
             backup: BackupSettings::default(),

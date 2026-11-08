@@ -858,8 +858,68 @@ async fn import_with_progress(
     let quotas = Quotas::load(db.clone()).await?;
     quotas.configure(&upgrade.settings.providers);
     quotas.seed(&upgrade.quota_used).await;
+    let allowance = |name: &str, default: u64| -> anyhow::Result<u64> {
+        vars.iter()
+            .find(|(key, _)| key == name)
+            .map_or(Ok(default), |(_, value)| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| anyhow::anyhow!("invalid migration sizing allowance"))
+            })
+    };
+    let max_articles = allowance("INFINIDYSK_IMPORT_MAX_ARTICLES", 0)?;
+    let max_bytes = allowance("INFINIDYSK_IMPORT_MAX_DECODED_BYTES", 64_000_000)?;
+    anyhow::ensure!(
+        max_articles <= 1_000_000 && max_bytes <= 1_000_000_000_000,
+        "migration sizing allowance exceeds supported bounds"
+    );
+    let previous = db
+        .config()
+        .await?
+        .into_iter()
+        .find(|(key, _)| key == "upgrade.sizing")
+        .map(|(_, value)| serde_json::from_str::<infinidysk_import::sizing::Usage>(&value))
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("migration sizing checkpoint is invalid"))?
+        .unwrap_or_default();
+    let checkpoint_db = db.clone();
+    let checkpoint: infinidysk_import::sizing::Checkpoint = Arc::new(move |usage| {
+        let db = checkpoint_db.clone();
+        Box::pin(async move {
+            let value = serde_json::to_string(&usage).map_err(|_| ())?;
+            db.write_config(&[("upgrade.sizing", &value)], &[])
+                .await
+                .map_err(|_| ())
+        })
+    });
+    let sizing = infinidysk_import::sizing::Sizing::checkpointed(
+        max_articles,
+        max_bytes,
+        previous,
+        checkpoint,
+    )?;
+    let selected = vars
+        .iter()
+        .find(|(key, _)| key == "INFINIDYSK_IMPORT_PROVIDER_ID")
+        .map(|(_, value)| value.parse::<Uuid>())
+        .transpose()
+        .map_err(|_| anyhow::anyhow!("invalid migration sizing provider identity"))?;
+    let mut providers = Vec::new();
+    if max_articles > 0 {
+        let provider = upgrade
+            .settings
+            .providers
+            .iter()
+            .filter(|p| p.enabled && selected.is_none_or(|id| p.id == id))
+            .min_by_key(|p| p.priority)
+            .ok_or_else(|| anyhow::anyhow!("migration sizing provider is unavailable"))?;
+        let mut provider = provider.clone();
+        provider.max_connections = 1;
+        provider.pipeline_depth = 1;
+        providers.push(provider);
+    }
     let client = Client::new(crate::app::providers(
-        &upgrade.settings.providers,
+        &providers,
         &quotas,
         &Arc::new(Bandwidth::new(crate::app::download_limit(
             &upgrade.settings,
@@ -870,10 +930,39 @@ async fn import_with_progress(
         ImportStrategy::Strm => imports.strm_dir.clone(),
         ImportStrategy::Symlinks => format!("{}/completed-symlinks", upgrade.settings.mount.dir),
     };
-    let imported =
-        infinidysk_import::apply_with_progress(config, db, &client, &storage_root, progress)
-            .await?;
+    let imported = infinidysk_import::apply_with_sizing(
+        config,
+        db,
+        &client,
+        &storage_root,
+        progress,
+        Some(&sizing),
+    )
+    .await?;
     drop(client);
+    db.write_config(
+        &[("upgrade.sizing", &serde_json::to_string(&sizing.usage()?)?)],
+        &[],
+    )
+    .await?;
+    if imported.skipped_count != 0 {
+        db.write_config(
+            &[
+                ("upgrade.pending_files", &imported.skipped_count.to_string()),
+                (
+                    "upgrade.pending_report",
+                    &serde_json::to_string(&imported.to_string())?,
+                ),
+            ],
+            &[],
+        )
+        .await?;
+        anyhow::bail!(
+            "{} legacy files remain held; review the private migration report and retry with an explicit sizing allowance",
+            imported.skipped_count
+        );
+    }
+    upgrade.notes.push("Imported history and NZBs are held from daily cleanup until maintenance.imported_retention is explicitly enabled after review.".into());
 
     let mut store =
         ConfigStore::load_in(db.clone(), std::iter::empty(), default_cache_dir.to_owned()).await?;
@@ -915,7 +1004,8 @@ async fn import_with_progress(
     let set: Vec<(&str, &str)> = set.iter().map(|(k, v)| (*k, v.as_str())).collect();
     // Before "done": a later import never runs again to remove it.
     infinidysk_import::postgres::remove_staged(config)?;
-    db.write_config(&set, &[]).await?;
+    db.write_config(&set, &["upgrade.pending_files", "upgrade.pending_report"])
+        .await?;
     tracing::info!(
         files = imported.files,
         skipped = imported.skipped_count,
@@ -1040,13 +1130,9 @@ pub(crate) async fn skipped_pending(db: &Db) -> Result<bool, infinidysk_db::Erro
 /// runs again on the next start.
 // ponytail: remove before beta 1; every alpha install has run it by then. Files written
 // by a run that hit provider errors are left out of the import report.
-pub async fn retry_skipped(
-    db: Db,
-    config: PathBuf,
-    client: Arc<Client>,
-    settings: Settings,
-    cancel: CancellationToken,
-) {
+pub async fn retry_skipped(db: Db, config: PathBuf, settings: Settings, cancel: CancellationToken) {
+    // Archived migration state never authorizes network activity on startup.
+    let client = Arc::new(Client::new(Vec::new()));
     let stored = match db.config().await {
         Ok(stored) => stored,
         Err(error) => {
@@ -1856,6 +1942,95 @@ mod tests {
         db.close().await;
     }
 
+    fn write_recorded_fixture(dir: &Path) {
+        fn object(fields: &[Vec<u8>]) -> Vec<u8> {
+            let mut bytes = vec![u8::try_from(fields.len()).unwrap()];
+            bytes.extend(fields.iter().map(|f| u8::try_from(f.len()).unwrap()));
+            bytes.extend(fields.iter().flatten());
+            bytes
+        }
+        fn list(items: &[Vec<u8>]) -> Vec<u8> {
+            let mut bytes = i32::try_from(items.len()).unwrap().to_le_bytes().to_vec();
+            bytes.extend(items.iter().flatten());
+            bytes
+        }
+        let range = || object(&[0_i64.to_le_bytes().to_vec(), 100_i64.to_le_bytes().to_vec()]);
+        let text = [
+            (!3_i32).to_le_bytes().as_slice(),
+            3_i32.to_le_bytes().as_slice(),
+            b"a@b",
+        ]
+        .concat();
+        let part = object(&[list(&[text]), range(), range(), list(&[range()])]);
+        let metadata = object(&[
+            Uuid::from_u128(7).to_bytes_le().to_vec(),
+            object(&[vec![255], list(&[part])]),
+        ]);
+        let id = Uuid::parse_str("0198a3c2-5a10-7000-8000-0000000000ff").unwrap();
+        let hex = id.simple().to_string();
+        let path = dir
+            .join("blobs")
+            .join(&hex[..2])
+            .join(&hex[2..4])
+            .join(id.to_string());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, zstd::encode_all(metadata.as_slice(), 1).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn skipped_files_hold_completion_and_retry_preserves_existing_rows() {
+        use sqlx::{ConnectOptions as _, Connection as _};
+        let dir = v1_dir();
+        let mut source = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(dir.join("db.sqlite"))
+            .create_if_missing(true)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../../import/tests/fixtures/v1-postgres.sql"))
+            .execute(&mut source)
+            .await
+            .unwrap();
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let reason = import_with_progress(&db, &dir, &[], crate::config::DEFAULT_CACHE_DIR, |_| {})
+            .await
+            .unwrap_err();
+        assert!(reason.to_string().contains("legacy files remain held"));
+        let stored: HashMap<_, _> = db.config().await.unwrap().into_iter().collect();
+        assert_eq!(stored[STATE_KEY], "\"started\"");
+        assert_eq!(stored["upgrade.pending_files"], "1");
+        assert!(import_needed(&db, &dir, &[]).await.unwrap());
+        assert_eq!(db.history().await.unwrap().len(), 1);
+        write_recorded_fixture(&dir);
+        sqlx::query("UPDATE DavItems SET FileSize=100 WHERE Type=2")
+            .execute(&mut source)
+            .await
+            .unwrap();
+        source.close().await.unwrap();
+        import_with_progress(&db, &dir, &[], crate::config::DEFAULT_CACHE_DIR, |_| {})
+            .await
+            .unwrap();
+        let stored: HashMap<_, _> = db.config().await.unwrap().into_iter().collect();
+        assert_eq!(stored[STATE_KEY], "\"done\"");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored["upgrade.sizing"]).unwrap()["attempted"],
+            0
+        );
+        assert!(!stored.contains_key("upgrade.pending_files"));
+        assert_eq!(db.history().await.unwrap().len(), 1);
+        assert_eq!(db.queue().await.unwrap().len(), 1);
+        assert_eq!(
+            db.item_by_path("/content/tv/job/f.mkv")
+                .await
+                .unwrap()
+                .unwrap()
+                .size,
+            Some(100)
+        );
+        db.close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn v1_dir() -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("infinidysk-v1pg-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2006,6 +2181,10 @@ mod tests {
             .await
             .unwrap();
         sqlx::raw_sql(FIXTURE).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE \"DavItems\" SET \"FileSize\"=100 WHERE \"Type\"=2")
+            .execute(&pool)
+            .await
+            .unwrap();
         pool.close().await;
         let rest = base.strip_prefix("postgres://").unwrap();
         let (credentials, address) = rest.split_once('@').unwrap();
@@ -2017,6 +2196,7 @@ mod tests {
         );
 
         let dir = v1_dir();
+        write_recorded_fixture(&dir);
         // An explicitly selected PostgreSQL source must ignore a stray SQLite file.
         std::fs::write(dir.join("db.sqlite"), "not the selected source").unwrap();
         // The cache folder this import checks; a 1.x mount at /config/cache does not hold it.

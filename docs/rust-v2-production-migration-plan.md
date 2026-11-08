@@ -27,6 +27,60 @@ still need disposition. [Optional policy eviction](validation/rust-v2-legacy-evi
 is a separate management feature: keep it disabled during initial migration,
 include its private recovery ledger in backups, and settle intents before handback.
 
+## Migration safeguards added on 2026-11-08
+
+Follow-ups [#252](https://github.com/johoja12/infinidysk/issues/252),
+[#253](https://github.com/johoja12/infinidysk/issues/253) and
+[#254](https://github.com/johoja12/infinidysk/issues/254) are addressed in the fork's
+migration path. Qualification still requires the complete real installation.
+
+The PostgreSQL evidence package now uses receipt version 2, while version 1 remains
+readable. Valid UTF-8 stays unchanged. Invalid bytes in the optional
+`LibraryLinkMaps.TargetText` field are retained as a SQLite BLOB and explicit hex in
+the raw evidence. The receipt counts held cells. This does not normalize the path,
+drop its row, activate it as a link, repair the source database or make a native
+UTF-8 restore pass. Invalid active/core text still refuses migration. Native cache
+payload formats and storage paths are unchanged.
+
+First-start migration cannot report completion while files are skipped. It retains
+`upgrade.state=started`, `upgrade.pending_files`, a private `upgrade.pending_report`
+and `upgrade.sizing` counters. History/queue already written remain checkpointed;
+retry skips committed IDs. Keep the frozen input, blobs and receipts available.
+Do not force the state to `done` or delete held rows to make health pass.
+
+Migration sizing is offline by default. To authorize a bounded recovery pass, set:
+
+```text
+INFINIDYSK_IMPORT_MAX_ARTICLES=4
+INFINIDYSK_IMPORT_MAX_DECODED_BYTES=128000000
+# Optional: select one enabled source provider by its stable UUID.
+INFINIDYSK_IMPORT_PROVIDER_ID=<source-provider-uuid>
+```
+
+Allowance reservations are persisted before network admission. Failed reads keep
+their reservation, and retries/restarts reload consumed allowance; extending it
+requires an explicit limit change. Do not reset the checkpoint to bypass it.
+
+The import client uses one provider, one connection and pipeline depth one; its
+normal post-import provider settings are preserved. A shared admission gate permits
+one sizing request at a time. Each read reserves the NNTP maximum decoded body
+(33,554,432 bytes); successful reads return unused allowance, while failures retain
+the reservation. Counts distinguish admitted attempts, successes, decoded bytes and
+charged allowance. These are decoded-response bounds, not TLS/wire-byte accounting;
+NNTP retry/transport overhead must be measured separately. Preserve provider quota
+settings. Use NNTP-only egress and explicit per-pass budgets. Archived state cannot
+authorize provider traffic from the automatic legacy retry worker.
+
+Daily cleanup, NZB expiry and remote reconciliation hold for imported installations
+until `maintenance.imported_retention=true` is explicitly configured after review.
+This is independent of reading the import report and survives restarts, including
+installations imported by an older image. New installations retain their normal
+cleanup policy. `maintenance.cleanup_enabled=false` suppresses that cleanup worker;
+also keep `maintenance.scheduled=[]`, repair/prefetch disabled, no production library
+binds and restricted egress for isolated trials. Suppressing scheduled jobs alone
+does not define the complete migration isolation policy. Keep original-cache eviction
+disabled throughout the initial handover.
+
 ## Source and upstream sync
 
 After fetching both remotes, `feat/rust-v2-fork-migration` and its origin branch

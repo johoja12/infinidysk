@@ -48,9 +48,10 @@ async fn main() -> anyhow::Result<()> {
         let receipt =
             infinidysk_import::postgres::snapshot(&connection, args[0].as_ref(), &args[1]).await?;
         println!(
-            "legacy PostgreSQL snapshot: {} files, digest {}",
+            "legacy PostgreSQL snapshot: {} files, digest {}, optional metadata cells held {}",
             receipt.files.len(),
-            receipt.digest
+            receipt.digest,
+            receipt.quarantined_cells
         );
         return Ok(());
     }
@@ -66,9 +67,10 @@ async fn main() -> anyhow::Result<()> {
             "PostgreSQL snapshot digest differs from the export receipt"
         );
         println!(
-            "legacy PostgreSQL snapshot verified: {} files, digest {}",
+            "legacy PostgreSQL snapshot verified: {} files, digest {}, optional metadata cells held {}",
             receipt.files.len(),
-            receipt.digest
+            receipt.digest,
+            receipt.quarantined_cells
         );
         return Ok(());
     }

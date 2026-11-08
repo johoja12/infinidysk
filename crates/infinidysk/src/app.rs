@@ -682,7 +682,6 @@ async fn serve_inner(
     tokio::spawn(crate::upgrade::retry_skipped(
         db.clone(),
         boot.config_dir.clone(),
-        Arc::clone(&client),
         settings.clone(),
         cancel.clone(),
     ));
@@ -821,6 +820,7 @@ async fn serve_inner(
         Arc::clone(&discovery),
         arr_tx.subscribe(),
         Arc::clone(&handoff),
+        Arc::clone(&config),
     ));
     let library = Arc::new(
         crate::library::Library::load(crate::library::Parts {

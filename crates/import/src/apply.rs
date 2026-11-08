@@ -136,7 +136,7 @@ impl fmt::Display for Imported {
         )?;
         writeln!(
             f,
-            "  fetched {} articles to learn segment sizes",
+            "  attempted {} article reads to learn segment sizes",
             self.fetched
         )?;
         if self.skipped_count > 0 {
@@ -240,6 +240,17 @@ pub async fn apply_with_progress(
     storage_root: &str,
     progress: impl Fn(Progress) + Sync,
 ) -> Result<Imported, Error> {
+    apply_with_sizing(config, db, client, storage_root, progress, None).await
+}
+
+pub async fn apply_with_sizing(
+    config: &Path,
+    db: &Db,
+    client: &Client,
+    storage_root: &str,
+    progress: impl Fn(Progress) + Sync,
+    sizing: Option<&crate::sizing::Sizing>,
+) -> Result<Imported, Error> {
     crate::repair_holds::import(config, db).await?;
     let mut cs = open(config).await?;
     let blobs = config.join("blobs");
@@ -273,7 +284,16 @@ pub async fn apply_with_progress(
         "C# import: directories written"
     );
     let nzbs = import_nzbs(&mut cs, db, &blobs, None, &mut done, &progress).await?;
-    convert_files(tree.files, &blobs, client, &nzbs, db, &mut done, &progress).await?;
+    convert_files(
+        tree.files,
+        &blobs,
+        client,
+        &nzbs,
+        db,
+        &mut done,
+        (&progress, sizing),
+    )
+    .await?;
     progress(Progress::counting(Stage::Finishing));
     let items: HashSet<Uuid> = db.item_ids().await?.into_iter().map(|i| i.0).collect();
     record_handoffs(&mut cs, db, &items).await?;
@@ -501,7 +521,7 @@ pub async fn retry_files(
         .collect();
     let nzbs = import_nzbs(&mut cs, db, &blobs, Some(&wanted), &mut done, &|_| {}).await?;
     let ids: HashSet<Uuid> = files.iter().filter_map(|f| uuid(&f.id)).collect();
-    convert_files(files, &blobs, client, &nzbs, db, &mut done, &|_| {}).await?;
+    convert_files(files, &blobs, client, &nzbs, db, &mut done, (&|_| {}, None)).await?;
     let written: HashSet<Uuid> = db
         .item_ids()
         .await?
@@ -634,8 +654,9 @@ async fn convert_files(
     nzbs: &HashSet<Uuid>,
     db: &Db,
     done: &mut Imported,
-    progress: &(dyn Fn(Progress) + Sync),
+    options: (&(dyn Fn(Progress) + Sync), Option<&crate::sizing::Sizing>),
 ) -> Result<(), Error> {
+    let (progress, sizing) = options;
     let total = files.len() as u64;
     let skipped_before = done.skipped_count;
     let report = |done: &Imported| {
@@ -655,7 +676,7 @@ async fn convert_files(
         }
     }
     let mut converted = stream::iter(groups)
-        .map(|group| convert_dir(group, blobs, client, nzbs))
+        .map(|group| convert_dir(group, blobs, client, nzbs, sizing))
         .buffer_unordered(PARALLEL);
     let mut pending: Vec<(Item, HealthStatus)> = Vec::new();
     let mut pending_blobs: Vec<(BlobId, Vec<u8>)> = Vec::new();
@@ -864,9 +885,11 @@ async fn convert_dir(
     blobs: &Path,
     client: &Client,
     nzbs: &HashSet<Uuid>,
+    sizing: Option<&crate::sizing::Sizing>,
 ) -> Dir {
     let mut dir = Dir::default();
     let mut sizer = Sizer {
+        sizing,
         client,
         part: None,
         volumes: Vec::new(),
@@ -1266,6 +1289,7 @@ async fn offline_mapped_source(
             .collect(),
     };
     let mut sizer = Sizer {
+        sizing: None,
         client: &client,
         part,
         volumes,
@@ -1363,6 +1387,7 @@ fn crypt(aes: &csharp::AesParams) -> Result<Crypt, String> {
 /// usually sizes a whole directory.
 struct Sizer<'a> {
     client: &'a Client,
+    sizing: Option<&'a crate::sizing::Sizing>,
     /// The directory's article size, once known.
     part: Option<u64>,
     /// Posted sizes of the directory's archive volumes measured so far.
@@ -1393,11 +1418,18 @@ impl Sizer<'_> {
     async fn body(&mut self, id: &str) -> Result<Body, infinidysk_nntp::Error> {
         use infinidysk_nntp::Error as E;
         self.fetched += 1;
-        let body = self.client.body(id, Workload::Queue, None).await;
+        let body = match self.sizing {
+            Some(sizing) => sizing.body(self.client, id).await,
+            None => self.client.body(id, Workload::Queue, None).await,
+        };
         if let Err(error) = &body
             && !matches!(
                 error,
-                E::NotFound | E::Yenc(_) | E::CrcMismatch { .. } | E::TooLarge
+                E::NotFound
+                    | E::Yenc(_)
+                    | E::CrcMismatch { .. }
+                    | E::TooLarge
+                    | E::InvalidArgument(_)
             )
         {
             self.provider_errors += 1;
@@ -2707,6 +2739,7 @@ mod tests {
         };
         let client = Client::new(Vec::<infinidysk_nntp::Provider>::new());
         let mut sizer = Sizer {
+            sizing: None,
             client: &client,
             part: None,
             volumes: Vec::new(),
@@ -2750,12 +2783,90 @@ mod tests {
 
     fn sizer(client: &Client) -> Sizer<'_> {
         Sizer {
+            sizing: None,
             client,
             part: None,
             volumes: Vec::new(),
             fetched: 0,
             provider_errors: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_sizing_allowance_counts_success_and_prevents_excess_reads() {
+        let data = vec![17_u8; 100];
+        let articles = infinidysk_testkit::post("sizing", "fixture.bin", &data, 100);
+        let id = articles[0].message_id.clone();
+        let (_server, client) = loopback(articles).await;
+        let offline = crate::sizing::Sizing::new(0, 64_000_000);
+        let mut reader = sizer(&client);
+        reader.sizing = Some(&offline);
+        assert!(matches!(
+            reader.body(&id).await,
+            Err(infinidysk_nntp::Error::InvalidArgument(_))
+        ));
+        assert_eq!(offline.usage().unwrap().attempted, 0);
+        assert_eq!(reader.provider_errors, 0);
+        let allowance = crate::sizing::Sizing::new(3, 32 * 1024 * 1024 + 100);
+        reader.sizing = Some(&allowance);
+        assert_eq!(
+            reader.body(&id).await.unwrap().data.as_ref(),
+            data.as_slice()
+        );
+        assert_eq!(
+            reader.body(&id).await.unwrap().data.as_ref(),
+            data.as_slice()
+        );
+        assert!(matches!(
+            reader.body(&id).await,
+            Err(infinidysk_nntp::Error::InvalidArgument(_))
+        ));
+        let usage = allowance.usage().unwrap();
+        assert_eq!(usage.attempted, 2);
+        assert_eq!(usage.succeeded, 2);
+        assert_eq!(usage.decoded_bytes, 200);
+        assert_eq!(usage.charged_bytes, 200);
+    }
+
+    #[tokio::test]
+    async fn sizing_checkpoint_precedes_network_and_survives_restart() {
+        use std::sync::{Arc, Mutex};
+        let articles = infinidysk_testkit::post("checkpoint", "fixture.bin", &[19; 100], 100);
+        let id = articles[0].message_id.clone();
+        let (_server, client) = loopback(articles).await;
+        let saved = Arc::new(Mutex::new(crate::sizing::Usage::default()));
+        let storage = saved.clone();
+        let checkpoint: crate::sizing::Checkpoint = Arc::new(move |usage| {
+            *storage.lock().unwrap() = usage;
+            Box::pin(async { Ok(()) })
+        });
+        let allowance = crate::sizing::Sizing::checkpointed(
+            1,
+            64_000_000,
+            *saved.lock().unwrap(),
+            checkpoint.clone(),
+        )
+        .unwrap();
+        let mut reader = sizer(&client);
+        reader.sizing = Some(&allowance);
+        reader.body(&id).await.unwrap();
+        let restored =
+            crate::sizing::Sizing::checkpointed(1, 64_000_000, *saved.lock().unwrap(), checkpoint)
+                .unwrap();
+        reader.sizing = Some(&restored);
+        assert!(reader.body(&id).await.is_err());
+        assert_eq!(restored.usage().unwrap().attempted, 1);
+        let denied: crate::sizing::Checkpoint = Arc::new(|_| Box::pin(async { Err(()) }));
+        let held = crate::sizing::Sizing::checkpointed(
+            1,
+            64_000_000,
+            crate::sizing::Usage::default(),
+            denied,
+        )
+        .unwrap();
+        reader.sizing = Some(&held);
+        assert!(reader.body(&id).await.is_err());
+        assert_eq!(held.usage().unwrap().succeeded, 0);
     }
 
     #[test]

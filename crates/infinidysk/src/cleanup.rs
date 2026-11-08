@@ -28,6 +28,7 @@ pub async fn run(
     discovery: Arc<Discovery>,
     arrs: watch::Receiver<Vec<Arr>>,
     handoff: Arc<Writer>,
+    config: Arc<tokio::sync::RwLock<crate::config::ConfigStore>>,
 ) {
     let mut last = match db.config().await {
         Ok(config) => config
@@ -46,6 +47,15 @@ pub async fn run(
     let mut retry_asked: Vec<Uuid> = Vec::new();
     let mut retry_at = RetryClock::default();
     loop {
+        if !live_allowed(&db, &config).await {
+            // The persisted import marker also fences imports completed by older images.
+            // Discard cleanup wakes while held; no expiry/reconcile/sweep is admitted.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {},
+                () = wake.notified() => {},
+            }
+            continue;
+        }
         let wait = last + DAY_MS - now_ms();
         if wait <= 0 {
             let writing = db.write_permit().await;
@@ -71,6 +81,7 @@ pub async fn run(
         let until = retry_at.0.map_or(daily_at, |at| at.min(daily_at));
         tokio::select! {
             () = tokio::time::sleep_until(until) => {
+                if !live_allowed(&db, &config).await { continue; }
                 if retry_at.due(Instant::now()) && last + DAY_MS > now_ms() {
                     retry_at.restart();
                     let pick = |ids: &[Uuid]| -> Vec<Arr> {
@@ -85,10 +96,12 @@ pub async fn run(
                 }
             }
             () = wake.notified() => {
+                if !live_allowed(&db, &config).await { continue; }
                 let _writing = db.write_permit().await;
                 expire(&db).await;
             }
             asked = discovery.requested_reconciles() => {
+                if !live_allowed(&db, &config).await { continue; }
                 let due: Vec<Arr> = arrs
                     .borrow()
                     .iter()
@@ -104,6 +117,26 @@ pub async fn run(
                     }
                 }
             }
+        }
+    }
+}
+
+async fn live_allowed(db: &Db, config: &tokio::sync::RwLock<crate::config::ConfigStore>) -> bool {
+    let policy = config.read().await.settings().maintenance.clone();
+    allowed(db, &policy).await
+}
+
+async fn allowed(db: &Db, policy: &crate::config::Maintenance) -> bool {
+    if !policy.cleanup_enabled {
+        return false;
+    }
+    match db.config().await {
+        Ok(stored) => {
+            policy.imported_retention || !stored.iter().any(|(key, _)| key == "upgrade.state")
+        }
+        Err(error) => {
+            warn!(reason=%error, "cleanup held because migration state is unavailable");
+            false
         }
     }
 }
@@ -155,6 +188,54 @@ impl RetryClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn imported_history_survives_restart_until_retention_is_explicit() {
+        use infinidysk_core::JobId;
+        use infinidysk_db::{HistoryEntry, JobStatus};
+        let root = std::env::temp_dir().join(format!("id-cleanup-retention-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let url = format!("sqlite:{}", root.join("target.sqlite").display());
+        let db = Db::connect(&url).await.unwrap();
+        let history = |age| HistoryEntry {
+            id: JobId::new(),
+            created_at: now_ms() - age,
+            file_name: "fixture.nzb".into(),
+            job_name: "fixture".into(),
+            category: "fixture".into(),
+            status: JobStatus::Completed,
+            total_bytes: 1,
+            download_seconds: 0,
+            fail_message: None,
+            download_dir: None,
+            nzb_blob: None,
+            storage: None,
+        };
+        db.import_history(&[history(90 * DAY_MS), history(DAY_MS)])
+            .await
+            .unwrap();
+        db.write_config(&[("upgrade.state", "\"done\"")], &[])
+            .await
+            .unwrap();
+        let mut policy = crate::config::Maintenance::default();
+        assert!(!allowed(&db, &policy).await);
+        assert_eq!(db.history_ids(false).await.unwrap().len(), 2);
+        db.close().await;
+        let db = Db::connect(&url).await.unwrap();
+        assert!(!allowed(&db, &policy).await);
+        assert_eq!(db.history_ids(false).await.unwrap().len(), 2);
+        policy.imported_retention = true;
+        assert!(allowed(&db, &policy).await);
+        policy.cleanup_enabled = false;
+        assert!(!allowed(&db, &policy).await);
+        policy.cleanup_enabled = true;
+        if allowed(&db, &policy).await {
+            daily(&db).await;
+        }
+        assert_eq!(db.history_ids(false).await.unwrap().len(), 1);
+        db.close().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn wakes_for_other_work_do_not_postpone_a_retry() {

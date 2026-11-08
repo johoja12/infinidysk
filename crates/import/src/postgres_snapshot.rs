@@ -29,6 +29,8 @@ pub struct Receipt {
     pub version: u8,
     pub id: Uuid,
     pub timezone: String,
+    #[serde(default)]
+    pub quarantined_cells: u64,
     pub files: Vec<crate::fork::Entry>,
     pub digest: String,
 }
@@ -42,16 +44,47 @@ struct Column {
     name: String,
     postgres_type: String,
 }
+/// Invalid UTF-8 in optional metadata is retained as bytes, never normalized.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum RawCell {
+    Text(String),
+    Invalid { invalid_utf8_hex: String },
+}
+fn cell(bytes: Vec<u8>, table: &str, column: &Column) -> Result<RawCell, Error> {
+    match String::from_utf8(bytes) {
+        Ok(value) => Ok(RawCell::Text(value)),
+        Err(error) if table == "LibraryLinkMaps" && column.name == "TargetText" => {
+            Ok(RawCell::Invalid {
+                invalid_utf8_hex: hex(error.as_bytes()),
+            })
+        }
+        Err(_) => Err(Error::Invalid(
+            "invalid UTF-8 in active legacy data; snapshot refused",
+        )),
+    }
+}
 fn ident(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 fn receipt_digest(receipt: &Receipt) -> Result<String, Error> {
-    Ok(hex(&Sha256::digest(serde_json::to_vec(&(
-        receipt.version,
-        receipt.id,
-        &receipt.timezone,
-        &receipt.files,
-    ))?)))
+    let bytes = if receipt.version == 1 {
+        serde_json::to_vec(&(
+            receipt.version,
+            receipt.id,
+            &receipt.timezone,
+            &receipt.files,
+        ))?
+    } else {
+        serde_json::to_vec(&(
+            receipt.version,
+            receipt.id,
+            &receipt.timezone,
+            &receipt.files,
+            receipt.quarantined_cells,
+        ))?
+    };
+    Ok(hex(&Sha256::digest(bytes)))
 }
 
 /// Writes a private, bounded snapshot of all public base tables in one read-only
@@ -89,8 +122,16 @@ async fn snapshot_inner(
         .connect()
         .await
         .map_err(|_| Error::Invalid("could not connect to the legacy PostgreSQL source"))?;
+    let encoding: String = sqlx::query_scalar("SHOW server_encoding")
+        .fetch_one(&mut source)
+        .await?;
+    if !matches!(encoding.as_str(), "UTF8" | "SQL_ASCII") {
+        return Err(Error::Invalid(
+            "legacy database encoding requires explicit translation review",
+        ));
+    }
     let mut transaction = source.begin().await?;
-    sqlx::raw_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout='60s'; SET LOCAL DateStyle='ISO, YMD'; SET LOCAL TIME ZONE 'UTC'; SET LOCAL bytea_output='hex'; SET LOCAL extra_float_digits=3")
+    sqlx::raw_sql("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; SET LOCAL statement_timeout='60s'; SET LOCAL client_encoding='SQL_ASCII'; SET LOCAL DateStyle='ISO, YMD'; SET LOCAL TIME ZONE 'UTC'; SET LOCAL bytea_output='hex'; SET LOCAL extra_float_digits=3")
         .execute(&mut *transaction).await?;
     let foreign: i64 = sqlx::query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_type='BASE TABLE' AND table_schema NOT IN ('public','information_schema') AND table_schema NOT LIKE 'pg_%'")
         .fetch_one(&mut *transaction).await?;
@@ -120,6 +161,7 @@ async fn snapshot_inner(
     let mut raw = output(&destination.join(FILES[2]))?;
     let mut raw_bytes = 0_u64;
     let mut tables = Vec::new();
+    let mut quarantined_cells = 0_u64;
     for name in names {
         let columns: Vec<(String,String)> = sqlx::query_as("SELECT a.attname, pg_catalog.format_type(a.atttypid,a.atttypmod) FROM pg_catalog.pg_attribute a JOIN pg_catalog.pg_class c ON c.oid=a.attrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND c.relname=$1 AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum")
             .bind(&name).fetch_all(&mut *transaction).await?;
@@ -170,7 +212,7 @@ async fn snapshot_inner(
         let expressions = table
             .columns
             .iter()
-            .map(|c| format!("{}::text", ident(&c.name)))
+            .map(|c| format!("pg_catalog.textsend({}::text)", ident(&c.name)))
             .collect::<Vec<_>>()
             .join(",");
         let select = format!("SELECT {expressions} FROM public.{}", ident(&table.name));
@@ -185,8 +227,21 @@ async fn snapshot_inner(
         let mut rows = sqlx::query(sqlx::AssertSqlSafe(select)).fetch(&mut *transaction);
         while let Some(row) = rows.try_next().await? {
             let values = (0..table.columns.len())
-                .map(|i| row.try_get::<Option<String>, _>(i))
+                .map(|i| row.try_get::<Option<Vec<u8>>, _>(i))
                 .collect::<Result<Vec<_>, _>>()?;
+            let values = values
+                .into_iter()
+                .zip(&table.columns)
+                .map(|(value, column)| {
+                    value
+                        .map(|bytes| cell(bytes, &table.name, column))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            quarantined_cells += values
+                .iter()
+                .filter(|value| matches!(value, Some(RawCell::Invalid { .. })))
+                .count() as u64;
             let encoded = serde_json::to_vec(&(&table.name, &values))?;
             raw_bytes = raw_bytes.saturating_add(encoded.len() as u64 + 1);
             if raw_bytes > MAX_BYTES {
@@ -198,6 +253,15 @@ async fn snapshot_inner(
             raw.write_all(b"\n")?;
             let mut query = sqlx::query(sqlx::AssertSqlSafe(insert.clone()));
             for (value, column) in values.into_iter().zip(&table.columns) {
+                let value = match value {
+                    Some(RawCell::Invalid { invalid_utf8_hex }) => {
+                        // Dynamic SQLite BLOB storage prevents accidental String activation.
+                        query = query.bind(binary(&format!("\\x{invalid_utf8_hex}"))?);
+                        continue;
+                    }
+                    Some(RawCell::Text(value)) => Some(value),
+                    None => None,
+                };
                 query = match column.postgres_type.as_str() {
                     "boolean" => query.bind(value.map(|v| i64::from(v == "true"))),
                     "smallint" | "integer" | "bigint" => query.bind(
@@ -238,9 +302,10 @@ async fn snapshot_inner(
     // Source transaction never writes. Commit only releases its consistent snapshot.
     transaction.commit().await?;
     let mut receipt = Receipt {
-        version: 1,
+        version: 2,
         id: Uuid::new_v4(),
         timezone: timezone.to_owned(),
+        quarantined_cells,
         files: Vec::new(),
         digest: String::new(),
     };
@@ -310,7 +375,8 @@ pub fn verify(directory: &Path) -> Result<Receipt, Error> {
         return Err(Error::Invalid("legacy PostgreSQL receipt exceeds bound"));
     }
     let receipt: Receipt = serde_json::from_slice(&raw)?;
-    if receipt.version != 1
+    if !matches!(receipt.version, 1 | 2)
+        || (receipt.version == 1 && receipt.quarantined_cells != 0)
         || receipt.files.len() != FILES.len()
         || receipt.digest != receipt_digest(&receipt)?
         || TimeZone::get(&receipt.timezone).is_err()
@@ -363,6 +429,22 @@ mod tests {
             assert!(binary(value).is_err());
         }
     }
+    #[test]
+    fn invalid_active_text_is_never_normalized_or_accepted() {
+        let column = Column {
+            name: "Path".into(),
+            postgres_type: "text".into(),
+        };
+        assert!(cell(vec![0xff], "DavItems", &column).is_err());
+        let column = Column {
+            name: "TargetText".into(),
+            postgres_type: "text".into(),
+        };
+        assert!(
+            matches!(cell(vec![0xff], "LibraryLinkMaps", &column).unwrap(),RawCell::Invalid{invalid_utf8_hex} if invalid_utf8_hex=="ff")
+        );
+    }
+
     #[tokio::test]
     async fn snapshots_postgres_types_unknown_state_and_source_timezone_without_writes() {
         let Ok(url) = std::env::var("INFINIDYSK_TEST_POSTGRES_URL") else {
@@ -372,7 +454,7 @@ mod tests {
         let mut admin = options.clone().connect().await.unwrap();
         let name = format!("legacy_snapshot_{}", Uuid::new_v4().simple());
         sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE DATABASE {}",
+            "CREATE DATABASE {} TEMPLATE template0 ENCODING 'SQL_ASCII' LC_COLLATE 'C' LC_CTYPE 'C'",
             ident(&name)
         )))
         .execute(&mut admin)
@@ -392,6 +474,10 @@ CREATE TABLE "Sentinels"("Created" timestamp without time zone);INSERT INTO "Sen
         let root = std::env::temp_dir().join(format!("infinidysk-pg-snapshot-{}", Uuid::new_v4()));
         // Connection URI is private input only, never included in receipts/errors.
         let connection = options.to_url_lossy().to_string();
+        sqlx::raw_sql(r#"CREATE TABLE "LibraryLinkMaps"("Id" uuid,"TargetText" text);
+SET client_encoding='SQL_ASCII';
+INSERT INTO "LibraryLinkMaps" VALUES('00000000-0000-0000-0000-000000000124',convert_from(decode('ee9345','hex'),'SQL_ASCII'));
+SET client_encoding='UTF8';"#).execute(&mut source).await.unwrap();
         let receipt = snapshot(&connection, &root, "America/New_York")
             .await
             .unwrap();
@@ -403,6 +489,18 @@ CREATE TABLE "Sentinels"("Created" timestamp without time zone);INSERT INTO "Sen
         let cs = crate::Config::read(&root, []).await.unwrap();
         assert_eq!(cs.get("fork.unknown"), Some("private-fixture"));
         let mut adapter = crate::open(&root).await.unwrap();
+        assert_eq!(receipt.version, 2);
+        assert_eq!(receipt.quarantined_cells, 1);
+        let held: Vec<u8> = sqlx::query_scalar("SELECT TargetText FROM LibraryLinkMaps")
+            .fetch_one(&mut adapter)
+            .await
+            .unwrap();
+        assert_eq!(held, [0xee, 0x93, 0x45]);
+        assert!(
+            fs::read_to_string(root.join("postgres-rows.jsonl"))
+                .unwrap()
+                .contains("invalid_utf8_hex")
+        );
         let row = sqlx::query("SELECT * FROM ForkJournal")
             .fetch_one(&mut adapter)
             .await
