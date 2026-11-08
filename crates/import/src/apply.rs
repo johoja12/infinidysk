@@ -1496,7 +1496,70 @@ impl Sizer<'_> {
         }
         // The last article of a volume is usually small and confirms where it ends.
         let order = if volume { [n - 1, 0, 1] } else { [0, 1, 2] };
-        let probe = self.measure(ids, order).await?;
+        let probe = self.measure(ids, order).await;
+        let contradicted = probe.as_ref().is_ok_and(|p| {
+            !volume
+                && p.body.file_size != len
+                && p.body
+                    .part
+                    .is_some_and(|part| u64::from(part) != p.index as u64 + 1)
+        });
+        let mut tried = match &probe {
+            Ok(probe) => order
+                .into_iter()
+                .take_while(|&i| i != probe.index)
+                .chain([probe.index])
+                .collect(),
+            Err(_) => order.to_vec(),
+        };
+        let result = match probe {
+            Ok(probe) => self.sizes_from_probe(ids, len, member, probe).await,
+            Err(error) => Err(error),
+        };
+        if let Ok((sizes, _)) = &result
+            && (!contradicted || sizes.iter().map(|&s| u64::from(s)).sum::<u64>() == len)
+        {
+            return result;
+        }
+        // Preserve the established gap/obfuscated-header reconstruction first.
+        // On failure, a different complete BODY may independently prove the run.
+        // A readable article from another post is not such a proof.
+        for i in [0, 1, 2, n - 1] {
+            if i >= n || tried.contains(&i) {
+                continue;
+            }
+            tried.push(i);
+            let Ok(probe) = self.measure(ids, [i; 3]).await else {
+                continue;
+            };
+            let Some(part) = probe.part else {
+                continue;
+            };
+            if probe.body.part != u32::try_from(i + 1).ok()
+                || probe.body.total != u32::try_from(n).ok()
+                || (volume && probe.body.file_size < need)
+                || (!volume && probe.body.file_size != len)
+                || uniform(n, probe.body.file_size, part).is_none()
+            {
+                continue;
+            }
+            if let Ok(sized) = self.sizes_from_probe(ids, len, member, probe).await {
+                return Ok(sized);
+            }
+        }
+        result
+    }
+
+    async fn sizes_from_probe(
+        &mut self,
+        ids: &[String],
+        len: u64,
+        member: Option<u64>,
+        probe: Probe,
+    ) -> Result<(Vec<u32>, Option<Vec<String>>), String> {
+        let n = ids.len();
+        let volume = member.is_some();
+        let need = member.unwrap_or(len);
         let file_size = probe.body.file_size;
         let reach = probe.body.offset + probe.body.data.len() as u64;
         let tail = probe.index == n - 1;
@@ -1853,7 +1916,9 @@ impl Sizer<'_> {
         }
         let sizes = match p.segment_ids.len() {
             1 => u32::try_from(part).ok().map(|s| vec![s]),
-            n if self.volumes.contains(&claim) => uniform(n, claim, part),
+            n if self.volumes.contains(&claim) && uniform(n, claim, part).is_some() => {
+                uniform(n, claim, part)
+            }
             // Every article before the last is `part` bytes, so a wrong claim only
             // misplaces the end of a volume the member does not reach.
             n if entry.data.end <= part * (n as u64 - 1) && uniform(n, claim, part).is_some() => {
@@ -3085,6 +3150,95 @@ mod tests {
             assert_eq!(s.items[0].size, 100);
             assert_eq!(s.size(), 950);
             assert_eq!(s.missing, [5, 6, 7, 8]);
+        });
+    }
+
+    #[test]
+    fn sizing_uses_a_consistent_probe_when_the_head_is_missing_or_misplaced() {
+        use infinidysk_nntp::{BodyExpectation, Error as NntpError};
+        use infinidysk_testkit::post;
+
+        rt().block_on(async {
+            let good = post("good", "fixture.bin", &[7; 950], 100);
+            let ids: Vec<_> = good.iter().map(|a| a.message_id.clone()).collect();
+            let mut wrong = post("wrong", "other.bin", &[9; 600], 40)[5].clone();
+            wrong.message_id.clone_from(&ids[0]);
+            let mut available = good[1..].to_vec();
+            available.push(wrong);
+            let (_server, client) = loopback(available).await;
+            let sized = sizer(&client)
+                .run(&ids, None, (0, 950), None, None)
+                .await
+                .unwrap();
+            assert_eq!(sized.sizes, uniform(10, 950, 100).unwrap());
+            assert!(sized.filled.is_none());
+            // Learning geometry from a different, consistent article must not allow
+            // the misplaced body's bytes through the serving/cache boundary.
+            assert!(matches!(
+                client
+                    .body_checked(
+                        &ids[0],
+                        Workload::Queue,
+                        BodyExpectation {
+                            part: Some(1),
+                            total: Some(10),
+                            file_size: Some(950),
+                            offset: Some(0),
+                            decoded_len: Some(100),
+                        },
+                    )
+                    .await,
+                Err(NntpError::Yenc(_))
+            ));
+
+            let (_server, client) = loopback(good[3..].to_vec()).await;
+            let sized = sizer(&client)
+                .run(&ids, None, (0, 950), None, None)
+                .await
+                .unwrap();
+            assert_eq!(sized.sizes, uniform(10, 950, 100).unwrap());
+            assert!(sized.filled.is_none());
+            assert_eq!(
+                segments(&ids, &sized, None, (None, None)).items[0].id,
+                ids[0]
+            );
+        });
+    }
+
+    #[test]
+    fn pending_volume_remeasures_a_cached_claim_that_does_not_fit_its_articles() {
+        use infinidysk_testkit::post;
+
+        let volume = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../archive/tests/fixtures/Rar5.multi.none.part02.rar"
+        ))
+        .unwrap();
+        let mut articles = post("v", "fixture.part02.rar", &volume, 50_000);
+        for article in &mut articles {
+            let line = article.wire.iter().position(|&b| b == b'\n').unwrap();
+            let header = String::from_utf8(article.wire[..=line].to_vec()).unwrap();
+            article.wire.splice(
+                ..=line,
+                header
+                    .replace(&format!("size={}", volume.len()), "size=90000")
+                    .bytes(),
+            );
+        }
+        let pending = csharp::PendingPart {
+            segment_ids: articles.iter().map(|a| a.message_id.clone()).collect(),
+            segment_range: csharp::LongRange::default(),
+            estimated_size: 0,
+            fallbacks: None,
+            proof: None,
+        };
+        rt().block_on(async {
+            let (_server, client) = loopback(articles).await;
+            let mut sizing = sizer(&client);
+            sizing.volumes.push(90_000);
+            let part = sizing.resolve(&pending, None, None, false).await.unwrap();
+            assert_eq!((part.data.start, part.data.end), (45, 100_045));
+            assert_eq!(part.segments.size(), volume.len() as u64);
         });
     }
 
