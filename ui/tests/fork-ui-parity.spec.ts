@@ -19,7 +19,10 @@ test("original cache is visible, protected and inspectable", async ({
     await expect(
       page.getByRole("heading", { name: `fixture-folder-${i}` }),
     ).toBeVisible();
-  await expect(page.getByText(/12 verified cached block reads/)).toBeVisible();
+  await expect(
+    page.getByText(/12 hits · 3 misses since restart/),
+  ).toBeVisible();
+  await page.getByRole("tab", { name: "Files", exact: true }).click();
   const file = page.getByRole("row").filter({ hasText: "Fixture cached file" });
   const protectedFile = page
     .getByRole("row")
@@ -48,6 +51,8 @@ test("original cache is visible, protected and inspectable", async ({
         ),
     ),
   ).toBe(true);
+  await page.getByRole("button", { name: "Close ranges", exact: true }).click();
+  await page.getByRole("tab", { name: "Diagnostics", exact: true }).click();
   await page
     .getByRole("button", { name: "Check cache storage", exact: true })
     .click();
@@ -374,4 +379,228 @@ test("coverage filters keep changed revisions unknown and bound metadata concurr
   await expect(
     page.getByRole("button", { name: "Retry", exact: true }),
   ).toHaveCount(0);
+});
+
+test("native cache restores whole-catalogue filters, sorting, paging and range maps", async ({
+  page,
+}, info) => {
+  await page.goto(fixture("cache"));
+  await page
+    .getByRole("heading", { name: "Original cache storage", exact: true })
+    .waitFor();
+  await page.getByRole("tab", { name: "Files", exact: true }).click();
+  const rows = page
+    .getByRole("table", { name: "Cached files", exact: true })
+    .getByRole("row")
+    .filter({ has: page.getByRole("cell") });
+  await expect(rows).toHaveCount(4);
+  await page
+    .getByLabel("Filter coverage", { exact: true })
+    .selectOption("complete");
+  await expect(rows).toHaveCount(1);
+  await expect(
+    page.getByRole("row", { name: "Fixture complete file", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByLabel("Filter coverage", { exact: true })
+    .selectOption("empty");
+  await expect(rows).toHaveCount(1);
+  await expect(
+    page.getByRole("row", { name: "Fixture empty file", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByLabel("Filter coverage", { exact: true })
+    .selectOption("held");
+  await expect(rows).toHaveCount(2);
+  const unknown = page.getByRole("row", {
+    name: "Fixture unknown hold",
+    exact: true,
+  });
+  await expect(
+    unknown.getByRole("button", { name: "Pin", exact: true }),
+  ).toBeDisabled();
+  await expect(
+    unknown.getByRole("button", { name: "Evict", exact: true }),
+  ).toBeDisabled();
+  await page
+    .getByRole("button", { name: "Clear filters", exact: true })
+    .click();
+  await page.evaluate(() => {
+    (window as any).__mock.cachePageSize = 2;
+  });
+  await page
+    .getByRole("button", { name: "Refresh files", exact: true })
+    .click();
+  await expect(rows).toHaveCount(2);
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(
+    page.getByRole("row", { name: "Fixture complete file", exact: true }),
+  ).toBeVisible();
+  await page.getByLabel("Sort cached files").selectOption("coverage");
+  await expect(rows.first()).toHaveAccessibleName("Fixture complete file");
+  await page
+    .getByLabel("Filter coverage", { exact: true })
+    .selectOption("partial");
+  await expect(rows).toHaveCount(2);
+  await page
+    .getByRole("searchbox", { name: "Search cached files" })
+    .fill("Fixture cached file");
+  await expect(rows).toHaveCount(1);
+  await page.getByRole("button", { name: "Ranges", exact: true }).click();
+  await expect(
+    page.getByRole("img", { name: "1 cached ranges; 1 known gaps" }),
+  ).toBeVisible();
+  await page.getByText("Known gaps", { exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Verify cached sample", exact: true }),
+  ).toBeVisible();
+  await page.screenshot({
+    path: `test-results/cache-ranges-${info.project.name}.png`,
+    fullPage: true,
+  });
+  await page.getByRole("button", { name: "Close ranges", exact: true }).click();
+  await page.evaluate(() => {
+    (window as any).__mock.cacheReadOnly = true;
+  });
+  await page
+    .getByRole("button", { name: "Refresh files", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Pin", exact: true }),
+  ).toBeDisabled();
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+    )
+    .toBe(true);
+  const last = await page.evaluate(() =>
+    (window as any).__mock.calls
+      .filter(
+        (c: any) =>
+          c.path === "/api/v1/native-cache/legacy" && c.method === "GET",
+      )
+      .at(-1),
+  );
+  expect(last.query.coverage).toBe("partial");
+  expect(last.query.sort).toBe("coverage");
+  expect(last.query.search).toBe("Fixture cached file");
+});
+
+test("native cache exposes preserved eviction history and service event filters", async ({
+  page,
+}) => {
+  await page.goto(fixture("cache"));
+  await page.getByRole("tab", { name: "Evictions", exact: true }).click();
+  await expect(
+    page.getByText("Fixture evicted file 3", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByLabel("Filter eviction reason", { exact: true })
+    .selectOption("age");
+  await page
+    .getByLabel("Filter eviction folder", { exact: true })
+    .selectOption("fixture-folder-1");
+  await expect(
+    page.getByText("Fixture evicted file 1", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Fixture evicted file 3", { exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Clear history filters", exact: true })
+    .click();
+  await page.evaluate(() => {
+    (window as any).__mock.evictionPageSize = 1;
+  });
+  await page
+    .getByRole("button", { name: "Latest evictions", exact: true })
+    .click();
+  await expect(
+    page.getByText("Fixture evicted file 3", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Older evictions", exact: true })
+    .click();
+  await expect(
+    page.getByText("Fixture evicted file 2", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByLabel("Filter eviction reason", { exact: true })
+    .selectOption("age");
+  await expect(
+    page.getByText("Fixture evicted file 3", { exact: true }),
+  ).toBeVisible();
+  await page.getByLabel("Eviction history source").selectOption("current");
+  await page
+    .getByRole("searchbox", { name: "Search evictions" })
+    .fill("fixture-service-generation");
+  await page
+    .getByLabel("Filter eviction reason", { exact: true })
+    .selectOption("legacy:manual");
+  await expect(
+    page.getByRole("paragraph").filter({ hasText: /^Existing cache: manual$/ }),
+  ).toBeVisible();
+  await page
+    .getByLabel("Filter eviction reason", { exact: true })
+    .selectOption("legacy:policy");
+  await expect(
+    page.getByText("No eviction records match this view."),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      (window as any).__mock.calls.filter((c: any) => c.method === "POST"),
+    ),
+  ).toHaveLength(0);
+});
+
+test("native cache folder settings are compact, editable and respect environment locks", async ({
+  page,
+}, info) => {
+  await page.goto(fixture("cache-settings"));
+  const summary = page
+    .locator("summary")
+    .filter({ hasText: "fixture-folder-1" });
+  await expect(summary).toBeVisible();
+  await expect(
+    page.getByRole("textbox", { name: "Original folder 1 ID", exact: true }),
+  ).toHaveCount(0);
+  await summary.click();
+  const quota = page.getByRole("spinbutton", {
+    name: "Original folder 1 quota",
+    exact: true,
+  });
+  await expect(quota).toHaveValue("100");
+  await quota.fill("120");
+  expect(
+    await page.evaluate(
+      () =>
+        (window as any).__mock.settings.native_cache.legacy.write.folders[0]
+          .quota_bytes,
+    ),
+  ).toBe(120000000000);
+  expect(
+    await page.evaluate(
+      () => (window as any).__mock.settings.native_cache.legacy.folders[0].path,
+    ),
+  ).toBe("/fixture/cache1");
+  await page.screenshot({
+    path: `test-results/cache-settings-${info.project.name}.png`,
+    fullPage: true,
+  });
+  await page.goto(fixture("cache-settings-locked"));
+  await page.locator("summary").filter({ hasText: "fixture-folder-1" }).click();
+  await expect(
+    page.getByRole("spinbutton", {
+      name: "Original folder 1 quota",
+      exact: true,
+    }),
+  ).toBeDisabled();
+  await expect(
+    page.getByRole("switch", { name: /Use existing v1 cache/ }),
+  ).toBeDisabled();
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+    )
+    .toBe(true);
 });

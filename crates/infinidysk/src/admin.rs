@@ -97,6 +97,7 @@ pub struct Admin {
         crate::native_cache::coverage,
         crate::native_cache::import_legacy,
         crate::native_cache::legacy_inventory,
+        crate::native_cache::legacy_evictions,
         crate::native_cache::legacy_diagnostics,
         crate::native_cache::legacy_probe,
         crate::native_cache::legacy_action,
@@ -215,6 +216,7 @@ pub struct Admin {
         backup::api::delete_last_restore,
         backup::api::put_upload,
     ),
+    components(schemas(infinidysk_native_cache::legacy::InventorySort,infinidysk_native_cache::legacy::InventoryFilter)),
     modifiers(&Security),
     security(("session" = []), ("api_key" = []))
 )]
@@ -311,6 +313,10 @@ pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
         .route(
             "/api/v1/native-cache/legacy",
             get(crate::native_cache::legacy_inventory).post(crate::native_cache::legacy_action),
+        )
+        .route(
+            "/api/v1/native-cache/legacy/evictions",
+            get(crate::native_cache::legacy_evictions),
         )
         .route(
             "/api/v1/native-cache/legacy/coverage",

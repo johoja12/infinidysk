@@ -500,6 +500,8 @@ async fn legacy_mapping(
 pub struct EvictionPage {
     pub before: Option<i64>,
     pub limit: Option<u32>,
+    pub reason: Option<String>,
+    pub search: Option<String>,
 }
 #[utoipa::path(get,operation_id="native_cache_evictions",path="/api/v1/native-cache/evictions",params(EvictionPage),responses((status=200,body=Vec<infinidysk_native_cache::Eviction>)))]
 pub async fn evictions(
@@ -509,7 +511,12 @@ pub async fn evictions(
     let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
     Ok(Json(
         cache
-            .evictions(page.before, page.limit.unwrap_or(100))
+            .evictions_filtered(
+                page.before,
+                page.limit.unwrap_or(100),
+                page.reason.as_deref(),
+                page.search.as_deref().unwrap_or(""),
+            )
             .await
             .map_err(|e| fail(&e))?,
     ))
@@ -621,6 +628,8 @@ pub struct LegacyBrowse {
     pub after: Option<String>,
     pub folder: Option<String>,
     pub search: Option<String>,
+    pub sort: Option<infinidysk_native_cache::legacy::InventorySort>,
+    pub coverage: Option<infinidysk_native_cache::legacy::InventoryFilter>,
 }
 #[utoipa::path(get,operation_id="legacy_cache_inventory",path="/api/v1/native-cache/legacy",params(LegacyBrowse),responses((status=200,body=infinidysk_native_cache::legacy::Inventory)))]
 pub async fn legacy_inventory(
@@ -628,19 +637,39 @@ pub async fn legacy_inventory(
     Query(q): Query<LegacyBrowse>,
 ) -> Result<Json<infinidysk_native_cache::legacy::Inventory>, Fail> {
     if q.search.as_ref().is_some_and(|s| s.len() > 256)
-        || q.after.as_ref().is_some_and(|s| s.len() > 64)
+        || q.after.as_ref().is_some_and(|s| s.len() > 8192)
     {
         return Err(Fail::Bad("Cache search or cursor is too long".into()));
     }
     let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
     let reader = cache.legacy_reader().ok_or(Fail::NotFound)?;
     let legacy = reader.catalogue().ok_or(Fail::NotFound)?;
+    let missing: Vec<uuid::Uuid> = legacy
+        .unnamed_items()
+        .await
+        .map_err(|e| fail(&e))?
+        .iter()
+        .filter_map(|id| uuid::Uuid::parse_str(id).ok())
+        .collect();
+    let names: std::collections::HashMap<String, String> = admin
+        .vfs
+        .db()
+        .item_labels(&missing)
+        .await?
+        .into_iter()
+        .map(|(id, name)| (id.simple().to_string(), name))
+        .collect();
     let mut result = legacy
-        .inventory(
-            q.after.as_deref().unwrap_or(""),
-            q.folder.as_deref(),
-            q.search.as_deref().unwrap_or(""),
-            50,
+        .inventory_page(
+            &infinidysk_native_cache::legacy::Browse {
+                after: q.after.as_deref().unwrap_or(""),
+                folder: q.folder.as_deref(),
+                search: q.search.as_deref().unwrap_or(""),
+                limit: 50,
+                sort: q.sort.unwrap_or_default(),
+                coverage: q.coverage.unwrap_or_default(),
+                names: Some(&names),
+            },
             reader.writer().map(AsRef::as_ref),
         )
         .await
@@ -763,4 +792,36 @@ pub async fn legacy_probe(
     .map_err(|_| Fail::Unavailable("Cache sample timed out; storage remains uncertain".into()))?
     .map_err(|e| fail(&e))?;
     Ok(Json(bytes))
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in=Query)]
+pub struct LegacyEvictionQuery {
+    pub before: Option<i64>,
+    pub search: Option<String>,
+    pub reason: Option<String>,
+    pub folder: Option<String>,
+}
+#[utoipa::path(get,operation_id="legacy_cache_evictions",path="/api/v1/native-cache/legacy/evictions",params(LegacyEvictionQuery),responses((status=200,body=infinidysk_native_cache::legacy::OriginalEvictions)))]
+pub async fn legacy_evictions(
+    State(admin): State<Arc<Admin>>,
+    Query(q): Query<LegacyEvictionQuery>,
+) -> Result<Json<infinidysk_native_cache::legacy::OriginalEvictions>, Fail> {
+    let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
+    let legacy = cache
+        .legacy_reader()
+        .and_then(infinidysk_native_cache::legacy::Reader::catalogue)
+        .ok_or(Fail::NotFound)?;
+    Ok(Json(
+        legacy
+            .original_evictions(
+                q.before,
+                q.search.as_deref().unwrap_or(""),
+                q.reason.as_deref(),
+                q.folder.as_deref(),
+                50,
+            )
+            .await
+            .map_err(|e| fail(&e))?,
+    ))
 }

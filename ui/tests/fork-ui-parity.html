@@ -81,6 +81,44 @@
         chunk: 0,
       },
     ];
+    entries.push(
+      {
+        ...entries[0],
+        key: "c".repeat(64),
+        item: "30000000-0000-0000-0000-000000000001",
+        name: "Fixture complete file",
+        cached_bytes: 8000000,
+        allocated_bytes: 8200000,
+        source_present: false,
+      },
+      {
+        ...entries[0],
+        key: "d".repeat(64),
+        item: "30000000-0000-0000-0000-000000000002",
+        name: "Fixture empty file",
+        cached_bytes: 0,
+        allocated_bytes: 0,
+      },
+      {
+        ...entries[0],
+        key: "e".repeat(64),
+        item: "30000000-0000-0000-0000-000000000003",
+        name: "Fixture unknown hold",
+        pinned: 3,
+      },
+    );
+    const cacheHistory = [1, 2, 3].map((n) => ({
+      cursor: n,
+      key: String(n).repeat(64),
+      folder: folders[n === 3 ? 1 : 0].id,
+      item: id,
+      name: `Fixture evicted file ${n}`,
+      size: 8000000,
+      allocated_bytes: 4200000,
+      cached_bytes: 4000000,
+      reason: n === 2 ? "pressure" : "age",
+      at_ms: 1700000000000 + n * 1000,
+    }));
     const source = {
       enabled: false,
       server: "fixture-server",
@@ -137,7 +175,16 @@
         legacy: {
           metadata_path: "/fixture/metadata",
           folders: folders.map(({ id, path }) => ({ id, path })),
-          write: { folders: [], chunk_mb: 0 },
+          write: {
+            folders: folders.map((f) => ({
+              id: f.id,
+              priority: 1,
+              quota_bytes: 100000000000,
+              min_free_bytes: 1000000000,
+              eviction: null,
+            })),
+            chunk_mb: 0,
+          },
         },
       },
       providers: [{ name: "Initial fixture provider" }],
@@ -256,7 +303,12 @@
       if (!path.startsWith("/api")) return original(input, init);
       const data =
         method === "GET" ? null : await request.json().catch(() => null);
-      window.__mock.calls.push({ path, method, data });
+      window.__mock.calls.push({
+        path,
+        method,
+        data,
+        query: Object.fromEntries(url.searchParams),
+      });
       const respond = (data) => Response.json(data);
       if (path === "/api/v1/settings") {
         if (method === "PUT") {
@@ -312,6 +364,7 @@
             files: 0,
             bytes: 0,
             hits: 12,
+            misses: 3,
             legacy_hits: 12,
             legacy_written_bytes: 4000000,
           },
@@ -325,23 +378,84 @@
           else return respond(false);
           return respond(true);
         }
-        const search = url.searchParams.get("search") ?? "",
-          folder = url.searchParams.get("folder");
-        return respond({
-          folders,
-          entries: entries.filter(
+        const search = (url.searchParams.get("search") ?? "").toLowerCase(),
+          folder = url.searchParams.get("folder"),
+          coverage = url.searchParams.get("coverage") ?? "all",
+          sort = url.searchParams.get("sort") ?? "key";
+        const matching = entries
+          .filter(
             (e) =>
               (!folder || e.folder === folder) &&
-              e.name.toLowerCase().includes(search.toLowerCase()),
-          ),
-          next: null,
-          writable: true,
+              (!search ||
+                e.name.toLowerCase().includes(search) ||
+                e.item.includes(search)) &&
+              (coverage === "all" ||
+                (coverage === "cached" && e.cached_bytes > 0) ||
+                (coverage === "complete" && e.cached_bytes >= e.size) ||
+                (coverage === "partial" &&
+                  e.cached_bytes > 0 &&
+                  e.cached_bytes < e.size) ||
+                (coverage === "empty" && e.cached_bytes === 0) ||
+                (coverage === "held" &&
+                  (e.pinned !== 0 || e.dirty !== 0 || e.pending_bytes > 0))),
+          )
+          .sort((a, b) =>
+            sort === "name"
+              ? a.name.localeCompare(b.name)
+              : sort === "recent"
+                ? b.last_used_ms - a.last_used_ms || a.key.localeCompare(b.key)
+                : sort === "coverage"
+                  ? b.cached_bytes / b.size - a.cached_bytes / a.size ||
+                    a.key.localeCompare(b.key)
+                  : a.key.localeCompare(b.key),
+          );
+        const offset = Number(url.searchParams.get("after")) || 0,
+          limit = window.__mock.cachePageSize ?? 50;
+        return respond({
+          folders: window.__mock.cacheReadOnly
+            ? folders.map((f) => ({ ...f, writable: false }))
+            : folders,
+          entries: matching.slice(offset, offset + limit),
+          matched_files: matching.length,
+          next:
+            offset + limit < matching.length ? String(offset + limit) : null,
+          writable: !window.__mock.cacheReadOnly,
           recency_pending: 0,
           recency_dropped: 0,
         });
       }
+      if (path === "/api/v1/native-cache/legacy/evictions") {
+        const q = (url.searchParams.get("search") ?? "").toLowerCase(),
+          r = url.searchParams.get("reason"),
+          f = url.searchParams.get("folder"),
+          before = Number(url.searchParams.get("before")) || Infinity;
+        const all = cacheHistory
+            .filter(
+              (e) =>
+                (!q ||
+                  e.name.toLowerCase().includes(q) ||
+                  e.item.includes(q)) &&
+                (!r || e.reason === r) &&
+                (!f || e.folder === f),
+            )
+            .sort((a, b) => b.cursor - a.cursor),
+          eligible = all.filter((e) => e.cursor < before),
+          limit = window.__mock.evictionPageSize ?? 50;
+        return respond({
+          available: true,
+          total: all.length,
+          entries: eligible.slice(0, limit),
+          next: eligible.length > limit ? eligible[limit - 1].cursor : null,
+        });
+      }
       if (path === "/api/v1/native-cache/legacy/coverage")
-        return respond([{ start: 0, end: 4000000 }]);
+        return respond(
+          data.key === "c".repeat(64)
+            ? [{ start: 0, end: 8000000 }]
+            : data.key === "d".repeat(64)
+              ? []
+              : [{ start: 0, end: 4000000 }],
+        );
       if (path === "/api/v1/native-cache/legacy/probe") return respond(4000000);
       if (path === "/api/v1/native-cache/legacy/diagnostics")
         return respond(
@@ -353,7 +467,24 @@
             write_permitted: true,
           })),
         );
-      if (path === "/api/v1/native-cache/evictions") return respond([]);
+      if (path === "/api/v1/native-cache/evictions") {
+        const event = {
+          cursor: 1,
+          item: id,
+          revision: "fixture-service-generation",
+          bytes: 4000000,
+          at_ms: 1700000000000,
+          reason: "legacy:manual",
+        };
+        const q = url.searchParams.get("search") ?? "",
+          r = url.searchParams.get("reason");
+        return respond(
+          (!q || event.item.includes(q) || event.revision.includes(q)) &&
+            (!r || event.reason === r)
+            ? [event]
+            : [],
+        );
+      }
       if (path.startsWith("/api/v1/files/")) {
         window.__mock.coverageActive = (window.__mock.coverageActive || 0) + 1;
         window.__mock.coverageMax = Math.max(
@@ -444,17 +575,42 @@
         return respond({ instances: [], categories: [] });
       throw Error(`Unexpected fixture request ${method} ${path}`);
     };
-    const [{ SmartPrefetch }, { CachePage }, { PlexLibrary }, { Nav }] =
-      await Promise.all([
-        import("/src/pages/smart-prefetch.tsx"),
-        import("/src/pages/cache-page.tsx"),
-        import("/src/pages/plex-library.tsx"),
-        import("/src/layout.tsx"),
-      ]);
+    const [
+      { SmartPrefetch },
+      { CachePage },
+      { PlexLibrary },
+      { Nav },
+      { OriginalCacheSettings },
+    ] = await Promise.all([
+      import("/src/pages/smart-prefetch.tsx"),
+      import("/src/pages/cache-page.tsx"),
+      import("/src/pages/plex-library.tsx"),
+      import("/src/layout.tsx"),
+      import("/src/pages/original-cache-settings.tsx"),
+    ]);
     const screen =
       new URL(location.href).searchParams.get("screen") ?? "settings";
-    const component =
-      screen === "cache"
+    function CacheSettingsFixture() {
+      const [value, setValue] = React.useState(
+        window.__mock.settings.native_cache.legacy,
+      );
+      return React.createElement(
+        "form",
+        { onSubmit: (e) => e.preventDefault() },
+        React.createElement(OriginalCacheSettings, {
+          value,
+          locked: () =>
+            window.__mock.cacheSettingsLocked ?? screen.endsWith("-locked"),
+          onChange: (v) => {
+            window.__mock.settings.native_cache.legacy = v;
+            setValue(v);
+          },
+        }),
+      );
+    }
+    const component = screen.startsWith("cache-settings")
+      ? CacheSettingsFixture
+      : screen === "cache"
         ? CachePage
         : screen === "plex"
           ? PlexLibrary

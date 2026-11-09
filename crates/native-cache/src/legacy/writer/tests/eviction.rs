@@ -906,3 +906,290 @@ async fn catalogue_administration_preserves_exact_identity_and_protected_pins() 
         "legacy:manual"
     );
 }
+
+#[tokio::test]
+async fn catalogue_filters_sort_and_page_all_matches_with_stable_ties() {
+    use crate::legacy::{Browse, InventoryFilter as Filter, InventorySort as Sort};
+    let fixture = Fixture::new().await;
+    let writer = fixture.open(8).await;
+    for (n, name, access, verified, pin) in [
+        (1, "alpha", 5, 25, 0),
+        (2, "alpha", 5, 100, 0),
+        (3, "zeta", 2, 50, 0),
+        (4, "empty", 8, 0, 0),
+        (5, "fixture%_literal", 1, 100, 2),
+        (6, "beta", 5, 75, 0),
+    ] {
+        sqlx::query("INSERT INTO Entries(Key,Folder,Length,Access,ItemId,VerifiedBytes,DisplayName,Pinned) VALUES($1,'a',100,$2,$3,$4,$5,$6)")
+            .bind(format!("{n:064x}")).bind(access).bind(Uuid::from_u128(n).simple().to_string()).bind(verified).bind(name).bind(pin).execute(&writer.legacy.db).await.unwrap();
+    }
+    for (sort, expected) in [
+        (Sort::Key, vec![1, 2, 3, 4, 5, 6]),
+        (Sort::Recent, vec![4, 1, 2, 6, 3, 5]),
+        (Sort::Name, vec![1, 2, 6, 4, 5, 3]),
+        (Sort::Coverage, vec![2, 5, 6, 3, 1, 4]),
+    ] {
+        let mut cursor = String::new();
+        let mut keys = Vec::new();
+        loop {
+            let page = writer
+                .legacy
+                .inventory_page(
+                    &Browse {
+                        after: &cursor,
+                        limit: 2,
+                        sort,
+                        ..Browse::default()
+                    },
+                    Some(&writer),
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.matched_files, 6);
+            keys.extend(page.entries.iter().map(|e| e.key.clone()));
+            if let Some(next) = page.next {
+                assert_ne!(cursor, next);
+                cursor = next;
+            } else {
+                break;
+            }
+            assert!(keys.len() <= 6);
+        }
+        assert_eq!(
+            keys,
+            expected
+                .into_iter()
+                .map(|n| format!("{n:064x}"))
+                .collect::<Vec<_>>()
+        );
+    }
+    for (coverage, count) in [
+        (Filter::All, 6),
+        (Filter::Cached, 5),
+        (Filter::Complete, 2),
+        (Filter::Partial, 3),
+        (Filter::Empty, 1),
+        (Filter::Held, 1),
+    ] {
+        let page = writer
+            .legacy
+            .inventory_page(
+                &Browse {
+                    limit: 100,
+                    coverage,
+                    ..Browse::default()
+                },
+                Some(&writer),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.matched_files, count);
+        assert_eq!(page.entries.len(), usize::try_from(count).unwrap());
+    }
+    sqlx::query("UPDATE Entries SET DisplayName='' WHERE Key=$1")
+        .bind(format!("{:064x}", 1))
+        .execute(&writer.legacy.db)
+        .await
+        .unwrap();
+    let labels = std::collections::HashMap::from([(
+        Uuid::from_u128(1).simple().to_string(),
+        "resolved current label".to_owned(),
+    )]);
+    let resolved = writer
+        .legacy
+        .inventory_page(
+            &Browse {
+                limit: 50,
+                search: "resolved current",
+                sort: Sort::Name,
+                names: Some(&labels),
+                ..Browse::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved.matched_files, 1);
+    assert_eq!(
+        resolved.entries[0].name.as_deref(),
+        Some("resolved current label")
+    );
+    let unchanged: String = sqlx::query_scalar("SELECT DisplayName FROM Entries WHERE Key=$1")
+        .bind(format!("{:064x}", 1))
+        .fetch_one(&writer.legacy.db)
+        .await
+        .unwrap();
+    assert_eq!(unchanged, "");
+    let literal = writer
+        .legacy
+        .inventory_page(
+            &Browse {
+                limit: 50,
+                search: "%_",
+                sort: Sort::Name,
+                ..Browse::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(literal.matched_files, 1);
+    let first = writer
+        .legacy
+        .inventory_page(
+            &Browse {
+                limit: 1,
+                sort: Sort::Name,
+                ..Browse::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let after = first.next.unwrap();
+    assert!(
+        writer
+            .legacy
+            .inventory_page(
+                &Browse {
+                    after: &after,
+                    limit: 1,
+                    sort: Sort::Recent,
+                    ..Browse::default()
+                },
+                None
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        writer
+            .legacy
+            .inventory_page(
+                &Browse {
+                    after: &after,
+                    limit: 1,
+                    sort: Sort::Name,
+                    search: "changed",
+                    ..Browse::default()
+                },
+                None
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn original_eviction_history_is_read_only_filtered_and_cursor_paged() {
+    let fixture = Fixture::new().await;
+    let writer = fixture.open(8).await;
+    assert!(
+        !writer
+            .legacy
+            .original_evictions(None, "", None, None, 1)
+            .await
+            .unwrap()
+            .available
+    );
+    sqlx::raw_sql("CREATE TABLE CacheEvictions(Id INTEGER PRIMARY KEY,Key TEXT NOT NULL,Folder TEXT NOT NULL,ItemId TEXT NOT NULL,DisplayName TEXT,Length INTEGER,AllocatedBytes INTEGER,VerifiedBytes INTEGER,Reason TEXT,EvictedUnix INTEGER)").execute(&writer.legacy.db).await.unwrap();
+    for (id, folder, name, reason) in [
+        (1, "a", "fixture%_literal", "age"),
+        (2, "a", "fixture older", "pressure"),
+        (3, "b", "fixture newer", "clear"),
+    ] {
+        sqlx::query("INSERT INTO CacheEvictions VALUES($1,$2,$3,$4,$5,100,80,50,$6,1700000000)")
+            .bind(id)
+            .bind(format!("{id:064x}"))
+            .bind(folder)
+            .bind(
+                Uuid::from_u128(u128::try_from(id).unwrap())
+                    .simple()
+                    .to_string(),
+            )
+            .bind(name)
+            .bind(reason)
+            .execute(&writer.legacy.db)
+            .await
+            .unwrap();
+    }
+    let first = writer
+        .legacy
+        .original_evictions(None, "", None, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(first.total, 3);
+    assert_eq!(first.entries[0].cursor, 3);
+    assert_eq!(first.next, Some(2));
+    let second = writer
+        .legacy
+        .original_evictions(first.next, "", None, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(second.entries.len(), 1);
+    assert_eq!(second.entries[0].cursor, 1);
+    assert!(second.next.is_none());
+    assert_eq!(second.entries[0].at_ms, 1_700_000_000_000);
+    assert_eq!(
+        writer
+            .legacy
+            .original_evictions(None, "%_", None, None, 50)
+            .await
+            .unwrap()
+            .total,
+        1
+    );
+    assert_eq!(
+        writer
+            .legacy
+            .original_evictions(None, "", Some("age"), Some("a"), 50)
+            .await
+            .unwrap()
+            .total,
+        1
+    );
+    assert_eq!(
+        writer
+            .legacy
+            .original_evictions(None, "", Some("clear"), Some("a"), 50)
+            .await
+            .unwrap()
+            .total,
+        0
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM CacheEvictions")
+        .fetch_one(&writer.legacy.db)
+        .await
+        .unwrap();
+    assert_eq!(count, 3);
+}
+
+#[tokio::test]
+async fn service_eviction_history_filters_all_records_before_paging() {
+    let fixture = Fixture::new().await;
+    let cache = open_cache(&fixture).await;
+    for (id, revision, reason) in [
+        (1, "fixture%_literal", "legacy:manual"),
+        (2, "fixture other", "legacy:policy"),
+        (3, "fixture newer", "manual"),
+    ] {
+        sqlx::query("INSERT INTO evictions(item,revision,bytes,at,reason) VALUES($1,$2,100,1700000000000,$3)").bind(Uuid::from_u128(id).to_string()).bind(revision).bind(reason).execute(&cache.db).await.unwrap();
+    }
+    let found = cache
+        .evictions_filtered(None, 1, Some("legacy:policy"), "")
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].item, Uuid::from_u128(2));
+    let literal = cache.evictions_filtered(None, 1, None, "%_").await.unwrap();
+    assert_eq!(literal.len(), 1);
+    assert_eq!(literal[0].item, Uuid::from_u128(1));
+    let newest = cache.evictions_filtered(None, 1, None, "").await.unwrap();
+    let next = cache
+        .evictions_filtered(Some(newest[0].cursor), 1, None, "")
+        .await
+        .unwrap();
+    assert_eq!(newest[0].item, Uuid::from_u128(3));
+    assert_eq!(next[0].item, Uuid::from_u128(2));
+    assert_eq!(cache.evictions(None, 100).await.unwrap().len(), 3);
+}
