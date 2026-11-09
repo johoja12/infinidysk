@@ -751,3 +751,158 @@ async fn restored_current_metadata_does_not_erase_quarantine_ownership_or_delete
         .join(format!("rust-evict-{nonce}/content.data"));
     assert_eq!(std::fs::read(payload).unwrap(), super::bytes(0));
 }
+
+#[tokio::test]
+async fn catalogue_administration_preserves_exact_identity_and_protected_pins() {
+    let f = Fixture::new().await;
+    let mut writer = f.open(8).await;
+    let cache = open_cache(&f).await;
+    put(&writer, 0).await.unwrap();
+    another(&writer, Uuid::new_v4()).await;
+    let page = writer
+        .legacy
+        .inventory("", None, "", 1, Some(&writer))
+        .await
+        .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    assert!(page.next.is_some());
+    assert_eq!(page.folders.iter().map(|f| f.files).sum::<i64>(), 2);
+    let second = writer
+        .legacy
+        .inventory(page.next.as_deref().unwrap(), None, "", 1, Some(&writer))
+        .await
+        .unwrap();
+    assert_eq!(second.entries.len(), 1);
+    assert_ne!(second.entries[0].key, page.entries[0].key);
+    assert!(second.next.is_none());
+    let entry = writer
+        .legacy
+        .find(ITEM, GENERATION, SIZE)
+        .await
+        .unwrap()
+        .unwrap();
+    let identity = crate::legacy::EntryIdentity::from(&entry);
+    assert_eq!(
+        writer.legacy.probe(&identity, 0).await.unwrap(),
+        Some(BLOCK)
+    );
+    assert!(writer.legacy.probe(&identity, 1).await.is_err());
+    assert!(
+        writer
+            .legacy
+            .label(&identity, "fixture%_entry")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !writer
+            .legacy
+            .label(&identity, "replacement label")
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        writer
+            .legacy
+            .inventory("", None, "%_", 50, Some(&writer))
+            .await
+            .unwrap()
+            .entries
+            .len(),
+        1
+    );
+    assert!(
+        writer
+            .legacy
+            .inventory("", Some("not-configured"), "", 50, Some(&writer))
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+    let mut stale = identity.clone();
+    stale.generation = Some("changed-generation".into());
+    assert!(!writer.legacy.manual_pin(&stale, true).await.unwrap());
+    assert!(writer.legacy.manual_pin(&identity, true).await.unwrap());
+    assert!(writer.legacy.manual_pin(&identity, false).await.unwrap());
+    for pin in [2, 3] {
+        sqlx::query("UPDATE Entries SET Pinned=$1 WHERE Key=$2")
+            .bind(pin)
+            .bind(&entry.key)
+            .execute(&writer.legacy.db)
+            .await
+            .unwrap();
+        assert!(!writer.legacy.manual_pin(&identity, false).await.unwrap());
+        assert!(!writer.legacy.manual_pin(&identity, true).await.unwrap());
+    }
+    sqlx::query("UPDATE Entries SET Pinned=0,PendingBytes=1 WHERE Key=$1")
+        .bind(&entry.key)
+        .execute(&writer.legacy.db)
+        .await
+        .unwrap();
+    assert!(!writer.legacy.manual_pin(&identity, true).await.unwrap());
+    let inventory = writer
+        .legacy
+        .inventory("", None, "", 50, Some(&writer))
+        .await
+        .unwrap();
+    assert_eq!(
+        inventory
+            .folders
+            .iter()
+            .map(|f| f.pending_bytes)
+            .sum::<i64>(),
+        1
+    );
+    assert_eq!(
+        inventory.folders.iter().map(|f| f.held_files).sum::<i64>(),
+        1
+    );
+    sqlx::query("UPDATE Entries SET PendingBytes=0 WHERE Key=$1")
+        .bind(&entry.key)
+        .execute(&writer.legacy.db)
+        .await
+        .unwrap();
+    assert!(
+        !writer
+            .manual_evict(identity.clone(), cache.legacy_maintenance())
+            .await
+            .unwrap()
+    );
+    enable(&mut writer);
+    let lease = cache
+        .lease(Key::new(ITEM, b"active-administration", SIZE))
+        .unwrap();
+    assert!(
+        !writer
+            .manual_evict(identity.clone(), cache.legacy_maintenance())
+            .await
+            .unwrap()
+    );
+    drop(lease);
+    assert!(
+        !writer
+            .manual_evict(stale, cache.legacy_maintenance())
+            .await
+            .unwrap()
+    );
+    assert!(
+        writer
+            .manual_evict(identity, cache.legacy_maintenance())
+            .await
+            .unwrap()
+    );
+    assert!(
+        writer
+            .legacy
+            .find(ITEM, GENERATION, SIZE)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(counts(&writer, &cache).await, (1, 0, 0));
+    assert_eq!(
+        cache.evictions(None, 100).await.unwrap()[0].reason,
+        "legacy:manual"
+    );
+}

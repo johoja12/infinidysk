@@ -795,7 +795,7 @@ Modals interrupt, so use them sparingly: to confirm, to collect input an action 
 
 (Supabase: [Navigation](https://supabase.com/design-system/docs/ui-patterns/navigation), [Skip to Content](https://supabase.com/design-system/docs/fragments/skip-to-content))
 
-- Primary nav: the sidebar lists the pages in a fixed order (Overview, Queue, Explorer, Health, Stats, System, Settings), icon and label, one route each. Overview answers "is it working right now" (what needs attention, live reads, recent activity); Stats holds the per-provider, per-workload and per-app breakdowns. Active `bg-sidebar-accent text-sidebar-accent-foreground` with a `text-primary` icon; inactive `text-sidebar-foreground/80`, hover `bg-sidebar-accent/60`. Page names are title case and one or two words.
+- Primary nav: the sidebar lists the pages in a fixed order (Overview, Queue, Media Library, Plex Library, Native Cache, Smart Prefetch, Explorer, Health, Stats, System, Settings), icon and label, one route each. Overview answers "is it working right now" (what needs attention, live reads, recent activity); Stats holds the per-provider, per-workload and per-app breakdowns. Active `bg-sidebar-accent text-sidebar-accent-foreground` with a `text-primary` icon; inactive `text-sidebar-foreground/80`, hover `bg-sidebar-accent/60`. Page names are title case and one or two words.
 - Counters beside nav items show work waiting for the user (jobs in the queue, files that need action). An item can carry a neutral and a needs-action counter side by side (Queue: jobs, then downloads that need you in the Arr).
 - Overview opens with a needs-attention list when something does (files that need action, providers with an open circuit, a paused queue, the mount down): one row per problem with a `Status` and a link to where it is fixed. It renders nothing when all is well.
 - Overview activity plots average download speed per bucket as bars stacked by workload, Playback at the bottom. The header shows what was downloaded and served, each with its fastest 2 s rate; the legend above the plot gives each workload's total and toggles it. Errors draw in a lane under the bars.
@@ -1047,3 +1047,11 @@ Report one finding per issue with `file:line`, the rule (section › heading), a
 **Responsive**
 
 - [ ] At 360px: no page-level horizontal scroll; tables, toolbars and dialogs usable. At 768px and 1280px: layout per Responsive Behavior.
+
+
+### Fork feature screens
+
+- Native Cache is a top-level page at `/native-cache`. Show original-format storage separately from any new Rust store. Original folder totals, names, ranges and pin reasons come from the original catalogue. Do not present zero new-store totals as an empty original cache. Read-only mode, recovery mode and disabled eviction have visible states. Manual removal uses confirmation and preserves active readers and health pins.
+- Plex Library at `/plex-library` browses enabled Plex servers and their named movie/TV libraries. Show-to-episode navigation, search and paging remain bounded. Only an exact imported-source mapping offers cache inspection and warming. Keep connection and path-mapping management within reach.
+- Smart Prefetch at `/smart-prefetch` separates Activity and history, Predictions and Settings. Activity opens with the current queue; Settings uses one Save/Discard bar. Catalogue refresh and previews never download media. Discover named hubs, collections and library sources using a server/profile selector; manual resource paths and viewer IDs are not the primary configuration flow.
+- Smart Prefetch settings group basic enablement, movies/TV and daily allowances first, then source selection, signals and warming behavior. Advanced policy is collapsed by default. Source customization exposes item limits, exclusions and a metadata preview. Retain saved selections across partial catalogue failures. Untouched values take fresh server settings when saving, and navigation warns about unsaved edits.

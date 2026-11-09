@@ -9,7 +9,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 type Options = Schemas["PlexPrefetchSettings"];
 type Policy = Schemas["PlexPredictionPolicy"];
-export function PlexPredictions() {
+export function PlexPredictions({
+  showSettings = true,
+  showResults = true,
+}: {
+  showSettings?: boolean;
+  showResults?: boolean;
+}) {
   const view = useSettings(),
     save = useSaveSettings(),
     client = useQueryClient();
@@ -57,216 +63,298 @@ export function PlexPredictions() {
         with warming disabled; downloading requires Enable warming. Incomplete
         refreshes retain the last complete result.
       </p>
-      {(
-        [
-          ["enabled", "Enable Plex predictions"],
-          ["history", "Predict from recent history"],
-          ["realtime", "Predict from active playback"],
-        ] as const
-      ).map(([key, label]) => (
-        <Toggle
-          key={key}
-          id={`prediction-${key}`}
-          label={
-            <>
-              {label} <Locked locked={locked(`prefetch.plex.${key}`)} />
-            </>
-          }
-          checked={value[key] ?? false}
-          disabled={change.isPending || locked(`prefetch.plex.${key}`)}
-          onChange={(checked) => change.mutate({ options: { [key]: checked } })}
-        />
-      ))}
-      <Toggle
-        id="prediction-local"
-        label={
-          <>
-            Resolve mapped local library pointers{" "}
-            <Locked locked={locked("prefetch.plex.local_files")} />
-          </>
-        }
-        hint="Recognizes imported symlinks and signed STRM pointers. It does not warm arbitrary local media."
-        checked={value.local_files === "imported_pointers"}
-        disabled={change.isPending || locked("prefetch.plex.local_files")}
-        onChange={(checked) =>
-          change.mutate({
-            options: {
-              local_files: checked ? "imported_pointers" : "disabled",
-            },
-          })
-        }
-      />
-      <div className="grid gap-4 sm:grid-cols-2">
-        <ApplyNumber
-          id="prediction-refresh"
-          label="Refresh interval (seconds)"
-          value={value.refresh_seconds ?? 60}
-          min={30}
-          max={3600}
-          disabled={change.isPending || locked("prefetch.plex.refresh_seconds")}
-          apply={(n) => change.mutateAsync({ options: { refresh_seconds: n } })}
-        />
-        <ApplyNumber
-          id="prediction-next"
-          label="Next episodes per show"
-          value={value.next_episodes ?? 2}
-          min={1}
-          max={20}
-          disabled={change.isPending || locked("prefetch.plex.next_episodes")}
-          apply={(n) => change.mutateAsync({ options: { next_episodes: n } })}
-        />
-        {(
-          [
-            ["lookback_days", "History lookback (days)", 1, 365, 7],
+      {showSettings && (
+        <>
+          {(
             [
-              "partial_movie_lookback_days",
-              "Partial-movie lookback (days)",
-              0,
-              365,
-              7,
-            ],
-            ["min_distinct_episodes", "Minimum distinct episodes", 1, 100, 2],
-            ["confidence_percent", "Confidence threshold (%)", 0, 100, 50],
-          ] as const
-        ).map(([key, label, min, max, fallback]) => (
-          <ApplyNumber
-            key={key}
-            id={`prediction-${key}`}
-            label={label}
-            value={policy[key] ?? fallback}
-            min={min}
-            max={max}
-            disabled={change.isPending || locked(`prefetch.plex.policy.${key}`)}
-            apply={(n) => change.mutateAsync({ policy: { [key]: n } })}
+              ["enabled", "Enable Plex predictions"],
+              ["history", "Predict from recent history"],
+              ["realtime", "Predict from active playback"],
+            ] as const
+          ).map(([key, label]) => (
+            <Toggle
+              key={key}
+              id={`prediction-${key}`}
+              label={
+                <>
+                  {label} <Locked locked={locked(`prefetch.plex.${key}`)} />
+                </>
+              }
+              checked={value[key] ?? false}
+              disabled={change.isPending || locked(`prefetch.plex.${key}`)}
+              onChange={(checked) =>
+                change.mutate({ options: { [key]: checked } })
+              }
+            />
+          ))}
+          <Toggle
+            id="prediction-local"
+            label={
+              <>
+                Resolve mapped local library pointers{" "}
+                <Locked locked={locked("prefetch.plex.local_files")} />
+              </>
+            }
+            hint="Recognizes imported symlinks and signed STRM pointers. It does not warm arbitrary local media."
+            checked={value.local_files === "imported_pointers"}
+            disabled={change.isPending || locked("prefetch.plex.local_files")}
+            onChange={(checked) =>
+              change.mutate({
+                options: {
+                  local_files: checked ? "imported_pointers" : "disabled",
+                },
+              })
+            }
           />
-        ))}
-      </div>
-      <p className="text-xs text-muted-foreground">
-        Confidence reaches 50% at the minimum episode count and 100% at twice
-        that count. Time-based ranges are hints; playback remains authoritative
-        for seeking.
-      </p>
-      {(
-        [
-          ["movies", "Include movies"],
-          ["television", "Include television"],
-          ["full_file", "Warm complete files"],
-          ["minimum_warm", "Keep minimum head and tail coverage for partial warming"],
-        ] as const
-      ).map(([key, label]) => (
-        <Toggle
-          key={key}
-          id={`prediction-${key}`}
-          label={
-            <>
-              {label} <Locked locked={locked(`prefetch.plex.policy.${key}`)} />
-            </>
-          }
-          checked={policy[key] ?? (key !== "minimum_warm")}
-          disabled={change.isPending || locked(`prefetch.plex.policy.${key}`)}
-          onChange={(checked) => change.mutate({ policy: { [key]: checked } })}
-        />
-      ))}
-      <div className="grid gap-3 sm:grid-cols-2">
-        {([['head_bytes','Minimum head (MB)'],['tail_bytes','Minimum tail (MB)']] as const).map(([key,label])=><ApplyNumber key={key} id={`prediction-${key}`} label={label} value={policy[key]/1000000} min={0} max={1000} disabled={change.isPending || locked(`prefetch.plex.policy.${key}`)} apply={n=>change.mutateAsync({policy:{[key]:n*1000000}})} />)}
-      </div>
-      <PlexPrefetchSources value={value.sources} servers={view.data.settings.plex.servers} disabled={change.isPending || locked("prefetch.plex.sources")} apply={sources=>change.mutateAsync({options:{sources}})} />
-      <Toggle id="prediction-restrict-viewers" label={<>Limit predictions to selected viewers <Locked locked={locked("prefetch.plex.policy.restrict_viewers")} /></>} hint="When enabled, an empty viewer list permits no predictions. Review this selection after migrating legacy profiles." checked={policy.restrict_viewers} disabled={change.isPending || locked("prefetch.plex.policy.restrict_viewers")} onChange={checked=>change.mutate({policy:{restrict_viewers:checked}})} />
-      <ApplyList
-        id="prediction-viewers"
-        label="Viewer identities"
-        hint="Comma-separated server:viewer IDs. An empty list includes verified profiles only when the selection limit is off. Display names do not identify profiles."
-        value={policy.viewers ?? []}
-        disabled={change.isPending || locked("prefetch.plex.policy.viewers")}
-        apply={(ids) => change.mutateAsync({ policy: { viewers: ids } })}
-      />
-      <ApplyList
-        id="prediction-excluded"
-        label="Excluded show keys"
-        hint="Comma-separated Plex show keys; these exclusions apply to all configured servers."
-        value={policy.excluded_shows ?? []}
-        disabled={
-          change.isPending || locked("prefetch.plex.policy.excluded_shows")
-        }
-        apply={(ids) => change.mutateAsync({ policy: { excluded_shows: ids } })}
-      />
-      {change.error && <Failure error={change.error} />}
-      {snapshot.error && <Failure error={snapshot.error} />}
-      <div className="flex flex-wrap items-center gap-3">
-        <Button
-          type="button"
-          variant="outline"
-          disabled={refresh.isPending || snapshot.data?.refreshing}
-          onClick={() => refresh.mutate()}
-        >
-          Refresh predictions
-        </Button>
-        <p className="text-sm text-muted-foreground">
-          {snapshot.data?.refreshing
-            ? "Refreshing"
-            : snapshot.data?.stale
-              ? "Stale result"
-              : "Current result"}
-          {snapshot.data?.updated_at
-            ? ` · ${new Date(snapshot.data.updated_at).toLocaleString()}`
-            : ""}
-        </p>
-      </div>
-      {refresh.error && <Failure error={refresh.error} />}
-      {snapshot.data?.error && (
-        <p className="text-sm text-warning-text" role="status">
-          {snapshot.data.error} · Showing the last complete result when
-          available.
-        </p>
-      )}
-      {snapshot.data?.warning && (
-        <p className="text-sm text-warning-text" role="status">
-          {snapshot.data.warning}
-        </p>
-      )}
-      <div className="overflow-x-auto">
-        <table className="w-full text-left text-sm">
-          <thead className="text-muted-foreground">
-            <tr>
-              <th className="p-2">Candidate</th>
-              <th className="p-2">Viewer</th>
-              <th className="p-2">Warming</th>
-            </tr>
-          </thead>
-          <tbody>
-            {snapshot.data?.predictions.map((p) => (
-              <tr key={p.id} className="border-t">
-                <td className="p-2">
-                  <p>{p.title}</p>
-                  <p className="text-xs text-muted-foreground">
-                    {
-                      {
-                        playback: "Playing file",
-                        next_episode: "Next episode",
-                        partial_movie: "Partially watched",
-                        hub: "Hub source",
-                        collection: "Collection source",
-                        library: "Library source",
-                      }[p.source]
-                    }
-                  </p>
-                </td>
-                <td className="p-2 break-all font-mono text-xs">
-                  {p.server}:{p.viewer}
-                </td>
-                <td className="p-2">
-                  {p.warning ||
-                    `${bytes(p.ranges.reduce((n, r) => n + r.end - r.start, 0))} eligible`}
-                </td>
-              </tr>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <ApplyNumber
+              id="prediction-refresh"
+              label="Refresh interval (seconds)"
+              value={value.refresh_seconds ?? 60}
+              min={30}
+              max={3600}
+              disabled={
+                change.isPending || locked("prefetch.plex.refresh_seconds")
+              }
+              apply={(n) =>
+                change.mutateAsync({ options: { refresh_seconds: n } })
+              }
+            />
+            <ApplyNumber
+              id="prediction-next"
+              label="Next episodes per show"
+              value={value.next_episodes ?? 2}
+              min={1}
+              max={20}
+              disabled={
+                change.isPending || locked("prefetch.plex.next_episodes")
+              }
+              apply={(n) =>
+                change.mutateAsync({ options: { next_episodes: n } })
+              }
+            />
+            {(
+              [
+                ["lookback_days", "History lookback (days)", 1, 365, 7],
+                [
+                  "partial_movie_lookback_days",
+                  "Partial-movie lookback (days)",
+                  0,
+                  365,
+                  7,
+                ],
+                [
+                  "min_distinct_episodes",
+                  "Minimum distinct episodes",
+                  1,
+                  100,
+                  2,
+                ],
+                ["confidence_percent", "Confidence threshold (%)", 0, 100, 50],
+              ] as const
+            ).map(([key, label, min, max, fallback]) => (
+              <ApplyNumber
+                key={key}
+                id={`prediction-${key}`}
+                label={label}
+                value={policy[key] ?? fallback}
+                min={min}
+                max={max}
+                disabled={
+                  change.isPending || locked(`prefetch.plex.policy.${key}`)
+                }
+                apply={(n) => change.mutateAsync({ policy: { [key]: n } })}
+              />
             ))}
-          </tbody>
-        </table>
-      </div>
-      {snapshot.data?.predictions.length === 0 && (
-        <p className="text-sm text-muted-foreground">
-          No matching candidates in the last complete refresh.
-        </p>
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Confidence reaches 50% at the minimum episode count and 100% at
+            twice that count. Time-based ranges are hints; playback remains
+            authoritative for seeking.
+          </p>
+          {(
+            [
+              ["movies", "Include movies"],
+              ["television", "Include television"],
+              ["full_file", "Warm complete files"],
+              [
+                "minimum_warm",
+                "Keep minimum head and tail coverage for partial warming",
+              ],
+            ] as const
+          ).map(([key, label]) => (
+            <Toggle
+              key={key}
+              id={`prediction-${key}`}
+              label={
+                <>
+                  {label}{" "}
+                  <Locked locked={locked(`prefetch.plex.policy.${key}`)} />
+                </>
+              }
+              checked={policy[key] ?? key !== "minimum_warm"}
+              disabled={
+                change.isPending || locked(`prefetch.plex.policy.${key}`)
+              }
+              onChange={(checked) =>
+                change.mutate({ policy: { [key]: checked } })
+              }
+            />
+          ))}
+          <div className="grid gap-3 sm:grid-cols-2">
+            {(
+              [
+                ["head_bytes", "Minimum head (MB)"],
+                ["tail_bytes", "Minimum tail (MB)"],
+              ] as const
+            ).map(([key, label]) => (
+              <ApplyNumber
+                key={key}
+                id={`prediction-${key}`}
+                label={label}
+                value={policy[key] / 1000000}
+                min={0}
+                max={1000}
+                disabled={
+                  change.isPending || locked(`prefetch.plex.policy.${key}`)
+                }
+                apply={(n) =>
+                  change.mutateAsync({ policy: { [key]: n * 1000000 } })
+                }
+              />
+            ))}
+          </div>
+          <PlexPrefetchSources
+            value={value.sources}
+            servers={view.data.settings.plex.servers}
+            disabled={change.isPending || locked("prefetch.plex.sources")}
+            apply={(sources) => change.mutateAsync({ options: { sources } })}
+          />
+          <Toggle
+            id="prediction-restrict-viewers"
+            label={
+              <>
+                Limit predictions to selected viewers{" "}
+                <Locked
+                  locked={locked("prefetch.plex.policy.restrict_viewers")}
+                />
+              </>
+            }
+            hint="When enabled, an empty viewer list permits no predictions. Review this selection after migrating legacy profiles."
+            checked={policy.restrict_viewers}
+            disabled={
+              change.isPending ||
+              locked("prefetch.plex.policy.restrict_viewers")
+            }
+            onChange={(checked) =>
+              change.mutate({ policy: { restrict_viewers: checked } })
+            }
+          />
+          <ApplyList
+            id="prediction-viewers"
+            label="Viewer identities"
+            hint="Comma-separated server:viewer IDs. An empty list includes verified profiles only when the selection limit is off. Display names do not identify profiles."
+            value={policy.viewers ?? []}
+            disabled={
+              change.isPending || locked("prefetch.plex.policy.viewers")
+            }
+            apply={(ids) => change.mutateAsync({ policy: { viewers: ids } })}
+          />
+          <ApplyList
+            id="prediction-excluded"
+            label="Excluded show keys"
+            hint="Comma-separated Plex show keys; these exclusions apply to all configured servers."
+            value={policy.excluded_shows ?? []}
+            disabled={
+              change.isPending || locked("prefetch.plex.policy.excluded_shows")
+            }
+            apply={(ids) =>
+              change.mutateAsync({ policy: { excluded_shows: ids } })
+            }
+          />
+          {change.error && <Failure error={change.error} />}
+        </>
+      )}
+      {showResults && (
+        <>
+          {snapshot.error && <Failure error={snapshot.error} />}
+          <div className="flex flex-wrap items-center gap-3">
+            <Button
+              type="button"
+              variant="outline"
+              disabled={refresh.isPending || snapshot.data?.refreshing}
+              onClick={() => refresh.mutate()}
+            >
+              Refresh predictions
+            </Button>
+            <p className="text-sm text-muted-foreground">
+              {snapshot.data?.refreshing
+                ? "Refreshing"
+                : snapshot.data?.stale
+                  ? "Stale result"
+                  : "Current result"}
+              {snapshot.data?.updated_at
+                ? ` · ${new Date(snapshot.data.updated_at).toLocaleString()}`
+                : ""}
+            </p>
+          </div>
+          {refresh.error && <Failure error={refresh.error} />}
+          {snapshot.data?.error && (
+            <p className="text-sm text-warning-text" role="status">
+              {snapshot.data.error} · Showing the last complete result when
+              available.
+            </p>
+          )}
+          {snapshot.data?.warning && (
+            <p className="text-sm text-warning-text" role="status">
+              {snapshot.data.warning}
+            </p>
+          )}
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="text-muted-foreground">
+                <tr>
+                  <th className="p-2">Candidate</th>
+                  <th className="p-2">Viewer</th>
+                  <th className="p-2">Warming</th>
+                </tr>
+              </thead>
+              <tbody>
+                {snapshot.data?.predictions.map((p) => (
+                  <tr key={p.id} className="border-t">
+                    <td className="p-2">
+                      <p>{p.title}</p>
+                      <p className="text-xs text-muted-foreground">
+                        {
+                          {
+                            playback: "Playing file",
+                            next_episode: "Next episode",
+                            partial_movie: "Partially watched",
+                            hub: "Hub source",
+                            collection: "Collection source",
+                            library: "Library source",
+                          }[p.source]
+                        }
+                      </p>
+                    </td>
+                    <td className="p-2 break-all font-mono text-xs">
+                      {p.server}:{p.viewer}
+                    </td>
+                    <td className="p-2">
+                      {p.warning ||
+                        `${bytes(p.ranges.reduce((n, r) => n + r.end - r.start, 0))} eligible`}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {snapshot.data?.predictions.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              No matching candidates in the last complete refresh.
+            </p>
+          )}
+        </>
       )}
     </SettingsPanel>
   );

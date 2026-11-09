@@ -34,21 +34,37 @@ pub struct View {
     #[serde(flatten)]
     pub queue: Status,
     pub followup: followups::Snapshot,
+    pub names: std::collections::HashMap<Uuid, String>,
 }
 #[utoipa::path(get,operation_id="prefetch_status",path="/api/v1/prefetch",responses((status=200,body=View)))]
 pub async fn status(State(admin): State<Arc<Admin>>) -> Json<View> {
     let queue = admin.prefetch.status().await;
-    let jobs = queue
+    let jobs: Vec<Job> = queue
         .jobs
         .iter()
         .cloned()
         .chain(queue.history.iter().map(|h| h.job.clone()))
         .collect();
+    let mut ids: Vec<Uuid> = jobs.iter().map(|j| j.item).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let names = admin
+        .vfs
+        .db()
+        .item_labels(&ids)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     let followup = admin
         .prefetch_followups
         .snapshot(Arc::clone(&admin), jobs)
         .await;
-    Json(View { queue, followup })
+    Json(View {
+        queue,
+        followup,
+        names,
+    })
 }
 #[utoipa::path(post,operation_id="prefetch_enqueue",path="/api/v1/prefetch",request_body=Request,responses((status=200,body=Job)))]
 pub async fn enqueue(

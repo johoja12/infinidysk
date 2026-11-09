@@ -104,6 +104,12 @@ impl LegacyReader {
     }
 }
 impl infinidysk_native_cache::legacy::Reader for LegacyReader {
+    fn catalogue(&self) -> Option<&infinidysk_native_cache::legacy::Legacy> {
+        Some(&self.legacy)
+    }
+    fn writer(&self) -> Option<&Arc<infinidysk_native_cache::legacy::Writer>> {
+        self.writer.as_ref()
+    }
     fn read<'a>(
         &'a self,
         key: &'a infinidysk_native_cache::Key,
@@ -185,9 +191,31 @@ impl infinidysk_native_cache::legacy::Reader for LegacyReader {
                 .original_generation(key)
                 .await?
                 .unwrap_or_else(|| format!("rust-v2:{}", key.revision()));
-            writer
-                .put(key.item(), generation, key.size(), block, data, permit)
-                .await
+            let stored = writer
+                .put(
+                    key.item(),
+                    generation.clone(),
+                    key.size(),
+                    block,
+                    data,
+                    permit,
+                )
+                .await?;
+            if stored
+                && block == 0
+                && let Ok(Some(item)) = self.db.item(infinidysk_core::ItemId(key.item())).await
+                && let Ok(Some(entry)) = self.legacy.find(key.item(), &generation, key.size()).await
+                && let Err(error) = self
+                    .legacy
+                    .label(
+                        &infinidysk_native_cache::legacy::EntryIdentity::from(&entry),
+                        &item.name,
+                    )
+                    .await
+            {
+                tracing::warn!(reason=%error,"cache display label update deferred");
+            }
+            Ok(stored)
         })
     }
 }
@@ -586,3 +614,153 @@ pub async fn recover(
 
 #[cfg(test)]
 mod legacy_tests;
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in=Query)]
+pub struct LegacyBrowse {
+    pub after: Option<String>,
+    pub folder: Option<String>,
+    pub search: Option<String>,
+}
+#[utoipa::path(get,operation_id="legacy_cache_inventory",path="/api/v1/native-cache/legacy",params(LegacyBrowse),responses((status=200,body=infinidysk_native_cache::legacy::Inventory)))]
+pub async fn legacy_inventory(
+    State(admin): State<Arc<Admin>>,
+    Query(q): Query<LegacyBrowse>,
+) -> Result<Json<infinidysk_native_cache::legacy::Inventory>, Fail> {
+    if q.search.as_ref().is_some_and(|s| s.len() > 256)
+        || q.after.as_ref().is_some_and(|s| s.len() > 64)
+    {
+        return Err(Fail::Bad("Cache search or cursor is too long".into()));
+    }
+    let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
+    let reader = cache.legacy_reader().ok_or(Fail::NotFound)?;
+    let legacy = reader.catalogue().ok_or(Fail::NotFound)?;
+    let mut result = legacy
+        .inventory(
+            q.after.as_deref().unwrap_or(""),
+            q.folder.as_deref(),
+            q.search.as_deref().unwrap_or(""),
+            50,
+            reader.writer().map(AsRef::as_ref),
+        )
+        .await
+        .map_err(|e| fail(&e))?;
+    let ids: Vec<uuid::Uuid> = result
+        .entries
+        .iter()
+        .filter_map(|e| uuid::Uuid::parse_str(&e.item).ok())
+        .collect();
+    let labels: std::collections::HashMap<_, _> = admin
+        .vfs
+        .db()
+        .item_labels(&ids)
+        .await?
+        .into_iter()
+        .collect();
+    for entry in &mut result.entries {
+        if let Ok(id) = uuid::Uuid::parse_str(&entry.item) {
+            entry.source_present = labels.contains_key(&id);
+            if entry.name.as_ref().is_none_or(String::is_empty) {
+                entry.name = labels.get(&id).cloned();
+            }
+        }
+    }
+    if cache.recovery_mode() {
+        result.writable = false;
+        for folder in &mut result.folders {
+            folder.writable = false;
+            folder.eviction_enabled = false;
+        }
+    }
+    Ok(Json(result))
+}
+#[derive(Deserialize, ToSchema)]
+#[schema(as=LegacyCacheAction)]
+pub struct LegacyAction {
+    pub entry: infinidysk_native_cache::legacy::EntryIdentity,
+    pub operation: Operation,
+}
+#[utoipa::path(post,operation_id="legacy_cache_action",path="/api/v1/native-cache/legacy",request_body=LegacyAction,responses((status=200,body=bool)))]
+pub async fn legacy_action(
+    State(admin): State<Arc<Admin>>,
+    Json(a): Json<LegacyAction>,
+) -> Result<Json<bool>, Fail> {
+    let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
+    let reader = cache.legacy_reader().ok_or(Fail::NotFound)?;
+    let legacy = reader.catalogue().ok_or(Fail::NotFound)?;
+    if cache.recovery_mode()
+        || !reader
+            .writer()
+            .is_some_and(|w| w.settings().folders.iter().any(|f| f.id == a.entry.folder))
+    {
+        return Ok(Json(false));
+    }
+    let changed = match a.operation {
+        Operation::Pin => legacy.manual_pin(&a.entry, true).await,
+        Operation::Unpin => legacy.manual_pin(&a.entry, false).await,
+        Operation::Evict => {
+            reader
+                .writer()
+                .ok_or_else(unavailable)?
+                .manual_evict(a.entry, cache.legacy_maintenance())
+                .await
+        }
+    }
+    .map_err(|e| fail(&e))?;
+    Ok(Json(changed))
+}
+#[utoipa::path(post,operation_id="legacy_cache_coverage",path="/api/v1/native-cache/legacy/coverage",request_body=infinidysk_native_cache::legacy::EntryIdentity,responses((status=200,body=Vec<Coverage>)))]
+pub async fn legacy_coverage(
+    State(admin): State<Arc<Admin>>,
+    Json(id): Json<infinidysk_native_cache::legacy::EntryIdentity>,
+) -> Result<Json<Vec<Coverage>>, Fail> {
+    let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
+    let legacy = cache
+        .legacy_reader()
+        .and_then(infinidysk_native_cache::legacy::Reader::catalogue)
+        .ok_or(Fail::NotFound)?;
+    let entry = legacy
+        .exact_entry(&id)
+        .await
+        .map_err(|e| fail(&e))?
+        .ok_or(Fail::NotFound)?;
+    Ok(Json(legacy.coverage(&entry).await.map_err(|e| fail(&e))?))
+}
+
+#[utoipa::path(get,operation_id="legacy_cache_diagnostics",path="/api/v1/native-cache/legacy/diagnostics",responses((status=200,body=Vec<infinidysk_native_cache::legacy::StorageDiagnostic>)))]
+pub async fn legacy_diagnostics(
+    State(admin): State<Arc<Admin>>,
+) -> Result<Json<Vec<infinidysk_native_cache::legacy::StorageDiagnostic>>, Fail> {
+    let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
+    let legacy = cache
+        .legacy_reader()
+        .and_then(infinidysk_native_cache::legacy::Reader::catalogue)
+        .ok_or(Fail::NotFound)?;
+    Ok(Json(legacy.diagnostics().await))
+}
+
+#[derive(Deserialize, ToSchema)]
+#[schema(as=LegacyCacheProbe)]
+pub struct LegacyProbe {
+    pub entry: infinidysk_native_cache::legacy::EntryIdentity,
+    pub offset: u64,
+}
+#[utoipa::path(post,operation_id="legacy_cache_probe",path="/api/v1/native-cache/legacy/probe",request_body=LegacyProbe,responses((status=200,body=Option<u64>)))]
+pub async fn legacy_probe(
+    State(admin): State<Arc<Admin>>,
+    Json(probe): Json<LegacyProbe>,
+) -> Result<Json<Option<u64>>, Fail> {
+    let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
+    let legacy = cache
+        .legacy_reader()
+        .and_then(infinidysk_native_cache::legacy::Reader::catalogue)
+        .ok_or(Fail::NotFound)?;
+    let bytes = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        legacy.probe(&probe.entry, probe.offset),
+    )
+    .await
+    .map_err(|_| Fail::Unavailable("Cache sample timed out; storage remains uncertain".into()))?
+    .map_err(|e| fail(&e))?;
+    Ok(Json(bytes))
+}

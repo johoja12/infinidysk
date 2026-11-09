@@ -62,7 +62,6 @@ import { PerformanceSettings } from "./performance";
 import { NativeCachePanel } from "./native-cache";
 import { Providers } from "./providers";
 import { PlexConnections } from "./plex";
-import { PrefetchPanel } from "./prefetch";
 import { PlexClassification } from "./library-plex";
 import { Checkbox } from "@/components/ui/checkbox";
 
@@ -169,7 +168,8 @@ const categories = [
     title: "Performance",
     description: "Read-ahead, caching and download speed",
   },
-  { group:"Automation",slug:"prefetch",title:"Background warming",description:"Persistent warming jobs and native cache progress" },
+  { group:"Automation",slug:"prefetch",title:"Smart Prefetch",description:"Plex sources, warming policy and daily allowances" },
+  { group:"Platform",slug:"native-cache",title:"Native Cache",description:"Original cache folders, compatible writes and storage policy" },
   { group:"Automation",slug:"plex",title:"Plex connections",description:"Accounts, Home profiles and exact library path mappings" },
   {
     group: "Automation",
@@ -721,9 +721,10 @@ export function Settings() {
           {category.slug === "providers" && <Providers title={category.title} description={category.description} />}
           {category.slug === "arr" && <ArrInstances title={category.title} description={category.description} />}
           {category.slug === "plex" && <PlexConnections />}
-          {category.slug === "prefetch" && <PrefetchPanel />}
+          {category.slug === "prefetch" && <Navigate to="/smart-prefetch?tab=settings" replace/>}
           {category.slug === "database" && <DatabasePanel title={category.title} description={category.description} />}
           <form id="settings" onSubmit={submit}>
+            {category.slug==="native-cache"&&<Section category={category}><NativeCachePanel value={draft.native_cache} locked={locked} onChange={native_cache=>patch("native_cache",native_cache)}/></Section>}
             {category.slug === "download-client" && (
               <Section category={category}>
                 <SettingsPanel title="Connection">
@@ -1305,7 +1306,7 @@ export function Settings() {
                   limit={draft.network.download_limit_mb_per_s ?? null}
                   onLimit={(download_limit_mb_per_s) => patch("network", { download_limit_mb_per_s })}
                 />
-                <NativeCachePanel value={draft.native_cache} locked={locked} onChange={native_cache=>patch("native_cache",native_cache)} />
+
               </Section>
             )}
 

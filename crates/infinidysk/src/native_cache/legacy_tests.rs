@@ -22,7 +22,9 @@ impl Drop for Temp {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
-fn inventory(path: &Path) -> Vec<(PathBuf, Vec<u8>, u64)> {
+// Allocation counters can settle after reads; stable inode, length and hash prove reuse.
+type FileSnapshot = (PathBuf, Vec<u8>, (u64, u64, u64));
+fn inventory(path: &Path) -> Vec<FileSnapshot> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(path).unwrap() {
         let entry = entry.unwrap();
@@ -32,7 +34,10 @@ fn inventory(path: &Path) -> Vec<(PathBuf, Vec<u8>, u64)> {
             files.push((
                 entry.path(),
                 Sha256::digest(std::fs::read(entry.path()).unwrap()).to_vec(),
-                entry.metadata().unwrap().blocks(),
+                {
+                    let metadata = entry.metadata().unwrap();
+                    (metadata.dev(), metadata.ino(), metadata.len())
+                },
             ));
         }
     }
@@ -248,7 +253,7 @@ impl Fixture {
             .with_native_cache(Some(cache)),
         )
     }
-    fn legacy_inventory(&self) -> Vec<(PathBuf, Vec<u8>, u64)> {
+    fn legacy_inventory(&self) -> Vec<FileSnapshot> {
         let mut files = inventory(&self.temp.0.join("legacy-meta"));
         for root in &self.settings.legacy.as_ref().unwrap().folders {
             files.extend(inventory(Path::new(&root.path)));
@@ -403,7 +408,7 @@ async fn playback_and_warming_reuse_multiple_legacy_roots_without_copying_after_
         assert_eq!(
             f.legacy_inventory(),
             before,
-            "legacy contents and allocation stay unchanged"
+            "legacy file identity, length and content stay unchanged"
         );
         drop(warming);
         drop(vfs);

@@ -96,11 +96,16 @@ pub struct Admin {
         crate::native_cache::action,
         crate::native_cache::coverage,
         crate::native_cache::import_legacy,
+        crate::native_cache::legacy_inventory,
+        crate::native_cache::legacy_diagnostics,
+        crate::native_cache::legacy_probe,
+        crate::native_cache::legacy_action,
+        crate::native_cache::legacy_coverage,
         crate::predictions::status,crate::predictions::refresh,
         crate::prefetch::status,crate::prefetch::enqueue,crate::prefetch::pause,crate::prefetch::control,
         crate::plex::start, crate::plex::poll, crate::plex::cancel,
         crate::plex::discover, crate::plex::select, crate::plex::home,
-        crate::plex::switch_home, crate::plex::libraries,
+        crate::plex::switch_home, crate::plex::libraries, crate::plex::browse, crate::plex::source_catalogue, crate::plex::source_preview,
         get_settings,
         put_settings,
         get_key,
@@ -279,10 +284,38 @@ pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
         )
         .route("/api/v1/plex/servers", post(crate::plex::select))
         .route(
+            "/api/v1/plex/servers/{id}/sources",
+            get(crate::plex::source_catalogue),
+        )
+        .route(
+            "/api/v1/plex/sources/preview",
+            post(crate::plex::source_preview),
+        )
+        .route(
             "/api/v1/plex/servers/{id}/libraries",
             get(crate::plex::libraries),
         )
+        .route(
+            "/api/v1/plex/servers/{id}/libraries/{library}/media",
+            get(crate::plex::browse),
+        )
         .route("/api/v1/native-cache", get(crate::native_cache::status))
+        .route(
+            "/api/v1/native-cache/legacy/probe",
+            post(crate::native_cache::legacy_probe),
+        )
+        .route(
+            "/api/v1/native-cache/legacy/diagnostics",
+            get(crate::native_cache::legacy_diagnostics),
+        )
+        .route(
+            "/api/v1/native-cache/legacy",
+            get(crate::native_cache::legacy_inventory).post(crate::native_cache::legacy_action),
+        )
+        .route(
+            "/api/v1/native-cache/legacy/coverage",
+            post(crate::native_cache::legacy_coverage),
+        )
         .route(
             "/api/v1/native-cache/recovery",
             get(crate::native_cache::recovery_candidates).post(crate::native_cache::recover),

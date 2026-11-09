@@ -1,0 +1,411 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" /><title>Generated fork UI fixtures</title
+  ><meta name="viewport" content="width=device-width, initial-scale=1" />
+  <div class="border-b p-2 text-xs">
+    Generated fixture data. No production services or media.
+  </div>
+  <div id="root" class="mx-auto max-w-6xl p-4"></div>
+  <script type="module">
+    import React from "react";
+    import { createRoot } from "react-dom/client";
+    import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+    import { createMemoryRouter, RouterProvider } from "react-router";
+    import { TooltipProvider } from "/src/components/ui/tooltip.tsx";
+    import { Toaster } from "/src/components/ui/sonner.tsx";
+    import "/src/index.css";
+    if (matchMedia("(prefers-color-scheme: dark)").matches)
+      document.documentElement.classList.add("dark");
+    const id = "10000000-0000-0000-0000-000000000001";
+    const other = "10000000-0000-0000-0000-000000000002";
+    const policy = {
+      confidence_percent: 50,
+      excluded_shows: [],
+      full_file: true,
+      head_bytes: 16000000,
+      tail_bytes: 8000000,
+      lookback_days: 7,
+      partial_movie_lookback_days: 7,
+      min_distinct_episodes: 2,
+      minimum_warm: false,
+      movies: true,
+      television: true,
+      restrict_viewers: false,
+      viewers: [],
+    };
+    const folders = Array.from({ length: 4 }, (_, i) => ({
+      id: `fixture-folder-${i + 1}`,
+      path: `/fixture/cache${i + 1}`,
+      files: 2,
+      cached_bytes: 4000000,
+      allocated_bytes: 4200000,
+      pending_bytes: 0,
+      retired_bytes: 0,
+      held_files: i === 1 ? 1 : 0,
+      writable: true,
+      eviction_enabled: false,
+      quota_bytes: 100000000000,
+      min_free_bytes: 1000000000,
+    }));
+    const entries = [
+      {
+        key: "a".repeat(64),
+        item: id,
+        name: "Fixture cached file",
+        source_present: true,
+        folder: folders[0].id,
+        size: 8000000,
+        cached_bytes: 4000000,
+        allocated_bytes: 4200000,
+        pending_bytes: 0,
+        dirty: 0,
+        pinned: 0,
+        last_used_ms: 1700000000000,
+        generation: "fixture-generation",
+        chunk: 0,
+      },
+      {
+        key: "b".repeat(64),
+        item: other,
+        name: "Fixture protected file",
+        source_present: true,
+        folder: folders[1].id,
+        size: 8000000,
+        cached_bytes: 4000000,
+        allocated_bytes: 4200000,
+        pending_bytes: 0,
+        dirty: 0,
+        pinned: 2,
+        last_used_ms: 1700000000000,
+        generation: "fixture-generation",
+        chunk: 0,
+      },
+    ];
+    const source = {
+      enabled: false,
+      server: "fixture-server",
+      viewer: "1",
+      kind: "hub",
+      path: "/hubs/fixture-unavailable",
+      limit: 50,
+      excluded_shows: [],
+    };
+    const prefetch = {
+      enabled: true,
+      connections_per_job: 2,
+      daily_fill_bytes: 100000000000,
+      daily_wire_bytes: 100000000000,
+      finish_watched: { enabled: false, percent: 10 },
+      plex: {
+        enabled: true,
+        history: true,
+        realtime: true,
+        local_files: "imported_pointers",
+        next_episodes: 2,
+        refresh_seconds: 60,
+        policy,
+        sources: [source],
+      },
+    };
+    const plex = {
+      servers: [
+        {
+          id: "fixture-server",
+          name: "Fixture Plex server",
+          url: "http://fixture.invalid",
+          token: "********",
+          enabled: true,
+          account_id: "fixture-account",
+          path_mappings: [],
+        },
+      ],
+      accounts: [
+        {
+          id: "fixture-account",
+          numeric_id: "99",
+          name: "Fixture profile",
+          token: "********",
+        },
+      ],
+    };
+    const settings = {
+      prefetch,
+      plex,
+      native_cache: {
+        enabled: true,
+        folders: [],
+        legacy: {
+          metadata_path: "/fixture/metadata",
+          folders: folders.map(({ id, path }) => ({ id, path })),
+          write: { folders: [], chunk_mb: 0 },
+        },
+      },
+      providers: [{ name: "Initial fixture provider" }],
+    };
+    const job = {
+      id: other,
+      item: id,
+      revision: "fixture-revision",
+      size: 8000000,
+      ranges: [{ start: 0, end: 8000000 }],
+      priority: 50,
+      intent: other,
+      family: "manual",
+      state: "queued",
+      created_at: 1700000000000,
+      updated_at: 1700000000000,
+      expires_at: 1800000000000,
+      next_attempt: 0,
+      run: 1,
+      attempts: 0,
+      verified_bytes: 4000000,
+      source_bytes: 4000000,
+      cached_bytes: 0,
+      reason: null,
+      automatic_scope: null,
+      attribution: { playback: [], policy: null },
+    };
+    const media = {
+      rating_key: "42",
+      kind: "movie",
+      title: "Fixture Plex media",
+      show: null,
+      show_title: null,
+      season: null,
+      episode: null,
+      file: "/fixture/media",
+      view_count: 0,
+      view_offset_ms: 0,
+      duration_ms: 100000,
+      viewed_at: null,
+      user: null,
+    };
+    window.__mock = {
+      settings,
+      calls: [],
+      external: false,
+      catalogueError: false,
+    };
+    const original = window.fetch;
+    window.fetch = async (input, init) => {
+      const request =
+          input instanceof Request ? input : new Request(input, init),
+        url = new URL(request.url),
+        path = url.pathname,
+        method = request.method;
+      if (!path.startsWith("/api")) return original(input, init);
+      const data =
+        method === "GET" ? null : await request.json().catch(() => null);
+      window.__mock.calls.push({ path, method, data });
+      const respond = (data) => Response.json(data);
+      if (path === "/api/v1/settings") {
+        if (method === "PUT") {
+          window.__mock.settings = data;
+          return respond({ settings: data, locked: [], restart_required: [] });
+        }
+        const fresh = structuredClone(window.__mock.settings);
+        if (window.__mock.external) {
+          fresh.providers = [{ name: "External fixture provider" }];
+          fresh.prefetch.connections_per_job = 3;
+        }
+        return respond({ settings: fresh, locked: [], restart_required: [] });
+      }
+      if (path === "/api/v1/plex/servers/fixture-server/libraries")
+        return respond([{ id: "7", title: "Fixture Movies", kind: "movie" }]);
+      if (path === "/api/v1/plex/servers/fixture-server/sources") {
+        if (window.__mock.catalogueError)
+          return Response.json(
+            { error: "Fixture catalogue unavailable" },
+            { status: 503 },
+          );
+        return respond([
+          {
+            title: "Fixture hub",
+            kind: "hub",
+            path: "/hubs/fixture",
+            library: null,
+            media_kind: "movie",
+          },
+          {
+            title: "Fixture collection",
+            kind: "collection",
+            path: "/library/metadata/44/children",
+            library: "7",
+            media_kind: "movie",
+          },
+        ]);
+      }
+      if (path === "/api/v1/plex/sources/preview") return respond([media]);
+      if (path === "/api/v1/plex/servers/fixture-server/libraries/7/media")
+        return respond({
+          files: [{ media, item: id, size: 8000000 }],
+          next: null,
+          total: 1,
+        });
+      if (path === "/api/v1/native-cache")
+        return respond({
+          configured: true,
+          available: true,
+          recovery_mode: false,
+          reason: null,
+          stats: {
+            files: 0,
+            bytes: 0,
+            hits: 12,
+            legacy_hits: 12,
+            legacy_written_bytes: 4000000,
+          },
+        });
+      if (path === "/api/v1/native-cache/legacy") {
+        if (method === "POST") {
+          const entry = entries.find((e) => e.key === data.entry.key);
+          if (data.operation === "pin" && entry?.pinned === 0) entry.pinned = 1;
+          else if (data.operation === "unpin" && entry?.pinned === 1)
+            entry.pinned = 0;
+          else return respond(false);
+          return respond(true);
+        }
+        const search = url.searchParams.get("search") ?? "",
+          folder = url.searchParams.get("folder");
+        return respond({
+          folders,
+          entries: entries.filter(
+            (e) =>
+              (!folder || e.folder === folder) &&
+              e.name.toLowerCase().includes(search.toLowerCase()),
+          ),
+          next: null,
+          writable: true,
+          recency_pending: 0,
+          recency_dropped: 0,
+        });
+      }
+      if (path === "/api/v1/native-cache/legacy/coverage")
+        return respond([{ start: 0, end: 4000000 }]);
+      if (path === "/api/v1/native-cache/legacy/probe") return respond(4000000);
+      if (path === "/api/v1/native-cache/legacy/diagnostics")
+        return respond(
+          folders.map((f) => ({
+            id: f.id,
+            identity_ok: true,
+            free_bytes: 90000000000,
+            read_only: false,
+            write_permitted: true,
+          })),
+        );
+      if (path === "/api/v1/native-cache/evictions") return respond([]);
+      if (path === `/api/v1/files/${id}`)
+        return respond({
+          cache_available: true,
+          cached_ranges: [{ start: 0, end: 4000000 }],
+          cache_warning: null,
+        });
+      if (path === "/api/v1/prefetch")
+        return method === "POST"
+          ? respond(job)
+          : respond({
+              paused: false,
+              recovery_mode: false,
+              pending_backfills: 0,
+              dropped_backfills: 0,
+              rates: [],
+              recent_wire_bytes_per_second: 0,
+              day: 1,
+              charged_fill_bytes: 4000000,
+              received_wire_bytes: 4100000,
+              reserved_wire_bytes: 4200000,
+              wire_day: 1,
+              wire_blocked: false,
+              jobs: [job],
+              history: [],
+              history_available: true,
+              state_available: true,
+              names: { [id]: "Fixture warming file" },
+              followup: {
+                updated_at: 1,
+                refreshing: false,
+                stale: false,
+                available: true,
+                entries: [],
+                error: null,
+              },
+            });
+      if (path === "/api/v1/prefetch/predictions")
+        return respond({
+          predictions: [
+            {
+              id,
+              server: "fixture-server",
+              viewer: "1",
+              rating_key: "42",
+              title: "Fixture prediction",
+              source: "next_episode",
+              item: id,
+              revision: "fixture-revision",
+              size: 8000000,
+              ranges: [{ start: 0, end: 4000000 }],
+              warning: null,
+              playback: [],
+            },
+          ],
+          updated_at: 1700000000000,
+          refreshing: false,
+          stale: false,
+          error: null,
+          warning: null,
+        });
+      if (path === "/api/v1/prefetch/pause") return respond(null);
+      if (path === "/api/v1/queue" || path === "/api/v1/health/summary")
+        return respond([]);
+      if (path === "/api/v1/arr/status")
+        return respond({ instances: [], categories: [] });
+      throw Error(`Unexpected fixture request ${method} ${path}`);
+    };
+    const [{ SmartPrefetch }, { CachePage }, { PlexLibrary }, { Nav }] =
+      await Promise.all([
+        import("/src/pages/smart-prefetch.tsx"),
+        import("/src/pages/cache-page.tsx"),
+        import("/src/pages/plex-library.tsx"),
+        import("/src/layout.tsx"),
+      ]);
+    const screen =
+      new URL(location.href).searchParams.get("screen") ?? "settings";
+    const component =
+      screen === "cache"
+        ? CachePage
+        : screen === "plex"
+          ? PlexLibrary
+          : screen === "nav"
+            ? Nav
+            : SmartPrefetch;
+    const router = createMemoryRouter(
+      [{ path: "*", element: React.createElement(component) }],
+      {
+        initialEntries: [
+          screen === "settings"
+            ? "/smart-prefetch?tab=settings"
+            : screen === "activity"
+              ? "/smart-prefetch"
+              : "/",
+        ],
+      },
+    );
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false, refetchOnWindowFocus: false },
+      },
+    });
+    createRoot(document.getElementById("root")).render(
+      React.createElement(
+        QueryClientProvider,
+        { client },
+        React.createElement(
+          TooltipProvider,
+          null,
+          React.createElement(RouterProvider, { router }),
+          React.createElement(Toaster),
+        ),
+      ),
+    );
+  </script>
+</html>

@@ -14,3 +14,7 @@ db.sqlite-wal
 
 # The Rust skill is private and installed per user; never vendor it here.
 /.agents/skills/rust-skills/
+
+# Browser regression artifacts.
+/ui/test-results/
+/ui/playwright-report/

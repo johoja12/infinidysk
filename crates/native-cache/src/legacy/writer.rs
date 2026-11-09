@@ -137,6 +137,10 @@ pub struct Writer {
     fault: Option<Fault>,
 }
 impl Writer {
+    pub fn settings(&self) -> &WriteSettings {
+        &self.settings
+    }
+
     pub fn new(legacy: Arc<Legacy>, mut settings: WriteSettings) -> Result<Arc<Self>, Error> {
         settings.validate(
             &legacy

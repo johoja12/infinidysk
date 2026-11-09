@@ -237,6 +237,23 @@ pub struct Media {
     pub viewed_at: Option<i64>,
     pub user: Option<String>,
 }
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[schema(as=PlexMediaPage)]
+pub struct MediaPage {
+    pub items: Vec<Media>,
+    pub offset: u32,
+    pub total: Option<u32>,
+    pub next: Option<u32>,
+}
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[schema(as=PlexCatalogueSource)]
+pub struct CatalogueSource {
+    pub title: String,
+    pub kind: sources::Kind,
+    pub path: String,
+    pub library: Option<String>,
+    pub media_kind: String,
+}
 /// Every explicit Part path for a metadata identity, including multiple versions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogueMedia {

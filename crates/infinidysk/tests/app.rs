@@ -18,6 +18,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 
+// These proof endpoints intentionally share one process-wide offline mapper.
+// Parallel fixtures must not interpret each other's valid admission hold as a failure.
+static OFFLINE_PROOF_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const NZB: &str = r#"<?xml version="1.0"?><nzb><file poster="p" date="0" subject="a.mkv"><groups><group>a.b</group></groups><segments><segment bytes="100" number="1">a@b</segment></segments></file></nzb>"#;
 
 /// Sends one raw HTTP/1.1 request; returns the status line and body.
@@ -1347,6 +1351,7 @@ async fn legacy_member_proof_is_source_bound_and_never_claims_payload_validation
     use infinidysk_core::{BlobId, FileMeta, NzbFile, Segment, Segments, blob};
     use infinidysk_db::{HealthState, HealthStatus};
     use sha2::{Digest as _, Sha256};
+    let _proof_lane = OFFLINE_PROOF_TEST.lock().await;
     let (addr, cancel, server, url) = start().await;
     assert_eq!(
         status(addr, &admin_request("GET", "/api/v1/status", "")).await,
@@ -1507,6 +1512,7 @@ async fn reimport_proof_binds_exact_offline_member_to_completed_accepted_job() {
     use infinidysk_core::{BlobId, FileMeta, NzbFile, Segment, Segments, blob};
     use infinidysk_db::HealthState;
     use sqlx::{ConnectOptions as _, Connection as _};
+    let _proof_lane = OFFLINE_PROOF_TEST.lock().await;
     let (addr, cancel, server, url) = start().await;
     assert_eq!(
         status(addr, &admin_request("GET", "/api/v1/status", "")).await,

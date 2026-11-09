@@ -903,3 +903,179 @@ mod tests {
         assert_eq!(store.settings().plex.accounts[0].id, "parent");
     }
 }
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in=Query)]
+pub struct Browse {
+    pub offset: Option<u32>,
+    pub search: Option<String>,
+    pub parent: Option<String>,
+}
+#[derive(Serialize, ToSchema)]
+#[schema(as=PlexLibraryFile)]
+pub struct LibraryFile {
+    pub media: infinidysk_plex::Media,
+    pub item: Option<Uuid>,
+    pub size: Option<u64>,
+}
+#[derive(Serialize, ToSchema)]
+#[schema(as=PlexLibraryPage)]
+pub struct LibraryPage {
+    pub files: Vec<LibraryFile>,
+    pub next: Option<u32>,
+    pub total: Option<u32>,
+}
+#[utoipa::path(get,operation_id="plex_library_browse",path="/api/v1/plex/servers/{id}/libraries/{library}/media",params(("id"=String,Path),("library"=String,Path),Browse),responses((status=200,body=LibraryPage)))]
+pub async fn browse(
+    State(admin): State<Arc<Admin>>,
+    Path((id, library)): Path<(String, String)>,
+    axum::extract::Query(q): axum::extract::Query<Browse>,
+) -> Result<Json<LibraryPage>, Fail> {
+    let server = admin
+        .config
+        .read()
+        .await
+        .settings()
+        .plex
+        .servers
+        .iter()
+        .find(|s| s.id == id && s.enabled)
+        .cloned()
+        .ok_or(Fail::NotFound)?;
+    admin.plex.client.test_server(&server).await.map_err(fail)?;
+    let library = admin
+        .plex
+        .client
+        .libraries(&server)
+        .await
+        .map_err(fail)?
+        .into_iter()
+        .find(|l| l.id == library)
+        .ok_or(Fail::NotFound)?;
+    let page = admin
+        .plex
+        .client
+        .browse_media(
+            &server,
+            &library,
+            q.parent.as_deref(),
+            q.search.as_deref().unwrap_or(""),
+            q.offset.unwrap_or(0),
+        )
+        .await
+        .map_err(fail)?;
+    let mut files = Vec::new();
+    for media in page.items {
+        let item = match media
+            .file
+            .as_deref()
+            .and_then(|f| infinidysk_plex::map_path(f, &server.path_mappings))
+        {
+            Some(infinidysk_plex::MappedPath::Dav(path)) => {
+                match admin.vfs.lookup(&path).await.map_err(|_| Fail::Internal)? {
+                    Some(infinidysk_vfs::Node::Item(i) | infinidysk_vfs::Node::IdFile(i)) => {
+                        Some(i)
+                    }
+                    _ => None,
+                }
+            }
+            Some(infinidysk_plex::MappedPath::Local(path)) => {
+                match admin.library.prediction_pointer(path).await.map_err(|()| {
+                    Fail::Unavailable("Mapped library pointer could not be read".into())
+                })? {
+                    Some(id) => admin.vfs.db().item(id).await?,
+                    None => None,
+                }
+            }
+            None => None,
+        }
+        .filter(|i| i.health_state != infinidysk_db::HealthState::Hidden);
+        files.push(LibraryFile {
+            media,
+            item: item.as_ref().map(|i| i.id.0),
+            size: item.and_then(|i| i.size),
+        });
+    }
+    Ok(Json(LibraryPage {
+        files,
+        next: page.next,
+        total: page.total,
+    }))
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in=Query)]
+pub struct SourceBrowse {
+    pub viewer: String,
+    pub library: Option<String>,
+}
+#[utoipa::path(get,operation_id="plex_source_catalogue",path="/api/v1/plex/servers/{id}/sources",params(("id"=String,Path),SourceBrowse),responses((status=200,body=Vec<infinidysk_plex::CatalogueSource>)))]
+pub async fn source_catalogue(
+    State(admin): State<Arc<Admin>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<SourceBrowse>,
+) -> Result<Json<Vec<infinidysk_plex::CatalogueSource>>, Fail> {
+    let settings = admin.config.read().await.settings().plex.clone();
+    let server = settings
+        .servers
+        .iter()
+        .find(|s| s.id == id && s.enabled)
+        .ok_or(Fail::NotFound)?;
+    let viewer = admin
+        .plex
+        .client
+        .viewer(server, &q.viewer, &settings.accounts)
+        .await
+        .map_err(fail)?;
+    let library = if let Some(id) = q.library {
+        Some(
+            admin
+                .plex
+                .client
+                .libraries(server)
+                .await
+                .map_err(fail)?
+                .into_iter()
+                .find(|l| l.id == id)
+                .ok_or(Fail::NotFound)?,
+        )
+    } else {
+        None
+    };
+    Ok(Json(
+        admin
+            .plex
+            .client
+            .source_catalogue(&viewer, library.as_ref())
+            .await
+            .map_err(fail)?,
+    ))
+}
+#[utoipa::path(post,operation_id="plex_source_preview",path="/api/v1/plex/sources/preview",request_body=infinidysk_plex::sources::Source,responses((status=200,body=Vec<infinidysk_plex::Media>)))]
+pub async fn source_preview(
+    State(admin): State<Arc<Admin>>,
+    Json(mut source): Json<infinidysk_plex::sources::Source>,
+) -> Result<Json<Vec<infinidysk_plex::Media>>, Fail> {
+    source.limit = source.limit.min(50);
+    source.enabled = true;
+    let settings = admin.config.read().await.settings().plex.clone();
+    let server = settings
+        .servers
+        .iter()
+        .find(|s| s.id == source.server && s.enabled)
+        .ok_or(Fail::NotFound)?;
+    let viewer = admin
+        .plex
+        .client
+        .viewer(server, &source.viewer, &settings.accounts)
+        .await
+        .map_err(fail)?;
+    Ok(Json(
+        admin
+            .plex
+            .client
+            .prefetch_source(&viewer, &source)
+            .await
+            .map_err(fail)?,
+    ))
+}
