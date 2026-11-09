@@ -41,6 +41,8 @@ use crate::quota::Quotas;
 use crate::sab::{self, Sab};
 use crate::ui;
 
+mod warming;
+
 const MB: u64 = 1_000_000;
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(30);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -943,16 +945,14 @@ async fn serve_inner(
         let config = Arc::clone(&config);
         let stop = cancel.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! { ()=stop.cancelled()=>break, _=interval.tick()=>{} }
-                let snapshot = if prefetch.pending_backfills() > 0 {
-                    Some(predictions.snapshot().await)
-                } else {
-                    None
-                };
-                let settings = {
+            warming::run(
+                &stop,
+                || async {
+                    let snapshot = if prefetch.pending_backfills() > 0 {
+                        Some(predictions.snapshot().await)
+                    } else {
+                        None
+                    };
                     let config = config.read().await;
                     if let Err(error) = prefetch
                         .reconcile_automatic(
@@ -962,7 +962,7 @@ async fn serve_inner(
                         .await
                     {
                         warn!(reason=%error,"automatic warming cleanup deferred");
-                        continue;
+                        return false;
                     }
                     let contexts = snapshot
                         .as_ref()
@@ -977,13 +977,16 @@ async fn serve_inner(
                     if let Err(error) = prefetch.observe_reads(&config.settings().prefetch).await {
                         warn!(reason=%error,"finish-watched admission deferred");
                     }
-                    config.settings().prefetch.clone()
-                };
-                tokio::select! {
-                    ()=stop.cancelled()=>break,
-                    result=prefetch.tick(&settings)=>if let Err(error)=result {warn!(reason=%error,"warming step deferred");}
-                }
-            }
+                    drop(config);
+                    true
+                },
+                || async {
+                    // Refresh between blocks, and release the config lock before I/O.
+                    let settings = config.read().await.settings().prefetch.clone();
+                    prefetch.tick(&settings).await
+                },
+            )
+            .await;
         })
     };
     let database = crate::database::Migrator::new(
