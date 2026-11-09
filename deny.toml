@@ -41,3 +41,6 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+# Pinned SQLx upstream revision permits patched libsqlite3-sys 0.39.x.
+allow-git = ["https://github.com/launchbadge/sqlx"]
