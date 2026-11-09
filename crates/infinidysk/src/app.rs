@@ -977,6 +977,7 @@ async fn serve_inner(
                     if let Err(error) = prefetch.observe_reads(&config.settings().prefetch).await {
                         warn!(reason=%error,"finish-watched admission deferred");
                     }
+                    drop(config);
                     true
                 },
                 || async {
