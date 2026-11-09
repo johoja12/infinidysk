@@ -43,6 +43,15 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
+      - name: Resolve the test temporary directory
+        # macOS may expose TMPDIR through /var, a symlink to /private/var.
+        # Cache fixtures require canonical paths, just like configured cache roots.
+        run: |
+          python3 - <<'PYTHON'
+          import os, tempfile
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
+              env.write("TMPDIR=" + os.path.realpath(tempfile.gettempdir()) + "\n")
+          PYTHON
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked

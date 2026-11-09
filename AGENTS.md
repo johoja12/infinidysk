@@ -67,6 +67,7 @@ Project rules (these override rust-skills where they differ):
 - Release profile: `lto = "fat"`, `codegen-units = 1`, panic **unwind** (never `abort`; the streaming invariants need catchable callback panics).
 - Clippy: `pedantic` baseline minus noisy lints plus selected nursery lints, all set in the root `Cargo.toml`. Prefer fixing over `#[allow]`; any `#[allow]` needs a one-line reason.
 - Edition 2024, toolchain pinned in `rust-toolchain.toml`. Before committing: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`. CI also runs `cargo-deny` (`deny.toml` license allowlist + advisories) and native glibc release builds on Ubuntu 26.04 x64/arm64.
+- On macOS, resolve `TMPDIR` to its real path before testing; `/var` may alias `/private/var`. Cache fixtures require canonical paths. CI resolves this before running the workspace suite.
 - Product version lives in `version.txt` (owned by release-please); crate versions stay `0.0.0`.
 - Mark deliberate corner-cutting with a `ponytail:` comment naming the ceiling and the upgrade path.
 - `unsafe` only in FFI crates (e.g. yEnc), which opt in with `#![allow(unsafe_code)]`; every block needs a `// SAFETY:` comment (enforced by clippy).
