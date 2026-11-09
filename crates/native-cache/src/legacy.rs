@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use bytes::Bytes;
 use nix::fcntl::{Flock, FlockArg, OFlag, openat};
-use nix::sys::stat::{Mode, major, minor};
+use nix::sys::stat::Mode;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -350,8 +350,7 @@ impl Legacy {
             .ok_or(Error::Invalid(
                 "compatible catalogue requires an absolute local path",
             ))?;
-        let kind = nix::sys::statfs::statfs(directory)?.filesystem_type().0;
-        if matches!(kind, 0x6969 | 0xFF53_4D42 | 0x517B) {
+        if crate::filesystem::remote(directory)? {
             return Err(Error::Invalid(
                 "compatible cache catalogue must remain on local storage",
             ));
@@ -426,8 +425,8 @@ impl Legacy {
                     .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
                     .open(&path)?;
                 let stat = file.metadata()?;
-                let registration =
-                    format!("{}:{}:{}", major(stat.dev()), minor(stat.dev()), stat.ino());
+                let (major, minor) = crate::filesystem::device_parts(stat.dev());
+                let registration = format!("{major}:{minor}:{}", stat.ino());
                 if identity.as_deref() != Some(registration.as_str())
                     || Uuid::parse_str(&volume).is_err()
                     || volume.len() != 32

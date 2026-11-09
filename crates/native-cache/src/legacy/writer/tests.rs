@@ -18,7 +18,10 @@ impl Fixture {
         Self::with_payload_base(None).await
     }
     async fn with_payload_base(nas: Option<&Path>) -> Self {
-        let path = std::env::temp_dir().join(format!("id-compatible-cache-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("id-compatible-cache-{}", Uuid::new_v4()));
         std::fs::create_dir_all(path.join("meta")).unwrap();
         std::fs::write(
             path.join("fixture-owner"),
@@ -60,8 +63,8 @@ impl Fixture {
                 .bind(volume)
                 .bind(format!(
                     "{}:{}:{}",
-                    nix::sys::stat::major(stat.dev()),
-                    nix::sys::stat::minor(stat.dev()),
+                    crate::filesystem::device_parts(stat.dev()).0,
+                    crate::filesystem::device_parts(stat.dev()).1,
                     stat.ino()
                 ))
                 .execute(&db)
@@ -116,10 +119,7 @@ async fn export_nas_write_readback_fixtures() {
             std::fs::read(root.join("fixture-owner")).unwrap(),
             b"generated-native-cache-write-tests"
         );
-        assert_eq!(
-            nix::sys::statfs::statfs(&root).unwrap().filesystem_type().0,
-            0x6969
-        );
+        assert!(crate::filesystem::remote(&root).unwrap());
         for chunk in [0, 8] {
             let f = std::mem::ManuallyDrop::new(Fixture::with_payload_base(Some(&root)).await);
             let writer = f.open(chunk).await;

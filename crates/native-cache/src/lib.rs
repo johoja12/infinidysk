@@ -1,6 +1,7 @@
 //! Final-media bytes, below delivery: checksummed blocks in bounded chunk files.
 //! The catalogue stays on local storage; browsing never scans payload volumes.
 mod diagnostics;
+mod filesystem;
 mod manifest;
 mod recency;
 pub use manifest::{
@@ -364,8 +365,7 @@ impl Cache {
         }
         tokio::fs::create_dir_all(&settings.metadata_path).await?;
         let metadata = std::fs::canonicalize(&settings.metadata_path)?;
-        let kind = nix::sys::statfs::statfs(&metadata)?.filesystem_type().0;
-        if matches!(kind, 0x6969 | 0xFF53_4D42 | 0x517B) {
+        if crate::filesystem::remote(&metadata)? {
             return Err(Error::Invalid(
                 "native cache catalogue must be on local storage",
             ));
@@ -861,7 +861,7 @@ impl Cache {
                 .bind(folder.settings.id.to_string()).fetch_one(&self.db).await?;
             let free = nix::sys::statvfs::fstatvfs(&folder.root)
                 .ok()
-                .map(|s| s.blocks_available().saturating_mul(s.fragment_size()));
+                .map(|s| crate::filesystem::bytes(s.blocks_available(), s.fragment_size()));
             let high = folder.settings.quota_bytes / 100 * u64::from(folder.settings.high_percent);
             if used.cast_unsigned().saturating_add(additional) > high
                 || free.is_none_or(|free| {

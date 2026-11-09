@@ -328,7 +328,10 @@ impl Writer {
                         "compatible write folder is mounted read-only",
                     ));
                 }
-                Ok::<_, Error>(stat.blocks_available().saturating_mul(stat.fragment_size()))
+                Ok::<_, Error>(crate::filesystem::bytes(
+                    stat.blocks_available(),
+                    stat.fragment_size(),
+                ))
             });
             if let Ok(Ok(Ok(bytes))) =
                 tokio::time::timeout(std::time::Duration::from_secs(1), job).await

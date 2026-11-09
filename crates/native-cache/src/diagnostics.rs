@@ -125,7 +125,7 @@ impl Cache {
                 }
                 let free = nix::sys::statvfs::fstatvfs(&folder_job.root)
                     .ok()
-                    .map(|fs| fs.blocks_available().saturating_mul(fs.fragment_size()));
+                    .map(|fs| crate::filesystem::bytes(fs.blocks_available(), fs.fragment_size()));
                 (Some(true), free)
             });
             let (identity_ok, free_bytes) = match tokio::time::timeout(self.deadline(), job).await {

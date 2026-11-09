@@ -257,7 +257,7 @@ impl Writer {
             let _permit = permit;
             root.validate()?;
             let stat = nix::sys::statvfs::fstatvfs(&root.file)?;
-            if reserve > stat.blocks().saturating_mul(stat.fragment_size()) {
+            if reserve > crate::filesystem::bytes(stat.blocks(), stat.fragment_size()) {
                 return Err(Error::Invalid(
                     "cache free-space reserve exceeds filesystem capacity; eviction held",
                 ));
@@ -265,9 +265,10 @@ impl Writer {
             if stat.flags().contains(nix::sys::statvfs::FsFlags::ST_RDONLY) {
                 return Ok(None);
             }
-            Ok(Some(
-                stat.blocks_available().saturating_mul(stat.fragment_size()),
-            ))
+            Ok(Some(crate::filesystem::bytes(
+                stat.blocks_available(),
+                stat.fragment_size(),
+            )))
         })
         .await
         .map_err(|_| Error::Invalid("compatible eviction capacity probe failed"))?

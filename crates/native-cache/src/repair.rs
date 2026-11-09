@@ -208,8 +208,7 @@ impl Store {
             .mode(0o700)
             .create(path)?;
         let path = std::fs::canonicalize(path)?;
-        let kind = nix::sys::statfs::statfs(&path)?.filesystem_type().0;
-        if matches!(kind, 0x6969 | 0xFF53_4D42 | 0x517B) {
+        if crate::filesystem::remote(&path)? {
             return Err(Error::Invalid("repair ledger must use local storage"));
         }
         let dir = OpenOptions::new()

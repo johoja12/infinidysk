@@ -34,7 +34,10 @@ impl Drop for Fixture {
 }
 impl Fixture {
     async fn new(chunk: i64) -> Self {
-        let root = std::env::temp_dir().join(format!("id-v1-cache-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("id-v1-cache-{}", Uuid::new_v4()));
         let source = root.join("legacy");
         std::fs::create_dir_all(&source).unwrap();
         let item = Uuid::new_v4();
@@ -81,8 +84,8 @@ impl Fixture {
             .bind("11111111111111111111111111111111")
             .bind(format!(
                 "{}:{}:{}",
-                nix::sys::stat::major(stat.dev()),
-                nix::sys::stat::minor(stat.dev()),
+                device_parts(stat.dev()).0,
+                device_parts(stat.dev()).1,
                 stat.ino()
             ))
             .execute(&db)
@@ -502,5 +505,17 @@ async fn real_csharp_writer_payloads_are_reused_and_partial_coverage_stays_parti
                 receipt["sha256"].as_str().unwrap()
             );
         }
+    }
+}
+
+// Construct native device registration independently of the reader under test.
+fn device_parts(device: u64) -> (u64, u64) {
+    #[cfg(target_os = "macos")]
+    {
+        ((device >> 24) & 0xff, device & 0x00ff_ffff)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (nix::sys::stat::major(device), nix::sys::stat::minor(device))
     }
 }

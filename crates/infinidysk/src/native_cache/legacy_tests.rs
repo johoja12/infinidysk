@@ -48,7 +48,10 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(provenance: bool) -> Self {
-        let path = std::env::temp_dir().join(format!("id-in-place-{}", Uuid::new_v4()));
+        let path = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("id-in-place-{}", Uuid::new_v4()));
         std::fs::create_dir_all(path.join("legacy-meta")).unwrap();
         let temp = Temp(path);
         let db = Db::connect(&format!("sqlite:{}", temp.0.join("main.sqlite").display()))
@@ -95,8 +98,8 @@ impl Fixture {
                 .bind(volume)
                 .bind(format!(
                     "{}:{}:{}",
-                    nix::sys::stat::major(stat.dev()),
-                    nix::sys::stat::minor(stat.dev()),
+                    device_parts(stat.dev()).0,
+                    device_parts(stat.dev()).1,
                     stat.ino()
                 ))
                 .execute(&catalogue)
@@ -902,7 +905,10 @@ async fn actual_csharp_payloads_serve_in_place_after_import_without_providers() 
     let receipt = std::env::var("INFINIDYSK_LEGACY_CACHE_FIXTURE").unwrap();
     let rows: Vec<serde_json::Value> =
         serde_json::from_slice(&std::fs::read(receipt).unwrap()).unwrap();
-    let path = std::env::temp_dir().join(format!("id-real-in-place-{}", Uuid::new_v4()));
+    let path = std::env::temp_dir()
+        .canonicalize()
+        .unwrap()
+        .join(format!("id-real-in-place-{}", Uuid::new_v4()));
     std::fs::create_dir_all(path.join("source")).unwrap();
     let temp = Temp(path);
     let source = temp.0.join("source");
@@ -1084,5 +1090,17 @@ async fn actual_csharp_payloads_serve_in_place_after_import_without_providers() 
             before,
             "C# cache and metadata must remain byte-identical"
         );
+    }
+}
+
+// Construct native device registration independently of the reader under test.
+fn device_parts(device: u64) -> (u64, u64) {
+    #[cfg(target_os = "macos")]
+    {
+        ((device >> 24) & 0xff, device & 0x00ff_ffff)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (nix::sys::stat::major(device), nix::sys::stat::minor(device))
     }
 }
