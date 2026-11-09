@@ -59,7 +59,7 @@ infinidysk-par2.workspace = true
 infinidysk-plex = { workspace = true, features = ["test-support"] }
 http-body-util.workspace = true
 infinidysk-testkit.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "rt"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "test-util"] }
 tower.workspace = true
 
 [lints]
