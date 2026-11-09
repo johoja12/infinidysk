@@ -449,10 +449,8 @@ async fn lost_recency_holds_eviction_and_free_space_pressure_still_respects_pins
     assert!(maintain(&writer, &cache).await.is_err());
     assert_eq!(counts(&writer, &cache).await, (2, 0, 0));
     let capacity = nix::sys::statvfs::statvfs(f.path.as_path()).unwrap();
-    Arc::get_mut(&mut writer).unwrap().settings.folders[0].min_free_bytes = capacity
-        .blocks()
-        .saturating_mul(capacity.fragment_size())
-        .saturating_sub(1);
+    Arc::get_mut(&mut writer).unwrap().settings.folders[0].min_free_bytes =
+        crate::filesystem::bytes(capacity.blocks(), capacity.fragment_size()).saturating_sub(1);
     maintain(&writer, &cache).await.unwrap();
     assert!(
         writer
