@@ -208,6 +208,32 @@ test("warming filters, grouped history and current coverage match v1 workflows",
 }, info) => {
   await page.goto(fixture("activity"));
   await expect(page.getByRole("article")).toHaveCount(20);
+  if (!info.project.name.startsWith("360")) {
+    const header = await page
+      .getByText("Progress", { exact: true })
+      .boundingBox();
+    const row = await page
+      .getByRole("progressbar", {
+        name: "Attempt progress Fixture warming file",
+        exact: true,
+      })
+      .boundingBox();
+    expect(header && row && Math.abs(header.x - row.x)).toBeLessThan(2);
+    const statusHeader = await page
+      .getByText("Status", { exact: true })
+      .boundingBox();
+    const statusCell = await page
+      .getByRole("article", {
+        name: "Warming file Fixture warming file",
+        exact: true,
+      })
+      .getByText("Queued", { exact: true })
+      .boundingBox();
+    expect(
+      statusHeader && statusCell && Math.abs(statusHeader.x - statusCell.x),
+    ).toBeLessThan(2);
+  }
+
   await page.screenshot({
     path: `test-results/activity-overview-${info.project.name}.png`,
     fullPage: true,
