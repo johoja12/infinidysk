@@ -557,7 +557,7 @@ export function PrefetchActivity() {
           </div>
         )}
         <div className="overflow-hidden rounded-lg border bg-card">
-          <div className="grid grid-cols-[minmax(0,1fr)_minmax(10rem,1fr)] gap-4 border-b px-4 py-2 text-xs font-medium text-muted-foreground sm:grid-cols-[minmax(0,3fr)_7rem_minmax(8rem,1fr)_auto]">
+          <div className="hidden gap-4 border-b px-4 py-2 text-xs font-medium text-muted-foreground sm:grid sm:grid-cols-[minmax(0,3fr)_7rem_minmax(10rem,1fr)_8.5rem]">
             <span>File and source</span>
             <span className="hidden sm:block">Status</span>
             <span>Progress</span>
@@ -582,7 +582,7 @@ export function PrefetchActivity() {
                   aria-label={`Warming file ${data.names[j.item] || j.item}`}
                   className="border-b last:border-0"
                 >
-                  <div className="grid min-w-0 gap-3 p-4 sm:grid-cols-[minmax(0,3fr)_7rem_minmax(8rem,1fr)_auto]">
+                  <div className="grid min-w-0 gap-4 p-4 sm:grid sm:grid-cols-[minmax(0,3fr)_7rem_minmax(10rem,1fr)_8.5rem]">
                     <div className="min-w-0">
                       <Link
                         to={`/files/${j.item}`}
