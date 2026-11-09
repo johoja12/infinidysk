@@ -1,9 +1,9 @@
+import { PredictionResults } from "./prefetch-prediction-results";
 import { PlexPrefetchSources } from "./plex-prefetch-sources";
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, body, type Schemas } from "../api/client";
 import { useSettings, useSaveSettings } from "../settings";
-import { bytes } from "../format";
 import { Failure, Field, Locked, SettingsPanel, Toggle } from "../ui";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -310,45 +310,7 @@ export function PlexPredictions({
               {snapshot.data.warning}
             </p>
           )}
-          <div className="overflow-x-auto">
-            <table className="w-full text-left text-sm">
-              <thead className="text-muted-foreground">
-                <tr>
-                  <th className="p-2">Candidate</th>
-                  <th className="p-2">Viewer</th>
-                  <th className="p-2">Warming</th>
-                </tr>
-              </thead>
-              <tbody>
-                {snapshot.data?.predictions.map((p) => (
-                  <tr key={p.id} className="border-t">
-                    <td className="p-2">
-                      <p>{p.title}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {
-                          {
-                            playback: "Playing file",
-                            next_episode: "Next episode",
-                            partial_movie: "Partially watched",
-                            hub: "Hub source",
-                            collection: "Collection source",
-                            library: "Library source",
-                          }[p.source]
-                        }
-                      </p>
-                    </td>
-                    <td className="p-2 break-all font-mono text-xs">
-                      {p.server}:{p.viewer}
-                    </td>
-                    <td className="p-2">
-                      {p.warning ||
-                        `${bytes(p.ranges.reduce((n, r) => n + r.end - r.start, 0))} eligible`}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <PredictionResults predictions={snapshot.data?.predictions ?? []} />
           {snapshot.data?.predictions.length === 0 && (
             <p className="text-sm text-muted-foreground">
               No matching candidates in the last complete refresh.

@@ -33,7 +33,11 @@ export function SmartPrefetch() {
             key={value}
             variant={section === value ? "secondary" : "ghost"}
             aria-current={section === value ? "page" : undefined}
-            onClick={() => setParams({ tab: value })}
+            onClick={() => {
+              const next = new URLSearchParams(params);
+              next.set("tab", value);
+              setParams(next);
+            }}
           >
             {label}
           </Button>

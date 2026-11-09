@@ -186,10 +186,13 @@ test("activity and predictions remain separate from settings", async ({
 }) => {
   await page.goto(fixture("activity"));
   await expect(
-    page.getByRole("cell", { name: /Fixture warming file/ }),
+    page.getByRole("article", {
+      name: "Warming file Fixture warming file",
+      exact: true,
+    }),
   ).toBeVisible();
   await expect(
-    page.getByRole("heading", { name: "Warming history" }),
+    page.getByRole("heading", { name: "Current warming" }),
   ).toBeVisible();
   await expect(
     page.getByRole("switch", { name: "Enable Smart Prefetch", exact: true }),
@@ -198,4 +201,151 @@ test("activity and predictions remain separate from settings", async ({
   await expect(
     page.getByText("Fixture prediction", { exact: true }),
   ).toBeVisible();
+});
+
+test("warming filters, grouped history and current coverage match v1 workflows", async ({
+  page,
+}, info) => {
+  await page.goto(fixture("activity"));
+  await expect(page.getByRole("article")).toHaveCount(20);
+  await page.screenshot({
+    path: `test-results/activity-overview-${info.project.name}.png`,
+    fullPage: true,
+  });
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(page.getByRole("article")).toHaveCount(6);
+  await page
+    .getByRole("searchbox", { name: "Search warming" })
+    .fill("queued file 01");
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await page
+    .getByLabel("Filter warming", { exact: true })
+    .selectOption("paused");
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await page
+    .getByRole("button", { name: "Clear filters", exact: true })
+    .click();
+  await page
+    .getByLabel("Filter warming", { exact: true })
+    .selectOption("deferred");
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await page.getByRole("tab", { name: /Warming history/ }).click();
+  await expect(page.getByRole("article")).toHaveCount(2);
+  await expect(page.getByText("2 runs", { exact: true })).toBeVisible();
+  await page
+    .getByLabel("Filter warming", { exact: true })
+    .selectOption("fully-cached");
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await expect(
+    page.getByText("Fixture fully cached file", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByLabel("Filter warming", { exact: true })
+    .selectOption("partial");
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await expect(
+    page.getByText("Fixture warming file", { exact: true }),
+  ).toBeVisible();
+  await page.getByLabel("History type").selectOption("gaps");
+  await expect(page.getByRole("article")).toHaveCount(2);
+  await page
+    .getByLabel("Filter outcome reason")
+    .selectOption("Source unavailable");
+  await expect(page.getByRole("article")).toHaveCount(1);
+  await page.screenshot({
+    path: `test-results/activity-${info.project.name}.png`,
+    fullPage: true,
+  });
+  await expect
+    .poll(() =>
+      page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+    )
+    .toBe(true);
+});
+
+test("predictions offer search, profile, source and current cache filters", async ({
+  page,
+}) => {
+  await page.goto(fixture("activity"));
+  await page.getByRole("button", { name: "Predictions", exact: true }).click();
+  await page
+    .getByRole("searchbox", { name: "Search predictions" })
+    .fill("absent fixture");
+  await expect(
+    page.getByText("No predictions match these filters."),
+  ).toBeVisible();
+  await page
+    .getByRole("searchbox", { name: "Search predictions" })
+    .fill("Fixture prediction");
+  await page
+    .getByLabel("Filter prediction viewer")
+    .selectOption("Plex profile 1");
+  await page
+    .getByLabel("Filter prediction source")
+    .selectOption("next_episode");
+  await page
+    .getByLabel("Filter prediction cache status")
+    .selectOption("partial");
+  await expect(
+    page.getByText("Fixture prediction", { exact: true }),
+  ).toBeVisible();
+  await page.getByLabel("Filter prediction cache status").selectOption("fully");
+  await expect(
+    page.getByText("No predictions match these filters."),
+  ).toBeVisible();
+});
+
+test("coverage filters keep changed revisions unknown and bound metadata concurrency", async ({
+  page,
+}) => {
+  await page.goto(fixture("activity"));
+  await expect(
+    page.getByRole("heading", { name: "Current warming" }),
+  ).toBeVisible();
+  await page.evaluate(() => {
+    const mock = (window as any).__mock;
+    mock.staleCoverage = true;
+    mock.historyOverride = Array.from({ length: 26 }, (_, i) => ({
+      id: `60000000-0000-0000-0000-${String(i + 1).padStart(12, "0")}`,
+      item: `40000000-0000-0000-0000-${String(i + 1).padStart(12, "0")}`,
+      revision: "fixture-revision",
+      size: 8000000,
+      ranges: [{ start: 0, end: 8000000 }],
+      priority: 50,
+      intent: "10000000-0000-0000-0000-000000000001",
+      family: "plex",
+      state: "complete",
+      created_at: 1700000000000,
+      updated_at: 1700000000000,
+      expires_at: 1800000000000,
+      next_attempt: 0,
+      run: 1,
+      attempts: 0,
+      verified_bytes: 8000000,
+      source_bytes: 8000000,
+      cached_bytes: 0,
+      reason: null,
+      automatic_scope: null,
+      attribution: { playback: [], policy: null },
+    }));
+  });
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
+  await page.getByRole("tab", { name: /Warming history/ }).click();
+  await page
+    .getByLabel("Filter warming", { exact: true })
+    .selectOption("fully-cached");
+  await expect(page.getByText(/Checked 26 files/)).toBeVisible();
+  await expect(page.getByRole("article")).toHaveCount(0);
+  await page
+    .getByLabel("Filter warming", { exact: true })
+    .selectOption("unknown");
+  await expect(page.getByRole("article")).toHaveCount(20);
+  await expect
+    .poll(() => page.evaluate(() => (window as any).__mock.coverageMax))
+    .toBeLessThanOrEqual(4);
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(page.getByRole("article")).toHaveCount(6);
+  await expect(
+    page.getByRole("button", { name: "Retry", exact: true }),
+  ).toHaveCount(0);
 });

@@ -150,7 +150,7 @@
       ranges: [{ start: 0, end: 8000000 }],
       priority: 50,
       intent: other,
-      family: "manual",
+      family: "plex",
       state: "queued",
       created_at: 1700000000000,
       updated_at: 1700000000000,
@@ -165,6 +165,66 @@
       automatic_scope: null,
       attribution: { playback: [], policy: null },
     };
+    const fixtureId = (n) =>
+      `40000000-0000-0000-0000-${String(n).padStart(12, "0")}`;
+    const queueJobs = [
+      job,
+      ...Array.from({ length: 25 }, (_, i) => ({
+        ...job,
+        id: fixtureId(i + 1),
+        item: fixtureId(i + 1),
+        state: i === 0 ? "paused" : "queued",
+        next_attempt: i === 1 ? Date.now() + 3600000 : 0,
+      })),
+    ];
+    const historyJobs = [
+      {
+        ...job,
+        id: fixtureId(40),
+        state: "complete",
+        verified_bytes: 8000000,
+        updated_at: 1700000002000,
+      },
+      {
+        ...job,
+        id: fixtureId(41),
+        state: "failed",
+        reason: "Source unavailable",
+        updated_at: 1700000001000,
+      },
+      {
+        ...job,
+        id: fixtureId(42),
+        item: other,
+        state: "complete",
+        verified_bytes: 8000000,
+        updated_at: 1700000000000,
+      },
+      {
+        ...job,
+        id: fixtureId(43),
+        family: "backfill",
+        state: "complete",
+        ranges: [{ start: 0, end: 4000000 }],
+        updated_at: 1700000003000,
+      },
+      {
+        ...job,
+        id: fixtureId(44),
+        family: "backfill",
+        state: "failed",
+        reason: "Source unavailable",
+        updated_at: 1700000004000,
+      },
+    ];
+    const fixtureNames = Object.fromEntries(
+      queueJobs
+        .slice(1)
+        .map((j, i) => [
+          j.item,
+          `Fixture queued file ${String(i + 1).padStart(2, "0")}`,
+        ]),
+    );
     const media = {
       rating_key: "42",
       kind: "movie",
@@ -294,12 +354,26 @@
           })),
         );
       if (path === "/api/v1/native-cache/evictions") return respond([]);
-      if (path === `/api/v1/files/${id}`)
+      if (path.startsWith("/api/v1/files/")) {
+        window.__mock.coverageActive = (window.__mock.coverageActive || 0) + 1;
+        window.__mock.coverageMax = Math.max(
+          window.__mock.coverageMax || 0,
+          window.__mock.coverageActive,
+        );
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        window.__mock.coverageActive--;
         return respond({
           cache_available: true,
-          cached_ranges: [{ start: 0, end: 4000000 }],
+          entry: { size: 8000000 },
+          source_revision: window.__mock.staleCoverage
+            ? "changed-fixture-revision"
+            : "fixture-revision",
+          cached_ranges: [
+            { start: 0, end: path.endsWith(other) ? 8000000 : 4000000 },
+          ],
           cache_warning: null,
         });
+      }
       if (path === "/api/v1/prefetch")
         return method === "POST"
           ? respond(job)
@@ -316,11 +390,20 @@
               reserved_wire_bytes: 4200000,
               wire_day: 1,
               wire_blocked: false,
-              jobs: [job],
-              history: [],
+              jobs: queueJobs,
+              history: (window.__mock.historyOverride || historyJobs).map(
+                (job) => ({
+                  job,
+                  recorded_at: job.updated_at,
+                }),
+              ),
               history_available: true,
               state_available: true,
-              names: { [id]: "Fixture warming file" },
+              names: {
+                ...fixtureNames,
+                [id]: "Fixture warming file",
+                [other]: "Fixture fully cached file",
+              },
               followup: {
                 updated_at: 1,
                 refreshing: false,

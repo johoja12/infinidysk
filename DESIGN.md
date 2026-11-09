@@ -1055,3 +1055,20 @@ Report one finding per issue with `file:line`, the rule (section › heading), a
 - Plex Library at `/plex-library` browses enabled Plex servers and their named movie/TV libraries. Show-to-episode navigation, search and paging remain bounded. Only an exact imported-source mapping offers cache inspection and warming. Keep connection and path-mapping management within reach.
 - Smart Prefetch at `/smart-prefetch` separates Activity and history, Predictions and Settings. Activity opens with the current queue; Settings uses one Save/Discard bar. Catalogue refresh and previews never download media. Discover named hubs, collections and library sources using a server/profile selector; manual resource paths and viewer IDs are not the primary configuration flow.
 - Smart Prefetch settings group basic enablement, movies/TV and daily allowances first, then source selection, signals and warming behavior. Advanced policy is collapsed by default. Source customization exposes item limits, exclusions and a metadata preview. Retain saved selections across partial catalogue failures. Untouched values take fresh server settings when saving, and navigation warns about unsaved edits.
+
+### Smart Prefetch activity and history
+
+Show queue state, current active workers, completed-today count and daily budget as
+four compact summary tiles. Activity contains active/waiting jobs only. Terminal
+outcomes belong to Warming history, with separate file warming and playback gap
+fills. Group repeated file/revision/range attempts while retaining each run in
+Details. Use source/viewer badges, proportional progress bars, human file names,
+search, state/source/viewer filters, sorting and bounded pagination. Keep queue
+accounting, repair follow-up and raw identifiers in collapsed details.
+
+Coverage filters use current cache metadata bound to the exact source revision
+and file size, fetched at most four requests at once. Job completion records past
+verification, never current cache coverage. Missing, changed or unreadable
+coverage stays unknown. Predictions group the same source across profiles and
+support search, source/profile and current-cache filters. Outcome reasons are
+warming results; never relabel them as playback cache-miss causes.
