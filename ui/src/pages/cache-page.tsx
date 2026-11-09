@@ -39,9 +39,7 @@ export function CachePage() {
         {status.data?.stats && (
           <SettingsPanel title="Activity since restart">
             <p className="text-sm">
-              {(
-                status.data.stats.hits + status.data.stats.legacy_hits
-              ).toLocaleString()}{" "}
+              {status.data.stats.hits.toLocaleString()}{" "}
               verified cached block reads ·{" "}
               {bytes(status.data.stats.legacy_written_bytes)} added to existing
               storage

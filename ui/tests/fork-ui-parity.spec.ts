@@ -19,6 +19,7 @@ test("original cache is visible, protected and inspectable", async ({
     await expect(
       page.getByRole("heading", { name: `fixture-folder-${i}` }),
     ).toBeVisible();
+  await expect(page.getByText(/12 verified cached block reads/)).toBeVisible();
   const file = page.getByRole("row").filter({ hasText: "Fixture cached file" });
   const protectedFile = page
     .getByRole("row")
