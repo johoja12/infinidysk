@@ -8,7 +8,11 @@ import { Button } from "@/components/ui/button";
 
 type Entry = Schemas["NativeCacheEntry"];
 
-export function NativeCacheTools() {
+export function NativeCacheTools({
+  showHistory = true,
+}: {
+  showHistory?: boolean;
+}) {
   const settings = useSettings();
   const originalDiagnostics = useMutation({
     mutationFn: () => body(api.GET("/api/v1/native-cache/legacy/diagnostics")),
@@ -27,7 +31,7 @@ export function NativeCacheTools() {
           params: { query: { before, limit: 50 } },
         }),
       ),
-    enabled: history,
+    enabled: history && showHistory,
   });
   return (
     <div className="space-y-3 rounded-lg border p-3">
@@ -53,14 +57,16 @@ export function NativeCacheTools() {
             ? "Checking storage…"
             : "Check cache storage"}
         </Button>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => setHistory((value) => !value)}
-        >
-          {history ? "Hide eviction history" : "Show eviction history"}
-        </Button>
+        {showHistory && (
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setHistory((value) => !value)}
+          >
+            {history ? "Hide eviction history" : "Show eviction history"}
+          </Button>
+        )}
       </div>
       {diagnostics.error && <Failure error={diagnostics.error} />}
       {originalDiagnostics.error && (
@@ -116,7 +122,7 @@ export function NativeCacheTools() {
           </p>
         </div>
       ))}
-      {history && (
+      {history && showHistory && (
         <div className="space-y-2">
           <h4 className="text-sm font-medium">Eviction history</h4>
           {evictions.error && <Failure error={evictions.error} />}

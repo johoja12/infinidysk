@@ -23,7 +23,10 @@ use uuid::Uuid;
 use crate::{BLOCK, Cache, Error, Key, hex};
 mod admin;
 mod writer;
-pub use admin::{EntryIdentity, Inventory, InventoryEntry, InventoryFolder, StorageDiagnostic};
+pub use admin::{
+    Browse, EntryIdentity, Inventory, InventoryEntry, InventoryFilter, InventoryFolder,
+    InventorySort, OriginalEviction, OriginalEvictions, StorageDiagnostic,
+};
 pub use writer::{EvictionPolicy, WriteFolder, WriteSettings, Writer};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

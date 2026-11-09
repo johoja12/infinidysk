@@ -45,9 +45,28 @@ pub struct FolderDiagnostic {
 impl Cache {
     /// Newest first, with a stable row cursor even when newer evictions arrive.
     pub async fn evictions(&self, before: Option<i64>, limit: u32) -> Result<Vec<Eviction>, Error> {
+        self.evictions_filtered(before, limit, None, "").await
+    }
+    pub async fn evictions_filtered(
+        &self,
+        before: Option<i64>,
+        limit: u32,
+        reason: Option<&str>,
+        search: &str,
+    ) -> Result<Vec<Eviction>, Error> {
         type Row = (i64, String, String, i64, i64, String);
-        let rows: Vec<Row> = sqlx::query_as("SELECT rowid,item,revision,bytes,at,reason FROM evictions WHERE rowid < $1 ORDER BY rowid DESC LIMIT $2")
-            .bind(before.unwrap_or(i64::MAX)).bind(limit.clamp(1, 200)).fetch_all(&self.db).await?;
+        if search.len() > 256 || reason.is_some_and(|r| r.len() > 128) {
+            return Err(Error::Invalid("eviction history filter too long"));
+        }
+        let search = format!(
+            "%{}%",
+            search
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_")
+        );
+        let rows: Vec<Row> = sqlx::query_as("SELECT rowid,item,revision,bytes,at,reason FROM evictions WHERE rowid < $1 AND ($3 IS NULL OR reason=$3) AND (item LIKE $4 ESCAPE '!' OR revision LIKE $4 ESCAPE '!') ORDER BY rowid DESC LIMIT $2")
+            .bind(before.unwrap_or(i64::MAX)).bind(limit.clamp(1, 200)).bind(reason).bind(search).fetch_all(&self.db).await?;
         rows.into_iter()
             .map(|(cursor, item, revision, bytes, at_ms, reason)| {
                 Ok(Eviction {

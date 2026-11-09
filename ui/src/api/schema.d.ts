@@ -1388,6 +1388,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/native-cache/legacy/evictions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["legacy_cache_evictions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/native-cache/legacy/probe": {
         parameters: {
             query?: never;
@@ -3080,6 +3096,8 @@ export interface components {
             entry: components["schemas"]["LegacyCacheEntryIdentity"];
             operation: components["schemas"]["NativeCacheOperation"];
         };
+        /** @enum {string} */
+        LegacyCacheCoverageFilter: "all" | "cached" | "complete" | "partial" | "empty" | "held";
         LegacyCacheCursor: {
             /** @description Last fully processed entry. The next entry's last processed block is `offset`. */
             after_key?: string;
@@ -3095,6 +3113,31 @@ export interface components {
             key: string;
             /** Format: int64 */
             size: number;
+        };
+        LegacyCacheEviction: {
+            /** Format: int64 */
+            allocated_bytes: number;
+            /** Format: int64 */
+            at_ms: number;
+            /** Format: int64 */
+            cached_bytes: number;
+            /** Format: int64 */
+            cursor: number;
+            folder: string;
+            item: string;
+            key: string;
+            name?: string | null;
+            reason: string;
+            /** Format: int64 */
+            size: number;
+        };
+        LegacyCacheEvictionPage: {
+            available: boolean;
+            entries: components["schemas"]["LegacyCacheEviction"][];
+            /** Format: int64 */
+            next?: number | null;
+            /** Format: int64 */
+            total: number;
         };
         LegacyCacheEvictionPolicy: {
             /** Format: int32 */
@@ -3119,6 +3162,8 @@ export interface components {
         LegacyCacheInventory: {
             entries: components["schemas"]["LegacyCacheInventoryEntry"][];
             folders: components["schemas"]["LegacyCacheInventoryFolder"][];
+            /** Format: int64 */
+            matched_files: number;
             next?: string | null;
             /** Format: int64 */
             recency_dropped: number;
@@ -3193,6 +3238,8 @@ export interface components {
             metadata_path: string;
             write?: components["schemas"]["LegacyCacheWriteSettings"] | null;
         };
+        /** @enum {string} */
+        LegacyCacheSort: "key" | "recent" | "name" | "coverage";
         LegacyCacheStorageDiagnostic: {
             /** Format: int64 */
             free_bytes?: number | null;
@@ -5135,7 +5182,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1c0a0-ec53-756f-94e9-6fbafabb089a
+             * @default 01a1c18a-90e2-7019-b271-d8f63adc5547
              */
             id: string;
             /**
@@ -8604,6 +8651,8 @@ export interface operations {
             query?: {
                 before?: number;
                 limit?: number;
+                reason?: string;
+                search?: string;
             };
             header?: never;
             path?: never;
@@ -8695,6 +8744,8 @@ export interface operations {
                 after?: string;
                 folder?: string;
                 search?: string;
+                sort?: components["schemas"]["LegacyCacheSort"];
+                coverage?: components["schemas"]["LegacyCacheCoverageFilter"];
             };
             header?: never;
             path?: never;
@@ -8773,6 +8824,30 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LegacyCacheStorageDiagnostic"][];
+                };
+            };
+        };
+    };
+    legacy_cache_evictions: {
+        parameters: {
+            query?: {
+                before?: number;
+                search?: string;
+                reason?: string;
+                folder?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LegacyCacheEvictionPage"];
                 };
             };
         };
