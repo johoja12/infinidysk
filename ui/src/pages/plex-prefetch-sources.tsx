@@ -26,7 +26,7 @@ export function PlexPrefetchSources({value,servers,disabled,apply}:{value:Source
       <Button type="button" size="sm" variant="ghost" disabled={disabled} onClick={()=>setDraft(rows.filter((_,i)=>i!==index))}>Remove source {index+1}</Button>
     </div>)}
     <div className="flex flex-wrap gap-2">
-      <Button type="button" variant="outline" disabled={disabled || rows.length>=128 || servers.length===0} onClick={()=>setDraft([...rows,{enabled:true,server:servers[0]?.id??"",viewer:"",kind:"hub",path:"",limit:50,excluded_shows:[]}])}>Add source</Button>
+      <Button type="button" variant="outline" disabled={disabled || rows.length>=128 || servers.length===0} onClick={()=>setDraft([...rows,{enabled:true,server:servers[0]?.id??"",viewer:"",kind:"hub",path:"",title:null,limit:50,excluded_shows:[]}])}>Add source</Button>
       <Button type="button" variant="outline" disabled={disabled || draft===null || invalid} onClick={()=>{void apply(rows).then(()=>setDraft(null)).catch(()=>{});}}>Apply sources</Button>
       {draft!==null && <Button type="button" variant="ghost" disabled={disabled} onClick={()=>setDraft(null)}>Discard source changes</Button>}
     </div>

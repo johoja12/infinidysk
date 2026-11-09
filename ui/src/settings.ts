@@ -22,6 +22,8 @@ export function useSaveSettings() {
     mutationFn: (settings: Settings) => body(api.PUT("/api/v1/settings", { body: settings })),
     onSuccess: (view) => {
       client.setQueryData(["settings"], view);
+      void client.invalidateQueries({queryKey:["plex-library"]});
+      void client.invalidateQueries({queryKey:["legacy-cache"]});
       void client.invalidateQueries({ queryKey: ["auth"] });
     },
   });

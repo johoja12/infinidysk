@@ -465,6 +465,107 @@ impl Client {
             })
             .collect())
     }
+    /// One bounded browser page; never fetch a whole Plex library for a UI request.
+    pub async fn browse_media(
+        &self,
+        server: &Server,
+        library: &Library,
+        parent: Option<&str>,
+        search: &str,
+        offset: u32,
+    ) -> Result<crate::MediaPage, Error> {
+        identity(&library.id)?;
+        if offset > 100_000 || search.len() > 256 {
+            return Err(Error::Invalid("Plex browser request exceeds its bounds"));
+        }
+        let resource = if let Some(parent) = parent {
+            identity(parent)?;
+            // Verify that the selected show belongs to the requested library.
+            let root = self
+                .xml(server, &format!("/library/metadata/{parent}"))
+                .await?;
+            let shows: Vec<_> = root
+                .children
+                .iter()
+                .filter(|n| {
+                    n.text("ratingKey") == Some(parent)
+                        && n.text("type") == Some("show")
+                        && n.text("librarySectionID") == Some(library.id.as_str())
+                })
+                .collect();
+            if shows.len() != 1 {
+                return Err(Error::Invalid("Plex show does not belong to this library"));
+            }
+            format!("/library/metadata/{parent}/allLeaves")
+        } else {
+            format!("/library/sections/{}/all", library.id)
+        };
+        let mut query = Url::parse("http://fixture.invalid")
+            .map_err(|_| Error::Invalid("invalid Plex browser query"))?;
+        query
+            .query_pairs_mut()
+            .append_pair("X-Plex-Container-Start", &offset.to_string())
+            .append_pair("X-Plex-Container-Size", "50")
+            .append_pair("sort", "titleSort:asc");
+        if !search.is_empty() {
+            query.query_pairs_mut().append_pair("title", search);
+        }
+        let root = self
+            .xml(
+                server,
+                &format!("{resource}?{}", query.query().unwrap_or_default()),
+            )
+            .await?;
+        if root.name != "MediaContainer"
+            || root
+                .text("offset")
+                .is_some_and(|s| s.parse::<u32>() != Ok(offset))
+        {
+            return Err(Error::Invalid("Plex returned a different browser page"));
+        }
+        let total = root
+            .text("totalSize")
+            .map(str::parse::<u32>)
+            .transpose()
+            .map_err(|_| Error::Invalid("invalid Plex browser total"))?;
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        for node in root
+            .children
+            .iter()
+            .filter(|n| matches!(n.name.as_str(), "Video" | "Directory"))
+        {
+            if items.len() >= 50 {
+                return Err(Error::Invalid("Plex browser page exceeds its bound"));
+            }
+            let mut item = media(node)?;
+            if !seen.insert(item.rating_key.clone()) {
+                return Err(Error::Invalid("duplicate Plex browser identity"));
+            }
+            let files: HashSet<_> = node
+                .children("Media")
+                .flat_map(|m| m.children("Part"))
+                .filter_map(|p| p.text("file"))
+                .collect();
+            if files.len() != 1 {
+                item.file = None;
+            }
+            items.push(item);
+        }
+        let count = u32::try_from(items.len())
+            .map_err(|_| Error::Invalid("Plex browser page exceeds its bound"))?;
+        if total.is_some_and(|t| offset.saturating_add(count) > t) {
+            return Err(Error::Invalid("Plex browser total changed"));
+        }
+        let next =
+            (count == 50 && total.is_none_or(|t| offset + count < t)).then_some(offset + count);
+        Ok(crate::MediaPage {
+            items,
+            offset,
+            total,
+            next,
+        })
+    }
     pub async fn library_media(
         &self,
         server: &Server,
@@ -549,6 +650,76 @@ impl Client {
         }
         Ok(items)
     }
+    /// Discover named candidate sources using this exact viewer credential.
+    pub async fn source_catalogue(
+        &self,
+        viewer: &ViewerServer,
+        library: Option<&Library>,
+    ) -> Result<Vec<crate::CatalogueSource>, Error> {
+        let server = &viewer.server;
+        let mut result = Vec::new();
+        let path = if let Some(l) = library {
+            identity(&l.id)?;
+            format!("/hubs/sections/{}", l.id)
+        } else {
+            "/hubs".into()
+        };
+        for node in self.pages(server, &path, "Hub", 2000).await? {
+            let Some(path) = node.text("key") else {
+                continue;
+            };
+            if crate::sources::resource(path).is_err() {
+                continue;
+            }
+            result.push(crate::CatalogueSource {
+                title: node.text("title").unwrap_or("Plex hub").into(),
+                kind: crate::sources::Kind::Hub,
+                path: path.into(),
+                library: library.map(|l| l.id.clone()),
+                media_kind: library.map_or_else(
+                    || node.text("type").unwrap_or("").into(),
+                    |l| l.kind.clone(),
+                ),
+            });
+        }
+        if let Some(l) = library {
+            for node in self
+                .pages(
+                    server,
+                    &format!("/library/sections/{}/collections", l.id),
+                    "Directory",
+                    2000,
+                )
+                .await?
+            {
+                let Some(id) = node.text("ratingKey") else {
+                    continue;
+                };
+                identity(id)?;
+                result.push(crate::CatalogueSource {
+                    title: node.text("title").unwrap_or("Plex collection").into(),
+                    kind: crate::sources::Kind::Collection,
+                    path: format!("/library/metadata/{id}/children"),
+                    library: Some(l.id.clone()),
+                    media_kind: l.kind.clone(),
+                });
+            }
+            result.push(crate::CatalogueSource {
+                title: format!("All {}", l.title),
+                kind: crate::sources::Kind::Library,
+                path: format!(
+                    "/library/sections/{}/all?type={}",
+                    l.id,
+                    if l.kind == "movie" { 1 } else { 2 }
+                ),
+                library: Some(l.id.clone()),
+                media_kind: l.kind.clone(),
+            });
+        }
+        let mut seen = HashSet::new();
+        result.retain(|s| seen.insert((s.kind as u8, s.path.clone())));
+        Ok(result)
+    }
     /// Fetch the explicitly selected ordered prefix with the exact viewer token.
     /// Changed totals, duplicate identities and partial pages fail the whole pass.
     pub async fn prefetch_source(
@@ -629,17 +800,32 @@ impl Client {
     /// A complete newest-first window, rather than an unbounded lifetime history.
     /// The planner's policy considers at most these 1000 distinct history records.
     pub async fn recent_history(&self, server: &Server) -> Result<Vec<Media>, Error> {
-        self.pages_window(
-            server,
-            "/status/sessions/history/all?sort=viewedAt%3Adesc",
-            "Video",
-            u32::MAX,
-            Some(1000),
-        )
-        .await?
-        .iter()
-        .map(media)
-        .collect()
+        Ok(self.recent_history_report(server).await?.0)
+    }
+    /// Historical events can outlive their media metadata. Never fabricate an ID.
+    pub async fn recent_history_report(
+        &self,
+        server: &Server,
+    ) -> Result<(Vec<Media>, usize), Error> {
+        let nodes = self
+            .pages_window(
+                server,
+                "/status/sessions/history/all?sort=viewedAt%3Adesc",
+                "Video",
+                u32::MAX,
+                Some(1000),
+            )
+            .await?;
+        let mut missing = 0;
+        let mut items = Vec::new();
+        for node in &nodes {
+            if node.text("ratingKey").is_none_or(str::is_empty) {
+                missing += 1;
+                continue;
+            }
+            items.push(media(node)?);
+        }
+        Ok((items, missing))
     }
     pub async fn history(&self, server: &Server) -> Result<Vec<Media>, Error> {
         self.pages(
@@ -1199,5 +1385,83 @@ mod tests {
                 Err(Error::Unauthorized)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn history_without_media_ids_does_not_block_actionable_records() {
+        let f=fixture(|_,_|response(200,"<MediaContainer totalSize='2' offset='0'><Video historyKey='1' ratingKey='10' type='movie' title='fixture'/><Video historyKey='2' type='movie' title='unavailable fixture'/></MediaContainer>")).await;
+        let (items, unavailable) = f.client.recent_history_report(&f.server).await.unwrap();
+        assert_eq!(unavailable, 1);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].rating_key, "10");
+        // Current media metadata remains strict: only historical events may lack identity.
+        assert!(f.client.metadata(&f.server, "10").await.is_err());
+    }
+    #[tokio::test]
+    async fn browser_page_keeps_search_bound_and_does_not_guess_multiple_versions() {
+        let f=fixture(|uri,_|{
+            assert!(uri.query().unwrap_or_default().contains("title=fixture%26extra%3D1"));
+            response(200,"<MediaContainer totalSize='1' offset='0'><Video ratingKey='10' type='movie' title='fixture'><Media><Part file='/fixture/first'/></Media><Media><Part file='/fixture/second'/></Media></Video></MediaContainer>")
+        }).await;
+        let library = Library {
+            id: "7".into(),
+            title: "fixture".into(),
+            kind: "movie".into(),
+        };
+        let page = f
+            .client
+            .browse_media(&f.server, &library, None, "fixture&extra=1", 0)
+            .await
+            .unwrap();
+        assert_eq!(page.total, Some(1));
+        assert!(page.next.is_none());
+        assert!(page.items[0].file.is_none());
+    }
+    #[tokio::test]
+    async fn browser_rejects_show_from_another_library_before_fetching_episodes() {
+        let f=fixture(|uri,_|{assert!(uri.path().ends_with("/library/metadata/42"));response(200,"<MediaContainer><Directory ratingKey='42' type='show' librarySectionID='8'/></MediaContainer>")}).await;
+        let library = Library {
+            id: "7".into(),
+            title: "fixture".into(),
+            kind: "show".into(),
+        };
+        assert!(
+            f.client
+                .browse_media(&f.server, &library, Some("42"), "", 0)
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn named_catalogue_keeps_hubs_and_canonical_collection_identity() {
+        let f=fixture(|uri,_|{
+            if uri.path().ends_with("/hubs/sections/7") {response(200,"<MediaContainer><Hub key='/library/sections/7/recentlyAdded' title='fixture hub'/></MediaContainer>")}
+            else {assert!(uri.path().ends_with("/library/sections/7/collections"));response(200,"<MediaContainer><Directory ratingKey='44' type='collection' title='fixture collection'/></MediaContainer>")}
+        }).await;
+        let viewer = ViewerServer {
+            server: f.server.clone(),
+            viewer: "1".into(),
+        };
+        let library = Library {
+            id: "7".into(),
+            title: "fixture".into(),
+            kind: "movie".into(),
+        };
+        let sources = f
+            .client
+            .source_catalogue(&viewer, Some(&library))
+            .await
+            .unwrap();
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[1].path, "/library/metadata/44/children");
+        crate::sources::Source {
+            server: "machine".into(),
+            viewer: "1".into(),
+            kind: sources[0].kind,
+            path: sources[0].path.clone(),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
     }
 }

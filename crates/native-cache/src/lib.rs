@@ -1000,6 +1000,16 @@ impl Cache {
         Ok(())
     }
 
+    pub fn legacy_reader(&self) -> Option<&dyn legacy::Reader> {
+        self.legacy.get().map(std::convert::AsRef::as_ref)
+    }
+
+    pub fn legacy_maintenance(self: &Arc<Self>) -> legacy::Maintenance {
+        legacy::Maintenance {
+            cache: self.clone(),
+        }
+    }
+
     /// Resolve action inputs through the catalogue; clients cannot change lease identity.
     pub async fn resolve(&self, entry: &Entry) -> Result<Option<Key>, Error> {
         let mut key = Key::from_entry(entry)?;

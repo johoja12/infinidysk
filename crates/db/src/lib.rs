@@ -1209,6 +1209,23 @@ impl Db {
         }
     }
 
+    pub async fn item_labels(&self, ids: &[Uuid]) -> Result<Vec<(Uuid, String)>, Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = &ids[..ids.len().min(2000)];
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT id,name FROM items WHERE id IN ({placeholders})");
+        Ok(on!(self,pool=>{
+            // Only generated numeric placeholders enter SQL; all IDs are bound.
+            let mut query=sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()));
+            for id in ids {query=query.bind(*id);}
+            query.fetch_all(pool).await?
+        }))
+    }
     pub async fn item(&self, id: ItemId) -> Result<Option<Item>, Error> {
         let sql = select_items!("WHERE id = $1");
         let row: Option<ItemRow> =

@@ -15,6 +15,9 @@ const named = <K extends string>(load: () => Promise<Record<K, ComponentType>>, 
 const Layout = named(() => import("./layout"), "Layout");
 const Overview = named(() => import("./pages/overview"), "Overview");
 const Queue = named(() => import("./pages/queue"), "Queue");
+const CachePage = named(() => import("./pages/cache-page"), "CachePage");
+const SmartPrefetch = named(() => import("./pages/smart-prefetch"), "SmartPrefetch");
+const PlexLibrary = named(() => import("./pages/plex-library"), "PlexLibrary");
 const Catalogue = named(() => import("./pages/catalogue"), "Catalogue");
 const Explorer = named(() => import("./pages/explorer"), "Explorer");
 const Health = named(() => import("./pages/health"), "Health");
@@ -54,6 +57,9 @@ const router = createBrowserRouter(
         <Route path="overview" element={<Overview />} />
         <Route path="queue" element={<Queue />} />
         <Route path="library" element={<Catalogue />} />
+        <Route path="native-cache" element={<CachePage />} />
+        <Route path="smart-prefetch" element={<SmartPrefetch />} />
+        <Route path="plex-library" element={<PlexLibrary />} />
         <Route path="explorer" element={<Explorer />} />
         <Route path="health" element={<Health />} />
         <Route path="stats" element={<Stats />} />

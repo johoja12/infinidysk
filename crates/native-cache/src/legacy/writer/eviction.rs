@@ -198,7 +198,7 @@ impl Writer {
                 state
                     .cursors
                     .insert(option.id.clone(), (access, key.clone()));
-                match self.stage(context, &key, access).await {
+                match self.stage(context, &key, access, "policy").await {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(error) => {
@@ -279,6 +279,7 @@ impl Writer {
         context: &Maintenance,
         key: &str,
         access: i64,
+        reason: &'static str,
     ) -> Result<bool, Error> {
         let row: Option<Entry> = sqlx::query_as("SELECT Key AS key,Folder AS folder,ItemId AS item,Length AS size,Pinned AS pinned,Generation AS generation,ChunkSize AS chunk FROM Entries WHERE Key=$1")
             .bind(key).fetch_optional(&self.legacy.db).await?;
@@ -308,11 +309,17 @@ impl Writer {
         let Some(bytes) = bytes else {
             return Ok(false);
         };
+        let mut identity = serde_json::to_value(&entry)
+            .map_err(|_| Error::Invalid("cannot encode eviction identity"))?;
+        let serde_json::Value::Object(fields) = &mut identity else {
+            return Err(Error::Invalid("invalid eviction identity"));
+        };
+        fields.insert("_reason".into(), serde_json::Value::String(reason.into()));
         let intent = Intent {
             key: key.into(),
             folder: entry.folder.clone(),
             volume: root.volume.clone(),
-            identity: serde_json::to_string(&entry)
+            identity: serde_json::to_string(&identity)
                 .map_err(|_| Error::Invalid("cannot encode eviction identity"))?,
             bytes,
             nonce: Uuid::new_v4().simple().to_string(),
@@ -438,8 +445,23 @@ impl Writer {
         }
         self.point("eviction_metadata")?;
         let mut tx = context.cache.db.begin().await?;
-        sqlx::query("INSERT INTO evictions(item,revision,bytes,at,reason) VALUES($1,$2,$3,$4,'legacy:policy')")
-            .bind(&entry.item).bind(&entry.key).bind(intent.bytes).bind(crate::now()).execute(&mut *tx).await?;
+        let reason = serde_json::from_str::<serde_json::Value>(&intent.identity)
+            .ok()
+            .map_or("legacy:policy", |v| {
+                if v.get("_reason").and_then(serde_json::Value::as_str) == Some("manual") {
+                    "legacy:manual"
+                } else {
+                    "legacy:policy"
+                }
+            });
+        sqlx::query("INSERT INTO evictions(item,revision,bytes,at,reason) VALUES($1,$2,$3,$4,$5)")
+            .bind(&entry.item)
+            .bind(&entry.key)
+            .bind(intent.bytes)
+            .bind(crate::now())
+            .bind(reason)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM legacy_evictions_v1 WHERE key=$1 AND folder=$2 AND nonce=$3")
             .bind(&entry.key)
             .bind(&entry.folder)
@@ -612,4 +634,61 @@ fn remove(
     root.validate()?;
     writer.point("eviction_removed")?;
     Ok(true)
+}
+
+impl Writer {
+    /// Manual deletion shares policy eviction's admission, journal and physical protocol.
+    /// It requires explicit eviction permission on this folder, even for manual actions.
+    pub async fn manual_evict(
+        self: &Arc<Self>,
+        identity: crate::legacy::EntryIdentity,
+        context: Maintenance,
+    ) -> Result<bool, Error> {
+        if context.cache.recovery_mode() {
+            return Ok(false);
+        }
+        if !self
+            .settings
+            .folders
+            .iter()
+            .any(|f| f.id == identity.folder && f.eviction.is_some())
+        {
+            return Ok(false);
+        }
+        let Ok(serial) = self.eviction.clone().try_lock_owned() else {
+            return Ok(false);
+        };
+        let writer = self.clone();
+        let task = tokio::spawn(async move {
+            writer.legacy.flush_recency().await?;
+            let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM legacy_evictions_v1")
+                .fetch_one(&context.cache.db)
+                .await?;
+            if pending >= 256 {
+                return Err(Error::Invalid(
+                    "too many compatible evictions are held; reconcile existing intents",
+                ));
+            }
+            if writer.legacy.exact_entry(&identity).await?.is_none() {
+                return Ok(false);
+            }
+            let access:Option<i64>=sqlx::query_scalar("SELECT Access FROM Entries WHERE Key=$1 AND Pinned=0 AND PendingBytes=0 AND Dirty=0").bind(&identity.key).fetch_optional(&writer.legacy.db).await?;
+            // The task owns serialization even if its HTTP caller disconnects.
+            let _serial = serial;
+            match access {
+                Some(access) => {
+                    writer
+                        .stage(&context, &identity.key, access, "manual")
+                        .await
+                }
+                None => Ok(false),
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .map_err(|_| {
+                Error::Invalid("cache eviction is still running; refresh before retrying")
+            })?
+            .map_err(|_| Error::Invalid("cache eviction task failed"))?
+    }
 }

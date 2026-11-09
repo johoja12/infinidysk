@@ -86,3 +86,13 @@ Keep eviction disabled during initial cache reuse and migration. Test policy
 reclamation on generated NAS data before any separately reviewed production
 configuration. Preserve existing cache storage/payloads in place. No production
 services, configuration, database or cache payload changes occurred in this work.
+
+## 2026-11-09 UI correction
+
+The earlier outcome inventory did not prove complete UI parity. The original cache
+inventory was absent from the browser and the fork workflows lacked dedicated
+navigation. See [UI qualification](validation/fork-ui-parity-20261109.md) for the
+native cache, Plex Library and Smart Prefetch workflows, generated browser tests
+and separate live Plex protocol evidence. Treat those complete user flows, not
+module/component presence, as the UI acceptance boundary. Lifecycle/reconciliation
+#250 remains a separate implementation scope.

@@ -21,7 +21,9 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::{BLOCK, Cache, Error, Key, hex};
+mod admin;
 mod writer;
+pub use admin::{EntryIdentity, Inventory, InventoryEntry, InventoryFolder, StorageDiagnostic};
 pub use writer::{EvictionPolicy, WriteFolder, WriteSettings, Writer};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -191,6 +193,13 @@ impl Drop for ItemGuard {
     }
 }
 pub trait Reader: Send + Sync {
+    /// Administrative access uses the already owned store, never a second opener.
+    fn catalogue(&self) -> Option<&Legacy> {
+        None
+    }
+    fn writer(&self) -> Option<&Arc<Writer>> {
+        None
+    }
     fn read<'a>(&'a self, key: &'a Key, block: u64, permit: OwnedSemaphorePermit)
     -> ReadFuture<'a>;
     fn writable(&self) -> bool {
@@ -301,6 +310,7 @@ pub struct Legacy {
     has_pending: bool,
     recency: Option<Arc<crate::recency::Updates>>,
     access_buckets: Arc<Mutex<HashMap<String, i64>>>,
+    diagnostic_slots: Arc<tokio::sync::Semaphore>,
 }
 #[derive(Clone, Debug, FromRow, Serialize, Deserialize)]
 pub struct Entry {
@@ -482,6 +492,7 @@ impl Legacy {
             has_pending,
             recency: None,
             access_buckets: Arc::default(),
+            diagnostic_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         })
     }
     pub async fn entries(&self, after: &str, limit: u32) -> Result<Vec<Entry>, Error> {

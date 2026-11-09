@@ -1340,6 +1340,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/native-cache/legacy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["legacy_cache_inventory"];
+        put?: never;
+        post: operations["legacy_cache_action"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/native-cache/legacy/coverage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["legacy_cache_coverage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/native-cache/legacy/diagnostics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["legacy_cache_diagnostics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/native-cache/legacy/probe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["legacy_cache_probe"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/native-cache/probe": {
         parameters: {
             query?: never;
@@ -1496,6 +1560,54 @@ export interface paths {
         get: operations["plex_libraries"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plex/servers/{id}/libraries/{library}/media": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["plex_library_browse"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plex/servers/{id}/sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["plex_source_catalogue"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plex/sources/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["plex_source_preview"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2964,11 +3076,25 @@ export interface components {
             /** Format: int64 */
             folders: number;
         };
+        LegacyCacheAction: {
+            entry: components["schemas"]["LegacyCacheEntryIdentity"];
+            operation: components["schemas"]["NativeCacheOperation"];
+        };
         LegacyCacheCursor: {
             /** @description Last fully processed entry. The next entry's last processed block is `offset`. */
             after_key?: string;
             /** Format: int64 */
             offset?: number;
+        };
+        LegacyCacheEntryIdentity: {
+            /** Format: int64 */
+            chunk: number;
+            folder: string;
+            generation?: string | null;
+            item: string;
+            key: string;
+            /** Format: int64 */
+            size: number;
         };
         LegacyCacheEvictionPolicy: {
             /** Format: int32 */
@@ -2990,6 +3116,66 @@ export interface components {
             /** @description Offline/checkpointed 1.x native metadata directory, containing both ledgers. */
             metadata_path: string;
         };
+        LegacyCacheInventory: {
+            entries: components["schemas"]["LegacyCacheInventoryEntry"][];
+            folders: components["schemas"]["LegacyCacheInventoryFolder"][];
+            next?: string | null;
+            /** Format: int64 */
+            recency_dropped: number;
+            recency_pending: number;
+            writable: boolean;
+        };
+        LegacyCacheInventoryEntry: {
+            /** Format: int64 */
+            allocated_bytes: number;
+            /** Format: int64 */
+            cached_bytes: number;
+            /** Format: int64 */
+            chunk: number;
+            /** Format: int64 */
+            dirty: number;
+            folder: string;
+            generation?: string | null;
+            item: string;
+            key: string;
+            /** Format: int64 */
+            last_used_ms: number;
+            name?: string | null;
+            /** Format: int64 */
+            pending_bytes: number;
+            /** Format: int64 */
+            pinned: number;
+            /** Format: int64 */
+            size: number;
+            source_present: boolean;
+        };
+        LegacyCacheInventoryFolder: {
+            /** Format: int64 */
+            allocated_bytes: number;
+            /** Format: int64 */
+            cached_bytes: number;
+            eviction_enabled: boolean;
+            /** Format: int64 */
+            files: number;
+            /** Format: int64 */
+            held_files: number;
+            id: string;
+            /** Format: int64 */
+            min_free_bytes?: number | null;
+            path: string;
+            /** Format: int64 */
+            pending_bytes: number;
+            /** Format: int64 */
+            quota_bytes?: number | null;
+            /** Format: int64 */
+            retired_bytes: number;
+            writable: boolean;
+        };
+        LegacyCacheProbe: {
+            entry: components["schemas"]["LegacyCacheEntryIdentity"];
+            /** Format: int64 */
+            offset: number;
+        };
         LegacyCacheReport: {
             complete: boolean;
             cursor: components["schemas"]["LegacyCacheCursor"];
@@ -3006,6 +3192,14 @@ export interface components {
             folders: components["schemas"]["LegacyCacheFolder"][];
             metadata_path: string;
             write?: components["schemas"]["LegacyCacheWriteSettings"] | null;
+        };
+        LegacyCacheStorageDiagnostic: {
+            /** Format: int64 */
+            free_bytes?: number | null;
+            id: string;
+            identity_ok?: boolean | null;
+            read_only?: boolean | null;
+            write_permitted?: boolean | null;
         };
         LegacyCacheWriteFolder: {
             eviction?: components["schemas"]["LegacyCacheEvictionPolicy"] | null;
@@ -4200,6 +4394,13 @@ export interface components {
             numeric_id?: string | null;
             token: components["schemas"]["PlexToken"];
         };
+        PlexCatalogueSource: {
+            kind: components["schemas"]["PlexPrefetchSourceKind"];
+            library?: string | null;
+            media_kind: string;
+            path: string;
+            title: string;
+        };
         PlexClassification: {
             matches: components["schemas"]["PlexClassificationMatch"][];
             stale: boolean;
@@ -4259,6 +4460,20 @@ export interface components {
             kind: string;
             title: string;
         };
+        PlexLibraryFile: {
+            /** Format: uuid */
+            item?: string | null;
+            media: components["schemas"]["PlexMedia"];
+            /** Format: int64 */
+            size?: number | null;
+        };
+        PlexLibraryPage: {
+            files: components["schemas"]["PlexLibraryFile"][];
+            /** Format: int32 */
+            next?: number | null;
+            /** Format: int32 */
+            total?: number | null;
+        };
         PlexLoginStart: {
             /** Format: int64 */
             expires_at_ms: number;
@@ -4272,6 +4487,27 @@ export interface components {
         };
         /** @enum {string} */
         PlexMatchBy: "mapped_path" | "indexed_path" | "filename";
+        PlexMedia: {
+            /** Format: int64 */
+            duration_ms: number;
+            /** Format: int32 */
+            episode?: number | null;
+            file?: string | null;
+            kind: string;
+            rating_key: string;
+            /** Format: int32 */
+            season?: number | null;
+            show?: string | null;
+            show_title?: string | null;
+            title: string;
+            user?: string | null;
+            /** Format: int32 */
+            view_count?: number;
+            /** Format: int64 */
+            view_offset_ms: number;
+            /** Format: int64 */
+            viewed_at?: number | null;
+        };
         PlexPathMapping: {
             dav_path?: string | null;
             local_path?: string | null;
@@ -4434,6 +4670,11 @@ export interface components {
             path: string;
             /** @default  */
             server: string;
+            /**
+             * @description Display label retained when Plex discovery is unavailable. It grants no access.
+             * @default null
+             */
+            title: string | null;
             /** @default  */
             viewer: string;
         };
@@ -4770,6 +5011,9 @@ export interface components {
         };
         PrefetchView: components["schemas"]["PrefetchStatus"] & {
             followup: components["schemas"]["PrefetchRepairSnapshot"];
+            names: {
+                [key: string]: string;
+            };
         };
         /** @enum {string} */
         Preset: "balanced" | "max_playback" | "low_resources";
@@ -4891,7 +5135,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1b48a-610d-7559-befc-ad5a41c05bbc
+             * @default 01a1c0a0-ec53-756f-94e9-6fbafabb089a
              */
             id: string;
             /**
@@ -8445,6 +8689,117 @@ export interface operations {
             };
         };
     };
+    legacy_cache_inventory: {
+        parameters: {
+            query?: {
+                after?: string;
+                folder?: string;
+                search?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LegacyCacheInventory"];
+                };
+            };
+        };
+    };
+    legacy_cache_action: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LegacyCacheAction"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain": boolean;
+                };
+            };
+        };
+    };
+    legacy_cache_coverage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LegacyCacheEntryIdentity"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NativeCacheCoverage"][];
+                };
+            };
+        };
+    };
+    legacy_cache_diagnostics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LegacyCacheStorageDiagnostic"][];
+                };
+            };
+        };
+    };
+    legacy_cache_probe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LegacyCacheProbe"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": number | null;
+                };
+            };
+        };
+    };
     native_cache_probe: {
         parameters: {
             query?: never;
@@ -8725,6 +9080,79 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PlexLibrary"][];
+                };
+            };
+        };
+    };
+    plex_library_browse: {
+        parameters: {
+            query?: {
+                offset?: number;
+                search?: string;
+                parent?: string;
+            };
+            header?: never;
+            path: {
+                id: string;
+                library: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexLibraryPage"];
+                };
+            };
+        };
+    };
+    plex_source_catalogue: {
+        parameters: {
+            query: {
+                viewer: string;
+                library?: string;
+            };
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexCatalogueSource"][];
+                };
+            };
+        };
+    };
+    plex_source_preview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlexPrefetchSource"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexMedia"][];
                 };
             };
         };

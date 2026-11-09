@@ -241,7 +241,7 @@ impl Predictions {
                 .refreshing = false;
             return Ok(());
         }
-        let predictions = match outcome {
+        let (predictions, unavailable_history) = match outcome {
             Ok(predictions) => predictions,
             Err(error) => {
                 let mut state = self.current.lock().unwrap_or_else(PoisonError::into_inner);
@@ -277,7 +277,7 @@ impl Predictions {
         self.current
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .warning = None;
+            .warning = (unavailable_history > 0).then(|| format!("{unavailable_history} Plex history records have no media identity and cannot contribute predictions"));
         if !matches!(
             tokio::time::timeout(
                 Duration::from_secs(5),
@@ -286,12 +286,14 @@ impl Predictions {
             .await,
             Ok(Ok(true))
         ) {
-            self.current
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .warning = Some(
-                "Some predictions could not enter warming; the next refresh will retry admission"
-                    .to_owned(),
+            let mut state = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+            let admission =
+                "Some predictions could not enter warming; the next refresh will retry admission";
+            state.warning = Some(
+                state
+                    .warning
+                    .as_ref()
+                    .map_or_else(|| admission.to_owned(), |old| format!("{old}. {admission}")),
             );
         }
         drop(config);
@@ -362,12 +364,17 @@ impl Predictions {
         }
         Ok(complete)
     }
-    async fn fetch(&self, settings: &Settings, scope: &str) -> Result<Vec<Prediction>, Error> {
+    async fn fetch(
+        &self,
+        settings: &Settings,
+        scope: &str,
+    ) -> Result<(Vec<Prediction>, usize), Error> {
         if !settings.prefetch.plex.enabled {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let options = &settings.prefetch.plex;
         let mut predictions = Vec::new();
+        let mut unavailable_history = 0;
         let mut seen = HashSet::new();
         for server in settings.plex.servers.iter().filter(|s| s.enabled) {
             // Validate the configured machine before accepting history or sessions.
@@ -376,14 +383,12 @@ impl Predictions {
             let mut sessions =
                 HashMap::<(String, String, Option<String>), Vec<PlaybackContext>>::new();
             if options.history {
+                let (history, unavailable) = self.client.recent_history_report(server).await?;
+                unavailable_history += unavailable;
                 inputs.extend(
                     options
                         .policy
-                        .history_candidates(
-                            &self.client.recent_history(server).await?,
-                            &server.id,
-                            now_ms() / 1000,
-                        )
+                        .history_candidates(&history, &server.id, now_ms() / 1000)
                         .into_iter()
                         .map(|m| (m, false)),
                 );
@@ -611,7 +616,7 @@ impl Predictions {
                 }
             }
         }
-        Ok(predictions)
+        Ok((predictions, unavailable_history))
     }
     async fn prediction(
         &self,

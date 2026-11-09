@@ -21,6 +21,8 @@ pub struct Source {
     pub kind: Kind,
     /// A relative Plex catalogue resource; never a supplied URL or credential.
     pub path: String,
+    /// Display label retained when Plex discovery is unavailable. It grants no access.
+    pub title: Option<String>,
     pub limit: u16,
     pub excluded_shows: Vec<String>,
 }
@@ -50,6 +52,7 @@ impl Default for Source {
             viewer: String::new(),
             kind: Kind::Hub,
             path: String::new(),
+            title: None,
             limit: 50,
             excluded_shows: vec![],
         }
@@ -62,6 +65,9 @@ impl Source {
         }
     }
     pub fn validate(&self) -> Result<(), Error> {
+        if self.title.as_ref().is_some_and(|s| s.len() > 4096) {
+            return Err(Error::Invalid("Plex source label is too long"));
+        }
         identity(&self.server)?;
         identity(&self.viewer)?;
         if !(1..=1000).contains(&self.limit) || self.excluded_shows.len() > 1000 {
@@ -71,7 +77,7 @@ impl Source {
             identity(id)?;
         }
         resource(&self.path)?;
-        if (self.kind == Kind::Hub) != self.path.starts_with("/hubs/") {
+        if self.path.starts_with("/hubs/") && self.kind != Kind::Hub {
             return Err(Error::Invalid(
                 "Plex source kind does not match its resource",
             ));
