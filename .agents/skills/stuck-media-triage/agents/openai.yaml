@@ -1,4 +1,0 @@
-interface:
-  display_name: "Stuck Media Triage"
-  short_description: "Diagnose and repair stuck Arr and Plex media"
-  default_prompt: "Use $stuck-media-triage to find stuck Arr imports and failed Plex previews, correlate their InfiniDysk sources, and automatically repair, retry, or regrab verified failures while preserving healthy media."

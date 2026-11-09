@@ -1,164 +1,90 @@
-> [!IMPORTANT] 
-> InfiniDysk is designed as a drop-in replacement and upgrade from `nzbdav-dev/nzbdav v0.6.4`. Follow the [migration guide](https://www.infinidysk.com/getting-started/migration/) before switching an existing installation.
->
-> Early adopters report **2x network throughput** and **seek times improved by up to 4x** compared with v0.6.4.
->
-> `ghcr.io/infinidysk/infinidysk:latest`
-
 <p align="center">
-  <img src="docs/assets/logo.png" width="160" alt="InfiniDysk logo" />
+  <img src="ui/public/logo.svg" width="128" alt="InfiniDysk logo" />
 </p>
 
 <h1 align="center">InfiniDysk</h1>
 
-<p align="center"><strong>The NzbDAV SuperFork</strong></p>
-<p align="center">
-  Stream NZBs directly from Usenet through a virtual filesystem — without downloading full media files first.
-</p>
-
-> [!NOTE]
-> **NzbDAV is now InfiniDysk.** Docs, GitHub, and the Docker image have moved. If you still pull `ghcr.io/nzbdav/nzbdav`, switch to `ghcr.io/infinidysk/infinidysk` (same `/config` and mounts). Read the [rename FAQ](https://www.infinidysk.com/community/renaming-to-infinidysk/).
-
-<img width="1024" height="601" alt="InfiniDysk overview dashboard" src="docs/assets/overview.png" />
+<p align="center"><strong>Your media library, streamed from Usenet.</strong></p>
 
 <p align="center">
-  <a href="https://github.com/infinidysk/infinidysk/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/infinidysk/infinidysk" /></a>
-  <a href="https://github.com/infinidysk/infinidysk/pkgs/container/infinidysk"><img alt="Docker image" src="https://img.shields.io/badge/ghcr.io-infinidysk%2Finfinidysk-blue?logo=docker&logoColor=white" /></a>
+  <a href="https://github.com/infinidysk/infinidysk/releases"><img alt="Latest 2.x release" src="https://img.shields.io/github/v/release/infinidysk/infinidysk?include_prereleases&filter=v2.*&label=2.x" /></a>
+  <a href="https://github.com/infinidysk/infinidysk/pkgs/container/infinidysk-next"><img alt="Docker image" src="https://img.shields.io/badge/ghcr.io-infinidysk%2Finfinidysk--next-blue?logo=docker&logoColor=white" /></a>
   <a href="https://github.com/infinidysk/infinidysk/actions/workflows/ci.yml"><img alt="CI status" src="https://img.shields.io/github/actions/workflow/status/infinidysk/infinidysk/ci.yml?branch=main&label=CI" /></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/infinidysk/infinidysk" /></a>
 </p>
 
----
+InfiniDysk is a Usenet-backed virtual filesystem. Sonarr, Radarr and other Arr apps add it as a SABnzbd download client. It never downloads the release: your media server reads the files over a native FUSE mount or WebDAV, and InfiniDysk streams them from your Usenet providers on demand.
 
-InfiniDysk combines a **WebDAV server** with a **SABnzbd-compatible API**. Sonarr, Radarr, and similar tools can use it as a drop-in download client, while Plex, Emby, Jellyfin, and other WebDAV clients stream content on demand from your Usenet providers.
+This is InfiniDysk **2.0**, rewritten in Rust and now in **beta**. Docs: [infinidysk.com](https://www.infinidysk.com/). Chat: [Discord](https://discord.gg/DAya7W6QMa). Bugs and ideas: [issues](https://github.com/infinidysk/infinidysk/issues).
 
-Please add feature requests and bug reports to the [issue tracker](https://github.com/infinidysk/infinidysk/issues), or join our [Discord](https://discord.gg/DAya7W6QMa) to chat with us.
+> [!WARNING]
+> **Moving from 1.x to 2.x is a breaking change.** It needs manual steps: copy your config, run the import, and replace the rclone sidecar with the built-in mount. Changing the image name alone is not an upgrade. Some 1.x features are not in 2.x yet.
+>
+> [Pick a version](https://www.infinidysk.com/) first. To move, follow [Upgrade from 1.x](https://www.infinidysk.com/v2/upgrade/), and check [what is not in 2.x yet](https://www.infinidysk.com/v2/whats-new/#feature-comparison).
 
-> After joining, use the channel and role selector to enable **InfiniDysk - SuperFork** for release notifications and development channels.
+## Looking for 1.x?
 
-## Features
+1.x (the C# version) lives on the [`v1`](https://github.com/infinidysk/infinidysk/tree/v1) branch and keeps the `ghcr.io/infinidysk/infinidysk` image. It gets bug fixes only. Its docs are at [infinidysk.com/v1](https://www.infinidysk.com/v1/).
 
-### Streaming and providers
+If your fork tracks 1.x, move it to `v1`:
 
-- **Virtual WebDAV filesystem** — Mount, browse, stream, and seek through NZB content without downloading complete media files first.
-- **Archive streaming** — Read RAR and 7z archives on demand, including password-protected content.
-- **Fast, resilient NNTP** — Pipeline article requests and cascade across multiple providers with automatic failover and circuit breakers.
-- **Provider routing and limits** — Separate provider-wide and article-transfer connection budgets, reserve burstable metadata capacity, set priorities and data caps, then Auto-tune transfers from the UI.
-- **Container-aware gap handling** — Preserve MPEG-TS timing across missing article ranges to reduce playback desynchronization.
+```sh
+git fetch upstream
+git push origin upstream/v1:refs/heads/v1
+```
 
-### Search and playback readiness
-
-- **Built-in Newznab search** — Configure indexers, monitor API usage, search manually, and mount results.
-- **Filters and adapters** — Apply regex or remote exclude lists and expose selected indexers through token-scoped Addon, Newznab, and JSON APIs.
-- **Watchdog, Preflight, and Warden** — Verify candidates, warm likely results, retry failed releases, and remember known-dead releases.
-- **Watchtower** — Keep wanted movies and episodes mapped to verified releases before playback begins.
-
-### Automation and library management
-
-- **SABnzbd-compatible queue** — Use add, queue, history, pause, resume, and speed-limit operations with configurable concurrent workers.
-- **Sonarr and Radarr integration** — Import through Rclone symlinks or lightweight STRM files and optionally repair unhealthy content.
-- **WebDAV management** — Browse, download, and delete eligible virtual filesystem items from the admin UI.
-- **[Experimental AltMount migration](https://www.infinidysk.com/guides/altmount-migration/)** — Rebuild and import an existing AltMount library through a guided wizard that leaves its source metadata untouched.
-
-### Operations and deployment
-
-- **Live operations dashboard** — Track throughput, latency, errors, active reads, provider usage, failover saves, and indexer activity.
-- **[Logs and diagnostics](https://www.infinidysk.com/configuration/support/)** — Filter and download logs, enable stream tracing from the UI, and generate redacted technical support packs.
-- **[Backup and restore](https://www.infinidysk.com/configuration/backup/)** — Schedule database backups and download, upload, or restore them from the Settings UI.
-- **[Headless configuration](https://www.infinidysk.com/configuration/headless/)** — Provision authoritative settings with `NZBDAV_CONFIG__...` environment variables.
-- **[OIDC / SSO](https://www.infinidysk.com/configuration/oidc/)** — Authenticate browser sessions through standards-compliant identity providers such as Authentik, Authelia, and Keycloak.
-- **[Prometheus metrics](https://www.infinidysk.com/operations/prometheus/)** — Scrape `/metrics` for streaming, seek latency, NNTP pools, circuit breakers, and process/runtime stats. Direct backend scrapes are anonymous unless `METRICS_REQUIRE_API_KEY=true`.
-- **[PostgreSQL](https://www.infinidysk.com/operations/postgresql/)** — Optional external PostgreSQL for the main operational database on new installs. SQLite stays the default; there is no SQLite-to-PostgreSQL migration yet. Auxiliary stores (`metrics.sqlite`, `warden.db`) remain in `/config`.
-- **[Admin API reference (Scalar)](https://www.infinidysk.com/configuration/environment-variables/)** — Opt-in Scalar explorer at `/scalar/` plus `/openapi/admin.json`, enabled with `ENABLE_API_DOCS=true`. Disabled by default in Docker.
-- **Flexible hosting** — Run with Docker, prebuilt Linux archives, or DUMB, and build for reverse-proxy sub-path hosting when needed.
+Then set your fork's default branch to `v1` and sync that branch from now on. A fork with its own commits merges `upstream/v1` instead of `upstream/main`; it is the same history, so there are no new conflicts.
 
 ## Quick start
 
-InfiniDysk ships as a single multi-architecture Docker image. Use `latest` for the newest stable release. The `lts` tag is a manually curated long-term-support pointer and may lag behind `latest`.
-
-To try it without keeping any settings:
-
-```bash
-docker run --rm -it -p 3000:3000 ghcr.io/infinidysk/infinidysk:latest
-```
-
-This trial command is ephemeral: its settings are discarded when the container exits.
-
-For a persistent setup, save the following as `compose.yml`:
+A new install. Coming from 1.x? Follow [Upgrade from 1.x](https://www.infinidysk.com/v2/upgrade/) instead, so your library and history carry over.
 
 ```yaml
 services:
-  nzbdav:
-    image: ghcr.io/infinidysk/infinidysk:latest
-    container_name: nzbdav
+  infinidysk:
+    image: ghcr.io/infinidysk/infinidysk-next:edge
+    container_name: infinidysk
     restart: unless-stopped
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - curl -fsSL http://localhost:3000/healthz > /dev/null || exit 1
-      interval: 30s
-      retries: 3
-      start_period: 60s
-      timeout: 5s
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Etc/UTC # your time zone, e.g. Europe/Oslo; the maintenance window follows it
     ports:
       - "3000:3000"
-    environment:
-      PUID: "1000"
-      PGID: "1000"
-      TZ: Etc/UTC
     volumes:
       - ./config:/config
+      - /mnt:/mnt:rshared
+      - /sys/devices/virtual/bdi:/sys/devices/virtual/bdi:rw
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
 ```
 
-Then run `docker compose up -d`, open `http://localhost:3000`, create your admin account, and configure your Usenet provider and WebDAV credentials under **Settings**.
+Open `http://<host>:3000`, create the admin account, then add your providers. Do this before exposing the port to an untrusted network: until an admin exists, anyone who reaches the page can create one.
 
-> [!IMPORTANT]
-> Port `3000` serves plain HTTP. If InfiniDysk will be reachable outside your trusted network, put it behind an HTTPS reverse proxy and do not expose the container port directly to the internet. WebDAV uses Basic authentication, so TLS is essential for remote access. When the proxy runs on the Docker host, bind the port to localhost with `127.0.0.1:3000:3000`.
+The UI, the SABnzbd API and WebDAV share port 3000. The library is mounted at `/mnt/infinidysk`. The image is `ghcr.io/infinidysk/infinidysk-next` for Linux x64 and arm64; `edge` is the newest 2.x release, every release also has its own `v2.x.y` tag, and there is no `latest` tag until 2.0 ships.
 
-Other supported setup paths:
+Next steps in the docs: [Run with Docker](https://www.infinidysk.com/v2/install/docker/), [Providers](https://www.infinidysk.com/v2/install/providers/), [Connect your Arr apps](https://www.infinidysk.com/v2/install/connect-arr/), [Settings](https://www.infinidysk.com/v2/reference/settings/).
 
-- **Linux without Docker** — Follow the [prebuilt archive guide](https://www.infinidysk.com/getting-started/prebuilt-archives/) to run the x64 or ARM64 release bundle.
-- **IPv6-only Docker hosts** — Use the Docker Hub mirror, `infinidysk/infinidysk`, because `ghcr.io` is not reachable over IPv6.
-- **Batteries-included Arr stack** — Use InfiniDysk as a supported core module in [DUMB](https://dumbarr.com/services/core/nzbdav/).
-- **Reverse-proxy sub-path** — Follow the [URL base guide](https://www.infinidysk.com/configuration/url-base/) to build an image for paths such as `/nzbdav`.
+## Reporting problems
 
-## Documentation
-
-Full documentation is published at [www.infinidysk.com](https://www.infinidysk.com/). Start with the [getting started guide](https://www.infinidysk.com/getting-started/) for a production deployment.
-
-- **Install and migrate** — Docker Compose, prebuilt Linux archives, first-run setup, upgrades from nzbdav-dev and community forks, and the [experimental AltMount migration](https://www.infinidysk.com/guides/altmount-migration/).
-- **Configure** — Settings walkthroughs, [headless environment configuration](https://www.infinidysk.com/configuration/headless/), OIDC, backup and restore, URL base, and provider tuning.
-- **Integrate** — Sonarr/Radarr automation, Rclone symlinks, STRM files, Plex, Emby, Jellyfin, and Stremio through AIOStreams.
-- **Search and prepare** — Indexers, token-scoped search profiles, Watchdog, Preflight, Warden, and [Watchtower](https://www.infinidysk.com/features/watchtower/).
-- **Operate and troubleshoot** — Health checks and repairs, live logs, stream tracing, support packs, performance tuning, [Prometheus metrics](https://www.infinidysk.com/operations/prometheus/), and [PostgreSQL](https://www.infinidysk.com/operations/postgresql/).
-- **Compare** — [InfiniDysk, AltMount, and classic download clients](https://www.infinidysk.com/guides/compare/).
-
-## Why another fork?
-
-This project is a maintained fork of [nzbdav-dev/nzbdav](https://github.com/nzbdav-dev/nzbdav). We took ownership of the full Usenet streaming stack — NzbDAV, UsenetSharp, RapidYencSharp, rapidyenc, and SharpCompress — so playback, connection, archive, and decoding fixes can land in the right layer.
-
-Read the full story on the [about page](https://www.infinidysk.com/community/about/).
-
-### Special thanks
-
-Special thanks to the forks and contributors whose ideas we consolidated:
-
-- [@Nzbdav-dev](https://github.com/Nzbdav-dev)
-- [@Pukabyte](https://github.com/Pukabyte)
-- [@elfhosted](https://github.com/elfhosted)
-- [@kha-kis](https://github.com/kha-kis)
-- [@mrghxst](https://github.com/mrghxst)
-- [@qooode](https://github.com/qooode)
-- [@dgherman](https://github.com/dgherman)
-- [@loambit](https://github.com/loambit)
+See [Reporting a bug](https://www.infinidysk.com/v2/help/reporting/): the image tag, a support pack from the System page, and for playback problems a read trace. Never post provider passwords or API keys. Release names are not needed; describe the file instead (for example "stored RAR5 episode").
 
 ## Development
 
-The project consists of a .NET 10 backend (WebDAV, Usenet streaming, SAB API) and a React Router 8 frontend (admin UI). See [CONTRIBUTING.md](CONTRIBUTING.md) for local development setup and [CHANGELOG.md](CHANGELOG.md) for release history. Source for the published documentation lives in [infinidysk/docs](https://github.com/infinidysk/docs). Local `run-backend.sh` enables the Scalar admin API reference at `/scalar/`; Docker requires `ENABLE_API_DOCS=true`.
+1.x bug fixes go to the `v1` branch; everything else targets `main`. Read [AGENTS.md](AGENTS.md) for the project rules and [DESIGN.md](DESIGN.md) before changing the UI.
+
+Requires [rustup](https://rustup.rs); the toolchain is pinned in `rust-toolchain.toml`.
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
 
 ## License
 
-InfiniDysk is released under the [MIT License](LICENSE).
-
-> [!NOTE]
-> InfiniDysk is intended for use with legally obtained or public domain content only. The project maintainers do not condone piracy and will not provide support for users suspected of engaging in copyright infringement.
+MIT

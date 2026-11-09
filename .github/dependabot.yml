@@ -1,8 +1,84 @@
 version: 2
-
 updates:
+  # Setting labels replaces Dependabot's defaults, so keep them next to v1/v2.
+  - package-ecosystem: cargo
+    directory: /
+    labels: [dependencies, v2]
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: fix(deps)
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: npm
+    directory: /ui
+    labels: [dependencies, javascript, v2]
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: fix(deps)
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: docker
+    directory: /
+    labels: [dependencies, v2]
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build(docker)
+    groups:
+      docker:
+        patterns: ["*"]
+
+  - package-ecosystem: rust-toolchain
+    directory: /
+    labels: [dependencies, v2]
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: build(deps)
+
+  - package-ecosystem: gitsubmodule
+    directory: /
+    labels: [dependencies, v2]
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: fix(yenc)
+
+  - package-ecosystem: github-actions
+    directory: /
+    labels: [dependencies, github_actions, v2]
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      github-actions:
+        patterns: ["*"]
+    open-pull-requests-limit: 10
+
+  # 1.x on the v1 branch. Dependabot only reads this file from the default branch.
   - package-ecosystem: nuget
     directory: /
+    target-branch: v1
+    labels: [dependencies, .NET, v1]
     schedule:
       interval: monthly
     cooldown:
@@ -20,6 +96,8 @@ updates:
 
   - package-ecosystem: github-actions
     directory: /
+    target-branch: v1
+    labels: [dependencies, github_actions, v1]
     schedule:
       interval: monthly
     cooldown:
@@ -34,6 +112,8 @@ updates:
 
   - package-ecosystem: npm
     directory: /frontend
+    target-branch: v1
+    labels: [dependencies, javascript, v1]
     schedule:
       interval: monthly
     cooldown:

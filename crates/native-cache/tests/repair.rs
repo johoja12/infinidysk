@@ -1,0 +1,753 @@
+//! Durable publication, rollback detection and payload-independent repair revisions.
+use bytes::Bytes;
+use infinidysk_native_cache::repair::{Error, Geometry, Patch, Proof, Revision, Store};
+use infinidysk_native_cache::{Cache, Settings};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
+fn directory() -> PathBuf {
+    let path = std::env::temp_dir().join(format!("infinidysk-repair-ledger-{}", Uuid::new_v4()));
+    std::fs::create_dir(&path).expect("directory");
+    path
+}
+fn patch(id: &str, data: &'static [u8]) -> Patch {
+    Patch {
+        message_id: id.into(),
+        geometry: Geometry {
+            offset: 8,
+            file_size: 100,
+            part: Some(2),
+            total: Some(4),
+        },
+        proof: Proof {
+            set: [1; 16],
+            file: [2; 16],
+            file_md5: [3; 16],
+            file_length: 100,
+        },
+        data: Bytes::from_static(data),
+    }
+}
+fn revision(store: &Store, id: &str) -> [u8; 32] {
+    match store.revision(id) {
+        Revision::Repaired(r) => r,
+        other => panic!("expected repair, found {other:?}"),
+    }
+}
+async fn database(path: &Path) -> sqlx::SqlitePool {
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(SqliteConnectOptions::new().filename(path.join("catalogue.sqlite")))
+        .await
+        .expect("database")
+}
+#[tokio::test]
+async fn publication_is_persistent_and_payload_eviction_never_forgets_a_revision() {
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    assert_eq!(store.revision("a@fixture"), Revision::Base);
+    store
+        .publish(vec![
+            patch("a@fixture", b"restored"),
+            patch("b@fixture", b"other"),
+        ])
+        .await
+        .expect("publish");
+    let id = store.id();
+    let a = revision(&store, "a@fixture");
+    let b = revision(&store, "b@fixture");
+    assert_eq!(store.epoch(), 1);
+    assert!(store.generation() >= 2);
+    assert_eq!(
+        store
+            .get("a@fixture", a)
+            .await
+            .expect("verified bytes")
+            .data
+            .as_ref(),
+        b"restored"
+    );
+    assert!(store.evict_payload("a@fixture").await.expect("evict"));
+    assert_eq!(revision(&store, "a@fixture"), a);
+    assert!(matches!(
+        store.get("a@fixture", a).await,
+        Err(Error::PayloadMissing)
+    ));
+    drop(store);
+    let store = Store::open(&path).await.expect("restart");
+    assert_eq!(store.id(), id);
+    assert_eq!(revision(&store, "a@fixture"), a);
+    assert!(matches!(
+        store.get("a@fixture", a).await,
+        Err(Error::PayloadMissing)
+    ));
+    assert_eq!(
+        store
+            .get("b@fixture", b)
+            .await
+            .expect("other bytes")
+            .data
+            .as_ref(),
+        b"other"
+    );
+    store
+        .publish(vec![patch("a@fixture", b"restored")])
+        .await
+        .expect("restore same repair");
+    assert_eq!(revision(&store, "a@fixture"), a);
+    store
+        .publish(vec![patch("a@fixture", b"changed")])
+        .await
+        .expect("new repair");
+    assert_ne!(revision(&store, "a@fixture"), a);
+    assert_eq!(revision(&store, "b@fixture"), b);
+    assert_eq!(store.revision("untouched@fixture"), Revision::Base);
+    assert!(matches!(
+        store.get("a@fixture", a).await,
+        Err(Error::Changed)
+    ));
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+#[tokio::test]
+async fn rollback_or_lost_catalogue_cannot_reset_repairs_to_base() {
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    store
+        .publish(vec![patch("a@fixture", b"restored")])
+        .await
+        .expect("publish");
+    drop(store);
+    let db = database(&path).await;
+    sqlx::query("UPDATE repair_state SET epoch=0")
+        .execute(&db)
+        .await
+        .expect("simulate stale restore");
+    db.close().await;
+    assert!(matches!(Store::open(&path).await, Err(Error::Invalid(_))));
+    std::fs::remove_file(path.join("catalogue.sqlite")).expect("simulate missing catalogue");
+    assert!(Store::open(&path).await.is_err());
+    assert!(
+        !path.join("catalogue.sqlite").exists(),
+        "do not replace lost state with an empty ledger"
+    );
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+#[tokio::test]
+async fn corruption_and_descriptor_changes_are_rejected_and_writer_ownership_is_exclusive() {
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    assert!(Store::open(&path).await.is_err());
+    store
+        .publish(vec![patch("a@fixture", b"restored")])
+        .await
+        .expect("publish");
+    let rev = revision(&store, "a@fixture");
+    let db = database(&path).await;
+    sqlx::query("UPDATE article_repairs SET payload=$1")
+        .bind(b"corrupt!".as_slice())
+        .execute(&db)
+        .await
+        .expect("corrupt bytes");
+    assert!(matches!(
+        store.get("a@fixture", rev).await,
+        Err(Error::Invalid(_))
+    ));
+    sqlx::query("UPDATE article_repairs SET geometry=$1")
+        .bind(r#"{"offset":9,"file_size":100,"part":2,"total":4}"#)
+        .execute(&db)
+        .await
+        .expect("corrupt geometry");
+    db.close().await;
+    drop(store);
+    assert!(matches!(Store::open(&path).await, Err(Error::Invalid(_))));
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+#[tokio::test]
+async fn failed_atomic_batch_stays_pending_until_readback_without_replaying_any_patch() {
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    store
+        .publish(vec![patch("existing@fixture", b"retained")])
+        .await
+        .expect("publish");
+    let retained = revision(&store, "existing@fixture");
+    let db = database(&path).await;
+    sqlx::query("CREATE TRIGGER reject_repair BEFORE INSERT ON article_repairs BEGIN SELECT RAISE(ABORT,'fixture storage rejection'); END").execute(&db).await.expect("inject write failure");
+    assert!(
+        store
+            .publish(vec![
+                patch("a@fixture", b"first"),
+                patch("b@fixture", b"second")
+            ])
+            .await
+            .is_err()
+    );
+    assert_eq!(store.revision("a@fixture"), Revision::Pending);
+    assert_eq!(store.revision("b@fixture"), Revision::Pending);
+    assert_eq!(revision(&store, "existing@fixture"), retained);
+    assert!(matches!(
+        store.publish(vec![patch("c@fixture", b"third")]).await,
+        Err(Error::Pending)
+    ));
+    store
+        .reconcile()
+        .await
+        .expect("observe rollback, not retry writes");
+    assert_eq!(store.revision("a@fixture"), Revision::Base);
+    assert_eq!(store.revision("b@fixture"), Revision::Base);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM article_repairs")
+        .fetch_one(&db)
+        .await
+        .expect("count");
+    assert_eq!(count, 1);
+    sqlx::query("DROP TRIGGER reject_repair")
+        .execute(&db)
+        .await
+        .expect("remove injection");
+    store
+        .publish(vec![patch("a@fixture", b"first")])
+        .await
+        .expect("explicit new attempt");
+    db.close().await;
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+#[tokio::test]
+async fn native_cache_and_repair_ledger_share_metadata_without_an_extra_payload_cache() {
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    let cache = Cache::open(Settings {
+        metadata_path: path.to_str().expect("path").into(),
+        ..Settings::default()
+    })
+    .await
+    .expect("cache without payload folders");
+    store
+        .publish(vec![patch("a@fixture", b"restored")])
+        .await
+        .expect("publish");
+    drop(cache);
+    drop(store);
+    let store = Store::open(&path).await.expect("reopen shared catalogue");
+    assert_eq!(store.epoch(), 1);
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+#[tokio::test]
+async fn invalid_batches_have_no_publication_side_effects() {
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    assert!(
+        store
+            .publish(vec![patch("a@fixture", b"one"), patch("a@fixture", b"two")])
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .publish(vec![patch("bad\r\nid", b"data")])
+            .await
+            .is_err()
+    );
+    let mut bad = patch("geometry@fixture", b"data");
+    bad.geometry.offset = u64::MAX;
+    assert!(store.publish(vec![bad]).await.is_err());
+    assert_eq!(store.revision("a@fixture"), Revision::Base);
+    assert_eq!(store.epoch(), 0);
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+
+#[tokio::test]
+async fn an_anchor_failure_after_commit_is_reconciled_by_readback_not_republication() {
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    store
+        .publish(vec![
+            patch("a@fixture", b"before"),
+            patch("other@fixture", b"stable"),
+        ])
+        .await
+        .expect("initial repair");
+    let old = revision(&store, "a@fixture");
+    let other = revision(&store, "other@fixture");
+    std::fs::remove_file(path.join("repair-anchor.json")).expect("anchor");
+    std::fs::create_dir(path.join("repair-anchor.json")).expect("inject rename failure");
+    assert!(
+        store
+            .publish(vec![
+                patch("a@fixture", b"after"),
+                patch("new@fixture", b"new")
+            ])
+            .await
+            .is_err()
+    );
+    assert_eq!(store.revision("a@fixture"), Revision::Pending);
+    assert_eq!(store.revision("new@fixture"), Revision::Pending);
+    assert_eq!(
+        store
+            .get("other@fixture", other)
+            .await
+            .expect("unaffected source")
+            .data
+            .as_ref(),
+        b"stable"
+    );
+    assert!(matches!(
+        store.get("a@fixture", old).await,
+        Err(Error::Pending)
+    ));
+    let temporary = std::fs::read_dir(&path)
+        .expect("directory")
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".repair-anchor-")
+        })
+        .count();
+    assert_eq!(
+        temporary, 0,
+        "failed atomic anchor write cleans up its temporary file"
+    );
+    std::fs::remove_dir(path.join("repair-anchor.json")).expect("restore anchor destination");
+    store
+        .reconcile()
+        .await
+        .expect("observe committed patch without rewriting it");
+    assert_eq!(store.epoch(), 2);
+    let new = revision(&store, "a@fixture");
+    assert_ne!(new, old);
+    assert_eq!(
+        store
+            .get("a@fixture", new)
+            .await
+            .expect("new bytes")
+            .data
+            .as_ref(),
+        b"after"
+    );
+    drop(store);
+    let store = Store::open(&path).await.expect("restart committed repair");
+    assert_eq!(store.epoch(), 2);
+    assert_eq!(revision(&store, "a@fixture"), new);
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+#[tokio::test]
+async fn symlinked_anchors_and_replaced_metadata_directories_cannot_redirect_state() {
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    store
+        .publish(vec![patch("a@fixture", b"retained")])
+        .await
+        .expect("publish");
+    let rev = revision(&store, "a@fixture");
+    let moved = path.with_extension("moved");
+    std::fs::rename(&path, &moved).expect("simulate mount change");
+    std::fs::create_dir(&path).expect("replacement path");
+    assert!(store.get("a@fixture", rev).await.is_err());
+    assert!(
+        store
+            .publish(vec![patch("b@fixture", b"rejected")])
+            .await
+            .is_err()
+    );
+    assert!(
+        std::fs::read_dir(&path)
+            .expect("replacement directory")
+            .next()
+            .is_none()
+    );
+    drop(store);
+    std::fs::remove_dir(&path).expect("remove replacement");
+    std::fs::rename(&moved, &path).expect("restore mount");
+    let anchor = std::fs::read(path.join("repair-anchor.json")).expect("anchor");
+    std::fs::write(path.join("outside.json"), &anchor).expect("outside");
+    std::fs::remove_file(path.join("repair-anchor.json")).expect("remove anchor");
+    std::os::unix::fs::symlink(path.join("outside.json"), path.join("repair-anchor.json"))
+        .expect("symlink");
+    assert!(Store::open(&path).await.is_err());
+    assert_eq!(
+        std::fs::read(path.join("outside.json")).expect("outside unchanged"),
+        anchor
+    );
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+
+#[tokio::test]
+async fn the_actual_ledger_serves_body_and_stat_without_providers_and_checks_geometry() {
+    use infinidysk_nntp::{BodyExpectation, Client, Workload};
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    let client = Client::new([]);
+    assert!(client.set_repairs(store.clone()));
+    store
+        .publish(vec![patch("a@fixture", b"restored")])
+        .await
+        .expect("repair");
+    let body = client
+        .body_checked(
+            "a@fixture",
+            Workload::Health,
+            BodyExpectation {
+                offset: Some(8),
+                decoded_len: Some(8),
+                file_size: Some(100),
+                ..BodyExpectation::default()
+            },
+        )
+        .await
+        .expect("body without providers");
+    assert_eq!(body.data.as_ref(), b"restored");
+    assert_eq!(body.part, Some(2));
+    client
+        .stat("a@fixture", Workload::Health, None)
+        .await
+        .expect("STAT against verified repair");
+    assert!(
+        client
+            .body_with("a@fixture", Workload::Stream, None, None, Some(9))
+            .await
+            .is_err()
+    );
+    store
+        .evict_payload("a@fixture")
+        .await
+        .expect("payload retention");
+    assert!(matches!(
+        client.stat("a@fixture", Workload::Health, None).await,
+        Err(infinidysk_nntp::Error::Unavailable)
+    ));
+    drop(client);
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+
+#[tokio::test]
+async fn monotonic_external_witnesses_complete_before_activation_and_readback_does_not_republish() {
+    use infinidysk_db::{Db, repair::Lineage};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let path = directory();
+    let store = Store::open(&path.join("repair")).await.expect("ledger");
+    let cache = Cache::open(Settings {
+        metadata_path: path.join("native").to_str().expect("path").into(),
+        ..Settings::default()
+    })
+    .await
+    .expect("cache");
+    let db = Db::connect(&format!("sqlite:{}", path.join("main.sqlite").display()))
+        .await
+        .expect("main database");
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(store.set_witness(Arc::new({
+        let db = db.clone();
+        let cache = cache.clone();
+        let calls = calls.clone();
+        move |id, epoch| {
+            let db = db.clone();
+            let cache = cache.clone();
+            let calls = calls.clone();
+            Box::pin(async move {
+                if !db
+                    .bind_repair_lineage(id, epoch)
+                    .await
+                    .map_err(|_| Error::Witness)?
+                {
+                    return Err(Error::Witness);
+                }
+                cache
+                    .bind_repair_lineage(id, epoch)
+                    .await
+                    .map_err(|_| Error::Witness)?;
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(Error::Witness);
+                }
+                Ok(())
+            })
+        }
+    })));
+    assert!(matches!(
+        store.publish(vec![patch("a@fixture", b"restored")]).await,
+        Err(Error::Witness)
+    ));
+    assert!(store.is_pending());
+    assert_eq!(store.revision("a@fixture"), Revision::Pending);
+    assert_eq!(
+        db.repair_lineage().await.expect("witness"),
+        Some(Lineage {
+            id: store.id(),
+            epoch: 1
+        })
+    );
+    store
+        .reconcile()
+        .await
+        .expect("complete witness by readback");
+    assert_eq!(store.epoch(), 1);
+    assert!(!store.is_pending());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let rev = revision(&store, "a@fixture");
+    assert_eq!(
+        store
+            .get("a@fixture", rev)
+            .await
+            .expect("bytes")
+            .data
+            .as_ref(),
+        b"restored"
+    );
+    assert!(
+        !db.bind_repair_lineage(store.id(), 0)
+            .await
+            .expect("late main write")
+    );
+    assert!(cache.bind_repair_lineage(store.id(), 0).await.is_err());
+    assert!(cache.bind_repair_lineage(Uuid::new_v4(), 2).await.is_err());
+    drop(store);
+    drop(cache);
+    drop(db);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+
+#[tokio::test]
+async fn source_check_runs_after_queued_mutations_and_before_pending_or_storage_changes() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    let gate = Arc::new(tokio::sync::RwLock::new(()));
+    assert!(store.set_mutation_gate(gate.clone()));
+    let old = gate.clone().read_owned().await;
+    let current = Arc::new(AtomicBool::new(true));
+    let checked = Arc::new(AtomicBool::new(false));
+    let generation = store.generation();
+    let task = {
+        let store = store.clone();
+        let current = current.clone();
+        let checked = checked.clone();
+        tokio::spawn(async move {
+            store
+                .publish_checked(vec![patch("guarded@fixture", b"restored")], async move {
+                    checked.store(true, Ordering::Release);
+                    if current.load(Ordering::Acquire) {
+                        Ok(())
+                    } else {
+                        Err(Error::Changed)
+                    }
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while gate.try_read().is_ok() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("publication queued");
+    assert!(
+        !checked.load(Ordering::Acquire),
+        "source check must not run before the publication barrier"
+    );
+    current.store(false, Ordering::Release);
+    drop(old);
+    assert!(matches!(task.await.expect("task"), Err(Error::Changed)));
+    assert!(checked.load(Ordering::Acquire));
+    assert!(!store.is_pending());
+    assert_eq!(store.generation(), generation);
+    assert_eq!(store.epoch(), 0);
+    assert_eq!(store.revision("guarded@fixture"), Revision::Base);
+    let patch = patch("guarded@fixture", b"restored");
+    let expected = patch.expected_revision().expect("deterministic receipt");
+    store
+        .publish_checked(vec![patch], async { Ok(()) })
+        .await
+        .expect("current source");
+    assert_eq!(revision(&store, "guarded@fixture"), expected);
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+#[tokio::test]
+async fn cancelled_source_validation_has_no_ambiguous_publication_to_replay() {
+    use std::sync::Arc;
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    let started = Arc::new(tokio::sync::Notify::new());
+    let wait = Arc::new(tokio::sync::Notify::new());
+    let task = {
+        let store = store.clone();
+        let started = started.clone();
+        let wait = wait.clone();
+        tokio::spawn(async move {
+            store
+                .publish_checked(vec![patch("cancelled@fixture", b"restored")], async move {
+                    started.notify_one();
+                    wait.notified().await;
+                    Ok(())
+                })
+                .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+        .await
+        .expect("source check entered");
+    assert!(!store.is_pending());
+    task.abort();
+    assert!(task.await.expect_err("aborted").is_cancelled());
+    assert!(!store.is_pending());
+    assert_eq!(store.epoch(), 0);
+    assert_eq!(store.revision("cancelled@fixture"), Revision::Base);
+    store
+        .publish(vec![patch("other@fixture", b"restored")])
+        .await
+        .expect("writer and publication guards released");
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+
+#[tokio::test]
+async fn reconciliation_waits_for_unresolved_database_writes_before_activating_a_snapshot() {
+    use sha2::{Digest as _, Sha256};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    let fail = Arc::new(AtomicBool::new(true));
+    assert!(store.set_witness(Arc::new({
+        let fail = fail.clone();
+        move |_, _| {
+            let fail = fail.clone();
+            Box::pin(async move {
+                if fail.load(Ordering::Acquire) {
+                    Err(Error::Witness)
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    })));
+    assert!(matches!(
+        store
+            .publish(vec![patch("in-flight@fixture", b"restored")])
+            .await,
+        Err(Error::Witness)
+    ));
+    assert!(store.is_pending());
+    fail.store(false, Ordering::Release);
+    // Models an already-dispatched SQLite write whose result the caller lost.
+    // WAL readers can still see the preceding epoch while this writer is active.
+    let db = database(&path).await;
+    let mut tx = db
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("in-flight transaction");
+    let newer = patch("in-flight@fixture", b"newbytes");
+    let expected = newer.expected_revision().expect("revision");
+    let hash: [u8; 32] = Sha256::digest(&newer.data).into();
+    sqlx::query("UPDATE article_repairs SET revision=$1,hash=$2,payload=$3 WHERE message_id=$4")
+        .bind(expected.as_slice())
+        .bind(hash.as_slice())
+        .bind(newer.data.as_ref())
+        .bind(&newer.message_id)
+        .execute(&mut *tx)
+        .await
+        .expect("pending body");
+    sqlx::query("UPDATE repair_state SET epoch=2 WHERE singleton=1")
+        .execute(&mut *tx)
+        .await
+        .expect("pending epoch");
+    let mut readback = {
+        let store = store.clone();
+        tokio::spawn(async move { store.reconcile().await })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut readback)
+            .await
+            .is_err(),
+        "readback must wait for the unresolved writer, not activate an earlier WAL snapshot"
+    );
+    assert!(store.is_pending());
+    tx.commit().await.expect("write completed");
+    readback.await.expect("readback worker").expect("reconcile");
+    assert_eq!(store.epoch(), 2);
+    assert_eq!(revision(&store, "in-flight@fixture"), expected);
+    assert_eq!(
+        store
+            .get("in-flight@fixture", expected)
+            .await
+            .expect("current bytes")
+            .data
+            .as_ref(),
+        b"newbytes"
+    );
+    db.close().await;
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}
+
+#[tokio::test]
+async fn startup_waits_for_an_older_owners_unresolved_database_write() {
+    use sha2::{Digest as _, Sha256};
+    let path = directory();
+    let store = Store::open(&path).await.expect("store");
+    store
+        .publish(vec![patch("startup-in-flight@fixture", b"restored")])
+        .await
+        .expect("first revision");
+    drop(store);
+    let db = database(&path).await;
+    let mut tx = db
+        .begin_with("BEGIN IMMEDIATE")
+        .await
+        .expect("unresolved writer");
+    let newer = patch("startup-in-flight@fixture", b"newbytes");
+    let expected = newer.expected_revision().expect("revision");
+    let hash: [u8; 32] = Sha256::digest(&newer.data).into();
+    sqlx::query("UPDATE article_repairs SET revision=$1,hash=$2,payload=$3 WHERE message_id=$4")
+        .bind(expected.as_slice())
+        .bind(hash.as_slice())
+        .bind(newer.data.as_ref())
+        .bind(&newer.message_id)
+        .execute(&mut *tx)
+        .await
+        .expect("pending body");
+    sqlx::query("UPDATE repair_state SET epoch=2 WHERE singleton=1")
+        .execute(&mut *tx)
+        .await
+        .expect("pending epoch");
+    let mut opening = {
+        let path = path.clone();
+        tokio::spawn(async move { Store::open(&path).await })
+    };
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut opening)
+            .await
+            .is_err(),
+        "startup cannot activate an older snapshot while a prior SQL writer is unresolved"
+    );
+    tx.commit().await.expect("settled writer");
+    let store = opening.await.expect("startup worker").expect("open");
+    assert_eq!(store.epoch(), 2);
+    assert_eq!(revision(&store, "startup-in-flight@fixture"), expected);
+    assert_eq!(
+        store
+            .get("startup-in-flight@fixture", expected)
+            .await
+            .expect("current bytes")
+            .data
+            .as_ref(),
+        b"newbytes"
+    );
+    db.close().await;
+    drop(store);
+    std::fs::remove_dir_all(path).expect("cleanup");
+}

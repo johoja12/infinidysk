@@ -1,0 +1,30 @@
+[package]
+name = "infinidysk-native-cache"
+description = "Verified final-media chunks shared by all virtual filesystem readers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+bytes.workspace = true
+infinidysk-nntp.workspace = true
+nix = { workspace = true, features = ["fs", "dir"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "rt", "sync", "time"] }
+tracing.workspace = true
+utoipa.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+infinidysk-db.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

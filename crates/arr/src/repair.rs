@@ -1,0 +1,743 @@
+//! The few Arr calls repair needs: find the media file imported from a download,
+//! blocklist the release, and get a replacement searched. Sonarr, Radarr, Whisparr
+//! (shaped like one of those), Lidarr and Chaptarr.
+
+use std::collections::HashSet;
+use std::time::Duration;
+
+use infinidysk_core::media;
+use reqwest::Method;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::{Arr, Error, Profile, Session, fetch, send, version};
+
+/// History `eventType` values shared by Sonarr, Radarr, Lidarr and Chaptarr.
+const GRABBED: &str = "1";
+const IMPORTED: &str = "3";
+/// How often the Arr queue is polled while waiting for its own search.
+const QUEUE_POLL: Duration = Duration::from_secs(5);
+/// History records per page.
+const PAGE: usize = 1000;
+/// Slack between an import's history date and its file's `dateAdded`.
+const DATE_SLACK: jiff::SignedDuration = jiff::SignedDuration::from_secs(60);
+
+/// A file an Arr imported from a download.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Import {
+    pub download_id: String,
+    pub dropped: String,
+    pub imported: String,
+    /// The library file the import created, where the history names it.
+    pub file_id: Option<i64>,
+}
+
+/// The media an Arr imported from a download, and the file it holds for it now.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Owner {
+    media: Media,
+    imported_path: String,
+    /// When the Arr imported it, per its history.
+    imported_at: Option<String>,
+    /// The Arr's id of the file we recorded it importing, if any.
+    recorded_file: Option<i64>,
+    current: Option<MediaFile>,
+    /// Verified import provenance, never an inferred migration job id.
+    download_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum Media {
+    Episodes(Vec<i64>),
+    Movie(i64),
+    Album(i64),
+    Book(i64),
+}
+
+/// Which API an instance repairs through.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Series,
+    Movies,
+    Music,
+    Books,
+}
+
+async fn shape(http: &reqwest::Client, arr: &Arr) -> Result<Option<Shape>, Error> {
+    Ok(match arr.profile {
+        Profile::Sonarr => Some(Shape::Series),
+        Profile::Radarr => Some(Shape::Movies),
+        Profile::Lidarr => Some(Shape::Music),
+        Profile::Chaptarr => Some(Shape::Books),
+        Profile::Whisparr => Some(if crate::whisparr_has_movies(&version(http, arr).await?) {
+            Shape::Movies
+        } else {
+            Shape::Series
+        }),
+        Profile::Sportarr => None,
+    })
+}
+
+impl Owner {
+    /// The original download proven by import history, when available.
+    #[must_use]
+    pub fn download_id(&self) -> Option<&str> {
+        self.download_id.as_deref()
+    }
+
+    /// Current exact Arr file path, or its proven original path after deletion.
+    #[must_use]
+    pub fn file_path(&self) -> &str {
+        self.current
+            .as_ref()
+            .map_or(self.imported_path.as_str(), |file| file.path.as_str())
+    }
+
+    /// The Arr has since imported a different file for this media. Compared by file id
+    /// where we recorded one, else by the file being added after the import, else by
+    /// path; so the same file under a new path (a STRM, a rename) is not a replacement.
+    #[must_use]
+    pub fn replaced(&self) -> bool {
+        let parse = |d: Option<&str>| d.and_then(|d| d.parse::<jiff::Timestamp>().ok());
+        self.current.as_ref().is_some_and(|f| {
+            if let Some(id) = self.recorded_file {
+                return f.id != id;
+            }
+            match (
+                parse(f.date_added.as_deref()),
+                parse(self.imported_at.as_deref()),
+            ) {
+                (Some(added), Some(imported)) => added.duration_since(imported) > DATE_SLACK,
+                _ => f.path != self.imported_path,
+            }
+        })
+    }
+
+    /// The media kind and ids a replacement search covers, for the shared search limit.
+    #[must_use]
+    pub fn searches(&self) -> (&'static str, &[i64]) {
+        match &self.media {
+            Media::Episodes(ids) => ("episode", ids),
+            Media::Movie(id) => ("movie", std::slice::from_ref(id)),
+            Media::Album(id) => ("album", std::slice::from_ref(id)),
+            Media::Book(id) => ("book", std::slice::from_ref(id)),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QueueRecord {
+    download_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Page {
+    records: Vec<Record>,
+    total_records: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Record {
+    id: i64,
+    download_id: Option<String>,
+    episode_id: Option<i64>,
+    movie_id: Option<i64>,
+    track_id: Option<i64>,
+    album_id: Option<i64>,
+    book_id: Option<i64>,
+    date: Option<String>,
+    #[serde(default)]
+    data: Data,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Data {
+    dropped_path: Option<String>,
+    imported_path: Option<String>,
+    /// Sent as a string; a number is accepted too.
+    file_id: Option<serde_json::Value>,
+}
+
+impl Record {
+    fn into_import(self) -> Option<Import> {
+        let file_id = self
+            .data
+            .file_id
+            .as_ref()
+            .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse().ok()));
+        Some(Import {
+            download_id: self.download_id?.trim().to_owned(),
+            dropped: self.data.dropped_path?,
+            imported: self.data.imported_path?,
+            file_id,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaFile {
+    id: i64,
+    path: String,
+    date_added: Option<String>,
+    /// Radarr's file records name their movie.
+    #[serde(default)]
+    movie_id: Option<i64>,
+    /// Lidarr's name their album.
+    #[serde(default)]
+    album_id: Option<i64>,
+    /// Chaptarr's name their book.
+    #[serde(default)]
+    book_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Episode {
+    episode_file_id: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Track {
+    track_file_id: i64,
+}
+
+#[derive(Deserialize)]
+struct Id {
+    id: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Movie {
+    movie_file: Option<MediaFile>,
+}
+
+/// The media this instance imported from download `job` at a path ending in one of
+/// `dropped` (the path under the completed-downloads folder, from the category on, by
+/// each name it was handed off under); `None` if it imported nothing from there or its
+/// profile has no repair support. `recorded_file` is the Arr's file id we recorded.
+pub async fn owner(
+    http: &reqwest::Client,
+    arr: &Arr,
+    job: &str,
+    dropped: &[String],
+    recorded_file: Option<i64>,
+) -> Result<Option<Owner>, Error> {
+    let Some(shape) = shape(http, arr).await? else {
+        return Ok(None);
+    };
+    let s = Session::open(http, arr).await?;
+    let call = |method, path: String| s.call(method, &path);
+    let imported: Page = fetch(call(Method::GET, "history".to_owned()).query(&[
+        ("downloadId", job),
+        ("eventType", IMPORTED),
+        ("pageSize", "1000"),
+    ]))
+    .await?;
+    let last_import = imported
+        .records
+        .iter()
+        .filter_map(|r| r.date.as_deref()?.parse::<jiff::Timestamp>().ok())
+        .max();
+    let records: Vec<_> = imported
+        .records
+        .into_iter()
+        .filter(|r| {
+            r.data
+                .dropped_path
+                .as_deref()
+                .is_some_and(|p| dropped.iter().any(|d| p.ends_with(d.as_str())))
+        })
+        .collect();
+    let Some((imported_path, imported_at)) = records.iter().find_map(|r| {
+        let path = r.data.imported_path.clone()?;
+        Some((path, r.date.clone()))
+    }) else {
+        return Ok(None);
+    };
+    let (media, current) = match shape {
+        Shape::Series => {
+            let ids: Vec<i64> = records.iter().filter_map(|r| r.episode_id).collect();
+            let first = ids
+                .first()
+                .ok_or(Error::Unexpected("import record without episodeId"))?;
+            let episode: Episode = fetch(call(Method::GET, format!("episode/{first}"))).await?;
+            let current = match episode.episode_file_id {
+                0 => None,
+                id => Some(fetch(call(Method::GET, format!("episodefile/{id}"))).await?),
+            };
+            (Media::Episodes(ids), current)
+        }
+        Shape::Movies => {
+            let id = records
+                .iter()
+                .find_map(|r| r.movie_id)
+                .ok_or(Error::Unexpected("import record without movieId"))?;
+            let movie: Movie = fetch(call(Method::GET, format!("movie/{id}"))).await?;
+            (Media::Movie(id), movie.movie_file)
+        }
+        Shape::Music => {
+            let (track, album) = records
+                .iter()
+                .find_map(|r| Some((r.track_id?, r.album_id?)))
+                .ok_or(Error::Unexpected("import record without trackId"))?;
+            let track: Track = fetch(call(Method::GET, format!("track/{track}"))).await?;
+            let current = match track.track_file_id {
+                0 => None,
+                id => Some(fetch(call(Method::GET, format!("trackfile/{id}"))).await?),
+            };
+            (Media::Album(album), current)
+        }
+        Shape::Books => {
+            let id = records
+                .iter()
+                .find_map(|r| r.book_id)
+                .ok_or(Error::Unexpected("import record without bookId"))?;
+            let files: Vec<MediaFile> =
+                fetch(call(Method::GET, "bookfile".to_owned()).query(&[("bookId", id)])).await?;
+            let current = current_book_file(files, &imported_path, last_import, recorded_file);
+            (Media::Book(id), current)
+        }
+    };
+    Ok(Some(Owner {
+        media,
+        imported_path,
+        imported_at,
+        recorded_file,
+        current,
+        download_id: Some(job.to_owned()),
+    }))
+}
+
+/// The file a book holds now in place of the one imported at `imported_path`. A book can
+/// hold an audiobook and an ebook, and an audiobook many files: the other chapters of the
+/// same download are no replacement, even renamed. Prefers the recorded file, then the
+/// imported path, then the newest of the same format added after the download's
+/// `last_import`.
+fn current_book_file(
+    files: Vec<MediaFile>,
+    imported_path: &str,
+    last_import: Option<jiff::Timestamp>,
+    recorded_file: Option<i64>,
+) -> Option<MediaFile> {
+    let format = |path: &str| match media::kind(path) {
+        Some(media::Kind::Book) => Some(media::Kind::Book),
+        _ if media::fits(path, media::Kind::Audio) => Some(media::Kind::Audio),
+        _ => None,
+    };
+    let wanted = format(imported_path)?;
+    let added = |f: &MediaFile| {
+        f.date_added
+            .as_deref()
+            .and_then(|d| d.parse::<jiff::Timestamp>().ok())
+    };
+    let mut files: Vec<MediaFile> = files
+        .into_iter()
+        .filter(|f| format(&f.path) == Some(wanted))
+        .collect();
+    let at = files
+        .iter()
+        .position(|f| Some(f.id) == recorded_file)
+        .or_else(|| files.iter().position(|f| f.path == imported_path))
+        .or_else(|| {
+            (0..files.len())
+                .filter(|&i| {
+                    last_import
+                        .zip(added(&files[i]))
+                        .is_some_and(|(t, a)| a.duration_since(t) > DATE_SLACK)
+                })
+                .max_by_key(|&i| added(&files[i]))
+        })?;
+    Some(files.swap_remove(at))
+}
+
+/// The media this instance's library file `file` holds, found without its import
+/// history; `None` if the file is gone or its profile has no repair support.
+pub async fn owner_of_file(
+    http: &reqwest::Client,
+    arr: &Arr,
+    file: i64,
+) -> Result<Option<Owner>, Error> {
+    let Some(shape) = shape(http, arr).await? else {
+        return Ok(None);
+    };
+    let s = Session::open(http, arr).await?;
+    let kind = match shape {
+        Shape::Series => "episodefile",
+        Shape::Movies => "moviefile",
+        Shape::Music => "trackfile",
+        Shape::Books => "bookfile",
+    };
+    let current: MediaFile = match fetch(s.call(Method::GET, &format!("{kind}/{file}"))).await {
+        Err(Error::Rejected {
+            status: reqwest::StatusCode::NOT_FOUND,
+            ..
+        }) => {
+            return Ok(None);
+        }
+        other => other?,
+    };
+    if current.id != file {
+        return Err(Error::Unexpected(
+            "file lookup returned a different file id",
+        ));
+    }
+    let media = match shape {
+        Shape::Series => {
+            let file = file.to_string();
+            let episodes: Vec<Id> = fetch(
+                s.call(Method::GET, "episode")
+                    .query(&[("episodeFileId", file.as_str())]),
+            )
+            .await?;
+            if episodes.is_empty() {
+                return Ok(None);
+            }
+            Media::Episodes(episodes.into_iter().map(|e| e.id).collect())
+        }
+        Shape::Movies => Media::Movie(
+            current
+                .movie_id
+                .ok_or(Error::Unexpected("movie file without movieId"))?,
+        ),
+        Shape::Music => Media::Album(
+            current
+                .album_id
+                .ok_or(Error::Unexpected("track file without albumId"))?,
+        ),
+        Shape::Books => Media::Book(
+            current
+                .book_id
+                .ok_or(Error::Unexpected("book file without bookId"))?,
+        ),
+    };
+    let download_id = original_download(http, arr, &media, &current).await?;
+    Ok(Some(Owner {
+        media,
+        download_id,
+        imported_path: current.path.clone(),
+        imported_at: None,
+        recorded_file: Some(file),
+        current: Some(current),
+    }))
+}
+
+/// Recover only an exact file id and path from a complete media-scoped history.
+/// A bounded/inconsistent response is an error, not permission to guess provenance.
+async fn original_download(
+    http: &reqwest::Client,
+    arr: &Arr,
+    media: &Media,
+    file: &MediaFile,
+) -> Result<Option<String>, Error> {
+    const SIZE: usize = 100;
+    const MAX_PAGES: usize = 50;
+    let s = Session::open(http, arr).await?;
+    let scopes = match media {
+        Media::Movie(id) => vec![("movieIds", *id)],
+        Media::Episodes(ids) => ids.iter().map(|&id| ("episodeId", id)).collect(),
+        Media::Album(_) | Media::Book(_) => return Ok(None),
+    };
+    let mut candidate: Option<String> = None;
+    for (key, id) in scopes {
+        let mut seen = HashSet::new();
+        let mut total = None;
+        let mut complete = false;
+        for page in 1..=MAX_PAGES {
+            let found: Page = fetch(s.call(Method::GET, "history").query(&[
+                (key, id.to_string()),
+                ("eventType", IMPORTED.to_owned()),
+                ("page", page.to_string()),
+                ("pageSize", SIZE.to_string()),
+                ("sortKey", "date".to_owned()),
+                ("sortDirection", "descending".to_owned()),
+            ]))
+            .await?;
+            if page == 1 {
+                total = found.total_records;
+            } else if total != found.total_records {
+                return Err(Error::Unexpected(
+                    "import history changed during pagination",
+                ));
+            }
+            let count = found.records.len();
+            if count > SIZE || (total.is_some_and(|total| seen.len() + count > total)) {
+                return Err(Error::Unexpected("inconsistent import history page"));
+            }
+            for record in found.records {
+                if !seen.insert(record.id) {
+                    return Err(Error::Unexpected("import history repeated a record"));
+                }
+                let scoped = match media {
+                    Media::Movie(_) => record.movie_id == Some(id),
+                    Media::Episodes(_) => record.episode_id == Some(id),
+                    Media::Album(_) | Media::Book(_) => false,
+                };
+                let file_id = record
+                    .data
+                    .file_id
+                    .as_ref()
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()));
+                if !scoped
+                    || file_id != Some(file.id)
+                    || record.data.imported_path.as_deref() != Some(file.path.as_str())
+                {
+                    continue;
+                }
+                let Some(download) = record.download_id.filter(|d| !d.trim().is_empty()) else {
+                    continue;
+                };
+                match &candidate {
+                    Some(known) if !known.eq_ignore_ascii_case(&download) => {
+                        return Err(Error::Unexpected("ambiguous original download identity"));
+                    }
+                    None => candidate = Some(download),
+                    Some(_) => {}
+                }
+            }
+            complete = match total {
+                Some(total) => seen.len() == total,
+                None => count < SIZE,
+            };
+            if complete {
+                break;
+            }
+            if count < SIZE {
+                return Err(Error::Unexpected("import history ended before its total"));
+            }
+        }
+        if !complete {
+            return Err(Error::Unexpected(
+                "import history exceeded the recovery limit",
+            ));
+        }
+    }
+    Ok(candidate)
+}
+
+/// What this instance imported from download `job`, as `(dropped, imported)` paths per
+/// file. Sportarr's history does not carry download ids.
+pub async fn imports(
+    http: &reqwest::Client,
+    arr: &Arr,
+    job: &str,
+) -> Result<Vec<(String, String)>, Error> {
+    if arr.profile == Profile::Sportarr {
+        return Ok(Vec::new());
+    }
+    let s = Session::open(http, arr).await?;
+    let page: Page = fetch(s.call(Method::GET, "history").query(&[
+        ("downloadId", job),
+        ("eventType", IMPORTED),
+        ("pageSize", "1000"),
+    ]))
+    .await?;
+    Ok(page
+        .records
+        .into_iter()
+        .filter_map(|r| Some((r.data.dropped_path?, r.data.imported_path?)))
+        .collect())
+}
+
+/// Every import in this instance's history, newest first. Every page must load for the
+/// result to count. Sportarr's history does not carry download ids.
+pub async fn all_imports(http: &reqwest::Client, arr: &Arr) -> Result<Vec<Import>, Error> {
+    let mut imports = Vec::new();
+    if arr.profile == Profile::Sportarr {
+        return Ok(imports);
+    }
+    let s = Session::open(http, arr).await?;
+    let size = PAGE.to_string();
+    for page in 1_u32.. {
+        let page = page.to_string();
+        let found: Page = fetch(s.call(Method::GET, "history").query(&[
+            ("eventType", IMPORTED),
+            ("page", &page),
+            ("pageSize", &size),
+        ]))
+        .await?;
+        let last = found.records.len() < PAGE;
+        imports.extend(found.records.into_iter().filter_map(Record::into_import));
+        if last {
+            break;
+        }
+    }
+    Ok(imports)
+}
+
+/// Gets `owner` a replacement for download `job`: blocklist the release, give the Arr's
+/// own search `wait` to queue one, else delete our file and search. With no download
+/// known, or no grab of it in the Arr's history, nothing gets blocklisted and so nothing
+/// triggers the Arr's search; it deletes and searches at once. Returns at once if a
+/// replacement is already imported or queued.
+pub async fn replace(
+    http: &reqwest::Client,
+    arr: &Arr,
+    _job: Option<&str>,
+    owner: &Owner,
+    wait: Duration,
+) -> Result<(), Error> {
+    // Use only the download identity proven by the import history.
+    let job = owner.download_id();
+    if owner.replaced() {
+        return Ok(());
+    }
+    let s = Session::open(http, arr).await?;
+    let call = |method, path: String| s.call(method, &path);
+    if replacing(&s, job, owner).await? {
+        return Ok(());
+    }
+    if let Some(job) = job {
+        let grabbed: Page = fetch(call(Method::GET, "history".to_owned()).query(&[
+            ("downloadId", job),
+            ("eventType", GRABBED),
+            ("pageSize", "1"),
+        ]))
+        .await?;
+        if let Some(grab) = grabbed.records.first() {
+            send(call(Method::POST, format!("history/failed/{}", grab.id)).json(&json!({})))
+                .await?;
+            // ponytail: also waits when the Arr's automatic redownload is off; reading its
+            // download-client config and the grab's release source would skip that too.
+            let deadline = tokio::time::Instant::now() + wait;
+            while tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(QUEUE_POLL.min(deadline - tokio::time::Instant::now())).await;
+                if replacing(&s, Some(job), owner).await? {
+                    return Ok(());
+                }
+            }
+        } else {
+            tracing::warn!(
+                arr = %arr.name,
+                reason = "no grab in its history",
+                "could not blocklist the broken release; deleting the file and searching now"
+            );
+        }
+    }
+    let (kind, search) = match &owner.media {
+        Media::Episodes(ids) => (
+            "episodefile",
+            json!({ "name": "EpisodeSearch", "episodeIds": ids }),
+        ),
+        Media::Movie(id) => (
+            "moviefile",
+            json!({ "name": "MoviesSearch", "movieIds": [id] }),
+        ),
+        // Lidarr searches whole albums; one bad track gets the album searched.
+        Media::Album(id) => (
+            "trackfile",
+            json!({ "name": "AlbumSearch", "albumIds": [id] }),
+        ),
+        Media::Book(id) => ("bookfile", json!({ "name": "BookSearch", "bookIds": [id] })),
+    };
+    if let Some(file) = &owner.current {
+        send(call(Method::DELETE, format!("{kind}/{}", file.id))).await?;
+    }
+    send(call(Method::POST, "command".to_owned()).json(&search)).await?;
+    Ok(())
+}
+
+/// Whether the Arr queue holds a download other than `job` for the owner's media.
+async fn replacing(s: &Session<'_>, job: Option<&str>, owner: &Owner) -> Result<bool, Error> {
+    let query: Vec<(&str, i64)> = match &owner.media {
+        Media::Episodes(ids) => ids.iter().map(|&id| ("episodeIds", id)).collect(),
+        Media::Movie(id) => vec![("movieId", *id)],
+        Media::Album(id) => vec![("albumIds", *id)],
+        Media::Book(id) => vec![("bookIds", *id)],
+    };
+    let queued: Vec<QueueRecord> =
+        fetch(s.call(Method::GET, "queue/details").query(&query)).await?;
+    Ok(queued.iter().any(|r| {
+        r.download_id
+            .as_deref()
+            .is_some_and(|id| job.is_none_or(|job| !id.eq_ignore_ascii_case(job)))
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_import_keeps_the_file_id_its_history_names() {
+        let import = |download: &str, file_id: serde_json::Value| {
+            let r: Record = serde_json::from_value(json!({
+                "id": 1, "downloadId": download,
+                "data": { "droppedPath": "/d/a.mkv", "importedPath": "/lib/a.mkv", "fileId": file_id },
+            }))
+            .expect("a history record");
+            r.into_import().expect("an import")
+        };
+        let record = |file_id| import("abc", file_id).file_id;
+        assert_eq!(record(json!("42")), Some(42));
+        assert_eq!(record(json!(42)), Some(42));
+        assert_eq!(record(json!("")), None);
+        assert_eq!(record(serde_json::Value::Null), None);
+        assert_eq!(import(" abc ", json!(1)).download_id, "abc");
+    }
+
+    #[test]
+    fn a_renamed_file_is_replaced_only_when_added_after_the_import() {
+        let owner = |added: &str| Owner {
+            media: Media::Movie(1),
+            imported_path: "/movies/a.mkv".to_owned(),
+            imported_at: Some("2024-05-01T12:00:00Z".to_owned()),
+            recorded_file: None,
+            download_id: None,
+            current: Some(MediaFile {
+                id: 2,
+                path: "/movies/renamed.mkv".to_owned(),
+                date_added: Some(added.to_owned()),
+                movie_id: None,
+                album_id: None,
+                book_id: None,
+            }),
+        };
+        assert!(!owner("2024-05-01T12:00:00.5Z").replaced());
+        assert!(owner("2024-06-01T00:00:00Z").replaced());
+    }
+
+    #[test]
+    fn a_book_file_stands_in_only_for_one_of_its_own_kind() {
+        let file = |id, path: &str, added: &str| MediaFile {
+            id,
+            path: path.to_owned(),
+            date_added: Some(added.to_owned()),
+            movie_id: None,
+            album_id: None,
+            book_id: Some(7),
+        };
+        let files = || {
+            vec![
+                file(1, "/books/a/a.epub", "2024-07-01T00:00:00Z"),
+                file(2, "/books/a/01.mp3", "2024-05-01T00:00:00Z"),
+                file(3, "/books/a/02.mp3", "2024-06-01T00:00:00Z"),
+            ]
+        };
+        let pick = |path, recorded, last_import: &str| {
+            let last_import = Some(last_import.parse().expect("a timestamp"));
+            current_book_file(files(), path, last_import, recorded).map(|f| f.id)
+        };
+        let early = "2024-04-01T00:00:00Z";
+        assert_eq!(pick("/books/a/01.mp3", Some(2), early), Some(2));
+        assert_eq!(pick("/books/a/01.mp3", None, early), Some(2));
+        assert_eq!(pick("/books/a/gone.mp3", Some(9), early), Some(3));
+        assert_eq!(pick("/books/a/gone.epub", None, early), Some(1));
+        assert_eq!(pick("/books/a/gone.m4b", None, early), Some(3));
+        assert_eq!(pick("/books/a/gone.nfo", None, early), None);
+        // A missing chapter: the chapters of its download, however slow or renamed since,
+        // are no replacement.
+        assert_eq!(
+            pick("/books/a/gone.mp3", Some(9), "2024-06-01T00:00:00Z"),
+            None
+        );
+    }
+}
+
+pub(crate) mod tracked;

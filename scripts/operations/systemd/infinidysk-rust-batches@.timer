@@ -1,0 +1,10 @@
+[Unit]
+Description=Observe and resume the InfiniDysk Rust canary pipeline (%i)
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=30s
+Unit=infinidysk-rust-batches@%i.service
+
+[Install]
+WantedBy=timers.target

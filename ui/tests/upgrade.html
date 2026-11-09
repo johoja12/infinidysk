@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Upgrade gate regression</title>
+<div id="root"></div>
+<pre id="result">Running</pre>
+<script type="module">
+  import { act, createElement } from "react";
+  import { createRoot } from "react-dom/client";
+  import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  const originalFetch = globalThis.fetch;
+  const check = (condition, message) => {
+    if (!condition) throw new Error(message);
+  };
+  let state = "none";
+  let progress = null;
+  let failing = false;
+  globalThis.fetch = async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/api/v1/database/cutover") {
+      return Response.json({ state: "none", started_ms: 1, progress: null });
+    }
+    if (url.pathname === "/api/v1/upgrade/status") {
+      return Response.json(
+        failing ? { error: "Temporary status failure" } : { state, error: state === "failed" ? "Provider unreachable" : null, progress },
+        { status: failing ? 503 : 200 },
+      );
+    }
+    check(url.pathname === "/api/v1/auth", `Unexpected request: ${url.pathname}`);
+    return Response.json({ required: false, setup_required: false, user: null });
+  };
+
+  try {
+    sessionStorage.removeItem("infinidysk.switch");
+    const { Gate } = await import("/src/auth.tsx");
+    for (const cached of ["done", "none", null]) {
+      state = cached ?? "none";
+      failing = cached === null;
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } },
+      });
+      if (cached) client.setQueryData(["upgrade"], { state, error: null, progress: null });
+      const root = createRoot(document.getElementById("root"));
+      const settle = async (action) => act(async () => {
+        await action();
+        await new Promise(resolve => setTimeout(resolve, 50));
+      });
+      try {
+        await settle(() => root.render(createElement(QueryClientProvider, { client },
+          createElement(Gate, null, createElement("input", { id: "unsaved", defaultValue: "Draft" })),
+        )));
+        await settle(() => client.invalidateQueries());
+        const input = document.getElementById("unsaved");
+        check(client.getQueryState(["cutover"])?.data?.state === "none", `${cached}: cutover was not asked`);
+        if (cached) {
+          check(input, `${cached}: app did not render`);
+          input.value = "Unsaved change";
+          failing = true;
+          await settle(() => client.invalidateQueries({ queryKey: ["upgrade"] }));
+          const query = client.getQueryState(["upgrade"]);
+          check(query.status === "error" && query.data.state === cached, `${cached}: refetch did not fail with cached data`);
+          check(document.getElementById("unsaved") === input, `${cached}: failed refetch unmounted the app`);
+          check(input.value === "Unsaved change", `${cached}: unsaved input was lost`);
+        } else {
+          check(!input, "Unknown status must not open the app");
+          check(document.querySelector('[role="alert"]')?.textContent.includes("Temporary status failure"), "Initial failure was not shown");
+        }
+        failing = false;
+        await settle(() => client.invalidateQueries({ queryKey: ["upgrade"] }));
+        await settle(() => client.invalidateQueries({ queryKey: ["auth"] }));
+        check(document.getElementById("unsaved"), `${cached}: successful refetch did not recover`);
+        if (cached) check(document.getElementById("unsaved") === input, `${cached}: recovery replaced the app`);
+      } finally {
+        await act(async () => root.unmount());
+        client.clear();
+      }
+    }
+    state = "importing";
+    const stages = [
+      [{ stage: "copying", done: 1200, total: 4800, skipped: 0, eta_seconds: 30 }, ["Copying 1.x PostgreSQL data", "Rows copied", "1,200", "Rows to copy", "4,800"], "25.0%"],
+      [{ stage: "checking", done: 0, total: null, skipped: 0, eta_seconds: null }, ["Checking 1.x files", "Step 1 of 4", "Counting…"], ""],
+      [{ stage: "checking", done: 250000, total: 781067, skipped: 0, eta_seconds: 120 }, ["Files checked", "250,000", "781,067"], "32.0%"],
+      [{ stage: "checking", done: 10, total: 10, skipped: 0, eta_seconds: null }, ["Checking 1.x files", "Finishing…"], "100.0%"],
+      [{ stage: "directories", done: 5, total: 10, skipped: 0, eta_seconds: 10 }, ["Writing folders", "Step 2 of 4", "Folders written", "Total folders"], "50.0%"],
+      [{ stage: "directories", done: 0, total: 0, skipped: 0, eta_seconds: null }, ["Writing folders", "Finishing…"], "100.0%"],
+      [{ stage: "nzbs", done: 5, total: 10, skipped: 0, eta_seconds: null }, ["Step 3 of 4", "NZBs processed", "Estimating…"], "50.0%"],
+      [{ stage: "files", done: 40, total: 100, skipped: 10, eta_seconds: 10 }, ["Importing files", "Skipped", "Time left in this step"], "50.0%"],
+      [{ stage: "files", done: 90, total: 100, skipped: 10, eta_seconds: null }, ["Importing files", "Skipped", "Finishing…"], "100.0%"],
+      [{ stage: "finishing", done: 0, total: null, skipped: 0, eta_seconds: null }, ["Finalizing import"], ""],
+    ];
+    for (const [fixture, texts, percent] of stages) {
+      progress = fixture;
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const root = createRoot(document.getElementById("root"));
+      try {
+        await act(async () => {
+          root.render(createElement(QueryClientProvider, { client }, createElement(Gate, null, null)));
+          await new Promise(resolve => setTimeout(resolve, 50));
+        });
+        await act(async () => {
+          await client.invalidateQueries();
+          await new Promise(resolve => setTimeout(resolve, 50));
+        });
+        const text = document.getElementById("root").textContent;
+        for (const expected of texts) check(text.includes(expected), `${fixture.stage}: missing "${expected}" in "${text}"`);
+        check(fixture.stage === "files" || !text.includes("Skipped"), `${fixture.stage}: showed skipped files`);
+        check(!["finishing", "copying"].includes(fixture.stage) || !text.includes("Step"), `${fixture.stage}: showed a step number`);
+        const bar = document.querySelector('[role="progressbar"]');
+        const value = bar.getAttribute("aria-valuenow");
+        check(percent === "" ? value === null : value !== null && Math.abs(Number(value) - parseFloat(percent)) < 0.05, `${fixture.stage}: wrong progressbar value ${value}`);
+        check(percent === "" || text.includes(percent), `${fixture.stage}: missing ${percent}`);
+        if (percent === "") {
+          check(!text.includes("%"), `${fixture.stage}: showed a percentage without a total`);
+          check(parseFloat(bar.firstElementChild.style.width) > 0, `${fixture.stage}: invisible activity indicator`);
+        }
+      } finally {
+        await act(async () => root.unmount());
+        client.clear();
+      }
+    }
+    state = "failed";
+    progress = null;
+    {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const root = createRoot(document.getElementById("root"));
+      try {
+        await act(async () => {
+          root.render(createElement(QueryClientProvider, { client }, createElement(Gate, null, createElement("input", { id: "unsaved" }))));
+          await new Promise(resolve => setTimeout(resolve, 50));
+        });
+        await act(async () => {
+          await client.invalidateQueries();
+          await new Promise(resolve => setTimeout(resolve, 50));
+        });
+        const text = document.getElementById("root").textContent;
+        check(text.includes("Upgrading from your C# install failed"), `failed: missing title in "${text}"`);
+        check(text.includes("Provider unreachable"), "failed: missing reason");
+        check(text.includes("Retry the import"), "failed: missing retry");
+        check(!document.getElementById("unsaved"), "failed: app rendered");
+      } finally {
+        await act(async () => root.unmount());
+        client.clear();
+      }
+    }
+    document.getElementById("result").textContent = "PASS";
+  } catch (error) {
+    document.getElementById("result").textContent = `FAIL: ${error.message}`;
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.IS_REACT_ACT_ENVIRONMENT;
+  }
+</script>
+</html>

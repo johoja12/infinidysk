@@ -1,0 +1,706 @@
+use infinidysk::config::{
+    ArrInstance, ArrProfile, ConfigStore, Error, LibraryDir, MASK, Provider, Secret, Settings,
+};
+use infinidysk_db::Db;
+
+#[tokio::test]
+async fn env_overrides_win_are_never_stored_and_masked_secrets_survive_saves() {
+    let path =
+        std::env::temp_dir().join(format!("infinidysk-config-{}.sqlite", uuid::Uuid::now_v7()));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("connect");
+    let env = [
+        ("INFINIDYSK__SAB__API_KEY".to_owned(), "123".to_owned()),
+        ("UNRELATED".to_owned(), "x".to_owned()),
+    ];
+    let mut store = ConfigStore::load(db.clone(), env.clone())
+        .await
+        .expect("load");
+    assert_eq!(
+        store.settings().sab.api_key,
+        Secret("123".into()),
+        "string fields stay verbatim"
+    );
+    assert_eq!(store.locked().collect::<Vec<_>>(), ["sab.api_key"]);
+
+    let mut settings = store.settings().clone();
+    settings.providers.push(Provider {
+        profile: Some("eweka".into()),
+        password: Secret("pw".into()),
+        ..Provider::default()
+    });
+    settings.auth.oidc.client_secret = Secret("sso-secret".into());
+    store.save(settings).await.expect("save");
+    let provider = &store.settings().providers[0];
+    assert_eq!(
+        (provider.hostname.as_str(), provider.port),
+        ("news.eweka.nl", 563)
+    );
+    assert_eq!(
+        provider.backbone.as_deref(),
+        Some("eweka"),
+        "catalog fills the backbone"
+    );
+
+    // The UI round-trips masked settings; secrets must survive and never leak.
+    let mut masked = store.settings().masked();
+    assert_eq!(masked.providers[0].password, Secret(MASK.into()));
+    assert_eq!(masked.auth.oidc.client_secret, Secret(MASK.into()));
+    assert!(!format!("{:?}", store.settings()).contains("pw"));
+    assert!(!format!("{:?}", store.settings()).contains("sso-secret"));
+    masked.providers[0].priority = 1;
+    store.save(masked.clone()).await.expect("save");
+    assert_eq!(store.settings().providers[0].password, Secret("pw".into()));
+    assert_eq!(
+        store.settings().auth.oidc.client_secret,
+        Secret("sso-secret".into())
+    );
+    assert_eq!(store.settings().providers[0].priority, 1);
+
+    masked.sab.api_key = Secret("changed".into());
+    assert!(matches!(store.save(masked).await, Err(Error::Locked(p)) if p == "sab.api_key"));
+
+    let keys: Vec<_> = db
+        .config()
+        .await
+        .expect("query")
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        keys,
+        ["auth", "providers"],
+        "env values and defaults are not stored"
+    );
+    let reloaded = ConfigStore::load(db.clone(), []).await.expect("reload");
+    assert_eq!(reloaded.settings().sab.api_key, Secret::default());
+    assert_eq!(reloaded.settings().providers, store.settings().providers);
+
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
+async fn a_readarr_instance_stops_loading_with_what_to_do() {
+    let path =
+        std::env::temp_dir().join(format!("infinidysk-config-{}.sqlite", uuid::Uuid::now_v7()));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("connect");
+    let readarr = r#"[{"id":"0192f0a0-0000-7000-8000-000000000001","name":"books","profile":"readarr","url":"http://readarr:8787","api_key":"k"}]"#;
+    let stopped = |result: Result<ConfigStore, Error>| match result {
+        Err(Error::Invalid { path, message }) => {
+            assert_eq!(path, "arr_instances");
+            assert!(message.contains("\"books\" is a Readarr"), "{message}");
+        }
+        other => panic!("loaded: {:?}", other.err()),
+    };
+
+    let env = [("INFINIDYSK__ARR_INSTANCES".to_owned(), readarr.to_owned())];
+    stopped(ConfigStore::load(db.clone(), env).await);
+    db.write_config(&[("arr_instances", readarr)], &[])
+        .await
+        .expect("write");
+    stopped(ConfigStore::load(db.clone(), []).await);
+    let cleared = [("INFINIDYSK__ARR_INSTANCES".to_owned(), "[]".to_owned())];
+    ConfigStore::load(db.clone(), cleared)
+        .await
+        .expect("the env list replaces the stored Readarr");
+
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
+async fn out_of_range_stored_values_load_as_defaults_but_never_save() {
+    let path =
+        std::env::temp_dir().join(format!("infinidysk-config-{}.sqlite", uuid::Uuid::now_v7()));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("connect");
+    let mut store = ConfigStore::load(db.clone(), []).await.expect("load");
+    let mut settings = store.settings().clone();
+    settings.providers.push(Provider {
+        profile: Some("eweka".into()),
+        password: Secret("pw".into()),
+        ..Provider::default()
+    });
+    store.save(settings).await.expect("save");
+
+    // As an older build or a hand edit could have stored them.
+    let (_, raw) = db
+        .config()
+        .await
+        .expect("query")
+        .into_iter()
+        .find(|(k, _)| k == "providers")
+        .expect("providers stored");
+    let mut providers: serde_json::Value = serde_json::from_str(&raw).expect("json");
+    providers[0]["pipeline_depth"] = 99.into();
+    db.write_config(
+        &[
+            ("providers", &providers.to_string()),
+            ("sab", r#"{"manual_category":" "}"#),
+        ],
+        &[],
+    )
+    .await
+    .expect("write");
+
+    let mut store = ConfigStore::load(db.clone(), []).await.expect("load");
+    assert_eq!(store.settings().providers[0].pipeline_depth, 4);
+    assert_eq!(store.settings().sab.manual_category, "uncategorized");
+
+    let mut blank = store.settings().clone();
+    blank.sab.manual_category = String::new();
+    assert!(matches!(
+        store.save(blank).await,
+        Err(Error::Invalid { .. })
+    ));
+
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[test]
+fn library_dirs_stored_as_plain_paths_still_load() {
+    let dirs: Vec<LibraryDir> =
+        serde_json::from_str(r#"["/old", {"path": "/new", "arr_path": "/arr"}]"#).expect("parse");
+    assert_eq!(
+        dirs,
+        [
+            LibraryDir {
+                path: "/old".into(),
+                arr_path: String::new()
+            },
+            LibraryDir {
+                path: "/new".into(),
+                arr_path: "/arr".into()
+            },
+        ]
+    );
+}
+
+#[test]
+fn retired_experiments_are_dropped_on_load() {
+    let settings: Settings =
+        serde_json::from_str(r#"{"experiments": ["retired", "win-floor", "win-floor"]}"#)
+            .expect("parse");
+    assert_eq!(settings.experiments, ["win-floor"]);
+}
+
+#[test]
+fn sso_settings_are_checked_only_while_an_issuer_is_set() {
+    let sso = |issuer: &str| {
+        let mut s = Settings::default();
+        s.auth.oidc.issuer = issuer.to_owned();
+        s.auth.oidc.client_id = "dysk".to_owned();
+        s.auth.oidc.client_secret = Secret("secret".into());
+        s
+    };
+    let path = |mut s: Settings| s.validate().err().and_then(|e| e.path().map(str::to_owned));
+
+    assert_eq!(path(sso("")), None);
+    let authentik = "https://auth.example.com/application/o/dysk/";
+    let mut no_secret = sso(authentik);
+    no_secret.auth.oidc.client_secret = Secret::default();
+    assert_eq!(path(no_secret).as_deref(), Some("auth.oidc.client_secret"));
+    let mut ok = sso(authentik);
+    ok.validate().expect("valid");
+    assert_eq!(ok.auth.oidc.issuer, authentik, "the trailing slash stays");
+
+    for issuer in ["http://auth.example.com", "http://10.0.0.5"] {
+        assert_eq!(
+            path(sso(issuer)).as_deref(),
+            Some("auth.oidc.issuer"),
+            "{issuer}"
+        );
+    }
+    for issuer in [
+        "http://127.0.0.1:9000",
+        "http://localhost:9000",
+        "http://[::1]:9000",
+    ] {
+        assert_eq!(path(sso(issuer)), None, "{issuer}");
+    }
+
+    let mut scopes = sso(authentik);
+    scopes.auth.oidc.scopes = "  profile   email ".to_owned();
+    scopes.validate().expect("valid");
+    assert_eq!(scopes.auth.oidc.scopes, "profile email");
+
+    let mut name = sso(authentik);
+    name.auth.oidc.display_name = "  Acme   Account ".to_owned();
+    name.validate().expect("valid");
+    assert_eq!(name.auth.oidc.display_name(), "Acme Account");
+    assert_eq!(sso(authentik).auth.oidc.display_name(), "SSO");
+    for bad in ["a".repeat(41), "Acme\u{7}".to_owned()] {
+        let mut s = sso(authentik);
+        s.auth.oidc.display_name = bad;
+        assert_eq!(path(s).as_deref(), Some("auth.oidc.display_name"));
+    }
+
+    for (uri, want) in [
+        ("https://dysk.example.com/sso/cb", None),
+        (
+            "https://dysk.example.com/cb#x",
+            Some("auth.oidc.redirect_uri"),
+        ),
+        ("ftp://dysk.example.com/cb", Some("auth.oidc.redirect_uri")),
+    ] {
+        let mut s = sso(authentik);
+        s.auth.oidc.redirect_uri = uri.to_owned();
+        assert_eq!(path(s).as_deref(), want, "{uri}");
+    }
+}
+
+#[test]
+fn password_login_stays_on_while_sso_is_off() {
+    let mut s = Settings::default();
+    s.auth.local_login = false;
+    assert!(s.auth.password_login());
+    s.auth.oidc.issuer = "https://auth.example.com".to_owned();
+    s.auth.oidc.client_id = "dysk".to_owned();
+    s.auth.oidc.client_secret = Secret("secret".into());
+    s.validate().expect("valid");
+    assert!(!s.auth.password_login());
+}
+
+#[test]
+fn validation_rejects_unknown_catalog_entries_and_bad_arr_urls() {
+    let custom = |backbone: Option<&str>| Settings {
+        providers: vec![Provider {
+            hostname: "news.example.com".into(),
+            backbone: backbone.map(Into::into),
+            ..Provider::default()
+        }],
+        ..Settings::default()
+    };
+    assert!(
+        custom(None).validate().is_ok(),
+        "a custom provider may be its own group"
+    );
+    assert!(custom(Some("eweka")).validate().is_ok());
+    assert!(matches!(
+        custom(Some("mine")).validate(),
+        Err(Error::Invalid { .. })
+    ));
+
+    let mut wrong_host = Settings {
+        providers: vec![Provider {
+            profile: Some("eweka".into()),
+            hostname: "news.example.com".into(),
+            ..Provider::default()
+        }],
+        ..Settings::default()
+    };
+    assert!(matches!(wrong_host.validate(), Err(Error::Invalid { .. })));
+
+    let old: Provider = serde_json::from_str(r#"{"hostname":"news.example.com"}"#).expect("json");
+    assert_eq!(old.pipeline_depth, 4, "saved providers keep the old depth");
+    for (depth, ok) in [(0, false), (1, true), (16, true), (17, false)] {
+        let mut settings = custom(None);
+        settings.providers[0].pipeline_depth = depth;
+        assert_eq!(settings.validate().is_ok(), ok, "depth {depth}");
+    }
+
+    let mut arr = Settings {
+        arr_instances: vec![ArrInstance {
+            id: uuid::Uuid::now_v7(),
+            name: "tv".into(),
+            profile: ArrProfile::Sonarr,
+            url: "ftp://arr".into(),
+            api_key: Secret("k".into()),
+            enabled: true,
+        }],
+        ..Settings::default()
+    };
+    assert!(matches!(arr.validate(), Err(Error::Invalid { .. })));
+    arr.arr_instances[0].url = "http://sonarr:8989".into();
+    assert!(arr.validate().is_ok());
+
+    let mut network = Settings::default();
+    network.network.trusted_proxies = vec![" 172.18.0.0/16 ".into(), String::new(), "::1".into()];
+    assert!(network.validate().is_ok());
+    assert_eq!(network.network.trusted_proxies, ["172.18.0.0/16", "::1"]);
+    network.network.trusted_proxies.push("proxy.lan".into());
+    assert!(matches!(network.validate(), Err(Error::Invalid { .. })));
+
+    let mut strm = Settings::default();
+    strm.imports.strategy = infinidysk::config::ImportStrategy::Strm;
+    assert!(
+        matches!(strm.validate(), Err(Error::Invalid { .. })),
+        "STRM links need a public URL"
+    );
+    strm.network.public_url = "https://media.example/".into();
+    assert!(strm.validate().is_ok());
+    let old: Settings = serde_json::from_str("{}").expect("json");
+    assert!(
+        old.network
+            .trusted_proxies
+            .contains(&"192.168.0.0/16".to_owned())
+    );
+
+    let mut public = Settings::default();
+    public.network.public_url = " https://media.example.com/infinidysk/ ".into();
+    assert!(public.validate().is_ok());
+    assert_eq!(
+        public.network.public_url,
+        "https://media.example.com/infinidysk"
+    );
+    public.network.public_url = "media.example.com".into();
+    assert!(matches!(public.validate(), Err(Error::Invalid { .. })));
+}
+
+#[tokio::test]
+async fn warming_settings_preserve_live_private_ledger_and_respect_environment_authority() {
+    let path =
+        std::env::temp_dir().join(format!("infinidysk-config-{}.sqlite", uuid::Uuid::now_v7()));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("connect");
+    db.write_config(&[("fork_prefetch_v1", "{\"generation\":1}")], &[])
+        .await
+        .expect("initial ledger");
+    let env = [(
+        "INFINIDYSK__PREFETCH__DAILY_FILL_BYTES".to_owned(),
+        "20000000000".to_owned(),
+    )];
+    let mut store = ConfigStore::load(db.clone(), env).await.expect("load");
+    db.write_config(&[("fork_prefetch_v1", "{\"generation\":2}")], &[])
+        .await
+        .expect("worker advances ledger");
+    let mut next = store.settings().clone();
+    next.prefetch.enabled = true;
+    assert!(
+        matches!(
+            store.save(next).await,
+            Err(Error::Invalid {
+                path: "prefetch",
+                ..
+            })
+        ),
+        "warming requires native cache"
+    );
+    let mut next = store.settings().clone();
+    next.prefetch.daily_fill_bytes = 10_000_000_000;
+    assert!(
+        matches!(store.save(next).await,Err(Error::Locked(p)) if p=="prefetch.daily_fill_bytes")
+    );
+    let mut next = store.settings().clone();
+    next.sab.manual_category = "fixture".into();
+    store.save(next).await.expect("unrelated settings save");
+    let ledger = db
+        .config()
+        .await
+        .expect("read config")
+        .into_iter()
+        .find(|(k, _)| k == "fork_prefetch_v1")
+        .expect("private ledger")
+        .1;
+    assert_eq!(
+        ledger, "{\"generation\":2}",
+        "stale Settings snapshot must not rewrite the worker ledger"
+    );
+    db.close().await;
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn plex_classification_settings_preserve_defaults_selection_and_environment_authority() {
+    let path = std::env::temp_dir().join(format!(
+        "infinidysk-classification-config-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("database");
+    let mut store = ConfigStore::load(
+        db.clone(),
+        [("INFINIDYSK__IMPORTS__PLEX_MATCHING".into(), "true".into())],
+    )
+    .await
+    .expect("settings");
+    assert!(store.settings().imports.plex_matching);
+    assert!(store.settings().imports.plex_server_ids.is_none());
+    let mut settings = store.settings().clone();
+    settings.imports.plex_server_ids = Some(vec!["machine".into(), "machine".into()]);
+    store.save(settings).await.expect("selection");
+    assert_eq!(
+        store
+            .settings()
+            .imports
+            .plex_server_ids
+            .as_ref()
+            .expect("selection"),
+        &["machine"]
+    );
+    let mut changed = store.settings().clone();
+    changed.imports.plex_matching = false;
+    assert!(matches!(store.save(changed).await,Err(Error::Locked(p))if p=="imports.plex_matching"));
+    let restored = ConfigStore::load(db.clone(), []).await.expect("reload");
+    assert!(
+        !restored.settings().imports.plex_matching,
+        "env opt-in is never written as a stored default"
+    );
+    assert_eq!(
+        restored
+            .settings()
+            .imports
+            .plex_server_ids
+            .as_ref()
+            .expect("stored selection"),
+        &["machine"]
+    );
+    let mut invalid = restored.settings().clone();
+    invalid.imports.plex_server_ids = Some(vec!["invalid/identity".into()]);
+    assert!(invalid.validate().is_err());
+    db.close().await;
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn additional_scan_roots_are_separate_validated_and_environment_owned() {
+    let path = std::env::temp_dir().join(format!(
+        "infinidysk-scan-config-{}.sqlite",
+        uuid::Uuid::now_v7()
+    ));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("db");
+    let mut store = ConfigStore::load(
+        db.clone(),
+        [(
+            "INFINIDYSK__IMPORTS__SCAN_DIRS".into(),
+            r#"[{"path":"/readonly/","arr_path":"/arr/readonly/"}]"#.into(),
+        )],
+    )
+    .await
+    .expect("env");
+    assert_eq!(
+        store.settings().imports.library_dirs,
+        Vec::<LibraryDir>::new()
+    );
+    assert_eq!(store.settings().imports.scan_dirs[0].path, "/readonly");
+    let mut changed = store.settings().clone();
+    changed.imports.scan_dirs.clear();
+    assert!(
+        matches!(store.save(changed).await,Err(Error::Locked(path))if path=="imports.scan_dirs")
+    );
+    assert_eq!(
+        ConfigStore::load(db.clone(), [])
+            .await
+            .expect("stored")
+            .settings()
+            .imports
+            .scan_dirs,
+        Vec::<LibraryDir>::new()
+    );
+    let defaults = Settings::default();
+    for bad in [
+        "/".to_owned(),
+        "relative".into(),
+        "/a/../b".into(),
+        defaults.mount.dir,
+        defaults.imports.strm_dir,
+        defaults.native_cache.metadata_path,
+    ] {
+        let mut settings = Settings::default();
+        settings.imports.scan_dirs.push(LibraryDir {
+            path: bad.clone(),
+            arr_path: String::new(),
+        });
+        assert!(
+            matches!(
+                settings.validate(),
+                Err(Error::Invalid {
+                    path: "imports.scan_dirs",
+                    ..
+                })
+            ),
+            "{bad}"
+        );
+    }
+    let mut settings = Settings::default();
+    settings.imports.library_dirs.push(LibraryDir {
+        path: "/managed".into(),
+        arr_path: "/arr/primary".into(),
+    });
+    settings.imports.scan_dirs.push(LibraryDir {
+        path: "/scan".into(),
+        arr_path: "/arr/primary/sub".into(),
+    });
+    assert!(settings.validate().is_err());
+    settings.imports.scan_dirs[0].arr_path = "/arr/scan".into();
+    assert!(settings.validate().is_ok());
+    assert_eq!(settings.imports.catalogue_dirs().count(), 2);
+    settings.imports.scan_dirs.push(LibraryDir {
+        path: "/scan/sub".into(),
+        arr_path: "/other".into(),
+    });
+    assert!(settings.validate().is_err());
+    db.close().await;
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn par2_limits_are_validated_and_environment_authority_is_preserved() {
+    let path = std::env::temp_dir().join(format!(
+        "infinidysk-par2-config-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("db");
+    let mut store = ConfigStore::load(
+        db.clone(),
+        [("INFINIDYSK__HEALTH__PAR2__ENABLED".into(), "true".into())],
+    )
+    .await
+    .expect("config");
+    assert!(store.settings().health.par2.enabled);
+    assert!(store.locked().any(|key| key == "health.par2.enabled"));
+    let mut changed = store.settings().clone();
+    changed.health.par2.enabled = false;
+    assert!(
+        matches!(store.save(changed).await, Err(Error::Locked(key)) if key=="health.par2.enabled")
+    );
+    for (memory, slices, cooldown) in [
+        (127, 8, 6),
+        (2049, 8, 6),
+        (256, 0, 6),
+        (256, 65, 6),
+        (256, 8, 0),
+        (256, 8, 169),
+    ] {
+        let mut changed = store.settings().clone();
+        changed.health.par2.memory_mb = memory;
+        changed.health.par2.max_missing_slices = slices;
+        changed.health.par2.failure_cooldown_hours = cooldown;
+        assert!(store.save(changed).await.is_err());
+    }
+    let mut changed = store.settings().clone();
+    changed.health.par2.memory_mb = 128;
+    store.save(changed).await.expect("valid policy");
+    let reloaded = ConfigStore::load(db.clone(), []).await.expect("reload");
+    assert!(
+        !reloaded.settings().health.par2.enabled,
+        "environment values are never persisted"
+    );
+    assert_eq!(reloaded.settings().health.par2.memory_mb, 128);
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
+async fn provider_response_allowance_and_finish_share_are_validated_and_managed() {
+    let path = std::env::temp_dir().join(format!(
+        "infinidysk-wire-settings-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("db");
+    let mut store = ConfigStore::load(
+        db.clone(),
+        [(
+            "INFINIDYSK__PREFETCH__DAILY_WIRE_BYTES".into(),
+            "9000000".into(),
+        )],
+    )
+    .await
+    .expect("config");
+    assert_eq!(store.settings().prefetch.daily_wire_bytes, 9_000_000);
+    let mut changed = store.settings().clone();
+    changed.prefetch.daily_wire_bytes = 10_000_000;
+    assert!(
+        matches!(store.save(changed).await,Err(Error::Locked(key)) if key=="prefetch.daily_wire_bytes")
+    );
+    for percent in [0, 101] {
+        let mut changed = store.settings().clone();
+        changed.prefetch.finish_watched.percent = percent;
+        assert!(store.save(changed).await.is_err());
+    }
+    let mut changed = store.settings().clone();
+    changed.prefetch.finish_watched.enabled = true;
+    changed.prefetch.finish_watched.percent = 25;
+    store.save(changed).await.expect("advanced policy");
+    let reloaded = ConfigStore::load(db.clone(), []).await.expect("reload");
+    assert_eq!(
+        reloaded.settings().prefetch.daily_wire_bytes,
+        10_000_000_000,
+        "environment value is not persisted"
+    );
+    assert_eq!(reloaded.settings().prefetch.finish_watched.percent, 25);
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
+async fn source_policies_require_configured_servers_and_keep_environment_authority() {
+    let path = std::env::temp_dir().join(format!(
+        "infinidysk-source-policy-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("db");
+    let env=[("INFINIDYSK__PREFETCH__PLEX__SOURCES".to_owned(),r#"[{"server":"machine","viewer":"7","kind":"library","path":"/library/sections/1/all","limit":10}]"#.to_owned())];
+    let mut initial = ConfigStore::load(db.clone(), []).await.expect("settings");
+    let mut settings = initial.settings().clone();
+    settings.plex.servers.push(infinidysk_plex::Server {
+        id: "machine".into(),
+        name: "Fixture".into(),
+        url: "http://127.0.0.1:32400".into(),
+        token: infinidysk_plex::Token("fixture-token".into()),
+        enabled: true,
+        account_id: None,
+        path_mappings: vec![],
+    });
+    initial.save(settings).await.expect("configured server");
+    let mut store = ConfigStore::load(db.clone(), env).await.expect("settings");
+    let mut changed = store.settings().clone();
+    changed.prefetch.plex.sources.clear();
+    assert!(
+        matches!(store.save(changed).await,Err(Error::Locked(key)) if key=="prefetch.plex.sources")
+    );
+    let mut unsafe_view = Settings::default();
+    unsafe_view
+        .prefetch
+        .plex
+        .sources
+        .push(infinidysk_plex::sources::Source {
+            path: "/hubs/home?token=fixture-private-value".into(),
+            ..Default::default()
+        });
+    assert_eq!(unsafe_view.masked().prefetch.plex.sources[0].path, MASK);
+    let mut unconfigured = Settings::default();
+    unconfigured
+        .prefetch
+        .plex
+        .sources
+        .push(infinidysk_plex::sources::Source {
+            server: "machine".into(),
+            viewer: "7".into(),
+            kind: infinidysk_plex::sources::Kind::Library,
+            path: "/library/sections/1/all".into(),
+            ..Default::default()
+        });
+    assert!(unconfigured.validate().is_err());
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}

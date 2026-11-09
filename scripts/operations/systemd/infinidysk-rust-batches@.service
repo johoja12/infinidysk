@@ -1,0 +1,27 @@
+[Unit]
+Description=Resume the InfiniDysk Rust canary pipeline (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=infinidysk-migration
+Group=infinidysk-migration
+EnvironmentFile=/etc/infinidysk/rust-migration/%i-batches.env
+LoadCredential=api-key:/etc/infinidysk/rust-migration/%i.api-key
+StateDirectory=infinidysk-rust-batches-%i
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/python3 /opt/infinidysk-tools/scripts/operations/rust-migration-batches.py --run --schedule ${SCHEDULE_PATH} --schedule-digest ${SCHEDULE_DIGEST} --batches ${BATCHES_PATH} --url ${RUST_URL} --server-commit ${RUST_COMMIT} --api-key-file %d/api-key --legacy-config ${LEGACY_CONFIG} --original-library ${ORIGINAL_LIBRARY} --canary-mount ${CANARY_MOUNT} --state-directory %S/infinidysk-rust-batches-%i --phase-timeout 600
+TimeoutStartSec=1800
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

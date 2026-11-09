@@ -7,6 +7,8 @@ body:
       value: |
         Thanks for sharing an idea. Feature requests should describe a legitimate use case for InfiniDysk; the project supports legally obtained content only.
 
+        New features go into 2.x. 1.x (the `v1` branch) gets bug fixes only.
+
   - type: checkboxes
     id: prerequisites
     attributes:

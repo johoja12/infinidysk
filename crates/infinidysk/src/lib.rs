@@ -1,0 +1,38 @@
+//! The product server: config, auth, SAB API, admin API and embedded UI.
+
+pub mod admin;
+pub mod app;
+pub mod arr;
+pub mod auth;
+mod backup;
+mod cleanup;
+pub mod config;
+mod confined;
+mod content_sweep;
+pub mod database;
+mod fetch;
+mod files;
+mod handoff;
+pub mod healthcheck;
+mod library;
+pub mod logs;
+mod maintenance;
+pub mod metrics;
+mod migration;
+mod oidc;
+mod plex;
+mod predictions;
+mod prefetch;
+mod probe;
+mod provider_status;
+mod provider_test;
+mod quota;
+mod regrabs;
+mod release_notes;
+pub mod repair;
+pub mod sab;
+mod ui;
+pub mod update;
+pub mod upgrade;
+
+pub mod native_cache;
