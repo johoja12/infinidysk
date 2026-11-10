@@ -5,6 +5,7 @@ Issue: #263. V1 is a read-only specification (`origin/v1`, `9c104b59`).
 ## Changes
 
 - Plex Library has summary counts, TV/Movie/All/Unmatched tabs, grouped cards and file tables, path search, mapping/match/quality/cache/watch/season filters, stable paging, and file inspection with existing playback, warming and cache tools. Complete metadata snapshots are filtered before paging. Different native pointer paths remain distinct even when they reference the same item.
+- Library cache links accept both compact v1 and hyphenated v2 item IDs. Name searches retain literal wildcard escaping.
 - Cache coverage is a bounded background metadata pass. Candidate identities are not coverage proof. Current source keys are checked before displaying existing coverage; unopened stores and failed checks remain unknown. Browsing does not download media. Playback and warming revalidate the exact Plex Part or native pointer immediately before acting.
 - Smart Prefetch records the verified viewer name and selected source title/path. Multiple hubs for the same media retain separate provenance. Old JSON remains readable. A display-only registry can recover historical labels for an exact policy scope; this does not rewrite the scheduling journal or history payloads.
 - Saved sources have explicit availability checks using the selected viewer credential. Disabled selections are probed on a request-local copy. Checks do not enable selections, replace paths, queue jobs or download media.

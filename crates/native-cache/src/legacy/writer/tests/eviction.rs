@@ -923,6 +923,50 @@ async fn catalogue_filters_sort_and_page_all_matches_with_stable_ties() {
         sqlx::query("INSERT INTO Entries(Key,Folder,Length,Access,ItemId,VerifiedBytes,DisplayName,Pinned) VALUES($1,'a',100,$2,$3,$4,$5,$6)")
             .bind(format!("{n:064x}")).bind(access).bind(Uuid::from_u128(n).simple().to_string()).bind(verified).bind(name).bind(pin).execute(&writer.legacy.db).await.unwrap();
     }
+    // Links use canonical v2 UUIDs; original cache metadata uses compact v1 IDs.
+    for search in [
+        Uuid::from_u128(1).to_string(),
+        Uuid::from_u128(1).simple().to_string(),
+    ] {
+        let page = writer
+            .legacy
+            .inventory_page(
+                &Browse {
+                    search: &search,
+                    limit: 50,
+                    ..Browse::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.matched_files, 1);
+        assert_eq!(
+            page.entries[0].item,
+            Uuid::from_u128(1).simple().to_string()
+        );
+    }
+    // Also accept old catalogues which recorded a hyphenated identity.
+    sqlx::query("UPDATE Entries SET ItemId=$1 WHERE Key=$2")
+        .bind(Uuid::from_u128(6).to_string())
+        .bind(format!("{:064x}", 6))
+        .execute(&writer.legacy.db)
+        .await
+        .unwrap();
+    let page = writer
+        .legacy
+        .inventory_page(
+            &Browse {
+                search: &Uuid::from_u128(6).simple().to_string(),
+                limit: 50,
+                ..Browse::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.matched_files, 1);
+
     for (sort, expected) in [
         (Sort::Key, vec![1, 2, 3, 4, 5, 6]),
         (Sort::Recent, vec![4, 1, 2, 6, 3, 5]),
@@ -1113,6 +1157,14 @@ async fn original_eviction_history_is_read_only_filtered_and_cursor_paged() {
             .await
             .unwrap();
     }
+    let by_id = writer
+        .legacy
+        .original_evictions(None, &Uuid::from_u128(1).to_string(), None, None, 50)
+        .await
+        .unwrap();
+    assert_eq!(by_id.total, 1);
+    assert_eq!(by_id.entries.len(), 1);
+
     let first = writer
         .legacy
         .original_evictions(None, "", None, None, 2)
