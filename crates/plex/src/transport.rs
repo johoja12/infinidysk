@@ -15,6 +15,8 @@ const LIMIT: usize = 4 * 1024 * 1024;
 pub enum Error {
     #[error("{0}")]
     Invalid(&'static str),
+    #[error("Plex no longer exposes this resource")]
+    NotFound,
     #[error("Plex rejected the credential")]
     Unauthorized,
     #[error("Plex is limiting requests")]
@@ -100,6 +102,7 @@ impl Client {
             let mut response = request.send().await.map_err(|_| Error::Unavailable)?;
             match response.status().as_u16() {
                 401 | 403 => return Err(Error::Unauthorized),
+                404 => return Err(Error::NotFound),
                 429 => return Err(Error::RateLimited),
                 200..=299 => {}
                 _ => return Err(Error::Unavailable),
@@ -599,12 +602,16 @@ impl Client {
             .iter()
             .map(|node| {
                 let mut files = std::collections::BTreeSet::new();
+                let mut file_sizes = std::collections::HashMap::new();
                 for part in node.children("Media").flat_map(|m| m.children("Part")) {
                     if let Some(path) = part.text("file") {
                         if !crate::safe_path(path) {
                             return Err(Error::Invalid("invalid Plex catalogue path"));
                         }
                         files.insert(path.to_owned());
+                        if let Some(size) = part.number::<u64>("size") {
+                            file_sizes.insert(path.to_owned(), size);
+                        }
                         if files.len() > 64 {
                             return Err(Error::Invalid("too many Plex media parts"));
                         }
@@ -613,6 +620,7 @@ impl Client {
                 Ok(CatalogueMedia {
                     media: media(node)?,
                     files: files.into_iter().collect(),
+                    file_sizes,
                     year: node.number("year"),
                 })
             })
@@ -753,6 +761,91 @@ impl Client {
             })
             .collect()
     }
+    /// Optional artwork stays on the configured Plex server and never carries tokens in a URL.
+    pub async fn artwork(
+        &self,
+        server: &Server,
+        key: &str,
+    ) -> Result<(Vec<u8>, &'static str), Error> {
+        identity(key)?;
+        let root = self
+            .xml(server, &format!("/library/metadata/{key}"))
+            .await?;
+        let node = root
+            .children
+            .iter()
+            .find(|n| matches!(n.name.as_str(), "Video" | "Directory"))
+            .ok_or(Error::Invalid("Plex artwork metadata is missing"))?;
+        let path = node
+            .text("thumb")
+            .or_else(|| node.text("grandparentThumb"))
+            .ok_or(Error::Invalid("Plex artwork is unavailable"))?;
+        if node.text("ratingKey") != Some(key)
+            || !path.starts_with("/library/metadata/")
+            || path.contains(['?', '#', '\\', '%'])
+            || path.contains("//")
+            || path.chars().any(char::is_control)
+            || path.contains("..")
+        {
+            return Err(Error::Invalid("Invalid Plex artwork resource"));
+        }
+        let mut url = server_url(&server.url)?;
+        let prefix = url.path().trim_end_matches('/').to_owned();
+        url.set_path(&format!("{prefix}{path}"));
+        url.set_query(None);
+        let bytes = self
+            .send(
+                Method::GET,
+                url,
+                Some(&server.token),
+                None,
+                "image/jpeg,image/png,image/webp",
+            )
+            .await?;
+        let content_type = if bytes.starts_with(&[255, 216, 255]) {
+            "image/jpeg"
+        } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+            "image/png"
+        } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+            "image/webp"
+        } else {
+            return Err(Error::Invalid("Unsupported Plex artwork"));
+        };
+        Ok((bytes, content_type))
+    }
+    /// Revalidate an explicitly selected Part; never substitute metadata's first version.
+    pub async fn metadata_variant(
+        &self,
+        server: &Server,
+        key: &str,
+        path: &str,
+    ) -> Result<Media, Error> {
+        identity(key)?;
+        let root = self
+            .xml(server, &format!("/library/metadata/{key}"))
+            .await?;
+        let nodes: Vec<_> = root
+            .children
+            .iter()
+            .filter(|n| matches!(n.name.as_str(), "Video" | "Directory"))
+            .collect();
+        let [node] = nodes.as_slice() else {
+            return Err(Error::Invalid("Plex media identity is ambiguous"));
+        };
+        let mut result = media(node)?;
+        if result.rating_key != key
+            || !node
+                .children("Media")
+                .flat_map(|m| m.children("Part"))
+                .any(|p| p.text("file") == Some(path))
+        {
+            return Err(Error::Invalid(
+                "Selected Plex version changed; refresh the library",
+            ));
+        }
+        result.file = Some(path.to_owned());
+        Ok(result)
+    }
     pub async fn viewer_metadata(&self, viewer: &ViewerServer, key: &str) -> Result<Media, Error> {
         let mut item = self.metadata(&viewer.server, key).await?;
         item.user = Some(viewer.viewer.clone());
@@ -886,6 +979,7 @@ impl Client {
                 return Ok(ViewerServer {
                     server: scoped,
                     viewer: viewer.to_owned(),
+                    viewer_name: account.name,
                 });
             }
         }
@@ -953,7 +1047,19 @@ fn media(node: &xml::Node) -> Result<Media, Error> {
         .flat_map(|m| m.children("Part"))
         .find_map(|p| p.text("file"))
         .map(str::to_owned);
+    let resolutions: std::collections::HashSet<_> = node
+        .children("Media")
+        .filter_map(|m| m.text("videoResolution"))
+        .collect();
     Ok(Media {
+        artwork: node
+            .text("thumb")
+            .or_else(|| node.text("grandparentThumb"))
+            .is_some(),
+        year: node.number("year"),
+        resolution: (resolutions.len() == 1)
+            .then(|| resolutions.into_iter().next().map(str::to_owned))
+            .flatten(),
         rating_key,
         kind: node.text("type").unwrap_or_default().into(),
         title: node.text("title").unwrap_or_default().into(),
@@ -1045,6 +1151,46 @@ mod tests {
         }
         xml.push_str("</MediaContainer>");
         xml
+    }
+    #[tokio::test]
+    async fn exact_part_selection_revalidates_current_metadata() {
+        let f=fixture(|_,_| response(200,"<MediaContainer><Video ratingKey='42' type='movie' title='Fixture'><Media videoResolution='1080'><Part file='/fixture/first.mkv'/><Part file='/fixture/second.mkv'/></Media></Video></MediaContainer>")).await;
+        let media = f
+            .client
+            .metadata_variant(&f.server, "42", "/fixture/second.mkv")
+            .await
+            .unwrap();
+        assert_eq!(media.file.as_deref(), Some("/fixture/second.mkv"));
+        assert!(
+            f.client
+                .metadata_variant(&f.server, "42", "/fixture/gone.mkv")
+                .await
+                .is_err()
+        );
+        assert!(
+            f.client
+                .metadata_variant(&f.server, "43", "/fixture/second.mkv")
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn artwork_rejects_untrusted_resource_before_fetching_it() {
+        for resource in [
+            "https://example.invalid/thumb",
+            "/library/metadata/42/%2e%2e/private",
+            "/library/metadata/42/thumb?token=secret",
+        ] {
+            let xml = format!(
+                "<MediaContainer><Video ratingKey='42' type='movie' title='Fixture' thumb='{resource}'/></MediaContainer>"
+            );
+            let f = fixture(move |uri, _| {
+                assert!(uri.path().ends_with("/library/metadata/42"));
+                response(200, xml.clone())
+            })
+            .await;
+            assert!(f.client.artwork(&f.server, "42").await.is_err());
+        }
     }
     #[tokio::test]
     async fn identity_requires_protected_access_and_credentials_stay_out_of_urls() {
@@ -1356,6 +1502,7 @@ mod tests {
                 ..f.server.clone()
             },
             viewer: "7".into(),
+            viewer_name: "Fixture viewer".into(),
         };
         for (kind, path) in [
             (crate::sources::Kind::Hub, "/hubs/home/continueWatching"),
@@ -1441,6 +1588,7 @@ mod tests {
         let viewer = ViewerServer {
             server: f.server.clone(),
             viewer: "1".into(),
+            viewer_name: "Fixture owner".into(),
         };
         let library = Library {
             id: "7".into(),

@@ -51,11 +51,18 @@ export function PredictionResults({
     values,
   }));
   const name = (p: Prediction) =>
+    p.viewer_name ||
     p.playback?.find((v) => v.viewer_name)?.viewer_name ||
     `Plex profile ${p.viewer}`;
   const matching = groups.filter(
     (g) =>
-      (!search || g.p.title.toLowerCase().includes(search.toLowerCase())) &&
+      (!search ||
+        g.values.some((p) =>
+          [p.title, p.source_title, name(p)]
+            .join(" ")
+            .toLowerCase()
+            .includes(search.toLowerCase()),
+        )) &&
       (viewer === "all" || g.values.some((p) => name(p) === viewer)) &&
       (source === "all" || g.values.some((p) => p.source === source)),
   );
@@ -228,7 +235,10 @@ export function PredictionResults({
               <div className="flex flex-wrap gap-1">
                 {[
                   ...new Set(
-                    g.values.map((p) => sourceLabels[p.source] ?? p.source),
+                    g.values.map(
+                      (p) =>
+                        p.source_title || sourceLabels[p.source] || p.source,
+                    ),
                   ),
                 ].map((s) => (
                   <Badge variant="secondary" key={s}>

@@ -507,6 +507,8 @@ pub struct Health {
     pub enabled: bool,
     /// Share of segments each check probes, 5 to 100; at least 5 segments.
     pub check_percent: u8,
+    /// V1 size-based depth, or an explicit custom percentage.
+    pub sample_depth: HealthSampleDepth,
     /// Ask the Arr that imported a broken file for a replacement.
     pub auto_repair: bool,
     /// Keep serving files with a few small gaps instead of replacing them.
@@ -524,11 +526,48 @@ impl Default for Health {
         Self {
             enabled: true,
             check_percent: infinidysk_core::media::SAMPLE_PERCENT,
+            sample_depth: HealthSampleDepth::Standard,
             auto_repair: true,
             degraded_tolerance: true,
             unowned_action: UnownedAction::Delete,
-            media_probe: true,
+            media_probe: false,
             par2: crate::repair::worker::Settings::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthSampleDepth {
+    Quick,
+    #[default]
+    Standard,
+    Enhanced,
+    Deep,
+    Complete,
+    Percent,
+}
+impl HealthSampleDepth {
+    pub const fn policy(self) -> infinidysk_core::media::SampleDepth {
+        use infinidysk_core::media::SampleDepth as D;
+        match self {
+            Self::Quick => D::Quick,
+            Self::Standard => D::Standard,
+            Self::Enhanced => D::Enhanced,
+            Self::Deep => D::Deep,
+            Self::Complete => D::Complete,
+            Self::Percent => D::Percent,
+        }
+    }
+}
+impl Health {
+    pub const fn effective_percent(&self) -> u8 {
+        match self.sample_depth {
+            HealthSampleDepth::Complete => 100,
+            HealthSampleDepth::Percent => self.check_percent,
+            // The percentage also marks imports proven complete. A retained custom
+            // 100 must not grant that proof after switching to a partial depth.
+            _ => infinidysk_core::media::SAMPLE_PERCENT,
         }
     }
 }
@@ -1990,5 +2029,38 @@ fn diff(value: Value, default: Option<&Value>) -> Option<Value> {
         }
         (value, Some(default)) if &value == default => None,
         (value, _) => Some(value),
+    }
+}
+
+#[cfg(test)]
+mod health_depth_defaults_tests {
+    use super::*;
+    #[test]
+    fn health_defaults_match_v1_and_custom_percentage_survives_round_trip() {
+        let health: Health = serde_json::from_str("{}").unwrap();
+        assert!(health.enabled && health.auto_repair);
+        assert!(!health.media_probe && !health.par2.enabled);
+        assert_eq!(health.sample_depth, HealthSampleDepth::Standard);
+        let mut health = health;
+        health.sample_depth = HealthSampleDepth::Percent;
+        health.check_percent = 25;
+        let mut health: Health =
+            serde_json::from_value(serde_json::to_value(health).unwrap()).unwrap();
+        assert_eq!(health.effective_percent(), 25);
+        assert_eq!(
+            health.sample_depth.policy(),
+            infinidysk_core::media::SampleDepth::Percent
+        );
+        health.check_percent = 100;
+        health.sample_depth = HealthSampleDepth::Standard;
+        assert_eq!(
+            health.effective_percent(),
+            infinidysk_core::media::SAMPLE_PERCENT
+        );
+        health_sample_complete(health);
+    }
+    fn health_sample_complete(mut health: Health) {
+        health.sample_depth = HealthSampleDepth::Complete;
+        assert_eq!(health.effective_percent(), 100);
     }
 }

@@ -1113,7 +1113,8 @@ async fn probe_path(mut req: Request) -> Request {
 
 fn set_rules(queue: &Queue, settings: &Settings) {
     queue.update_rules(|r| {
-        r.check_percent = settings.health.check_percent;
+        r.check_percent = settings.health.effective_percent();
+        r.sample_depth = settings.health.sample_depth.policy();
         r.blocklist.clone_from(&settings.queue.extra_blocklist);
     });
 }
@@ -1151,7 +1152,8 @@ pub(crate) fn to_arr(a: &config::ArrInstance) -> Arr {
 fn health_settings(h: &config::Health) -> HealthSettings {
     HealthSettings {
         enabled: h.enabled,
-        sample_percent: h.check_percent,
+        sample_percent: h.effective_percent(),
+        sample_depth: h.sample_depth.policy(),
         auto_repair: h.auto_repair,
         degraded_tolerance: h.degraded_tolerance,
         unowned_action: match h.unowned_action {

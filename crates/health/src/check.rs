@@ -25,6 +25,7 @@ pub enum Outcome {
 pub struct Options {
     /// Share of segments probed, 1 to 100.
     pub percent: u8,
+    pub depth: media::SampleDepth,
     pub tolerant: bool,
     pub concurrency: usize,
     /// Every segment answered STAT moments ago: only the BODY reads remain, and damage
@@ -76,7 +77,7 @@ pub async fn run(
 ) -> (Outcome, bool, Option<Vec<u8>>) {
     let (segments, old_missing, old_corrupt) = flatten(meta);
     let n = segments.len();
-    let sample = media::sample(n, opts.percent);
+    let sample = media::sample_depth(n, opts.percent, opts.depth);
     // Known holes are re-probed with BODY so a recovery is noticed.
     let mut bodies: BTreeSet<usize> = old_missing.union(&old_corrupt).copied().collect();
     if n > 0 {

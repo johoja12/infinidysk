@@ -60,6 +60,12 @@ impl Db {
         });
         Ok(())
     }
+    /// Display-only provenance recovered by a verified migration audit.
+    pub async fn prefetch_display_labels(&self) -> Result<Option<String>, Error> {
+        Ok(
+            on!(self,pool=>sqlx::query_scalar("SELECT value FROM config WHERE key='fork_prefetch_display_labels_v1'").fetch_optional(pool).await?),
+        )
+    }
     pub async fn prefetch_history(&self, limit: u16) -> Result<Vec<String>, Error> {
         Ok(
             on!(self,pool=>sqlx::query_scalar("SELECT payload FROM prefetch_history ORDER BY recorded_at DESC,id DESC LIMIT $1").bind(i64::from(limit.min(100))).fetch_all(pool).await?),

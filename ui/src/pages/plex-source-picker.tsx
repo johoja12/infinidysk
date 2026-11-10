@@ -14,7 +14,8 @@ import {
 } from "@/components/ui/select";
 type Source = Schemas["PlexPrefetchSource"];
 type Resource = Schemas["PlexCatalogueSource"];
-const same = (a: Source, b: Source) =>
+type SourceIdentity = Pick<Source, "server" | "viewer" | "kind" | "path">;
+const same = (a: SourceIdentity, b: SourceIdentity) =>
   a.server === b.server &&
   a.viewer === b.viewer &&
   a.kind === b.kind &&
@@ -53,20 +54,31 @@ export function PlexSourcePicker({
   });
   const catalogue = useQuery({
     queryKey: ["plex-library", "sources", server, viewer, libraryId],
-    queryFn: ({ signal }) =>
-      body(
-        api.GET("/api/v1/plex/servers/{id}/sources", {
-          params: {
-            path: { id: server!.id },
-            query: {
-              viewer,
-              library: libraryId === "home" ? undefined : libraryId,
-            },
+    queryFn: async ({ signal }) => {
+      const response = await api.GET("/api/v1/plex/servers/{id}/sources", {
+        params: {
+          path: { id: server!.id },
+          query: {
+            viewer,
+            library: libraryId === "home" ? undefined : libraryId,
           },
-          signal,
-        }),
-      ),
+        },
+        signal,
+      });
+      const sources = await body(Promise.resolve(response));
+      const encoded = response.response.headers.get("x-plex-viewer-name");
+      return {
+        sources,
+        viewerName: encoded ? decodeURIComponent(encoded) : null,
+      };
+    },
     enabled: !!server,
+  });
+  const validation = useMutation({
+    mutationFn: () =>
+      body(
+        api.POST("/api/v1/plex/sources/validate", { body: { sources: value } }),
+      ),
   });
   const preview = useMutation({
     mutationFn: (source: Source) =>
@@ -92,7 +104,7 @@ export function PlexSourcePicker({
   };
   const resourceLabel = (s: Source) =>
     s.title ||
-    catalogue.data?.find(
+    catalogue.data?.sources.find(
       (r) => r.kind === s.kind && r.path === s.path && s.server === server?.id,
     )?.title ||
     `Saved ${s.kind} source`;
@@ -101,7 +113,7 @@ export function PlexSourcePicker({
     preview.reset();
   };
   const resources =
-    catalogue.data?.filter((r) =>
+    catalogue.data?.sources.filter((r) =>
       r.title.toLowerCase().includes(search.toLowerCase()),
     ) ?? [];
   if (!server)
@@ -156,7 +168,9 @@ export function PlexSourcePicker({
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="1">Server owner</SelectItem>
+              <SelectItem value="1">
+                {catalogue.data?.viewerName || "Server owner"}
+              </SelectItem>
               {accounts
                 .filter((a) => (a.numeric_id ?? a.id) !== "1")
                 .map((a) => (
@@ -367,9 +381,23 @@ export function PlexSourcePicker({
             Saved selections ({value.length})
           </summary>
           <p className="my-2 text-xs text-muted-foreground">
-            Includes sources not in the current catalogue. Keep unavailable
-            selections for later recovery, or remove them explicitly.
+            Saved selections include sources from other libraries and old Plex
+            paths. Check availability to distinguish an empty hub from a path
+            Plex no longer exposes. Checks never enable sources or download
+            media.
           </p>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={validation.isPending || !value.length}
+            onClick={() => validation.mutate()}
+          >
+            {validation.isPending
+              ? "Checking saved sources…"
+              : "Check saved sources"}
+          </Button>
+          {validation.error && <Failure error={validation.error} />}
           <div className="space-y-2">
             {value.map((s, index) => (
               <div
@@ -385,6 +413,18 @@ export function PlexSourcePicker({
                     onChange={(checked) => set({ ...s, enabled: checked })}
                   />
                 </div>
+                {validation.data
+                  ?.filter((v) => same(v, s))
+                  .map((v) => (
+                    <p
+                      key={v.path}
+                      role="status"
+                      className={`basis-full text-xs ${v.status === "missing" ? "text-warning-text" : "text-muted-foreground"}`}
+                    >
+                      {v.viewer_name && <>{v.viewer_name} · </>}
+                      {v.message}
+                    </p>
+                  ))}
                 <Button
                   type="button"
                   size="sm"

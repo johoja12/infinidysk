@@ -170,8 +170,8 @@ impl Progress {
 }
 
 /// Requests the article sample and the media checks take.
-fn checks(segments: usize, media: usize, percent: u8) -> usize {
-    media::sample(segments, percent).len() + 2 * media
+fn checks(segments: usize, media: usize, percent: u8, depth: media::SampleDepth) -> usize {
+    media::sample_depth(segments, percent, depth).len() + 2 * media
 }
 
 /// What an import checks beyond the fixed policy.
@@ -179,6 +179,7 @@ fn checks(segments: usize, media: usize, percent: u8) -> usize {
 pub struct Rules {
     /// Share of segments the existence sample probes.
     pub check_percent: u8,
+    pub sample_depth: media::SampleDepth,
     /// Extra filename globs to drop.
     pub blocklist: Vec<String>,
     /// Media kinds the Arrs owning each lowercased category import.
@@ -189,6 +190,7 @@ impl Default for Rules {
     fn default() -> Self {
         Self {
             check_percent: media::SAMPLE_PERCENT,
+            sample_depth: media::SampleDepth::Percent,
             blocklist: Vec::new(),
             owners: HashMap::new(),
         }
@@ -402,6 +404,7 @@ pub async fn import(
                 .count()
                 .max(1),
             percent,
+            rules.sample_depth,
         );
     job.progress.plan(Step::Headers, nzb.files.len() + rest);
     let firsts = join_all(nzb.files.iter().map(|f| {
@@ -472,7 +475,7 @@ pub async fn import(
         .count()
         .max(1);
     let wanted_segments: usize = wanted.iter().map(|&i| inputs[i].ids.len()).sum();
-    let downstream = checks(wanted_segments, wanted_media, percent);
+    let downstream = checks(wanted_segments, wanted_media, percent, rules.sample_depth);
     job.progress.plan(
         Step::Layouts,
         wanted.iter().filter(|&&i| inputs[i].ids.len() > 1).count() + downstream,
@@ -562,7 +565,7 @@ pub async fn import(
     let required = rules.owners.get(&category.to_lowercase());
     require(&outputs, required.map_or(&[], Vec::as_slice))?;
     let outputs = name(outputs, release);
-    let outputs = check_articles(job, outputs, rules.check_percent).await?;
+    let outputs = check_articles(job, outputs, rules.check_percent, rules.sample_depth).await?;
     let check_at = started.elapsed();
     // Every article answered STAT just now; only the health check's reads remain.
     let verifier = verifier.filter(|_| rules.check_percent >= 100);
@@ -1564,6 +1567,7 @@ async fn check_articles(
     job: &Arc<Job>,
     outputs: Vec<Output>,
     percent: u8,
+    depth: media::SampleDepth,
 ) -> Result<Vec<Output>, Error> {
     // Each distinct segment once; archive members can share a volume's segments.
     let mut ids: Vec<String> = Vec::new();
@@ -1589,7 +1593,7 @@ async fn check_articles(
         .filter(|(o, _)| o.path.last().and_then(|n| media::kind(n)).is_some())
         .flat_map(|(_, used)| used.iter().copied())
         .collect();
-    let first = media::sample(ids.len(), percent);
+    let first = media::sample_depth(ids.len(), percent, depth);
     job.progress
         .plan(Step::Checking, first.len() + 2 * media_outputs(&outputs));
     let mut missed = stat_all(job, &ids, &first, &fatal).await?;
@@ -1941,7 +1945,9 @@ mod tests {
             }),
         };
 
-        let error = check_articles(&job, vec![output], 100).await.unwrap_err();
+        let error = check_articles(&job, vec![output], 100, media::SampleDepth::Complete)
+            .await
+            .unwrap_err();
         assert!(matches!(&error, Error::Missing(_)), "{error}");
         assert_eq!(error.to_string(), missing("media.mkv").to_string());
         let issued = job.progress.issued.load(Ordering::Relaxed);

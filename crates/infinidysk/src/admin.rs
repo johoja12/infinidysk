@@ -106,7 +106,8 @@ pub struct Admin {
         crate::prefetch::status,crate::prefetch::enqueue,crate::prefetch::pause,crate::prefetch::control,
         crate::plex::start, crate::plex::poll, crate::plex::cancel,
         crate::plex::discover, crate::plex::select, crate::plex::home,
-        crate::plex::switch_home, crate::plex::libraries, crate::plex::browse, crate::plex::source_catalogue, crate::plex::source_preview,
+        crate::plex::browser::browse, crate::plex::browser::resolve, crate::plex::browser::artwork,
+        crate::plex::switch_home, crate::plex::libraries, crate::plex::browse, crate::plex::source_catalogue, crate::plex::source_preview, crate::plex::validate_sources,
         get_settings,
         put_settings,
         get_key,
@@ -271,6 +272,22 @@ pub fn router(admin: Arc<Admin>, auth: Arc<Auth>) -> Router {
         )
         .route("/api/v1/prefetch/pause", post(crate::prefetch::pause))
         .route("/api/v1/prefetch/{id}", post(crate::prefetch::control))
+        .route(
+            "/api/v1/plex/servers/{id}/browse",
+            get(crate::plex::browser::browse),
+        )
+        .route(
+            "/api/v1/plex/servers/{id}/browse/resolve",
+            post(crate::plex::browser::resolve),
+        )
+        .route(
+            "/api/v1/plex/servers/{id}/artwork/{key}",
+            get(crate::plex::browser::artwork),
+        )
+        .route(
+            "/api/v1/plex/sources/validate",
+            post(crate::plex::validate_sources),
+        )
         .route("/api/v1/plex/login", post(crate::plex::start))
         .route(
             "/api/v1/plex/login/{handle}",

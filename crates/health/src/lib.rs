@@ -86,6 +86,7 @@ pub struct Settings {
     pub enabled: bool,
     /// Share of segments a check probes, 1 to 100.
     pub sample_percent: u8,
+    pub sample_depth: media::SampleDepth,
     pub auto_repair: bool,
     pub degraded_tolerance: bool,
     pub unowned_action: UnownedAction,
@@ -98,10 +99,11 @@ impl Default for Settings {
         Self {
             enabled: true,
             sample_percent: media::SAMPLE_PERCENT,
+            sample_depth: media::SampleDepth::Percent,
             auto_repair: true,
             degraded_tolerance: true,
             unowned_action: UnownedAction::Delete,
-            media_probe: true,
+            media_probe: false,
         }
     }
 }
@@ -724,6 +726,7 @@ impl Health {
         let repair_generation = self.client.repair_generation();
         let opts = check::Options {
             percent: settings.sample_percent,
+            depth: settings.sample_depth,
             tolerant: settings.degraded_tolerance,
             concurrency: if (self.streaming)() {
                 CONCURRENCY_STREAMING
@@ -1701,6 +1704,7 @@ pub async fn first_check(
     }
     let opts = check::Options {
         percent: 100,
+        depth: media::SampleDepth::Complete,
         tolerant: false,
         concurrency: CONCURRENCY_IDLE,
         proven: true,

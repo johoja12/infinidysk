@@ -66,6 +66,21 @@ async fn exercise(db: &Db) {
     .await
     .expect("insert");
 
+    let batch = db
+        .items_by_ids(&[
+            file.id.0,
+            other.id.0,
+            file.id.0,
+            uuid::Uuid::from_u128(u128::MAX),
+        ])
+        .await
+        .expect("catalogue join");
+    assert_eq!(batch.len(), 2);
+    assert!(batch.iter().any(|i| i.id == file.id && i.size == file.size));
+    assert!(batch.iter().any(|i| i.id == other.id && i.encrypted));
+    assert_eq!(db.items_by_ids(&[]).await.expect("empty batch").len(), 0);
+    assert!(db.items_by_ids(&vec![file.id.0; 1001]).await.is_err());
+
     assert!(
         db.item_descends_from(file.id, dir.id)
             .await

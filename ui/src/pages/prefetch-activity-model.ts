@@ -13,7 +13,11 @@ export function source(j: Job) {
   if (j.family === "backfill") return "Playback gap fill";
   if (j.family === "read") return "Finish watched";
   if (!j.automatic_scope) return "Manual";
-  return j.attribution?.policy?.source.replaceAll("_", " ") || "Plex policy";
+  return (
+    j.attribution?.policy?.source_title ||
+    j.attribution?.policy?.source.replaceAll("_", " ") ||
+    "Plex policy"
+  );
 }
 export function state(
   j: Job,
@@ -70,13 +74,15 @@ export function viewers(j: Job) {
     (p) => p.viewer_name || `Plex profile ${p.viewer}`,
   );
   return [
-    ...new Set(
-      reported.length
-        ? reported
-        : j.attribution?.policy
-          ? [`Plex profile ${j.attribution.policy.viewer}`]
-          : [],
-    ),
+    ...new Set([
+      ...(j.attribution?.policy
+        ? [
+            j.attribution.policy.viewer_name ||
+              `Plex profile ${j.attribution.policy.viewer}`,
+          ]
+        : []),
+      ...reported,
+    ]),
   ];
 }
 export function rangeCoverage(

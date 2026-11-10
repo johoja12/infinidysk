@@ -80,6 +80,12 @@ pub struct Prediction {
     pub id: Uuid,
     pub server: String,
     pub viewer: String,
+    #[serde(default)]
+    pub viewer_name: Option<String>,
+    #[serde(default)]
+    pub source_title: Option<String>,
+    #[serde(default)]
+    pub source_path: Option<String>,
     pub rating_key: String,
     pub title: String,
     pub source: Source,
@@ -349,6 +355,9 @@ impl Predictions {
                                     Source::Library => "library",
                                 }
                                 .into(),
+                                viewer_name: p.viewer_name.clone(),
+                                source_title: p.source_title.clone(),
+                                source_path: p.source_path.clone(),
                                 server: p.server.clone(),
                                 viewer: p.viewer.clone(),
                                 observed_at: saved.updated_at,
@@ -450,6 +459,7 @@ impl Predictions {
                         user.to_owned(),
                         input.rating_key.clone(),
                         Source::Playback as u8,
+                        None::<String>,
                     )) {
                         if predictions.len() >= MAX {
                             return Err(Error::Invalid(
@@ -459,7 +469,7 @@ impl Predictions {
                         let mut unknown = input.clone();
                         unknown.file = None;
                         let mut p = self
-                            .prediction(server, &unknown, Source::Playback, scope, settings)
+                            .prediction(server, &unknown, Source::Playback, scope, settings, None)
                             .await?;
                         p.item = None;
                         p.revision = None;
@@ -497,10 +507,18 @@ impl Predictions {
                         user.to_owned(),
                         current.rating_key.clone(),
                         source as u8,
+                        None::<String>,
                     ))
                 {
                     let mut prediction = self
-                        .prediction(server, &current, source, scope, settings)
+                        .prediction(
+                            server,
+                            &current,
+                            source,
+                            scope,
+                            settings,
+                            Some((viewer, None)),
+                        )
                         .await?;
                     if realtime
                         && prediction.item.is_some()
@@ -532,6 +550,7 @@ impl Predictions {
                                 user.to_owned(),
                                 item.rating_key.clone(),
                                 Source::NextEpisode as u8,
+                                None::<String>,
                             ))
                         {
                             predictions.push(
@@ -541,6 +560,7 @@ impl Predictions {
                                     Source::NextEpisode,
                                     scope,
                                     settings,
+                                    Some((viewer, None)),
                                 )
                                 .await?,
                             );
@@ -600,11 +620,19 @@ impl Predictions {
                                 selection.viewer.clone(),
                                 item.rating_key.clone(),
                                 origin as u8,
+                                Some(selection.path.clone()),
                             ))
                         {
                             predictions.push(
-                                self.prediction(server, &item, origin, scope, settings)
-                                    .await?,
+                                self.prediction(
+                                    server,
+                                    &item,
+                                    origin,
+                                    scope,
+                                    settings,
+                                    Some((&viewer, Some(selection))),
+                                )
+                                .await?,
                             );
                             if predictions.len() > MAX {
                                 return Err(Error::Invalid(
@@ -625,11 +653,17 @@ impl Predictions {
         source: Source,
         scope: &str,
         settings: &Settings,
+        origin: Option<(&ViewerServer, Option<&infinidysk_plex::sources::Source>)>,
     ) -> Result<Prediction, Error> {
         let mut p = Prediction {
             id: Uuid::nil(),
             server: server.id.clone(),
             viewer: media.user.clone().unwrap_or_default(),
+            viewer_name: origin
+                .map(|(viewer, _)| viewer.viewer_name().chars().take(256).collect::<String>())
+                .filter(|name| !name.trim().is_empty()),
+            source_title: origin.and_then(|(_, source)| source.and_then(|s| s.title.clone())),
+            source_path: origin.and_then(|(_, source)| source.map(|s| s.path.clone())),
             rating_key: media.rating_key.clone(),
             title: media.title.clone(),
             source,
@@ -714,6 +748,11 @@ impl Predictions {
             &p.ranges,
         ))
         .expect("serializable fields");
+        let identity = if let Some(path) = &p.source_path {
+            serde_json::to_vec(&(identity, path)).expect("serializable source identity")
+        } else {
+            identity
+        };
         let hash = Sha256::digest(identity);
         let mut bytes = [0; 16];
         bytes.copy_from_slice(&hash[..16]);
@@ -785,6 +824,9 @@ fn valid_saved(saved: &Saved) -> bool {
         && saved.predictions.iter().all(|p| {
             p.ranges.len() <= 64
                 && p.ranges.iter().all(|r| r.start < r.end && r.end <= p.size)
+                && p.viewer_name.as_ref().is_none_or(|v| v.len() <= 1024)
+                && p.source_title.as_ref().is_none_or(|v| v.len() <= 4096)
+                && p.source_path.as_ref().is_none_or(|v| v.len() <= 4096)
                 && p.playback.len() <= 32
                 && p.playback.iter().all(PlaybackContext::valid)
                 && (p.playback.is_empty()

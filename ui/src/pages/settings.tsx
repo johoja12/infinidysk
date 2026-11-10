@@ -1046,30 +1046,69 @@ export function Settings() {
                     onChange={(enabled) => patch("health", { enabled })}
                   />
                   <Field
-                    id="health-percent"
+                    id="health-depth"
                     layout="row"
-                    label={
-                      <span className="flex w-full justify-between">
-                        {label("Sample size", "health.check_percent")}
-                        <span className="font-mono tabular-nums">
-                          {draft.health.check_percent === 100 ? "Every segment" : `${draft.health.check_percent}%`}
-                        </span>
-                      </span>
-                    }
-                    hint="Applies to imports and subsequent health checks. At 100%, every article is checked for availability; the entire file is not downloaded and verified."
-                    error={invalid("health.check_percent")}
+                    label={label("Check depth", "health.sample_depth")}
+                    hint="Standard uses the v1 size-based sample, with checks at both ends. These check article availability; they do not download the whole file."
                   >
-                    <Slider
-                      id="health-percent"
-                      aria-label="Sample size"
-                      min={5}
-                      max={100}
-                      step={5}
-                      disabled={locked("health.check_percent")}
-                      value={[draft.health.check_percent]}
-                      onValueChange={([check_percent]) => patch("health", { check_percent })}
-                    />
+                    <Select
+                      value={draft.health.sample_depth}
+                      disabled={locked("health.sample_depth")}
+                      onValueChange={(sample_depth) =>
+                        patch("health", {
+                          sample_depth:
+                            sample_depth as Doc["health"]["sample_depth"],
+                        })
+                      }
+                    >
+                      <SelectTrigger id="health-depth" aria-label="Check depth">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="standard">
+                          Standard (v1 default)
+                        </SelectItem>
+                        <SelectItem value="quick">Quick</SelectItem>
+                        <SelectItem value="enhanced">Enhanced</SelectItem>
+                        <SelectItem value="deep">Deep</SelectItem>
+                        <SelectItem value="complete">Complete</SelectItem>
+                        <SelectItem value="percent">
+                          Custom percentage
+                        </SelectItem>
+                      </SelectContent>
+                    </Select>
                   </Field>
+                  {draft.health.sample_depth === "percent" && (
+                    <Field
+                      id="health-percent"
+                      layout="row"
+                      label={
+                        <span className="flex w-full justify-between">
+                          {label("Sample size", "health.check_percent")}
+                          <span className="font-mono tabular-nums">
+                            {draft.health.check_percent === 100
+                              ? "Every segment"
+                              : `${draft.health.check_percent}%`}
+                          </span>
+                        </span>
+                      }
+                      hint="Applies to imports and subsequent health checks. At 100%, every article is checked for availability; the entire file is not downloaded and verified."
+                      error={invalid("health.check_percent")}
+                    >
+                      <Slider
+                        id="health-percent"
+                        aria-label="Sample size"
+                        min={5}
+                        max={100}
+                        step={5}
+                        disabled={locked("health.check_percent")}
+                        value={[draft.health.check_percent]}
+                        onValueChange={([check_percent]) =>
+                          patch("health", { check_percent })
+                        }
+                      />
+                    </Field>
+                  )}
                   <Toggle
                     id="health-media"
                     label={label(
@@ -1086,7 +1125,10 @@ export function Settings() {
                 <SettingsPanel title="Repair">
                   <Toggle
                     id="health-repair"
-                    label={label("Replace broken files automatically", "health.auto_repair")}
+                    label={label(
+                      "Replace broken files automatically",
+                      "health.auto_repair",
+                    )}
                     hint="Asks the Arr that imported a broken file to find another release. When off, broken files wait in Needs attention."
                     disabled={locked("health.auto_repair")}
                     checked={draft.health.auto_repair}
@@ -1096,49 +1138,125 @@ export function Settings() {
                     <Field
                       id="health-unowned"
                       layout="row"
-                      label={label("Broken files not imported by an Arr", "health.unowned_action")}
+                      label={label(
+                        "Broken files not imported by an Arr",
+                        "health.unowned_action",
+                      )}
                       hint="Files added by hand or by an Arr that is no longer configured cannot be replaced."
                     >
                       <Select
                         disabled={locked("health.unowned_action")}
                         value={draft.health.unowned_action}
-                        onValueChange={(v) => patch("health", { unowned_action: v as Doc["health"]["unowned_action"] })}
+                        onValueChange={(v) =>
+                          patch("health", {
+                            unowned_action:
+                              v as Doc["health"]["unowned_action"],
+                          })
+                        }
                       >
                         <SelectTrigger id="health-unowned" className="w-full">
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
                           <SelectItem value="delete">Delete them</SelectItem>
-                          <SelectItem value="action_needed">Keep them in Needs attention</SelectItem>
+                          <SelectItem value="action_needed">
+                            Keep them in Needs attention
+                          </SelectItem>
                         </SelectContent>
                       </Select>
                     </Field>
                   )}
                   <Toggle
                     id="health-par2"
-                    label={label("Try PAR2 repair before replacement", "health.par2.enabled")}
+                    label={label(
+                      "Try PAR2 repair before replacement",
+                      "health.par2.enabled",
+                    )}
                     hint="Repairs missing or corrupt articles from the original release when imported recovery proofs are available. Uses a separate background lane and yields to provider reads. Enabling for the first time requires a restart. Automatic replacement must also be enabled."
                     disabled={locked("health.par2.enabled")}
                     checked={draft.health.par2.enabled}
-                    onChange={(enabled) => patch("health", { par2: { ...draft.health.par2, enabled } })}
+                    onChange={(enabled) =>
+                      patch("health", {
+                        par2: { ...draft.health.par2, enabled },
+                      })
+                    }
                   />
-                  {draft.health.par2.enabled && <>
-                    <p className="text-xs text-muted-foreground">Existing repaired data stays active when new attempts are disabled. Back up the repair-v2 directory with the database. Resource limits defer to the existing replacement policy after confirmed damage; provider outages keep repair pending.</p>
-                    {([
-                      ["max_missing_slices", "Maximum missing slices", 1, 64, "Caps reconstruction work per attempt."],
-                      ["memory_mb", "Repair working memory (MB)", 128, 2048, "Allowance for discovery and reconstruction buffers. Other application memory is additional."],
-                      ["failure_cooldown_hours", "Failure cooldown (hours)", 1, 168, "Wait before repeating an unsupported or over-limit attempt against the same source and settings."],
-                    ] as const).map(([key, title, min, max, hint]) => <Field key={key} id={`health-par2-${key}`} layout="row" label={label(title, `health.par2.${key}`)} hint={hint} error={invalid("health.par2")}>
-                      <Input id={`health-par2-${key}`} type="number" className="w-28" min={min} max={max} required disabled={locked(`health.par2.${key}`)} value={draft.health.par2[key]} onChange={e => patch("health", { par2: { ...draft.health.par2, [key]: Number(e.target.value) } })} />
-                    </Field>)}
-                  </>}
+                  {draft.health.par2.enabled && (
+                    <>
+                      <p className="text-xs text-muted-foreground">
+                        Existing repaired data stays active when new attempts
+                        are disabled. Back up the repair-v2 directory with the
+                        database. Resource limits defer to the existing
+                        replacement policy after confirmed damage; provider
+                        outages keep repair pending.
+                      </p>
+                      {(
+                        [
+                          [
+                            "max_missing_slices",
+                            "Maximum missing slices",
+                            1,
+                            64,
+                            "Caps reconstruction work per attempt.",
+                          ],
+                          [
+                            "memory_mb",
+                            "Repair working memory (MB)",
+                            128,
+                            2048,
+                            "Allowance for discovery and reconstruction buffers. Other application memory is additional.",
+                          ],
+                          [
+                            "failure_cooldown_hours",
+                            "Failure cooldown (hours)",
+                            1,
+                            168,
+                            "Wait before repeating an unsupported or over-limit attempt against the same source and settings.",
+                          ],
+                        ] as const
+                      ).map(([key, title, min, max, hint]) => (
+                        <Field
+                          key={key}
+                          id={`health-par2-${key}`}
+                          layout="row"
+                          label={label(title, `health.par2.${key}`)}
+                          hint={hint}
+                          error={invalid("health.par2")}
+                        >
+                          <Input
+                            id={`health-par2-${key}`}
+                            type="number"
+                            className="w-28"
+                            min={min}
+                            max={max}
+                            required
+                            disabled={locked(`health.par2.${key}`)}
+                            value={draft.health.par2[key]}
+                            onChange={(e) =>
+                              patch("health", {
+                                par2: {
+                                  ...draft.health.par2,
+                                  [key]: Number(e.target.value),
+                                },
+                              })
+                            }
+                          />
+                        </Field>
+                      ))}
+                    </>
+                  )}
                   <Toggle
                     id="health-tolerance"
-                    label={label("Keep files with small gaps", "health.degraded_tolerance")}
+                    label={label(
+                      "Keep files with small gaps",
+                      "health.degraded_tolerance",
+                    )}
                     hint="A video missing a few small pieces keeps playing, with a brief glitch, instead of being replaced."
                     disabled={locked("health.degraded_tolerance")}
                     checked={draft.health.degraded_tolerance}
-                    onChange={(degraded_tolerance) => patch("health", { degraded_tolerance })}
+                    onChange={(degraded_tolerance) =>
+                      patch("health", { degraded_tolerance })
+                    }
                   />
                 </SettingsPanel>
               </Section>

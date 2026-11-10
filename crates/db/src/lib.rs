@@ -1226,6 +1226,27 @@ impl Db {
             query.fetch_all(pool).await?
         }))
     }
+    /// Bounded metadata-only lookup for catalogue joins; no blob payloads are loaded.
+    pub async fn items_by_ids(&self, ids: &[Uuid]) -> Result<Vec<Item>, Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if ids.len() > 1000 {
+            return Err(Error::Corrupt("catalogue item batch exceeds 1000"));
+        }
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("{} WHERE id IN ({placeholders})", select_items!(""));
+        let rows: Vec<ItemRow> = on!(self,pool=>{
+            // Only generated numeric placeholders enter SQL; identifiers remain bound.
+            let mut query=sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()));
+            for id in ids { query=query.bind(*id); }
+            query.fetch_all(pool).await?
+        });
+        rows.into_iter().map(Item::try_from).collect()
+    }
     pub async fn item(&self, id: ItemId) -> Result<Option<Item>, Error> {
         let sql = select_items!("WHERE id = $1");
         let row: Option<ItemRow> =
