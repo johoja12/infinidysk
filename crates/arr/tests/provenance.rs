@@ -100,9 +100,16 @@ async fn complete_history_recovers_original_and_ignores_migration_id() {
     let http = reqwest::Client::new();
     let owner = owner_of_file(&http, &f.arr, 7).await.unwrap().unwrap();
     assert_eq!(owner.download_id(), Some("original"));
-    replace(&http, &f.arr, Some("migration-id"), &owner, Duration::ZERO)
-        .await
-        .unwrap();
+    replace(
+        &http,
+        &f.arr,
+        Some("migration-id"),
+        &owner,
+        Duration::ZERO,
+        &mut None,
+    )
+    .await
+    .unwrap();
     let calls = f.state.calls.lock().unwrap().clone();
     assert!(
         calls
@@ -125,9 +132,16 @@ async fn path_or_file_id_alone_does_not_resolve_provenance() {
     let http = reqwest::Client::new();
     let owner = owner_of_file(&http, &f.arr, 7).await.unwrap().unwrap();
     assert_eq!(owner.download_id(), None);
-    replace(&http, &f.arr, Some("migration-id"), &owner, Duration::ZERO)
-        .await
-        .unwrap();
+    replace(
+        &http,
+        &f.arr,
+        Some("migration-id"),
+        &owner,
+        Duration::ZERO,
+        &mut None,
+    )
+    .await
+    .unwrap();
     assert!(
         !f.state
             .calls

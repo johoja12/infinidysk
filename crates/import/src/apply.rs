@@ -3973,4 +3973,39 @@ mod tests {
             db.close().await;std::fs::remove_dir_all(config).unwrap();
         });
     }
+    #[test]
+    fn a_pending_volume_measures_a_known_size_its_articles_cannot_hold() {
+        use infinidysk_testkit::post;
+
+        // Every article claims a size another volume of the folder had, too small
+        // for this volume's three articles.
+        let volume = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../archive/tests/fixtures/Rar5.multi.none.part02.rar"
+        ))
+        .unwrap();
+        let mut articles = post("v", "v.part02.rar", &volume, 50_000);
+        assert_eq!(articles.len(), 3);
+        for article in &mut articles {
+            let line = article.wire.iter().position(|&b| b == b'\n').unwrap();
+            let header = String::from_utf8(article.wire[..=line].to_vec()).unwrap();
+            let claim = header.replace(&format!("size={}", volume.len()), "size=90000");
+            article.wire.splice(..=line, claim.into_bytes());
+        }
+        let pending = csharp::PendingPart {
+            segment_ids: articles.iter().map(|a| a.message_id.clone()).collect(),
+            segment_range: csharp::LongRange::default(),
+            estimated_size: 0,
+            fallbacks: None,
+            proof: None,
+        };
+        rt().block_on(async {
+            let (_server, client) = loopback(articles).await;
+            let mut sizing = sizer(&client);
+            sizing.volumes.push(90_000);
+            let part = sizing.resolve(&pending, None, None, false).await.unwrap();
+            assert_eq!((part.data.start, part.data.end), (45, 100_045));
+            assert_eq!(part.segments.size(), volume.len() as u64);
+        });
+    }
 }

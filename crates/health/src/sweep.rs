@@ -170,8 +170,10 @@ impl Health {
         }
         Ok(changed)
     }
+    #[allow(clippy::significant_drop_tightening)] // Admission must cover the findings and journal writes after the probe.
     pub(super) fn sweep_step(&self) -> futures_util::future::BoxFuture<'_, Result<bool, Error>> {
         Box::pin(async move {
+            let mut writing = Some(self.db.write_permit().await);
             if (self.importing)() || (self.streaming)() {
                 return Ok(false);
             }
@@ -209,7 +211,10 @@ impl Health {
                             ()=async {loop {tokio::time::sleep(Duration::from_millis(100)).await;if (self.importing)() || (self.streaming)() {return;}}}=>None,
                         }
                     };
-                    let result = tokio::select! {result=probe=>result,_=cancel.changed()=>return Ok(true),_=priority.changed()=>return Ok(true)};
+                    let result = self.released(&mut writing, async {tokio::select! {result=probe=>Some(result),_=cancel.changed()=>None,_=priority.changed()=>None}}).await;
+                    let Some(result) = result else {
+                        return Ok(true);
+                    };
                     let Some(result) = result else {
                         return Ok(false);
                     };

@@ -26,7 +26,7 @@ use infinidysk_db::{
 };
 use infinidysk_nntp::{Articles, Client, RepairRevision};
 use sha2::{Digest as _, Sha256};
-use tokio::sync::{Notify, watch};
+use tokio::sync::{Notify, OwnedRwLockReadGuard, watch};
 
 use check::Outcome;
 pub use infinidysk_arr::{Arr, Profile};
@@ -117,6 +117,8 @@ pub enum UnownedAction {
 }
 
 type Gate = Box<dyn Fn() -> bool + Send + Sync>;
+/// The write permit of one health step; `None` while it waits on an Arr or a provider.
+type Writing = Option<OwnedRwLockReadGuard<()>>;
 
 /// What one media analysis of a file found.
 #[derive(Debug)]
@@ -364,6 +366,15 @@ impl Health {
         self.counters[counter].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Awaits Arr or provider `work` with the step's write permit released, so a database
+    /// compaction need not wait for it, then takes the permit back for the writes after.
+    async fn released<T>(&self, writing: &mut Writing, work: impl Future<Output = T>) -> T {
+        *writing = None;
+        let output = work.await;
+        *writing = Some(self.db.write_permit().await);
+        output
+    }
+
     pub async fn run(&self) {
         tokio::time::sleep(STARTUP_DELAY).await;
         loop {
@@ -444,7 +455,7 @@ impl Health {
         if (self.importing)() {
             return Ok(false);
         }
-        let _writing = self.db.write_permit().await;
+        let mut writing = Some(self.db.write_permit().await);
         let settings = *self.settings.borrow();
         let primary = self
             .db
@@ -462,7 +473,7 @@ impl Health {
             let turn = self.maintenance_turn.fetch_add(1, Ordering::Relaxed) % 3;
             for offset in 0..3 {
                 match (turn + offset) % 3 {
-                    0 => match self.sweep_step().await {
+                    0 => match self.released(&mut writing, self.sweep_step()).await {
                         Ok(true) => {
                             self.priority_streak.store(0, Ordering::Relaxed);
                             return Ok(true);
@@ -477,7 +488,8 @@ impl Health {
                             && let Some(analyzer) = &self.analyzer
                             && let Some((item, requested)) = self.db.next_media_probe().await?
                         {
-                            self.analyze(analyzer, item, requested).await?;
+                            self.analyze(analyzer, item, requested, &mut writing)
+                                .await?;
                             self.priority_streak.store(0, Ordering::Relaxed);
                             return Ok(true);
                         }
@@ -503,8 +515,8 @@ impl Health {
         }
         let work = async {
             match status.state {
-                HealthState::Repairing => self.repair(&item, status, &settings).await,
-                HealthState::Hidden => self.reconcile(&item, status).await,
+                HealthState::Repairing => self.repair(&item, status, &settings, &mut writing).await,
+                HealthState::Hidden => self.reconcile(&item, status, &mut writing).await,
                 _ if !media::is_checkable(&item.name) => {
                     let ignored = HealthStatus {
                         state: HealthState::Ignored,
@@ -516,7 +528,7 @@ impl Health {
                         .set_health(item.id, &ignored, status.recheck)
                         .await?)
                 }
-                _ => self.check(&item, status, &settings).await,
+                _ => self.check(&item, status, &settings, &mut writing).await,
             }
         };
         // One file's failure must not keep it first in line and starve the rest.
@@ -535,6 +547,8 @@ impl Health {
                 .unwrap_or_else(|| "unknown panic".to_owned()),
         };
         tracing::warn!(item = %item.id, path = %item.path, reason = %reason, "health work on a file failed; retrying in an hour");
+        drop(writing);
+        let _writing = self.db.write_permit().await;
         self.db
             .postpone_health(item.id, now_ms() + HOUR_MS, status.recheck_generation)
             .await?;
@@ -620,9 +634,15 @@ impl Health {
         Ok(true)
     }
 
-    async fn analyze(&self, analyzer: &Analyzer, item: Item, requested: i64) -> Result<(), Error> {
+    async fn analyze(
+        &self,
+        analyzer: &Analyzer,
+        item: Item,
+        requested: i64,
+        writing: &mut Writing,
+    ) -> Result<(), Error> {
         let (id, path) = (item.id, item.path.clone());
-        let analysis = tokio::select! {result=analyzer(item)=>result,()=self.wake.notified()=>Analysis::Preempted};
+        let analysis = self.released(writing, async {tokio::select! {result=analyzer(item)=>result,()=self.wake.notified()=>Analysis::Preempted}}).await;
         let (outcome, reason, info) = match analysis {
             Analysis::Preempted => {
                 tracing::debug!(path = %path, "media analysis yielded to foreground work");
@@ -715,6 +735,7 @@ impl Health {
         item: &Item,
         status: HealthStatus,
         settings: &Settings,
+        writing: &mut Writing,
     ) -> Result<(), Error> {
         let Some((blob_id, raw, mut meta)) = self.meta_snapshot(item).await? else {
             tracing::warn!(item = %item.id, path = %item.path, reason = "its stored metadata is gone", "cannot check a file; retrying tomorrow");
@@ -736,9 +757,14 @@ impl Health {
             proven: false,
         };
         let client = check::Direct(&self.client);
-        let (outcome, changed, head) = check::run(&client, &mut meta, &item.name, &opts).await;
+        let (outcome, changed, head) = self
+            .released(writing, check::run(&client, &mut meta, &item.name, &opts))
+            .await;
         let found = if matches!(outcome, Outcome::Healthy | Outcome::Degraded(_)) {
-            Some(structure::walk(&client, &meta, &item.name, head).await)
+            Some(
+                self.released(writing, structure::walk(&client, &meta, &item.name, head))
+                    .await,
+            )
         } else {
             None
         };
@@ -1082,6 +1108,7 @@ impl Health {
         item: &Item,
         status: HealthStatus,
         settings: &Settings,
+        writing: &mut Writing,
     ) -> Result<(), Error> {
         if self.observe_overlay(item, status).await? {
             return Ok(());
@@ -1220,7 +1247,7 @@ impl Health {
             }
             (arr, Box::new(saved.progress.owner), saved.job_name)
         } else {
-            match self.owner(item).await? {
+            match self.released(writing, self.owner(item)).await? {
                 Lookup::Found {
                     arr,
                     owner,
@@ -1284,7 +1311,10 @@ impl Health {
             return Ok(());
         }
         let outcome = self
-            .tracked_regrab(item, &arr, &owner, &job_name, existing)
+            .released(
+                writing,
+                self.tracked_regrab(item, &arr, &owner, &job_name, existing),
+            )
             .await?;
         match outcome {
             Ok(()) => {
@@ -1304,6 +1334,14 @@ impl Health {
                     next_check: Some(now + HOUR_MS),
                     repair_attempts: status.repair_attempts + 1,
                     hidden_until: Some(now + HIDDEN_WAIT_MS),
+                    ..status
+                };
+                self.db.set_health(item.id, &next, status.recheck).await?;
+                Ok(())
+            }
+            Err(arr::Error::Searching) => {
+                let next = HealthStatus {
+                    next_check: Some(now + MINUTE_MS),
                     ..status
                 };
                 self.db.set_health(item.id, &next, status.recheck).await?;
@@ -1372,7 +1410,12 @@ impl Health {
 
     /// Hourly look at a `hidden` file: gone once the Arr has its replacement, back to
     /// repairing (or `action_needed`) when the wait runs out.
-    async fn reconcile(&self, item: &Item, status: HealthStatus) -> Result<(), Error> {
+    async fn reconcile(
+        &self,
+        item: &Item,
+        status: HealthStatus,
+        writing: &mut Writing,
+    ) -> Result<(), Error> {
         if self.db.legacy_repair_held(item.id).await? {
             return self
                 .give_up(
@@ -1397,7 +1440,7 @@ impl Health {
             .await?;
             return Ok(self.db.delete_item(item.id).await?);
         }
-        let lookup = self.owner(item).await?;
+        let lookup = self.released(writing, self.owner(item)).await?;
         match lookup {
             Lookup::Found { arr, owner, .. } if owner.replaced() => {
                 tracing::info!(path = %item.path, arr = %arr.name, "replacement imported; deleting the broken file");
@@ -1851,7 +1894,10 @@ mod tests {
         let check = {
             let h = h.clone();
             let item = item.clone();
-            tokio::spawn(async move { h.check(&item, status, &settings).await })
+            tokio::spawn(async move {
+                let mut writing = Some(h.db.write_permit().await);
+                h.check(&item, status, &settings, &mut writing).await
+            })
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             while h.mutation_gate.try_write().is_ok() {

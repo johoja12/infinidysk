@@ -246,7 +246,7 @@ async fn tracked_repair_uses_sonarr_v5_before_any_mutation_is_admitted() {
             "/api/v5/episode/5" => json!({"episodeFileId":7}),
             "/api/v5/history" => json!({"records":[],"totalRecords":0}),
             "/api/v5/rootfolder" => json!([{"path":"/library"}]),
-            "/api/v5/queue/details" => json!([]),
+            "/api/v5/queue/details" | "/api/v5/command" => json!([]),
             _ => panic!("unexpected repair request {path}"),
         }
     }

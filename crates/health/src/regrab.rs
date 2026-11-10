@@ -263,6 +263,7 @@ impl Health {
         job_name: &str,
         existing: Option<RegrabIntent>,
     ) -> Result<Result<(), arr::Error>, Error> {
+        let writing = self.db.write_permit().await;
         if self.db.legacy_repair_held(item.id).await? {
             return Ok(Err(arr::Error::Unexpected(
                 "legacy repair evidence requires reconciliation",
@@ -358,6 +359,7 @@ impl Health {
                         "read-only scan folder cannot authorize regrab",
                     ));
                 }
+                let _writing = db.write_permit().await;
                 let configured = configuration
                     .borrow()
                     .iter()
@@ -400,6 +402,7 @@ impl Health {
                 Ok(())
             }
         };
+        drop(writing);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(25),
             arr::replace_tracked(

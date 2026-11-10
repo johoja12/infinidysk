@@ -82,6 +82,12 @@ async fn handler(State(s): State<Arc<Data>>, request: Request) -> Response {
             }
             return Json(json!({"id":11})).into_response();
         }
+        if mode == 8 {
+            return Json(
+                json!([{"id":42,"name":"MoviesSearch","status":"started","body":{"movieIds":[3]}}]),
+            )
+            .into_response();
+        }
         return Json(if s.search.load(Ordering::SeqCst) > 0 {
             json!([{"id":11,"body":{"name":"MoviesSearch","movieIds":[3]}}])
         } else {
@@ -202,4 +208,47 @@ async fn current_library_authority_is_required_before_any_mutation() {
         assert_eq!(f.count("POST"), 0);
         assert_eq!(p.stage, RegrabStage::Prepared);
     }
+}
+
+#[tokio::test]
+async fn durable_blocklist_resume_waits_for_own_search_without_deleting_or_reblocking() {
+    let f = Fixture::new().await;
+    let original = progress(&f).await;
+    let mut value = serde_json::to_value(original).unwrap();
+    value["owner"]["download_id"] = json!("original");
+    value["stage"] = json!("blocklisted");
+    // This is the pre-beta7 journal shape, with no search baseline.
+    value.as_object_mut().unwrap().remove("search_since");
+    let mut resumed: Regrab = serde_json::from_value(value).unwrap();
+    let saved = recorder();
+    f.state.mode.store(8, Ordering::SeqCst);
+    assert!(matches!(
+        run(&f, &mut resumed, &saved).await,
+        Err(Error::Searching)
+    ));
+    assert_eq!(resumed.stage, RegrabStage::Blocklisted);
+    assert_eq!(f.count("DELETE"), 0);
+    assert_eq!(f.count("POST"), 0);
+    let mut restored: Regrab =
+        serde_json::from_str(&serde_json::to_string(&resumed).unwrap()).unwrap();
+    f.state.mode.store(0, Ordering::SeqCst);
+    run(&f, &mut restored, &saved).await.unwrap();
+    assert_eq!(restored.stage, RegrabStage::Submitted);
+    assert_eq!(f.count("DELETE"), 1);
+    assert_eq!(f.count("POST /api/v3/history/failed"), 0);
+}
+
+#[tokio::test]
+async fn a_file_only_durable_repair_also_waits_for_an_active_own_search() {
+    let f = Fixture::new().await;
+    let mut p = progress(&f).await;
+    assert!(p.owner.download_id().is_none());
+    f.state.mode.store(8, Ordering::SeqCst);
+    assert!(matches!(
+        run(&f, &mut p, &recorder()).await,
+        Err(Error::Searching)
+    ));
+    assert_eq!(p.stage, RegrabStage::Blocklisted);
+    assert_eq!(f.count("DELETE"), 0);
+    assert_eq!(f.count("POST"), 0);
 }

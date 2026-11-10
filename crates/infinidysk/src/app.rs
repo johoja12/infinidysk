@@ -1021,6 +1021,12 @@ async fn serve_inner(
         backups,
         updates,
         database: Arc::clone(&database),
+        leftovers: Arc::new(crate::upgrade::leftovers::Leftovers::new(
+            boot.config_dir.clone(),
+            sqlite_path(&boot.database_url).as_deref(),
+            &boot.metrics_path,
+            boot.log_dir.clone(),
+        )),
         cancel: cancel.clone(),
         restart: Arc::clone(&restart),
     });

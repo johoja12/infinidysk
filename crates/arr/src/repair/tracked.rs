@@ -43,6 +43,8 @@ pub struct Regrab {
     pub command: Option<i64>,
     before_command: i64,
     wait_until: i64,
+    #[serde(default)]
+    search_since: Option<i64>,
 }
 impl Regrab {
     pub fn new(owner: &Owner) -> Self {
@@ -53,6 +55,7 @@ impl Regrab {
             command: None,
             before_command: 0,
             wait_until: 0,
+            search_since: None,
         }
     }
     pub fn terminal(&self) -> bool {
@@ -88,7 +91,7 @@ async fn target(s: &Session<'_>, owner: &Owner) -> Result<Target, Error> {
                 .await?
                 .movie_file
         }
-        Media::Episodes(ids) => {
+        Media::Episodes { ids, .. } => {
             if ids.is_empty() || ids.len() > 256 {
                 return Err(Error::Unexpected(
                     "episode regrab target count is outside its bound",
@@ -97,8 +100,8 @@ async fn target(s: &Session<'_>, owner: &Owner) -> Result<Target, Error> {
             let mut files = std::collections::HashSet::new();
             for id in ids {
                 let episode: Episode = fetch(s.call(Method::GET, &format!("episode/{id}"))).await?;
-                if episode.episode_file_id != 0 {
-                    files.insert(episode.episode_file_id);
+                if episode.file_id != 0 {
+                    files.insert(episode.file_id);
                 }
             }
             if files.is_empty() {
@@ -110,13 +113,13 @@ async fn target(s: &Session<'_>, owner: &Owner) -> Result<Target, Error> {
                 Some(fetch::<MediaFile>(s.call(Method::GET, &format!("episodefile/{file}"))).await?)
             }
         }
-        Media::Book(id) => {
+        Media::Book { id, .. } => {
             let files: Vec<MediaFile> =
                 fetch(s.call(Method::GET, "bookfile").query(&[("bookId", *id)])).await?;
             let last_import = owner.imported_at.as_deref().and_then(|d| d.parse().ok());
             super::current_book_file(files, path, last_import, old)
         }
-        Media::Album(_) => {
+        Media::Album { .. } => {
             // An album may contain multiple tracks; only inspect the exact recorded file.
             let Some(id) = old else {
                 return Err(Error::Unexpected("track regrab needs an exact file id"));
@@ -212,9 +215,9 @@ where
 fn search(owner: &Owner) -> Value {
     match &owner.media {
         Media::Movie(id) => json!({"name":"MoviesSearch","movieIds":[id]}),
-        Media::Episodes(ids) => json!({"name":"EpisodeSearch","episodeIds":ids}),
-        Media::Album(id) => json!({"name":"AlbumSearch","albumIds":[id]}),
-        Media::Book(id) => json!({"name":"BookSearch","bookIds":[id]}),
+        Media::Episodes { ids, .. } => json!({"name":"EpisodeSearch","episodeIds":ids}),
+        Media::Album { id, .. } => json!({"name":"AlbumSearch","albumIds":[id]}),
+        Media::Book { id, .. } => json!({"name":"BookSearch","bookIds":[id]}),
     }
 }
 async fn commands(s: &Session<'_>) -> Result<Vec<Value>, Error> {
@@ -366,6 +369,14 @@ where
                 }
                 let mut next = progress.clone();
                 next.stage = RegrabStage::BlocklistPending;
+                next.search_since = Some(
+                    super::newest_grabs(&s, &progress.owner)
+                        .await?
+                        .iter()
+                        .map(|r| r.id)
+                        .max()
+                        .unwrap_or(0),
+                );
                 next.wait_until =
                     now().saturating_add(wait.as_millis().try_into().unwrap_or(i64::MAX));
                 library_authority(&s, &progress.owner).await?;
@@ -387,7 +398,26 @@ where
         }
     }
     if progress.stage == RegrabStage::Blocklisted {
-        if now() < progress.wait_until {
+        if let Some(job) = progress.owner.download_id() {
+            // Existing journals lack a baseline. Observe conservatively: ongoing own
+            // searches still hold deletion, but old history cannot prove a new grab.
+            let since = progress.search_since.unwrap_or(i64::MAX);
+            if super::own_search(&s, Some(job), &progress.owner, since, wait).await? {
+                let mut next = progress.clone();
+                next.stage = RegrabStage::Submitted;
+                save(progress, next, &checkpoint).await?;
+                return Ok(());
+            }
+        }
+        if progress.owner.download_id().is_none()
+            && super::own_search(&s, None, &progress.owner, i64::MAX, wait).await?
+        {
+            let mut next = progress.clone();
+            next.stage = RegrabStage::Submitted;
+            save(progress, next, &checkpoint).await?;
+            return Ok(());
+        }
+        if progress.search_since.is_none() && now() < progress.wait_until {
             return Err(Error::Uncertain(
                 "blocklist accepted; automatic search observation pending",
             ));
@@ -427,9 +457,9 @@ where
                 ))?;
             let kind = match progress.owner.media {
                 Media::Movie(_) => "moviefile",
-                Media::Episodes(_) => "episodefile",
-                Media::Album(_) => "trackfile",
-                Media::Book(_) => "bookfile",
+                Media::Episodes { .. } => "episodefile",
+                Media::Album { .. } => "trackfile",
+                Media::Book { .. } => "bookfile",
             };
             let result = send(s.call(Method::DELETE, &format!("{kind}/{file}"))).await;
             // Even a successful response must be verified before progressing. Any failure
@@ -594,7 +624,11 @@ pub async fn legacy_replacement_observed(
     let shape = super::shape(http, arr).await?;
     let media = match (kind, shape) {
         ("movie", Some(super::Shape::Movies)) if ids.len() == 1 => Media::Movie(ids[0]),
-        ("episode", Some(super::Shape::Series)) => Media::Episodes(ids.to_vec()),
+        ("episode", Some(super::Shape::Series)) => Media::Episodes {
+            ids: ids.to_vec(),
+            series: 0,
+            season: 0,
+        },
         _ => {
             return Err(Error::Unexpected(
                 "legacy Arr media kind differs from configured instance",
