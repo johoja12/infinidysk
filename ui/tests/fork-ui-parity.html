@@ -171,6 +171,12 @@
       plex,
       native_cache: {
         enabled: true,
+        metadata_path: "/fixture/new-metadata",
+        recovery_mode: false,
+        buffer_mb: 32,
+        min_file_mb: 0,
+        chunk_mb: 64,
+        io_timeout_ms: 1000,
         folders: [],
         legacy: {
           metadata_path: "/fixture/metadata",
@@ -516,6 +522,11 @@
           },
         });
       if (path === "/api/v1/native-cache/legacy") {
+        if (screen === "cache-settings-unavailable")
+          return Response.json(
+            { error: "Fixture cache unavailable" },
+            { status: 503 },
+          );
         if (method === "POST") {
           const entry = entries.find((e) => e.key === data.entry.key);
           if (data.operation === "pin" && entry?.pinned === 0) entry.pinned = 1;
@@ -560,7 +571,9 @@
         return respond({
           folders: window.__mock.cacheReadOnly
             ? folders.map((f) => ({ ...f, writable: false }))
-            : folders,
+            : screen.startsWith("cache-settings")
+              ? folders.map((f) => ({ ...f, allocated_bytes: 42000000000 }))
+              : folders,
           entries: matching.slice(offset, offset + limit),
           matched_files: matching.length,
           next:
@@ -727,29 +740,29 @@
       { CachePage },
       { PlexLibrary },
       { Nav },
-      { OriginalCacheSettings },
+      { NativeCachePanel },
     ] = await Promise.all([
       import("/src/pages/smart-prefetch.tsx"),
       import("/src/pages/cache-page.tsx"),
       import("/src/pages/plex-library.tsx"),
       import("/src/layout.tsx"),
-      import("/src/pages/original-cache-settings.tsx"),
+      import("/src/pages/native-cache.tsx"),
     ]);
     const screen =
       new URL(location.href).searchParams.get("screen") ?? "settings";
     function CacheSettingsFixture() {
       const [value, setValue] = React.useState(
-        window.__mock.settings.native_cache.legacy,
+        window.__mock.settings.native_cache,
       );
       return React.createElement(
         "form",
-        { onSubmit: (e) => e.preventDefault() },
-        React.createElement(OriginalCacheSettings, {
+        { className: "space-y-5", onSubmit: (e) => e.preventDefault() },
+        React.createElement(NativeCachePanel, {
           value,
           locked: () =>
             window.__mock.cacheSettingsLocked ?? screen.endsWith("-locked"),
           onChange: (v) => {
-            window.__mock.settings.native_cache.legacy = v;
+            window.__mock.settings.native_cache = v;
             setValue(v);
           },
         }),
