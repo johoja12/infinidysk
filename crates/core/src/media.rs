@@ -161,9 +161,111 @@ pub fn sample(n: usize, percent: u8) -> Vec<usize> {
     spread(n, 3, 2, (n * usize::from(percent) / 100).max(5))
 }
 
+/// Availability sample policy. Percent retains the original Rust policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SampleDepth {
+    #[default]
+    Percent,
+    Quick,
+    Standard,
+    Enhanced,
+    Deep,
+    Complete,
+}
+
+/// V1 depth sampling: a size-based target with both edges and a uniform middle.
+/// These are article availability checks, not complete payload verification.
+#[must_use]
+pub fn sample_depth(n: usize, percent: u8, depth: SampleDepth) -> Vec<usize> {
+    if depth == SampleDepth::Percent {
+        return sample(n, percent);
+    }
+    let root = (8_000 * n as u128).isqrt();
+    let target = match depth {
+        SampleDepth::Quick => 16,
+        SampleDepth::Standard => root / 2,
+        SampleDepth::Enhanced => root,
+        SampleDepth::Deep => (32_000 * n as u128).isqrt(),
+        SampleDepth::Complete | SampleDepth::Percent => n as u128,
+    };
+    let target = if depth == SampleDepth::Quick {
+        target
+    } else {
+        target.max(8_000)
+    };
+    let target = usize::try_from(target.min(n as u128)).unwrap_or(n);
+    if n <= target {
+        return (0..n).collect();
+    }
+    let edge = (target / 4).clamp(1, 100);
+    let mut indices: std::collections::BTreeSet<usize> = (0..edge).chain(n - edge..n).collect();
+    for k in 1..=target {
+        // Both operands are usize and their product fits u128. The quotient is < n.
+        let i = (k as u128 * n as u128 - 1) / target as u128;
+        indices.insert(usize::try_from(i).unwrap_or(n - 1));
+    }
+    indices.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_depths_match_v1_sampling_curve_and_edges() {
+        for n in [0, 1, 16, 17, 100, 7_999, 8_000, 8_001, 30_001, 128_000] {
+            for depth in [
+                SampleDepth::Quick,
+                SampleDepth::Standard,
+                SampleDepth::Enhanced,
+                SampleDepth::Deep,
+                SampleDepth::Complete,
+            ] {
+                let target = match depth {
+                    SampleDepth::Quick => n.min(16),
+                    SampleDepth::Complete => n,
+                    _ => {
+                        let multiplier = match depth {
+                            SampleDepth::Standard => 0.5,
+                            SampleDepth::Deep => 2.0,
+                            _ => 1.0,
+                        };
+                        #[allow(
+                            clippy::cast_precision_loss,
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss
+                        )]
+                        // Exact v1 reference uses floating point and truncation.
+                        let wanted =
+                            (multiplier * (8_000.0 * n as f64).sqrt()).max(8_000.0) as usize;
+                        wanted.min(n)
+                    }
+                };
+                let expected: Vec<_> = if n <= target {
+                    (0..n).collect()
+                } else {
+                    let edge = (target / 4).clamp(1, 100);
+                    let mut picks: std::collections::BTreeSet<_> =
+                        (0..edge).chain(n - edge..n).collect();
+                    let mut carry = 0;
+                    for i in 0..n {
+                        carry += target;
+                        if carry >= n {
+                            carry -= n;
+                            picks.insert(i);
+                        }
+                    }
+                    picks.into_iter().collect()
+                };
+                assert_eq!(sample_depth(n, 5, depth), expected, "{depth:?}, n={n}");
+            }
+        }
+        assert_eq!(
+            sample_depth(50_000, 25, SampleDepth::Percent),
+            sample(50_000, 25)
+        );
+        assert!(sample_depth(10_000, 5, SampleDepth::Standard).len() > 8_000);
+    }
 
     #[test]
     fn samples_five_percent_with_edges() {

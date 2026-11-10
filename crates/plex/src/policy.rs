@@ -305,6 +305,9 @@ mod tests {
     use super::*;
     fn item(viewer: &str, key: &str, episode: u32) -> Media {
         Media {
+            artwork: false,
+            year: None,
+            resolution: None,
             rating_key: key.into(),
             kind: "episode".into(),
             title: "fixture".into(),

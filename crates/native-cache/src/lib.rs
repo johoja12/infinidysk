@@ -1151,6 +1151,24 @@ impl Cache {
         }
         Ok(ranges)
     }
+    /// Metadata-only catalogue candidates. Absence means no advertised cached entry;
+    /// presence is never coverage proof and must be checked against a current key.
+    pub async fn cached_items(&self) -> Result<std::collections::HashSet<Uuid>, Error> {
+        let ids: Vec<String> = sqlx::query_scalar("SELECT DISTINCT item FROM entries LIMIT 150001")
+            .fetch_all(&self.db)
+            .await?;
+        if ids.len() > 150_000 {
+            return Err(Error::Invalid("cache browse identity bound exceeded"));
+        }
+        let mut items: std::collections::HashSet<_> = ids
+            .into_iter()
+            .filter_map(|id| Uuid::parse_str(&id).ok())
+            .collect();
+        if let Some(legacy) = self.legacy_reader().and_then(legacy::Reader::catalogue) {
+            items.extend(legacy.cached_items().await?);
+        }
+        Ok(items)
+    }
     pub async fn entries(&self, offset: u32, limit: u32) -> Result<Vec<Entry>, Error> {
         type Row = (String, String, i64, i64, String, i64, i64);
         let rows:Vec<Row>=sqlx::query_as("SELECT e.item,e.revision,e.size,COALESCE(SUM(CASE WHEN b.valid=1 THEN b.len ELSE 0 END),0),e.folder,e.used,e.pinned FROM entries e LEFT JOIN blocks b ON b.key=e.key GROUP BY e.key ORDER BY e.used DESC,e.key LIMIT $1 OFFSET $2")

@@ -222,6 +222,12 @@ pub struct Library {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(as=PlexMedia)]
 pub struct Media {
+    #[serde(default)]
+    pub artwork: bool,
+    #[serde(default)]
+    pub year: Option<u32>,
+    #[serde(default)]
+    pub resolution: Option<String>,
     pub rating_key: String,
     pub kind: String,
     pub title: String,
@@ -260,6 +266,7 @@ pub struct CatalogueMedia {
     pub media: Media,
     pub files: Vec<String>,
     pub year: Option<u32>,
+    pub file_sizes: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -279,10 +286,14 @@ pub struct Session {
 pub struct ViewerServer {
     pub(crate) server: Server,
     pub(crate) viewer: String,
+    pub(crate) viewer_name: String,
 }
 impl ViewerServer {
     pub fn server_id(&self) -> &str {
         &self.server.id
+    }
+    pub fn viewer_name(&self) -> &str {
+        &self.viewer_name
     }
     pub fn viewer_id(&self) -> &str {
         &self.viewer

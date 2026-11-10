@@ -5,6 +5,7 @@ use axum::{
     Json,
     extract::{Path, State},
     http::HeaderMap,
+    response::IntoResponse as _,
 };
 use infinidysk_db::{Db, now_ms};
 use infinidysk_plex::{Account, Client, Connection, HomeUser, Library, Resource, Server};
@@ -17,6 +18,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::Mutex as AsyncMutex;
 use utoipa::ToSchema;
 use uuid::Uuid;
+
+pub(crate) mod browser;
 
 type Logins = Arc<Mutex<HashMap<String, Arc<Login>>>>;
 struct Login {
@@ -39,6 +42,7 @@ struct Discovered {
     expires: i64,
 }
 pub struct Service {
+    pub(crate) browser: Arc<browser::Cache>,
     pub(crate) client: Client,
     logins: Logins,
     discovered: Mutex<HashMap<String, Discovered>>,
@@ -73,6 +77,7 @@ impl Service {
             id
         };
         Ok(Self {
+            browser: Arc::default(),
             client: Client::new(installation)?,
             logins: Arc::default(),
             discovered: Mutex::default(),
@@ -676,6 +681,7 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("keys"));
         let service = Service {
+            browser: Arc::default(),
             client: Client::loopback(Uuid::new_v4(), port)
                 .unwrap_or_else(|_| panic!("local client")),
             logins: Arc::default(),
@@ -966,30 +972,7 @@ pub async fn browse(
         .map_err(fail)?;
     let mut files = Vec::new();
     for media in page.items {
-        let item = match media
-            .file
-            .as_deref()
-            .and_then(|f| infinidysk_plex::map_path(f, &server.path_mappings))
-        {
-            Some(infinidysk_plex::MappedPath::Dav(path)) => {
-                match admin.vfs.lookup(&path).await.map_err(|_| Fail::Internal)? {
-                    Some(infinidysk_vfs::Node::Item(i) | infinidysk_vfs::Node::IdFile(i)) => {
-                        Some(i)
-                    }
-                    _ => None,
-                }
-            }
-            Some(infinidysk_plex::MappedPath::Local(path)) => {
-                match admin.library.prediction_pointer(path).await.map_err(|()| {
-                    Fail::Unavailable("Mapped library pointer could not be read".into())
-                })? {
-                    Some(id) => admin.vfs.db().item(id).await?,
-                    None => None,
-                }
-            }
-            None => None,
-        }
-        .filter(|i| i.health_state != infinidysk_db::HealthState::Hidden);
+        let item = resolve_source(&admin, &server, &media).await?;
         files.push(LibraryFile {
             media,
             item: item.as_ref().map(|i| i.id.0),
@@ -1014,7 +997,7 @@ pub async fn source_catalogue(
     State(admin): State<Arc<Admin>>,
     Path(id): Path<String>,
     axum::extract::Query(q): axum::extract::Query<SourceBrowse>,
-) -> Result<Json<Vec<infinidysk_plex::CatalogueSource>>, Fail> {
+) -> Result<axum::response::Response, Fail> {
     let settings = admin.config.read().await.settings().plex.clone();
     let server = settings
         .servers
@@ -1042,14 +1025,20 @@ pub async fn source_catalogue(
     } else {
         None
     };
-    Ok(Json(
-        admin
-            .plex
-            .client
-            .source_catalogue(&viewer, library.as_ref())
-            .await
-            .map_err(fail)?,
-    ))
+    let sources = admin
+        .plex
+        .client
+        .source_catalogue(&viewer, library.as_ref())
+        .await
+        .map_err(fail)?;
+    let mut response = Json(sources).into_response();
+    let name: String = viewer.viewer_name().chars().take(256).collect();
+    let encoded = percent_encoding::utf8_percent_encode(&name, percent_encoding::NON_ALPHANUMERIC)
+        .to_string();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&encoded) {
+        response.headers_mut().insert("x-plex-viewer-name", value);
+    }
+    Ok(response)
 }
 #[utoipa::path(post,operation_id="plex_source_preview",path="/api/v1/plex/sources/preview",request_body=infinidysk_plex::sources::Source,responses((status=200,body=Vec<infinidysk_plex::Media>)))]
 pub async fn source_preview(
@@ -1078,4 +1067,129 @@ pub async fn source_preview(
             .await
             .map_err(fail)?,
     ))
+}
+
+pub(super) async fn resolve_source(
+    admin: &Admin,
+    server: &Server,
+    media: &infinidysk_plex::Media,
+) -> Result<Option<infinidysk_db::Item>, Fail> {
+    let item = match media
+        .file
+        .as_deref()
+        .and_then(|f| infinidysk_plex::map_path(f, &server.path_mappings))
+    {
+        Some(infinidysk_plex::MappedPath::Dav(path)) => {
+            match admin.vfs.lookup(&path).await.map_err(|_| Fail::Internal)? {
+                Some(infinidysk_vfs::Node::Item(i) | infinidysk_vfs::Node::IdFile(i)) => Some(i),
+                _ => None,
+            }
+        }
+        Some(infinidysk_plex::MappedPath::Local(path)) => {
+            match admin.library.prediction_pointer(path).await.map_err(|()| {
+                Fail::Unavailable("Mapped library pointer could not be read".into())
+            })? {
+                Some(id) => admin.vfs.db().item(id).await?,
+                None => None,
+            }
+        }
+        None => None,
+    }
+    .filter(|i| i.health_state != infinidysk_db::HealthState::Hidden);
+    Ok(item)
+}
+
+#[derive(Deserialize, ToSchema)]
+#[schema(as=PlexSourceValidation)]
+pub struct SourceValidation {
+    pub sources: Vec<infinidysk_plex::sources::Source>,
+}
+#[derive(Serialize, ToSchema)]
+#[schema(as=PlexSourceAvailability)]
+pub struct SourceAvailability {
+    pub server: String,
+    pub viewer: String,
+    pub kind: infinidysk_plex::sources::Kind,
+    pub path: String,
+    pub status: String,
+    pub message: String,
+    pub viewer_name: Option<String>,
+}
+#[utoipa::path(post,operation_id="plex_source_validation",path="/api/v1/plex/sources/validate",request_body=SourceValidation,responses((status=200,body=Vec<SourceAvailability>)))]
+pub async fn validate_sources(
+    State(admin): State<Arc<Admin>>,
+    Json(q): Json<SourceValidation>,
+) -> Result<Json<Vec<SourceAvailability>>, Fail> {
+    if q.sources.len() > 128 {
+        return Err(Fail::Bad("At most 128 saved sources may be checked".into()));
+    }
+    for s in &q.sources {
+        s.validate().map_err(fail)?;
+    }
+    let settings = admin.config.read().await.settings().plex.clone();
+    let mut viewers = HashMap::<(String, String), Option<infinidysk_plex::ViewerServer>>::new();
+    let mut results = Vec::new();
+    let start = tokio::time::Instant::now();
+    for mut source in q.sources {
+        let identity = (source.server.clone(), source.viewer.clone());
+        let server = settings
+            .servers
+            .iter()
+            .find(|s| s.id == source.server && s.enabled);
+        if start.elapsed() < std::time::Duration::from_secs(30) && !viewers.contains_key(&identity)
+        {
+            let viewer = if let Some(server) = server {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    admin
+                        .plex
+                        .client
+                        .viewer(server, &source.viewer, &settings.accounts),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+            } else {
+                None
+            };
+            viewers.insert(identity.clone(), viewer);
+        }
+        let viewer = viewers.get(&identity).and_then(Option::as_ref);
+        source.limit = 1;
+        // Probe even a disabled saved selection, without changing stored settings.
+        source.enabled = true;
+        let status = if start.elapsed() >= std::time::Duration::from_secs(30) {
+            "unknown"
+        } else if let Some(viewer) = viewer {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                admin.plex.client.prefetch_source(viewer, &source),
+            )
+            .await
+            {
+                Ok(Ok(_)) => "available",
+                Ok(Err(infinidysk_plex::Error::NotFound)) => "missing",
+                _ => "unknown",
+            }
+        } else {
+            "unknown"
+        };
+        let message = match status {
+            "available" => "Available in Plex",
+            "missing" => {
+                "Plex no longer exposes this saved path. Choose a current source or edit its path."
+            }
+            _ => "Could not verify this source. Check the server and selected profile, then retry.",
+        };
+        results.push(SourceAvailability {
+            server: source.server,
+            viewer: source.viewer,
+            kind: source.kind,
+            path: source.path,
+            status: status.into(),
+            message: message.into(),
+            viewer_name: viewer.map(|v| v.viewer_name().chars().take(256).collect()),
+        });
+    }
+    Ok(Json(results))
 }

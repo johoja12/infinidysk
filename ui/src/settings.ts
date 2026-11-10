@@ -23,6 +23,7 @@ export function useSaveSettings() {
     onSuccess: (view) => {
       client.setQueryData(["settings"], view);
       void client.invalidateQueries({queryKey:["plex-library"]});
+      void client.invalidateQueries({queryKey:["plex-library-browser"]});
       void client.invalidateQueries({queryKey:["legacy-cache"]});
       void client.invalidateQueries({ queryKey: ["auth"] });
     },

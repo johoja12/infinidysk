@@ -1075,3 +1075,9 @@ verification, never current cache coverage. Missing, changed or unreadable
 coverage stays unknown. Predictions group the same source across profiles and
 support search, source/profile and current-cache filters. Outcome reasons are
 warming results; never relabel them as playback cache-miss causes.
+
+### Fork library browsing and migration settings
+
+Plex Library starts with summary counts and TV, Movie, All and Unmatched tabs. Grouped cards show artwork, file and season counts, quality and cache coverage; a file table and inspection dialog provide the exact source path and existing playback, warming and cache tools. Search and mapping, match, quality, cache, watch and season filters apply to the complete snapshot before paging. Show refresh progress and coverage timestamps. Unknown mapping or coverage is an explicit state. Revalidate the exact file version before playback or warming.
+
+Show verified viewer names and selected source titles in Smart Prefetch predictions and history. Retained source selections expose availability checks and keep their original enabled state when a source is missing. Health settings expose the v1 size-based depth choices (Standard by default) and a separate custom percentage. Controls use the normal settings save and environment-lock behavior.

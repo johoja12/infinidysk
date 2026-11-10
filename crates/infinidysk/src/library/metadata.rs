@@ -568,6 +568,7 @@ pub enum MatchBy {
 #[derive(Debug, Serialize, ToSchema)]
 #[schema(as=PlexClassificationMatch)]
 pub struct Matching {
+    pub show: Option<String>,
     pub server: String,
     pub library: String,
     pub key: String,
@@ -582,6 +583,7 @@ pub struct Matching {
 impl Matching {
     fn new(e: &Entry, matched_by: MatchBy) -> Self {
         Self {
+            show: e.show.clone(),
             server: e.server.clone(),
             library: e.library.clone(),
             key: e.key.clone(),

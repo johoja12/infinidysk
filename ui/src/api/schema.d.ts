@@ -1566,6 +1566,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/plex/servers/{id}/artwork/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["plex_library_artwork"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plex/servers/{id}/browse": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["plex_library_browser"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plex/servers/{id}/browse/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["plex_library_resolve"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/plex/servers/{id}/libraries": {
         parameters: {
             query?: never;
@@ -1624,6 +1672,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["plex_source_preview"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plex/sources/validate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["plex_source_validation"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2901,7 +2965,7 @@ export interface components {
             enabled: boolean;
             /**
              * @description Analyze each good media file once with ffprobe, when it is installed.
-             * @default true
+             * @default false
              */
             media_probe: boolean;
             /**
@@ -2914,6 +2978,11 @@ export interface components {
              *     }
              */
             par2: components["schemas"]["Par2Settings"];
+            /**
+             * @description V1 size-based depth, or an explicit custom percentage.
+             * @default standard
+             */
+            sample_depth: components["schemas"]["HealthSampleDepth"];
             /**
              * @description What happens to a broken file not imported by an Arr.
              * @default delete
@@ -2938,6 +3007,8 @@ export interface components {
             /** @description The checked file is still in the library. */
             in_library: boolean;
         };
+        /** @enum {string} */
+        HealthSampleDepth: "quick" | "standard" | "enhanced" | "deep" | "complete" | "percent";
         HeldFile: {
             /** Format: int64 */
             file_id?: number | null;
@@ -4441,6 +4512,72 @@ export interface components {
             numeric_id?: string | null;
             token: components["schemas"]["PlexToken"];
         };
+        PlexBrowseFile: {
+            artwork_key?: string | null;
+            /** Format: int64 */
+            cached_bytes?: number | null;
+            group: string;
+            group_title: string;
+            /** Format: uuid */
+            item?: string | null;
+            key: string;
+            library: string;
+            mapping: string;
+            matched: boolean;
+            media: components["schemas"]["PlexMedia"];
+            quality: string;
+            /** Format: int64 */
+            size?: number | null;
+            watched_known: boolean;
+        };
+        PlexBrowseGroup: {
+            artwork_key?: string | null;
+            attention: number;
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            cached_bytes?: number | null;
+            files: number;
+            key: string;
+            kind: string;
+            /** Format: int64 */
+            last_viewed_at?: number | null;
+            qualities: string[];
+            seasons: number;
+            title: string;
+            /** Format: int32 */
+            year?: number | null;
+        };
+        PlexBrowsePage: {
+            /** Format: int64 */
+            coverage_at?: number | null;
+            coverage_checked: number;
+            coverage_ready: boolean;
+            coverage_total: number;
+            files: components["schemas"]["PlexBrowseFile"][];
+            groups: components["schemas"]["PlexBrowseGroup"][];
+            matched_files: number;
+            /** Format: int32 */
+            next?: number | null;
+            refreshing: boolean;
+            snapshot?: string | null;
+            total_groups: number;
+            totals: components["schemas"]["PlexBrowseTotals"];
+            /** Format: int64 */
+            updated_at?: number | null;
+            warning?: string | null;
+        };
+        PlexBrowseResolve: {
+            key: string;
+            snapshot: string;
+        };
+        PlexBrowseTotals: {
+            attention: number;
+            external: number;
+            files: number;
+            internal: number;
+            unmatched: number;
+        };
         PlexCatalogueSource: {
             kind: components["schemas"]["PlexPrefetchSourceKind"];
             library?: string | null;
@@ -4467,6 +4604,7 @@ export interface components {
             /** Format: int32 */
             season?: number | null;
             server: string;
+            show?: string | null;
             show_title?: string | null;
             title: string;
             /** Format: int32 */
@@ -4535,6 +4673,7 @@ export interface components {
         /** @enum {string} */
         PlexMatchBy: "mapped_path" | "indexed_path" | "filename";
         PlexMedia: {
+            artwork?: boolean;
             /** Format: int64 */
             duration_ms: number;
             /** Format: int32 */
@@ -4542,6 +4681,7 @@ export interface components {
             file?: string | null;
             kind: string;
             rating_key: string;
+            resolution?: string | null;
             /** Format: int32 */
             season?: number | null;
             show?: string | null;
@@ -4554,6 +4694,8 @@ export interface components {
             view_offset_ms: number;
             /** Format: int64 */
             viewed_at?: number | null;
+            /** Format: int32 */
+            year?: number | null;
         };
         PlexPathMapping: {
             dav_path?: string | null;
@@ -4586,8 +4728,11 @@ export interface components {
             /** Format: int64 */
             size: number;
             source: components["schemas"]["PlexPredictionSource"];
+            source_path?: string | null;
+            source_title?: string | null;
             title: string;
             viewer: string;
+            viewer_name?: string | null;
             warning?: string | null;
         };
         PlexPredictionPolicy: {
@@ -4745,6 +4890,18 @@ export interface components {
             accounts: components["schemas"]["PlexAccount"][];
             /** @default [] */
             servers: components["schemas"]["PlexServer"][];
+        };
+        PlexSourceAvailability: {
+            kind: components["schemas"]["PlexPrefetchSourceKind"];
+            message: string;
+            path: string;
+            server: string;
+            status: string;
+            viewer: string;
+            viewer_name?: string | null;
+        };
+        PlexSourceValidation: {
+            sources: components["schemas"]["PlexPrefetchSource"][];
         };
         PlexSwitchHome: {
             pin?: components["schemas"]["Secret"] | null;
@@ -4911,7 +5068,10 @@ export interface components {
             observed_at: number;
             server: string;
             source: string;
+            source_path?: string | null;
+            source_title?: string | null;
             viewer: string;
+            viewer_name?: string | null;
         };
         PrefetchRange: {
             /** Format: int64 */
@@ -5182,7 +5342,7 @@ export interface components {
             /**
              * Format: uuid
              * @description Stable across edits, so masked secrets can be matched back.
-             * @default 01a1c18a-90e2-7019-b271-d8f63adc5547
+             * @default 01a1c517-23a6-7404-a816-1a2eba6f26a7
              */
             id: string;
             /**
@@ -5817,13 +5977,14 @@ export interface components {
              *       "check_percent": 5,
              *       "degraded_tolerance": true,
              *       "enabled": true,
-             *       "media_probe": true,
+             *       "media_probe": false,
              *       "par2": {
              *         "enabled": false,
              *         "failure_cooldown_hours": 6,
              *         "max_missing_slices": 8,
              *         "memory_mb": 256
              *       },
+             *       "sample_depth": "standard",
              *       "unowned_action": "delete"
              *     }
              */
@@ -9138,6 +9299,96 @@ export interface operations {
             };
         };
     };
+    plex_library_artwork: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Plex artwork */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No artwork */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    plex_library_browser: {
+        parameters: {
+            query?: {
+                library?: string;
+                view?: string;
+                category?: string;
+                search?: string;
+                mapping?: string;
+                matched?: string;
+                quality?: string;
+                cache?: string;
+                watched?: string;
+                season?: number;
+                group?: string;
+                sort?: string;
+                offset?: number;
+                limit?: number;
+                refresh?: boolean;
+            };
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexBrowsePage"];
+                };
+            };
+        };
+    };
+    plex_library_resolve: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlexBrowseResolve"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexLibraryFile"];
+                };
+            };
+        };
+    };
     plex_libraries: {
         parameters: {
             query?: never;
@@ -9228,6 +9479,29 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PlexMedia"][];
+                };
+            };
+        };
+    };
+    plex_source_validation: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PlexSourceValidation"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlexSourceAvailability"][];
                 };
             };
         };

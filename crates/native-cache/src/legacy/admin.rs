@@ -346,6 +346,21 @@ impl Legacy {
             recency_dropped: self.recency.as_ref().map_or(0, |r| r.dropped()),
         })
     }
+    /// Candidate identities only. The caller still validates each current source key.
+    pub async fn cached_items(&self) -> Result<Vec<uuid::Uuid>, Error> {
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT ItemId FROM Entries WHERE VerifiedBytes>0 LIMIT 150001",
+        )
+        .fetch_all(&self.db)
+        .await?;
+        if ids.len() > 150_000 {
+            return Err(Error::Invalid("cache browse identity bound exceeded"));
+        }
+        Ok(ids
+            .into_iter()
+            .filter_map(|id| uuid::Uuid::parse_str(&id).ok())
+            .collect())
+    }
     pub async fn unnamed_items(&self) -> Result<Vec<String>, Error> {
         Ok(sqlx::query_scalar("SELECT DISTINCT ItemId FROM Entries WHERE COALESCE(DisplayName,'')='' ORDER BY ItemId LIMIT 2000").fetch_all(&self.db).await?)
     }

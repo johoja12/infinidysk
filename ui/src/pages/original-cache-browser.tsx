@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "react-router";
+import { Link, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import { api, body, type Schemas } from "../api/client";
 import { ago, bytes } from "../format";
@@ -83,12 +83,13 @@ export function CacheSelect({
 }
 export function OriginalCacheBrowser() {
   const client = useQueryClient();
+  const [params] = useSearchParams();
   const [cursors, setCursors] = useState([""]),
     [folder, setFolder] = useState("all"),
-    [coverage, setCoverage] = useState<Coverage>("cached"),
+    [coverage, setCoverage] = useState<Coverage>(params.get("search") ? "all" : "cached"),
     [sort, setSort] = useState<Sort>("recent"),
-    [text, setText] = useState(""),
-    [search, setSearch] = useState("");
+    [text, setText] = useState(params.get("search") || ""),
+    [search, setSearch] = useState(params.get("search") || "");
   const [selected, setSelected] = useState<CacheEntry | null>(null),
     [evict, setEvict] = useState<CacheEntry | null>(null),
     [rangePage, setRangePage] = useState(0);

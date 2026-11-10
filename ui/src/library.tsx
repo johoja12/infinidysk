@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { Link } from "react-router";
+import { Link, useLocation } from "react-router";
 import { CircleAlert, Loader2, RefreshCw, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
@@ -67,6 +67,7 @@ function status(v: View) {
 
 /** On every page while the library is converting, stopped half-way, or not in the saved form. */
 export function LibraryBanner() {
+  const location=useLocation();
   const v = useLibrary().data;
   if (!v) return null;
   const settings = (
@@ -103,7 +104,7 @@ export function LibraryBanner() {
       </Alert>
     );
   }
-  if (!v.form_current) {
+  if (!v.form_current && ["/library","/settings/library"].includes(location.pathname)) {
     return (
       <Alert className="mb-6">
         <TriangleAlert className="text-warning-text" />

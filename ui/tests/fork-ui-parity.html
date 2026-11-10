@@ -228,6 +228,19 @@
       {
         ...job,
         id: fixtureId(40),
+        automatic_scope: "a".repeat(64),
+        attribution: {
+          playback: [],
+          policy: {
+            source: "hub",
+            server: "fixture-server",
+            viewer: "1",
+            viewer_name: "Fixture owner",
+            source_title: "Fixture named hub",
+            source_path: "/hubs/fixture",
+            observed_at: 1700000000000,
+          },
+        },
         state: "complete",
         verified_bytes: 8000000,
         updated_at: 1700000002000,
@@ -287,6 +300,34 @@
       viewed_at: null,
       user: null,
     };
+    const libraryFiles = Array.from({ length: 62 }, (_, i) => ({
+      key: `fixture-row-${i}`,
+      artwork_key: null,
+      media:
+        i === 0
+          ? media
+          : {
+              ...media,
+              rating_key: String(100 + i),
+              kind: "episode",
+              title: `Fixture episode ${String(i).padStart(2, "0")}`,
+              show: "show-1",
+              show_title: "Fixture Series",
+              season: i > 30 ? 2 : 1,
+              episode: i,
+              file: `/fixture/series/Fixture.S${i > 30 ? "02" : "01"}E${i}.1080p.mkv`,
+            },
+      library: "7",
+      item: id,
+      size: 8000000,
+      mapping: i === 61 ? "broken" : "internal",
+      quality: "1080p",
+      group: i === 0 ? "movie/42" : "show/show-1",
+      group_title: i === 0 ? media.title : "Fixture Series",
+      matched: true,
+      watched_known: true,
+      cached_bytes: i === 61 ? null : 4000000,
+    }));
     window.__mock = {
       settings,
       calls: [],
@@ -346,6 +387,111 @@
             media_kind: "movie",
           },
         ]);
+      }
+      if (path === "/api/v1/library/plex")
+        return respond({
+          enabled: true,
+          available: true,
+          stale: false,
+          refreshing: false,
+          entries: 62,
+          servers: 1,
+          warning: null,
+          updated_at: Date.now(),
+          progress: null,
+        });
+      if (path === "/api/v1/plex/sources/validate")
+        return respond(
+          data.sources.map((s) => ({
+            ...s,
+            status: "missing",
+            message: "No longer advertised by Plex; selection retained",
+            viewer_name: "Fixture owner",
+          })),
+        );
+      if (path === "/api/v1/plex/servers/fixture-server/browse/resolve") {
+        const row = libraryFiles.find((r) => r.key === data.key);
+        return respond({
+          media: row.media,
+          item: row.mapping === "broken" ? null : row.item,
+          size: row.size,
+        });
+      }
+      if (path === "/api/v1/plex/servers/fixture-server/browse") {
+        const q = Object.fromEntries(url.searchParams),
+          offset = Number(q.offset) || 0,
+          limit = Number(q.limit) || 50;
+        let rows = libraryFiles.filter(
+          (r) =>
+            (!q.category ||
+              q.category === "all" ||
+              (q.category === "shows" && r.media.kind === "episode") ||
+              (q.category === "movies" && r.media.kind === "movie")) &&
+            (!q.search ||
+              `${r.media.title} ${r.media.file} ${r.group_title}`
+                .toLowerCase()
+                .includes(q.search.toLowerCase())) &&
+            (!q.season || r.media.season === Number(q.season)) &&
+            (!q.mapping || q.mapping === "all" || r.mapping === q.mapping) &&
+            (!q.cache ||
+              q.cache === "all" ||
+              (q.cache === "unavailable"
+                ? r.cached_bytes === null
+                : q.cache === "any"
+                  ? r.cached_bytes > 0
+                  : q.cache === "complete"
+                    ? r.cached_bytes === r.size
+                    : r.cached_bytes === 0)),
+        );
+        const groups = [...new Set(rows.map((r) => r.group))].map((key) => {
+          const files = rows.filter((r) => r.group === key),
+            f = files[0];
+          return {
+            key,
+            title: f.group_title,
+            artwork_key: null,
+            kind: f.media.kind,
+            year: null,
+            files: files.length,
+            seasons: new Set(files.map((r) => r.media.season)).size,
+            last_viewed_at: null,
+            bytes: files.length * 8000000,
+            cached_bytes: files.every((r) => r.cached_bytes !== null)
+              ? files.length * 4000000
+              : null,
+            attention: files.filter((r) => r.mapping === "broken").length,
+            qualities: ["1080p"],
+          };
+        });
+        const selected = q.group
+            ? rows.filter((r) => r.group === q.group)
+            : rows,
+          grouped = q.view === "groups" && !q.group;
+        return respond({
+          snapshot: "fixture-snapshot",
+          updated_at: Date.now(),
+          refreshing: false,
+          warning: null,
+          coverage_checked: 62,
+          coverage_total: 62,
+          coverage_ready: true,
+          coverage_at: Date.now(),
+          totals: {
+            files: 62,
+            internal: 61,
+            attention: 1,
+            unmatched: 0,
+            external: 0,
+          },
+          matched_files: selected.length,
+          total_groups: groups.length,
+          files: grouped ? [] : selected.slice(offset, offset + limit),
+          groups: grouped ? groups.slice(offset, offset + limit) : [],
+          next:
+            (grouped ? groups.length : selected.length) > offset + limit
+              ? offset + limit
+              : null,
+        });
       }
       if (path === "/api/v1/plex/sources/preview") return respond([media]);
       if (path === "/api/v1/plex/servers/fixture-server/libraries/7/media")
@@ -553,6 +699,7 @@
               viewer: "1",
               rating_key: "42",
               title: "Fixture prediction",
+              viewer_name: "Fixture owner",
               source: "next_episode",
               item: id,
               revision: "fixture-revision",

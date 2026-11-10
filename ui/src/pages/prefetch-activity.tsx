@@ -155,7 +155,7 @@ export function PrefetchActivity() {
         [
           data?.names[j.item],
           j.item,
-          source(j),
+          ...r.runs.map((run) => source(run.job)),
           ...r.runs.flatMap((run) => viewers(run.job)),
         ]
           .join(" ")

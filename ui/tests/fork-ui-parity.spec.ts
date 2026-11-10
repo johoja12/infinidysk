@@ -78,6 +78,14 @@ test("named source settings preview, retain selections and preserve concurrent c
   ).toBeVisible();
   await page.getByRole("switch", { name: "Movies", exact: true }).click();
   await page.getByRole("switch", { name: "Fixture hub", exact: true }).click();
+  await page.locator("summary").filter({ hasText: "Saved selections" }).click();
+  await page
+    .getByRole("button", { name: "Check saved sources", exact: true })
+    .click();
+  await expect(
+    page.getByText(/No longer advertised by Plex; selection retained/).first(),
+  ).toBeVisible();
+  await page.locator("summary").filter({ hasText: "Saved selections" }).click();
   await page
     .getByRole("button", { name: "Customize", exact: true })
     .first()
@@ -151,12 +159,17 @@ test("Plex library offers exact mapped source actions", async ({
 }, info) => {
   await page.goto(fixture("plex"));
   await expect(
-    page.getByText("Fixture Plex media", { exact: true }),
+    page.getByRole("button", { name: "Open Fixture Series", exact: true }),
   ).toBeVisible();
-  await page
-    .getByRole("button", { name: "Cache coverage", exact: true })
-    .click();
-  await expect(page.getByText("4.0 MB cached", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Movies", exact: true }).click();
+  await page.getByRole("button", { name: "File table", exact: true }).click();
+  await expect(
+    page.getByRole("table", { name: "Library files" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Inspect file", exact: true }).click();
+  await expect(
+    page.getByText("8.0 MB · 4.0 MB cached", { exact: true }),
+  ).toBeVisible();
   await page.getByRole("button", { name: "Warm file", exact: true }).click();
   await expect
     .poll(() =>
@@ -263,6 +276,12 @@ test("warming filters, grouped history and current coverage match v1 workflows",
   await page.getByRole("tab", { name: /Warming history/ }).click();
   await expect(page.getByRole("article")).toHaveCount(2);
   await expect(page.getByText("2 runs", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("article").getByText("Fixture named hub", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("article").getByText("Fixture owner", { exact: true }),
+  ).toBeVisible();
   await page
     .getByLabel("Filter warming", { exact: true })
     .selectOption("fully-cached");
@@ -310,7 +329,7 @@ test("predictions offer search, profile, source and current cache filters", asyn
     .fill("Fixture prediction");
   await page
     .getByLabel("Filter prediction viewer")
-    .selectOption("Plex profile 1");
+    .selectOption("Fixture owner");
   await page
     .getByLabel("Filter prediction source")
     .selectOption("next_episode");
@@ -603,4 +622,67 @@ test("native cache folder settings are compact, editable and respect environment
       page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
     )
     .toBe(true);
+});
+
+test("Plex library restores grouped browsing, filters and full-catalogue pagination", async ({
+  page,
+}, info) => {
+  await page.goto(fixture("plex"));
+  await expect(page.getByText("Indexed files", { exact: true })).toBeVisible();
+  await page
+    .getByRole("button", { name: "Open Fixture Series", exact: true })
+    .click();
+  await expect(
+    page.getByRole("table", { name: "Library files" }),
+  ).toBeVisible();
+  await page.getByLabel("Season", { exact: true }).fill("2");
+  await expect(
+    page.getByText("31 matching files", { exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("button", { name: "Clear filters", exact: true })
+    .click();
+  await page.getByRole("button", { name: "File table", exact: true }).click();
+  await page.getByLabel("Rows per page", { exact: true }).selectOption("25");
+  await expect(
+    page.getByRole("row", { name: "Fixture episode 61", exact: true }),
+  ).toHaveCount(0);
+  await page.getByLabel("Search media and paths").fill("Fixture episode 61");
+  await page.getByRole("button", { name: "Apply filters", exact: true }).click();
+  await expect(
+    page.getByRole("row", { name: "Fixture episode 61", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByLabel("Native Cache", { exact: true })
+    .selectOption("unavailable");
+  await expect(
+    page.getByRole("row", { name: "Fixture episode 61", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Inspect file", exact: true }).click();
+  await expect(
+    page.getByText(
+      "No exact imported mapping. External files remain available in Plex.",
+    ),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Warm file", exact: true }),
+  ).toHaveCount(0);
+  await page
+    .getByRole("button", { name: "Close file details", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Clear filters", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Grouped browse", exact: true })
+    .click();
+  await page.screenshot({
+    path: info.outputPath("generated-plex-groups.png"),
+    fullPage: true,
+  });
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
 });
