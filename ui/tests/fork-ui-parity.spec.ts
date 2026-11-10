@@ -576,6 +576,31 @@ test("native cache folder settings are compact, editable and respect environment
   page,
 }, info) => {
   await page.goto(fixture("cache-settings"));
+  await expect(
+    page.getByRole("heading", { name: "Playback cache", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("progressbar", { name: /fixture-folder-\d cache capacity/ }),
+  ).toHaveCount(4);
+  await expect(
+    page.getByRole("progressbar", {
+      name: "fixture-folder-1 cache capacity",
+      exact: true,
+    }),
+  ).toHaveAttribute("aria-valuenow", "42");
+  await expect(
+    page.getByRole("switch", { name: /Enable native cache/ }),
+  ).toBeChecked();
+  await expect(page.getByRole("switch", { name: /Recovery mode/ })).toHaveCount(
+    0,
+  );
+  await expect(
+    page.getByText("Eviction disabled", { exact: true }),
+  ).toHaveCount(4);
+  await page.screenshot({
+    path: info.outputPath("generated-cache-settings-overview.png"),
+    fullPage: true,
+  });
   const summary = page
     .locator("summary")
     .filter({ hasText: "fixture-folder-1" });
@@ -648,7 +673,9 @@ test("Plex library restores grouped browsing, filters and full-catalogue paginat
     page.getByRole("row", { name: "Fixture episode 61", exact: true }),
   ).toHaveCount(0);
   await page.getByLabel("Search media and paths").fill("Fixture episode 61");
-  await page.getByRole("button", { name: "Apply filters", exact: true }).click();
+  await page
+    .getByRole("button", { name: "Apply filters", exact: true })
+    .click();
   await expect(
     page.getByRole("row", { name: "Fixture episode 61", exact: true }),
   ).toBeVisible();
@@ -685,4 +712,74 @@ test("Plex library restores grouped browsing, filters and full-catalogue paginat
       () => document.documentElement.scrollWidth <= innerWidth,
     ),
   ).toBe(true);
+});
+
+test("cache settings keep changed folder identity separate from running storage", async ({
+  page,
+}) => {
+  await page.goto(fixture("cache-settings"));
+  const card = page.getByRole("article").filter({
+    has: page.getByRole("heading", { name: "fixture-folder-1", exact: true }),
+  });
+  await expect(card.getByRole("progressbar")).toHaveAttribute(
+    "aria-valuenow",
+    "42",
+  );
+  await card
+    .locator("summary")
+    .filter({ hasText: "Configure fixture-folder-1" })
+    .click();
+  await card
+    .locator("summary")
+    .filter({ hasText: "Folder identity and paths" })
+    .click();
+  await card
+    .getByRole("textbox", { name: "Original folder 1 path", exact: true })
+    .fill("/fixture/changed-path");
+  await expect(
+    card.getByText("Usage unavailable", { exact: true }),
+  ).toBeVisible();
+  await expect(card.getByRole("progressbar")).toHaveCount(0);
+  expect(
+    await page.evaluate(
+      () =>
+        window.__mock.settings.native_cache.legacy.write.folders[0].eviction,
+    ),
+  ).toBeNull();
+  expect(
+    await page.evaluate(() =>
+      window.__mock.calls.filter((c) => c.method !== "GET"),
+    ),
+  ).toEqual([]);
+});
+
+test("cache settings show unknown storage without hiding editable saved policy", async ({
+  page,
+}) => {
+  await page.goto(fixture("cache-settings-unavailable"));
+  await expect(
+    page.getByText("Storage unavailable", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Usage unavailable", { exact: true }),
+  ).toHaveCount(4);
+  await expect(page.getByRole("progressbar")).toHaveCount(0);
+  await page
+    .locator("summary")
+    .filter({ hasText: "Configure fixture-folder-1" })
+    .click();
+  await expect(
+    page.getByRole("spinbutton", {
+      name: "Original folder 1 quota",
+      exact: true,
+    }),
+  ).toHaveValue("100");
+  await expect(
+    page.getByRole("switch", { name: "Allow eviction", exact: true }),
+  ).not.toBeChecked();
+  expect(
+    await page.evaluate(() =>
+      window.__mock.calls.filter((c) => c.method !== "GET"),
+    ),
+  ).toEqual([]);
 });

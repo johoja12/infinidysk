@@ -47,228 +47,254 @@ export function NativeCachePanel({
     });
   return (
     <>
-      <SettingsPanel title="Final-media cache">
-        <p className="text-sm text-muted-foreground">
-          Keeps verified media chunks for playback over FUSE, WebDAV and STRM.
-          Storage changes take effect after a restart. Use a separate, empty
-          folder for a new cache.
-        </p>
+      <SettingsPanel title="Playback cache">
         <Toggle
           id="native-cache-enabled"
           label={
             <>
-              Enable final-media cache{" "}
+              Enable native cache{" "}
               <Locked locked={locked("native_cache.enabled")} />
             </>
           }
+          hint="Verified media is shared by FUSE, WebDAV and STRM. Storage changes require a restart."
           checked={value.enabled}
           disabled={locked("native_cache.enabled")}
           onChange={(enabled) => patch({ enabled })}
         />
-        <Toggle
-          id="native-recovery-mode"
-          label={
-            <>
-              Recovery mode{" "}
-              <Locked locked={locked("native_cache.recovery_mode")} />
-            </>
-          }
-          hint="Requires a restart. Reconstructs coverage only from matching Rust recovery records and verified bytes. Payload writes and eviction stay off until you turn this off and restart. Existing older chunks without records cannot be reconstructed."
-          checked={value.recovery_mode}
-          disabled={locked("native_cache.recovery_mode")}
-          onChange={(recovery_mode) => patch({ recovery_mode })}
-        />
-        <Field
-          id="native-catalogue"
-          label="Local catalogue directory"
-          hint="Keep this on local storage, separate from media cache volumes."
-        >
-          <Input
-            id="native-catalogue"
-            value={value.metadata_path}
-            disabled={locked("native_cache.metadata_path")}
-            onChange={(e) => patch({ metadata_path: e.target.value })}
-          />
-        </Field>
-        <div className="grid gap-4 sm:grid-cols-2">
-          {(
-            [
-              ["buffer_mb", "Buffer budget (MB)"],
-              ["min_file_mb", "Minimum file size (MB)"],
-              ["chunk_mb", "Chunk target (MB)"],
-              ["io_timeout_ms", "Storage wait limit (ms)"],
-            ] as const
-          ).map(([key, label]) => (
-            <Field
-              key={key}
-              id={`native-${key}`}
-              label={label}
-              hint={
-                key === "chunk_mb"
-                  ? "Rounded up to a verified block boundary. Existing entries retain their layout."
-                  : undefined
-              }
-            >
-              <Input
-                id={`native-${key}`}
-                type="number"
-                min={
-                  key === "min_file_mb"
-                    ? 0
-                    : key === "buffer_mb"
-                      ? 9
-                      : key === "io_timeout_ms"
-                        ? 100
-                        : 4
-                }
-                value={value[key]}
-                disabled={locked(`native_cache.${key}`)}
-                onChange={(e) => patch({ [key]: Number(e.target.value) })}
-              />
-            </Field>
-          ))}
-        </div>
-        <p className="text-sm text-muted-foreground">
-          Disable the disk segment cache before enabling this cache. If storage
-          is unavailable or slow, playback uses the source.
-        </p>
-        <div className="space-y-4">
-          {value.folders.map((f, i) => (
-            <div key={f.id} className="space-y-3 rounded-lg border p-4">
-              <div className="flex items-center justify-between">
-                <span className="text-sm font-medium">
-                  Cache folder {i + 1}
-                </span>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  disabled={locked("native_cache.folders")}
-                  onClick={() =>
-                    patch({ folders: value.folders.filter((_, j) => j !== i) })
-                  }
-                >
-                  Remove
-                </Button>
-              </div>
-              <Field id={`native-folder-${f.id}-path`} label="Path">
-                <Input
-                  id={`native-folder-${f.id}-path`}
-                  value={f.path}
-                  disabled={locked("native_cache.folders")}
-                  onChange={(e) => folder(i, { path: e.target.value })}
-                />
-              </Field>
-              <div className="grid gap-3 sm:grid-cols-2">
-                <Field label="Quota (GB)">
-                  <Input
-                    type="number"
-                    min={1}
-                    value={f.quota_bytes / 1e9}
-                    disabled={locked("native_cache.folders")}
-                    onChange={(e) =>
-                      folder(i, { quota_bytes: Number(e.target.value) * 1e9 })
-                    }
-                  />
-                </Field>
-                <Field label="Keep free (GB)">
-                  <Input
-                    type="number"
-                    min={0}
-                    value={f.min_free_bytes / 1e9}
-                    disabled={locked("native_cache.folders")}
-                    onChange={(e) =>
-                      folder(i, {
-                        min_free_bytes: Number(e.target.value) * 1e9,
-                      })
-                    }
-                  />
-                </Field>
-                <Field label="Placement priority">
-                  <Input
-                    type="number"
-                    value={f.priority}
-                    disabled={locked("native_cache.folders")}
-                    onChange={(e) =>
-                      folder(i, { priority: Number(e.target.value) })
-                    }
-                  />
-                </Field>
-                <Field
-                  label="Maximum age (hours)"
-                  hint="Zero keeps files until space is needed."
-                >
-                  <Input
-                    type="number"
-                    min={0}
-                    value={f.max_age_hours}
-                    disabled={locked("native_cache.folders")}
-                    onChange={(e) =>
-                      folder(i, { max_age_hours: Number(e.target.value) })
-                    }
-                  />
-                </Field>
-              </div>
-              <Toggle
-                id={`native-folder-${f.id}-enabled`}
-                label="Enabled"
-                checked={f.enabled}
-                disabled={locked("native_cache.folders")}
-                onChange={(enabled) => folder(i, { enabled })}
-              />
-              <Toggle
-                id={`native-folder-${f.id}-readonly`}
-                label="Read only"
-                checked={f.read_only}
-                disabled={locked("native_cache.folders")}
-                onChange={(read_only) => folder(i, { read_only })}
-              />
-            </div>
-          ))}
-          <Button
-            type="button"
-            variant="outline"
-            disabled={locked("native_cache.folders")}
-            onClick={() =>
-              patch({
-                folders: [
-                  ...value.folders,
-                  {
-                    id: crypto.randomUUID(),
-                    path: "",
-                    enabled: true,
-                    read_only: false,
-                    priority: 0,
-                    quota_bytes: 100e9,
-                    min_free_bytes: 1e9,
-                    max_age_hours: 0,
-                    high_percent: 90,
-                    low_percent: 80,
-                  },
-                ],
-              })
-            }
-          >
-            Add cache folder
-          </Button>
-        </div>
+        {value.recovery_mode && (
+          <p role="status" className="text-sm text-warning-text">
+            Recovery mode is selected. Writes and eviction stay on hold after
+            restart.
+          </p>
+        )}
       </SettingsPanel>
       <OriginalCacheSettings
         value={value.legacy}
         locked={locked}
         onChange={(legacy) => patch({ legacy })}
       />
-      {value.legacy && (
+      <details
+        className="group border-t pt-4"
+        open={value.legacy ? undefined : true}
+      >
+        <summary className="cursor-pointer p-4 text-sm font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+          Advanced cache settings
+          <span className="mt-1 block text-xs font-normal text-muted-foreground">
+            Buffer limits, new storage folders and recovery options.
+          </span>
+        </summary>
+        <div className="space-y-5 border-t p-4">
+          <SettingsPanel title="Storage layout and recovery">
+            <p className="text-sm text-muted-foreground">
+              Keeps verified media chunks for playback over FUSE, WebDAV and
+              STRM. Storage changes take effect after a restart. Use a separate,
+              empty folder for a new cache.
+            </p>
+            <Toggle
+              id="native-recovery-mode"
+              label={
+                <>
+                  Recovery mode{" "}
+                  <Locked locked={locked("native_cache.recovery_mode")} />
+                </>
+              }
+              hint="Requires a restart. Reconstructs coverage only from matching Rust recovery records and verified bytes. Payload writes and eviction stay off until you turn this off and restart. Existing older chunks without records cannot be reconstructed."
+              checked={value.recovery_mode}
+              disabled={locked("native_cache.recovery_mode")}
+              onChange={(recovery_mode) => patch({ recovery_mode })}
+            />
+            <Field
+              id="native-catalogue"
+              label="Local catalogue directory"
+              hint="Keep this on local storage, separate from media cache volumes."
+            >
+              <Input
+                id="native-catalogue"
+                value={value.metadata_path}
+                disabled={locked("native_cache.metadata_path")}
+                onChange={(e) => patch({ metadata_path: e.target.value })}
+              />
+            </Field>
+            <div className="grid gap-4 sm:grid-cols-2">
+              {(
+                [
+                  ["buffer_mb", "Buffer budget (MB)"],
+                  ["min_file_mb", "Minimum file size (MB)"],
+                  ["chunk_mb", "Chunk target (MB)"],
+                  ["io_timeout_ms", "Storage wait limit (ms)"],
+                ] as const
+              ).map(([key, label]) => (
+                <Field
+                  key={key}
+                  id={`native-${key}`}
+                  label={label}
+                  hint={
+                    key === "chunk_mb"
+                      ? "Rounded up to a verified block boundary. Existing entries retain their layout."
+                      : undefined
+                  }
+                >
+                  <Input
+                    id={`native-${key}`}
+                    type="number"
+                    min={
+                      key === "min_file_mb"
+                        ? 0
+                        : key === "buffer_mb"
+                          ? 9
+                          : key === "io_timeout_ms"
+                            ? 100
+                            : 4
+                    }
+                    value={value[key]}
+                    disabled={locked(`native_cache.${key}`)}
+                    onChange={(e) => patch({ [key]: Number(e.target.value) })}
+                  />
+                </Field>
+              ))}
+            </div>
+            <p className="text-sm text-muted-foreground">
+              Disable the disk segment cache before enabling this cache. If
+              storage is unavailable or slow, playback uses the source.
+            </p>
+            <div className="space-y-4">
+              {value.folders.map((f, i) => (
+                <div key={f.id} className="space-y-3 rounded-lg border p-4">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">
+                      Cache folder {i + 1}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={locked("native_cache.folders")}
+                      onClick={() =>
+                        patch({
+                          folders: value.folders.filter((_, j) => j !== i),
+                        })
+                      }
+                    >
+                      Remove
+                    </Button>
+                  </div>
+                  <Field id={`native-folder-${f.id}-path`} label="Path">
+                    <Input
+                      id={`native-folder-${f.id}-path`}
+                      value={f.path}
+                      disabled={locked("native_cache.folders")}
+                      onChange={(e) => folder(i, { path: e.target.value })}
+                    />
+                  </Field>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <Field label="Quota (GB)">
+                      <Input
+                        type="number"
+                        min={1}
+                        value={f.quota_bytes / 1e9}
+                        disabled={locked("native_cache.folders")}
+                        onChange={(e) =>
+                          folder(i, {
+                            quota_bytes: Number(e.target.value) * 1e9,
+                          })
+                        }
+                      />
+                    </Field>
+                    <Field label="Keep free (GB)">
+                      <Input
+                        type="number"
+                        min={0}
+                        value={f.min_free_bytes / 1e9}
+                        disabled={locked("native_cache.folders")}
+                        onChange={(e) =>
+                          folder(i, {
+                            min_free_bytes: Number(e.target.value) * 1e9,
+                          })
+                        }
+                      />
+                    </Field>
+                    <Field label="Placement priority">
+                      <Input
+                        type="number"
+                        value={f.priority}
+                        disabled={locked("native_cache.folders")}
+                        onChange={(e) =>
+                          folder(i, { priority: Number(e.target.value) })
+                        }
+                      />
+                    </Field>
+                    <Field
+                      label="Maximum age (hours)"
+                      hint="Zero keeps files until space is needed."
+                    >
+                      <Input
+                        type="number"
+                        min={0}
+                        value={f.max_age_hours}
+                        disabled={locked("native_cache.folders")}
+                        onChange={(e) =>
+                          folder(i, { max_age_hours: Number(e.target.value) })
+                        }
+                      />
+                    </Field>
+                  </div>
+                  <Toggle
+                    id={`native-folder-${f.id}-enabled`}
+                    label="Enabled"
+                    checked={f.enabled}
+                    disabled={locked("native_cache.folders")}
+                    onChange={(enabled) => folder(i, { enabled })}
+                  />
+                  <Toggle
+                    id={`native-folder-${f.id}-readonly`}
+                    label="Read only"
+                    checked={f.read_only}
+                    disabled={locked("native_cache.folders")}
+                    onChange={(read_only) => folder(i, { read_only })}
+                  />
+                </div>
+              ))}
+              <Button
+                type="button"
+                variant="outline"
+                disabled={locked("native_cache.folders")}
+                onClick={() =>
+                  patch({
+                    folders: [
+                      ...value.folders,
+                      {
+                        id: crypto.randomUUID(),
+                        path: "",
+                        enabled: true,
+                        read_only: false,
+                        priority: 0,
+                        quota_bytes: 100e9,
+                        min_free_bytes: 1e9,
+                        max_age_hours: 0,
+                        high_percent: 90,
+                        low_percent: 80,
+                      },
+                    ],
+                  })
+                }
+              >
+                Add cache folder
+              </Button>
+            </div>
+          </SettingsPanel>
+          {!value.legacy && value.folders.length > 0 && <LegacyCacheImport />}
+        </div>
+      </details>
+      {!value.legacy && (
         <p className="text-sm">
-          <Link className="text-primary underline" to="/native-cache">
-            Browse cached files, inspect ranges and manage pins
+          <Link
+            className="text-primary underline underline-offset-4"
+            to="/native-cache"
+          >
+            View cache activity and cached files
           </Link>
         </p>
       )}
-      {value.folders.length > 0 && (
-        <NativeCacheBrowser folders={value.folders} />
-      )}
-      {!value.legacy && value.folders.length > 0 && <LegacyCacheImport />}
     </>
   );
 }
