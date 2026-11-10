@@ -228,7 +228,17 @@ impl Cache {
                 let result = tokio::select! {()=admin.cancel.cancelled()=>Err(Fail::Unavailable("Library refresh stopped".into())), result=work=>result};
                 let mut current = cache.current.lock().unwrap_or_else(PoisonError::into_inner);
                 current.pending.remove(&expected);
-                if result.is_err() {
+                if let Err(error) = result {
+                    let reason = match &error {
+                        Fail::Bad(message)
+                        | Fail::Conflict(message)
+                        | Fail::Unavailable(message)
+                        | Fail::Failed(message) => message.as_str(),
+                        Fail::NotFound => "Plex server or library is unavailable",
+                        Fail::Setting(_, _) => "Library settings are invalid",
+                        Fail::Internal => "Library database or internal operation failed",
+                    };
+                    tracing::warn!(reason, "Plex library refresh deferred");
                     if current.errors.len() >= 16 {
                         current.errors.clear();
                         current.retry_at.clear();
@@ -236,7 +246,9 @@ impl Cache {
                     current.retry_at.insert(expected.clone(), now_ms() + 30_000);
                     current.errors.insert(
                         expected,
-                        "Library refresh did not complete; previous results retained".into(),
+                        format!(
+                            "Library refresh did not complete: {reason}. Previous results retained."
+                        ),
                     );
                 } else {
                     current.errors.remove(&expected);

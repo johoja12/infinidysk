@@ -349,6 +349,22 @@ impl Client {
         limit: u32,
         window: Option<u32>,
     ) -> Result<Vec<xml::Node>, Error> {
+        self.pages_mapped(server, path, tag, limit, window, |node| {
+            let bytes = node.bytes();
+            Ok((node, bytes))
+        })
+        .await
+    }
+    /// Retain only the requested representation while complete-page checks remain shared.
+    async fn pages_mapped<T>(
+        &self,
+        server: &Server,
+        path: &str,
+        tag: &str,
+        limit: u32,
+        window: Option<u32>,
+        map: impl Fn(xml::Node) -> Result<(T, usize), Error>,
+    ) -> Result<Vec<T>, Error> {
         let mut out = Vec::new();
         let mut bytes = 0_usize;
         let mut seen = HashSet::new();
@@ -431,7 +447,8 @@ impl Client {
                 if !seen.insert(key) {
                     return Err(Error::Invalid("duplicate Plex snapshot record"));
                 }
-                bytes = bytes.saturating_add(item.bytes());
+                let (item, retained_bytes) = map(item)?;
+                bytes = bytes.saturating_add(retained_bytes);
                 if bytes > 128 * 1024 * 1024 {
                     return Err(Error::Invalid("Plex snapshot exceeds memory limit"));
                 }
@@ -597,34 +614,38 @@ impl Client {
             "show" => format!("/library/sections/{}/allLeaves", library.id),
             _ => return Err(Error::Invalid("unsupported Plex library")),
         };
-        self.pages(server, &path, "Video", 100_000)
-            .await?
-            .iter()
-            .map(|node| {
-                let mut files = std::collections::BTreeSet::new();
-                let mut file_sizes = std::collections::HashMap::new();
-                for part in node.children("Media").flat_map(|m| m.children("Part")) {
-                    if let Some(path) = part.text("file") {
-                        if !crate::safe_path(path) {
-                            return Err(Error::Invalid("invalid Plex catalogue path"));
-                        }
-                        files.insert(path.to_owned());
-                        if let Some(size) = part.number::<u64>("size") {
-                            file_sizes.insert(path.to_owned(), size);
-                        }
-                        if files.len() > 64 {
-                            return Err(Error::Invalid("too many Plex media parts"));
-                        }
+        self.pages_mapped(server, &path, "Video", 100_000, None, |node| {
+            let mut files = std::collections::BTreeSet::new();
+            let mut file_sizes = std::collections::HashMap::new();
+            for part in node.children("Media").flat_map(|m| m.children("Part")) {
+                if let Some(path) = part.text("file") {
+                    if !crate::safe_path(path) {
+                        return Err(Error::Invalid("invalid Plex catalogue path"));
+                    }
+                    files.insert(path.to_owned());
+                    if let Some(size) = part.number::<u64>("size") {
+                        file_sizes.insert(path.to_owned(), size);
+                    }
+                    if files.len() > 64 {
+                        return Err(Error::Invalid("too many Plex media parts"));
                     }
                 }
-                Ok(CatalogueMedia {
-                    media: media(node)?,
-                    files: files.into_iter().collect(),
-                    file_sizes,
-                    year: node.number("year"),
-                })
-            })
-            .collect()
+            }
+            let entry = CatalogueMedia {
+                media: media(&node)?,
+                files: files.into_iter().collect(),
+                file_sizes,
+                year: node.number("year"),
+            };
+            // Full XML includes cast, tags and stream details which this catalogue
+            // does not use. Drop each page's tree after extracting compact rows.
+            let bytes =
+                serde_json::to_vec(&(&entry.media, &entry.files, entry.year, &entry.file_sizes))
+                    .map_err(|_| Error::Invalid("cannot size Plex catalogue"))?
+                    .len();
+            Ok((entry, bytes))
+        })
+        .await
     }
 
     pub async fn metadata(&self, server: &Server, key: &str) -> Result<Media, Error> {
@@ -1152,6 +1173,65 @@ mod tests {
         xml.push_str("</MediaContainer>");
         xml
     }
+    #[tokio::test]
+    async fn compact_catalogue_rejects_partial_or_duplicate_late_pages() {
+        for duplicate in [false, true] {
+            let f = fixture(move |uri, _| {
+                let first = !uri
+                    .query()
+                    .unwrap_or_default()
+                    .contains("X-Plex-Container-Start=100");
+                let start = if first { 0 } else { 100 };
+                let mut xml = format!("<MediaContainer totalSize='101' offset='{start}'>");
+                let count = if first { 100 } else { usize::from(duplicate) };
+                for i in 0..count {
+                    write!(xml, "<Video ratingKey='{i}' type='movie' title='Fixture'/>").unwrap();
+                }
+                xml.push_str("</MediaContainer>");
+                response(200, xml)
+            })
+            .await;
+            let library = Library {
+                id: "7".into(),
+                title: "Fixture".into(),
+                kind: "movie".into(),
+            };
+            let result = f.client.catalogue(&f.server, &library).await;
+            assert!(matches!(result, Err(Error::Invalid(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn catalogue_discards_unused_xml_without_raising_snapshot_bounds() {
+        const TOTAL: u32 = 1_200;
+        let unused = "<Genre tag='fixture'/>".repeat(800);
+        let f=fixture(move |uri,_| {
+            let start=uri.query().unwrap_or_default().split('&').find_map(|part| part.strip_prefix("X-Plex-Container-Start=")).unwrap_or("0").parse::<u32>().unwrap();
+            let mut xml=format!("<MediaContainer totalSize='{TOTAL}' offset='{start}'>");
+            for i in start..(start+100).min(TOTAL) {
+                write!(xml,"<Video ratingKey='{i}' type='episode' title='Fixture' grandparentRatingKey='show' parentIndex='1' index='{i}'><Media><Part file='/fixture/{i}.mkv' size='100'/></Media>{unused}</Video>").unwrap();
+            }
+            xml.push_str("</MediaContainer>");response(200,xml)
+        }).await;
+        // The ordinary XML collector still enforces its original aggregate bound.
+        assert!(matches!(
+            f.client
+                .pages(&f.server, "/library/sections/7/allLeaves", "Video", 100_000)
+                .await,
+            Err(Error::Invalid("Plex snapshot exceeds memory limit"))
+        ));
+        let library = Library {
+            id: "7".into(),
+            title: "Fixture library".into(),
+            kind: "show".into(),
+        };
+        let rows = f.client.catalogue(&f.server, &library).await.unwrap();
+        assert_eq!(rows.len(), usize::try_from(TOTAL).unwrap());
+        assert_eq!(rows[1_199].media.rating_key, "1199");
+        assert_eq!(rows[1_199].files, ["/fixture/1199.mkv"]);
+        assert_eq!(rows[1_199].file_sizes["/fixture/1199.mkv"], 100);
+    }
+
     #[tokio::test]
     async fn exact_part_selection_revalidates_current_metadata() {
         let f=fixture(|_,_| response(200,"<MediaContainer><Video ratingKey='42' type='movie' title='Fixture'><Media videoResolution='1080'><Part file='/fixture/first.mkv'/><Part file='/fixture/second.mkv'/></Media></Video></MediaContainer>")).await;
