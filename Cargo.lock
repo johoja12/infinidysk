@@ -1777,6 +1777,7 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "futures-util",
  "hmac 0.13.0",
  "http-body-util",
  "httpdate",
@@ -1796,6 +1797,7 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

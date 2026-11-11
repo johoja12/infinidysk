@@ -183,7 +183,7 @@ impl Client {
             let mut known = self.known.lock().unwrap_or_else(PoisonError::into_inner);
             providers
                 .into_iter()
-                .map(|provider| {
+                .map(|mut provider| {
                     let index = known
                         .iter()
                         .position(|k| k.key == provider.key)
@@ -196,6 +196,7 @@ impl Client {
                             known.len() - 1
                         });
                     known[index].name.clone_from(&provider.name);
+                    provider.pool.set_stats(Arc::clone(&known[index].stats));
                     Entry {
                         stats: Arc::clone(&known[index].stats),
                         id: u16::try_from(index).unwrap_or(u16::MAX),
@@ -833,9 +834,6 @@ impl Client {
                 if matches!(result, Err(Failure::Request(Error::Unavailable))) {
                     skipped = true;
                     continue;
-                }
-                if matches!(result, Err(Failure::Connect(_))) {
-                    entry.stats.connect_failed();
                 }
                 if let Err(Failure::Request(error @ (Error::Status { .. } | Error::Protocol))) =
                     &result
