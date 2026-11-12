@@ -41,7 +41,7 @@ migration or persistent job format change is required.
 
 The two arms use seed 1025, 160 articles of 716,800 decoded bytes, a 500 ms reply
 delay, the same provider limits, a fresh durable cache and identical policy. The
-source contains 114,688,000 bytes. The source-memory budget is 64 MB and provider
+source contains 114,688,000 bytes. The source-memory budget is 67.1 MB and provider
 capacity is 40 connections. Corpus generation precedes timing. Complete cache
 verification follows timing. This is generated data, not live provider evidence.
 
@@ -87,7 +87,7 @@ separate SQLite databases and fresh cache folders outside the production cache
 namespace. It has no production library mounts or Arr/Plex connections. Routine
 health and cleanup are disabled. The provider configuration stays private on the
 host. Each arm includes 998 synthetic terminal jobs to exercise ledger overhead.
-A bounded 512 MB range is read into a separate folder on the NAS. Provider reads
+A bounded 536.9 MB range is read into a separate folder on the NAS. Provider reads
 are real and consume the isolated arm's explicit source/wire allowances.
 
 The baseline completed 536,870,912 newly committed bytes in 159.458 seconds:
@@ -96,7 +96,7 @@ candidate completed the same amount in 82.247 seconds: **6.528 MB/s**. No cached
 bytes, playback readers or imports were counted. This did not meet the target.
 The sixteen-block/64-article candidate completed in 159.846 seconds: **3.359 MB/s**.
 It also missed the target. Per-block timings put about 95% of elapsed time in source
-reads. A separate 64 MB connection trace showed requests waiting on new handshakes
+reads. A separate 67.1 MB connection trace showed requests waiting on new handshakes
 while established connections sat idle. The next candidate allows warming
 requests to reuse idle connections while those handshakes continue. It retains
 the spare-capacity article ceiling of 64 and the sixteen-block source window. The connection floor under pressure, target
@@ -109,12 +109,35 @@ image or acceptance result. Disabling warming after its first committed block
 stopped further progress, with no source failure attempt recorded. A second
 regression then confirmed that six cold warming requests all chose one provider
 while its handshakes were pending. Pending connections now contribute to warming
-provider selection; queue and playback selection are unchanged.
+provider selection; queue and playback selection are unchanged. Warming requests
+also count their connection waiters. Pending handshakes cover those waiters before
+new slots are opened, so repeated idle reuse does not multiply spare connections.
+A regression first opened 61 connections for six requests; the bounded path keeps
+that case within eight slots.
 
 The final unoptimized diagnostic committed the same range in 76.663 seconds
 (**7.003 MB/s**). A sample showed about 108% CPU with no active provider transfers,
 so this diagnostic also includes unoptimized processing time. It remains below
 target and does not establish release acceptance.
+
+The first optimized candidate reached 406,847,488 committed bytes in 38.406 seconds
+before its 2 GB wire allowance blocked the run. Only 460,000,000 wire bytes had
+actually arrived. A deterministic regression reproduced the loss of a durable
+grant when its transport waiter was cancelled. Refills now belong to the shared
+budget, with at most one owned task. A connection can retire its waiter without
+cancelling the persisted grant's accounting. Old policy epochs cannot credit or
+deny new reads, and dropping the budget aborts its unfinished task. Daily admission
+still precedes every response read. The POC allowance is not increased to mask the
+problem. A fresh 67,108,864-byte debug probe then received 69,522,623 wire
+bytes and reserved 70,000,000 bytes, leaving 477,377 unused credits rather than a
+multi-fold reservation loss. This is accounting evidence, not optimized throughput
+acceptance.
+
+The unchanged concurrent cache-publication test twice encountered an allowed
+admission decline in CI. Its successful-publication fixture now retries declines
+for a bounded period. Errors still fail immediately; final readback, accounting,
+restart and overwrite assertions remain unchanged. Production probe deadlines
+and admission rules do not change.
 
 Final POC and rollout results are recorded in PR #268 and the deployment
 receipt; neither the first candidate nor its measurements establish acceptance.

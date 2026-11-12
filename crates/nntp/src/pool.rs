@@ -65,6 +65,7 @@ pub struct Pool {
     /// Requests holding a ticket.
     busy: Arc<AtomicUsize>,
     warm_busy: Arc<AtomicUsize>,
+    warm_waiting: Arc<AtomicUsize>,
     /// Connection tasks running.
     live: Arc<AtomicUsize>,
     state: Arc<Mutex<State>>,
@@ -337,6 +338,7 @@ impl Pool {
             downloads,
             busy: Arc::default(),
             warm_busy: Arc::default(),
+            warm_waiting: Arc::default(),
             live: Arc::default(),
             state: Arc::default(),
             changed: Arc::default(),
@@ -576,9 +578,12 @@ impl Pool {
             }
             .ok_or(Failure::Request(Error::Closed))?;
             tag.step(Step::Permitted { provider });
+            let waiting =
+                (tag.workload == Workload::Warm).then(|| Load::acquire(&self.warm_waiting));
             let (tx, load, ahead, connection) = self
                 .worker(tag.workload, tag.fresh, tag.lane, deadline)
                 .await?;
+            drop(waiting);
             budget = budget.saturating_sub(admitted.elapsed());
             tag.step(Step::Connected {
                 provider,
@@ -659,7 +664,12 @@ impl Pool {
                         .count();
                     idle + limit.saturating_sub(open) <= 1
                 };
-                let spare = open < limit && !hold_headroom && held.is_none();
+                // A warming request that reuses an idle connection may leave its
+                // reserved handshake running. Those connects already cover waiting
+                // requests; do not multiply them on every pool notification.
+                let needed = workload != Workload::Warm
+                    || state.connecting < self.warm_waiting.load(Ordering::Relaxed);
+                let spare = open < limit && !hold_headroom && held.is_none() && needed;
                 let live = !state.workers.is_empty();
                 let best = state
                     .workers
@@ -1307,5 +1317,60 @@ mod tests {
         .unwrap();
         assert_eq!(second.offset, ARTICLE_SIZE as u64);
         assert!(first.await.unwrap().is_ok());
+    }
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)] // Loopback setup and outcomes are assertions.
+    async fn warming_reuse_does_not_multiply_pending_connection_opens() {
+        use crate::TlsMode;
+        use infinidysk_testkit::{Corpus, Impairment, LoopbackServer};
+        let corpus = Corpus::generate(1025, 6, 16 * 1024);
+        let server = LoopbackServer::start_impaired(
+            corpus.articles.clone(),
+            Impairment {
+                handshake_delay: Duration::from_secs(2),
+                response_delay: Duration::from_millis(20),
+                ..Impairment::default()
+            },
+        )
+        .await
+        .unwrap();
+        let downloads = Downloads::new(64);
+        let pool = Pool::new(
+            Endpoint::new(
+                "127.0.0.1",
+                server.addr().port(),
+                TlsMode::Plain,
+                None,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            PoolConfig {
+                max_connections: 64,
+                pipeline_depth: 4,
+                idle_timeout: Duration::from_secs(10),
+                min_connections: 1,
+            },
+            downloads.clone(),
+        )
+        .unwrap();
+        pool.prewarm(1).await;
+        let tag = Tag {
+            workload: Workload::Warm,
+            ..Tag::UNTRACKED
+        };
+        for _ in 0..4 {
+            let fetch = |i: usize| pool.fetch(Command::Body, &corpus.articles[i].message_id, &tag);
+            let (first, second, third, fourth, fifth, sixth) =
+                tokio::join!(fetch(0), fetch(1), fetch(2), fetch(3), fetch(4), fetch(5));
+            for result in [first, second, third, fourth, fifth, sixth] {
+                assert!(result.is_ok());
+            }
+        }
+        assert!(
+            server.peak_connections() <= 8,
+            "six requests must not fill a 64-slot provider with spare handshakes: {}",
+            server.peak_connections()
+        );
+        assert_eq!(downloads.available_permits(), 64);
     }
 }

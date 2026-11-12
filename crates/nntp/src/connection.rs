@@ -1009,11 +1009,13 @@ mod wire_tests {
             Poll::Ready(())
         })
         .await;
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "second refill holds the shared lock"
-        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while calls.load(Ordering::SeqCst) != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         drop(held);
         poll_fn(|cx| {
             assert!(
@@ -1026,7 +1028,7 @@ mod wire_tests {
         .await;
         assert!(
             reader.grant.is_none(),
-            "available credit cancels the stale refill"
+            "available credit retires the connection waiter without holding the shared refill lock"
         );
         assert!(!reader.granting.load(Ordering::Relaxed));
         tokio::time::timeout(Duration::from_millis(100), budget.ready())
