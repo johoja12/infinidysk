@@ -37,7 +37,7 @@ const EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 #[schema(as=PrefetchSettings)]
 pub struct Settings {
     pub enabled: bool,
-    /// Minimum article window under transfer pressure; spare capacity may grow it to 64.
+    /// Minimum article window under transfer pressure; spare capacity may grow it to 128.
     pub connections_per_job: u8,
     /// Allowance for attempted final-media block fills per UTC day; provider overfetch and wire overhead are excluded.
     pub daily_fill_bytes: u64,
