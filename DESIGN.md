@@ -1087,3 +1087,8 @@ Show verified viewer names and selected source titles in Smart Prefetch predicti
 The upstream 1.x leftover-data reminder treats all configured native and original cache roots, metadata and owner-lock paths, and read-only scan roots as live data, including disabled stores. It must never recommend cleanup of a parent that holds a reused fork cache. Provider misses on Overview use playback-only requests and preserve upstream's explanation.
 
 Native Cache settings lead with the shared playback-cache switch and existing storage. Show running allocation, configured quota, folder count and protected files, then one flat card per existing folder with path, running write mode, configured eviction state and a capacity bar. Keep limits, reserve and priority together in each folder's disclosure; move catalogue IDs and owner paths into a secondary disclosure. Unknown or unmatched running storage stays unknown, including after editing an ID or path. New-store setup and recovery options sit below existing folders in Advanced cache settings. Preserve the page's single Save/Discard workflow, all environment locks, original paths and retention defaults.
+
+Warming settings describe a floor of 1–8 articles under pressure and an adaptive
+ceiling of 64 articles when capacity is free, retaining a target quarter of provider
+capacity for other transfers. Playback waits still interrupt source reads. The
+source window is bounded separately from each cache block's verification and commit.

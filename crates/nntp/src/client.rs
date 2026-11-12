@@ -103,7 +103,7 @@ fn warm_target(floor: usize, held: usize, total: usize, free: usize, pressure: b
     }
     held.saturating_add(free)
         .saturating_sub(total.div_ceil(4))
-        .clamp(floor, 24)
+        .clamp(floor, 64)
 }
 
 /// Exclusive use of the providers for a diagnostic: background requests wait at
@@ -143,7 +143,7 @@ struct Entry {
 
 impl Entry {
     /// Request order: lower first.
-    fn preference(&self) -> (u32, bool, bool, usize) {
+    fn preference(&self, workload: Workload) -> (u32, bool, bool, usize) {
         // A due probe goes first on its level, or a peer serving every request
         // keeps it from ever being sent.
         let due = self.breaker.probe_due();
@@ -151,7 +151,7 @@ impl Entry {
             self.provider.priority,
             self.breaker.is_open() && !due,
             !due,
-            self.provider.pool.busy_permille(),
+            self.provider.pool.busy_permille(workload == Workload::Warm),
         )
     }
 }
@@ -365,7 +365,7 @@ impl Client {
                 !entry.provider.pool.exhausted()
                     && (!entry.breaker.is_open() || entry.breaker.probe_due())
             })
-            .min_by_key(|entry| entry.preference())
+            .min_by_key(|entry| entry.preference(Workload::Stream))
             .is_some_and(|entry| entry.provider.pool.can_hedge(size))
     }
 
@@ -786,7 +786,7 @@ impl Client {
             return Err(Error::Unavailable);
         }
         let mut order: Vec<_> = providers.iter().collect();
-        order.sort_by_cached_key(|entry| entry.preference());
+        order.sort_by_cached_key(|entry| entry.preference(workload));
 
         let mut last_error = None;
         let mut skipped = false;
@@ -935,7 +935,7 @@ mod tests {
         assert_eq!(warm_target(2, 12, 40, 28, true), 2);
         assert_eq!(warm_target(3, 0, 8, 0, false), 3);
         assert_eq!(warm_target(3, 0, 0, 0, false), 3);
-        assert_eq!(warm_target(2, 0, 400, 400, false), 24);
+        assert_eq!(warm_target(2, 0, 400, 400, false), 64);
         assert_eq!(warm_target(2, 0, 4, 4, false), 3);
         assert_eq!(warm_target(99, 0, 0, 0, true), 8);
     }

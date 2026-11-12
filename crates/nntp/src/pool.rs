@@ -65,6 +65,7 @@ pub struct Pool {
     /// Requests holding a ticket.
     busy: Arc<AtomicUsize>,
     warm_busy: Arc<AtomicUsize>,
+    warm_waiting: Arc<AtomicUsize>,
     /// Connection tasks running.
     live: Arc<AtomicUsize>,
     state: Arc<Mutex<State>>,
@@ -337,6 +338,7 @@ impl Pool {
             downloads,
             busy: Arc::default(),
             warm_busy: Arc::default(),
+            warm_waiting: Arc::default(),
             live: Arc::default(),
             state: Arc::default(),
             changed: Arc::default(),
@@ -489,10 +491,12 @@ impl Pool {
         self.downloads.available_permits()
     }
 
-    /// In-flight requests per mille of capacity.
-    pub(crate) fn busy_permille(&self) -> usize {
+    /// In-flight requests per mille of capacity. Warming also counts pending
+    /// connections so a cold burst does not all choose the same provider.
+    pub(crate) fn busy_permille(&self, warming: bool) -> usize {
         let capacity = self.config.max_connections * self.config.pipeline_depth;
-        self.busy().saturating_mul(1000) / capacity
+        let pending = if warming { self.lock().connecting } else { 0 };
+        self.busy().saturating_add(pending).saturating_mul(1000) / capacity
     }
 
     /// Requests in flight or queued on a connection.
@@ -574,8 +578,12 @@ impl Pool {
             }
             .ok_or(Failure::Request(Error::Closed))?;
             tag.step(Step::Permitted { provider });
-            let (tx, load, ahead, connection) =
-                self.worker(stream, tag.fresh, tag.lane, deadline).await?;
+            let waiting =
+                (tag.workload == Workload::Warm).then(|| Load::acquire(&self.warm_waiting));
+            let (tx, load, ahead, connection) = self
+                .worker(tag.workload, tag.fresh, tag.lane, deadline)
+                .await?;
+            drop(waiting);
             budget = budget.saturating_sub(admitted.elapsed());
             tag.step(Step::Connected {
                 provider,
@@ -626,11 +634,12 @@ impl Pool {
     /// cold connect it started itself runs on, so a hung provider is blamed for it.
     async fn worker(
         &self,
-        stream: bool,
+        workload: Workload,
         fresh: bool,
         lane: Option<Lane>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<(mpsc::Sender<Request>, Load, usize, u32), Failure> {
+        let stream = workload == Workload::Stream;
         let (mut impatient, mut first) = (false, true);
         loop {
             // A spent budget still takes a connection that is free right away.
@@ -655,7 +664,12 @@ impl Pool {
                         .count();
                     idle + limit.saturating_sub(open) <= 1
                 };
-                let spare = open < limit && !hold_headroom && held.is_none();
+                // A warming request that reuses an idle connection may leave its
+                // reserved handshake running. Those connects already cover waiting
+                // requests; do not multiply them on every pool notification.
+                let needed = workload != Workload::Warm
+                    || state.connecting < self.warm_waiting.load(Ordering::Relaxed);
+                let spare = open < limit && !hold_headroom && held.is_none() && needed;
                 let live = !state.workers.is_empty();
                 let best = state
                     .workers
@@ -730,6 +744,17 @@ impl Pool {
                         tokio::spawn(open);
                         impatient = true;
                         continue;
+                    }
+                } else if workload == Workload::Warm {
+                    tokio::select! {
+                        opened = &mut open => opened,
+                        () = &mut changed => {
+                            // A live connection may have become idle while this
+                            // handshake is pending. Keep opening the reserved slot,
+                            // but let this request compete for that idle connection.
+                            tokio::spawn(open);
+                            continue;
+                        }
                     }
                 } else {
                     open.await
@@ -1175,17 +1200,19 @@ mod tests {
         let pool = Pool::new(endpoint, config, Downloads::new(4)).unwrap();
         let deadline = Some(tokio::time::Instant::now());
         assert!(matches!(
-            pool.worker(true, false, None, deadline).await,
+            pool.worker(Workload::Stream, false, None, deadline).await,
             Err(Failure::Request(Error::Unavailable))
         ));
         assert_eq!(server.peak_connections(), 0);
         assert_eq!(pool.lock().connecting, 0);
 
-        let Ok((_, load, _, connection)) = pool.worker(true, false, None, None).await else {
+        let Ok((_, load, _, connection)) = pool.worker(Workload::Stream, false, None, None).await
+        else {
             panic!("a connection opens before admission expires");
         };
         drop(load);
-        let Ok((_, load, _, reused)) = pool.worker(true, false, None, deadline).await else {
+        let Ok((_, load, _, reused)) = pool.worker(Workload::Stream, false, None, deadline).await
+        else {
             panic!("an idle connection is reusable after admission expires");
         };
         assert_eq!(reused, connection);
@@ -1207,5 +1234,143 @@ mod tests {
         }
         let backoff = state.backoff.map(|b| (b.delay, b.failures));
         assert_eq!(backoff, Some((MAX_CONNECT_BACKOFF, 7)));
+    }
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)] // Loopback setup and outcomes are assertions.
+    async fn warming_reuses_a_released_connection_while_another_is_connecting() {
+        use crate::TlsMode;
+        use infinidysk_testkit::{Corpus, Impairment, LoopbackServer};
+        const ARTICLE_SIZE: usize = 16 * 1024;
+        const DOWNLOADS: usize = 64;
+        let corpus = Corpus::generate(1025, 2, ARTICLE_SIZE);
+        let server = LoopbackServer::start_impaired(
+            corpus.articles.clone(),
+            Impairment {
+                handshake_delay: Duration::from_secs(2),
+                response_delay: Duration::from_millis(100),
+                ..Impairment::default()
+            },
+        )
+        .await
+        .unwrap();
+        let downloads = Downloads::new(DOWNLOADS);
+        let pool = Arc::new(
+            Pool::new(
+                Endpoint::new(
+                    "127.0.0.1",
+                    server.addr().port(),
+                    TlsMode::Plain,
+                    None,
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+                PoolConfig {
+                    max_connections: 4,
+                    pipeline_depth: 4,
+                    idle_timeout: Duration::from_secs(10),
+                    min_connections: 1,
+                },
+                downloads,
+            )
+            .unwrap(),
+        );
+        pool.prewarm(1).await;
+        let first = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            let id = corpus.articles[0].message_id.clone();
+            async move {
+                pool.fetch(
+                    Command::Body,
+                    &id,
+                    &Tag {
+                        workload: Workload::Warm,
+                        ..Tag::UNTRACKED
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.body_commands() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.fetch(
+                Command::Body,
+                &corpus.articles[1].message_id,
+                &Tag {
+                    workload: Workload::Warm,
+                    ..Tag::UNTRACKED
+                },
+            ),
+        )
+        .await
+        .expect(
+            "background work must reuse the released connection before the new handshake finishes",
+        )
+        .ok()
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.offset, ARTICLE_SIZE as u64);
+        assert!(first.await.unwrap().is_ok());
+    }
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)] // Loopback setup and outcomes are assertions.
+    async fn warming_reuse_does_not_multiply_pending_connection_opens() {
+        use crate::TlsMode;
+        use infinidysk_testkit::{Corpus, Impairment, LoopbackServer};
+        let corpus = Corpus::generate(1025, 6, 16 * 1024);
+        let server = LoopbackServer::start_impaired(
+            corpus.articles.clone(),
+            Impairment {
+                handshake_delay: Duration::from_secs(2),
+                response_delay: Duration::from_millis(20),
+                ..Impairment::default()
+            },
+        )
+        .await
+        .unwrap();
+        let downloads = Downloads::new(64);
+        let pool = Pool::new(
+            Endpoint::new(
+                "127.0.0.1",
+                server.addr().port(),
+                TlsMode::Plain,
+                None,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            PoolConfig {
+                max_connections: 64,
+                pipeline_depth: 4,
+                idle_timeout: Duration::from_secs(10),
+                min_connections: 1,
+            },
+            downloads.clone(),
+        )
+        .unwrap();
+        pool.prewarm(1).await;
+        let tag = Tag {
+            workload: Workload::Warm,
+            ..Tag::UNTRACKED
+        };
+        for _ in 0..4 {
+            let fetch = |i: usize| pool.fetch(Command::Body, &corpus.articles[i].message_id, &tag);
+            let (first, second, third, fourth, fifth, sixth) =
+                tokio::join!(fetch(0), fetch(1), fetch(2), fetch(3), fetch(4), fetch(5));
+            for result in [first, second, third, fourth, fifth, sixth] {
+                assert!(result.is_ok());
+            }
+        }
+        assert!(
+            server.peak_connections() <= 8,
+            "six requests must not fill a 64-slot provider with spare handshakes: {}",
+            server.peak_connections()
+        );
+        assert_eq!(downloads.available_permits(), 64);
     }
 }

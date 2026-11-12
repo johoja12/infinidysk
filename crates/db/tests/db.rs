@@ -16,6 +16,7 @@ async fn exercise(db: &Db) {
     content_sweep(db).await;
     fair_rechecks(db).await;
     library_catalogue(db).await;
+    library_item_pages(db).await;
     library_staging(db).await;
     db.save_plex_classification("fixture-snapshot")
         .await
@@ -3475,4 +3476,61 @@ async fn legacy_source_retirement(db: &Db) {
             .await
             .expect("idempotent")
     );
+}
+
+async fn library_item_pages(db: &Db) {
+    use infinidysk_db::catalogue::Link;
+    let wanted = uuid::Uuid::new_v4();
+    let other = uuid::Uuid::new_v4();
+    let root = "/item-pages-fixture";
+    let links: Vec<_> = (0..5)
+        .map(|i| Link {
+            root: root.into(),
+            path: format!("{root}/{i}.mkv"),
+            relative_path: format!("{i}.mkv"),
+            group_name: if i < 3 { "first" } else { "second" }.into(),
+            item_id: if i == 1 { other } else { wanted },
+            pointer_hash: "fixture".into(),
+            link_kind: 1,
+            video: i16::from(i != 3),
+        })
+        .collect();
+    db.catalogue_replace(root, "fixture", &links, 1, 0)
+        .await
+        .expect("snapshot");
+    let first = db
+        .catalogue_links(None, None, Some(wanted), true, "", 2)
+        .await
+        .expect("item page");
+    assert_eq!(first, vec![links[0].clone(), links[2].clone()]);
+    let next = db
+        .catalogue_links(Some(root), None, Some(wanted), true, &first[1].path, 2)
+        .await
+        .expect("next item page");
+    assert_eq!(next, vec![links[4].clone()]);
+    let group = db
+        .catalogue_links(Some(root), Some("second"), Some(wanted), false, "", 10)
+        .await
+        .expect("group");
+    assert_eq!(group, links[3..].to_vec());
+    let broad = db
+        .catalogue_links(Some(root), None, None, false, "", 10)
+        .await
+        .expect("broad");
+    assert_eq!(broad, links);
+    let empty = db
+        .catalogue_links(
+            Some("/unconfigured-fixture"),
+            None,
+            Some(wanted),
+            false,
+            "",
+            10,
+        )
+        .await
+        .expect("empty");
+    assert_eq!(empty, [] as [Link; 0]);
+    db.catalogue_replace(root, "fixture", &[], 2, 1)
+        .await
+        .expect("cleanup fixture");
 }

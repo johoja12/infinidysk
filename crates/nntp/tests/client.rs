@@ -1395,3 +1395,50 @@ async fn requests_during_the_connect_backoff_count_one_connect_failure() {
         "every caller still saw its failure"
     );
 }
+
+#[tokio::test]
+async fn warming_spreads_pending_connections_across_equal_priority_providers() {
+    let corpus = Corpus::generate(1025, 6, ARTICLE_SIZE);
+    let impairment = Impairment {
+        handshake_delay: Duration::from_secs(2),
+        ..Impairment::default()
+    };
+    let a = LoopbackServer::start_impaired(corpus.articles.clone(), impairment)
+        .await
+        .unwrap();
+    let b = LoopbackServer::start_impaired(corpus.articles.clone(), impairment)
+        .await
+        .unwrap();
+    let downloads = Downloads::new(16);
+    let configured = |port| {
+        let mut provider = provider(port, 0, None, &downloads);
+        provider.pool = Pool::new(
+            Endpoint::new(
+                "127.0.0.1",
+                port,
+                TlsMode::Plain,
+                None,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            PoolConfig {
+                max_connections: 16,
+                pipeline_depth: 2,
+                idle_timeout: Duration::from_secs(5),
+                min_connections: 0,
+            },
+            Arc::clone(&downloads),
+        )
+        .unwrap();
+        provider
+    };
+    let client = Client::new([configured(a.addr().port()), configured(b.addr().port())]);
+    let fetch =
+        |index: usize| client.body(&corpus.articles[index].message_id, Workload::Warm, None);
+    let (r0, r1, r2, r3, r4, r5) =
+        tokio::join!(fetch(0), fetch(1), fetch(2), fetch(3), fetch(4), fetch(5));
+    for result in [r0, r1, r2, r3, r4, r5] {
+        result.unwrap();
+    }
+    assert_eq!((a.body_commands(), b.body_commands()), (3, 3));
+}

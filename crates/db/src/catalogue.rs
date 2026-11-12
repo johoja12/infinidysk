@@ -102,7 +102,8 @@ impl Db {
         after: &str,
         limit: u32,
     ) -> Result<Vec<Link>, Error> {
-        let sql = "SELECT root,path,relative_path,group_name,item_id,pointer_hash,link_kind,video FROM library_links WHERE (root=$1 OR $1 IS NULL) AND (group_name=$2 OR $2 IS NULL) AND (item_id=$3 OR $3 IS NULL) AND path>$4 AND (NOT $6 OR video=1) ORDER BY path,root LIMIT $5";
+        // Separate item and broad branches so SQLite can seek the item index.
+        let sql = "SELECT root,path,relative_path,group_name,item_id,pointer_hash,link_kind,video FROM library_links WHERE item_id=$3 AND (root=$1 OR $1 IS NULL) AND (group_name=$2 OR $2 IS NULL) AND path>$4 AND (NOT $6 OR video=1) UNION ALL SELECT root,path,relative_path,group_name,item_id,pointer_hash,link_kind,video FROM library_links WHERE $3 IS NULL AND (root=$1 OR $1 IS NULL) AND (group_name=$2 OR $2 IS NULL) AND path>$4 AND (NOT $6 OR video=1) ORDER BY path,root LIMIT $5";
         Ok(
             on!(self,pool=>sqlx::query_as(sql).bind(root).bind(group).bind(item).bind(after).bind(i64::from(limit.clamp(1,1000))).bind(video).fetch_all(pool).await?),
         )

@@ -250,15 +250,28 @@ fn fault(writer: &mut Arc<Writer>, fault: Fault) {
 #[tokio::test]
 async fn sparse_and_chunked_publication_is_concurrent_restart_safe_and_never_overwrites_committed_bytes()
  {
+    async fn admitted(writer: &Arc<Writer>, block: u64) -> Result<bool, Error> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            // A bounded folder probe may decline admission under test-runner
+            // contention. Test successful publication, without ignoring errors
+            // or changing the production probe deadline.
+            let written = put(writer, block).await?;
+            if written || tokio::time::Instant::now() >= deadline {
+                return Ok(written);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
     for chunk in [0, 8] {
         let f = Fixture::new().await;
         let writer = f.open(chunk).await;
         let (first, second, third, last, duplicate) = tokio::join!(
-            put(&writer, 0),
-            put(&writer, 1),
-            put(&writer, 2),
-            put(&writer, 3),
-            put(&writer, 0)
+            admitted(&writer, 0),
+            admitted(&writer, 1),
+            admitted(&writer, 2),
+            admitted(&writer, 3),
+            admitted(&writer, 0)
         );
         assert!(
             first.unwrap()

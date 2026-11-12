@@ -5242,7 +5242,7 @@ export interface components {
         PrefetchSettings: {
             /**
              * Format: int32
-             * @description Minimum article window under transfer pressure; spare capacity may grow it to 24.
+             * @description Minimum article window under transfer pressure; spare capacity may grow it to 64.
              * @default 2
              */
             connections_per_job: number;
