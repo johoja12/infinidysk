@@ -674,6 +674,12 @@ test("Plex library restores grouped browsing, filters and full-catalogue paginat
     .getByRole("button", { name: "Clear filters", exact: true })
     .click();
   await page.getByRole("button", { name: "File table", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "File table", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(
+    page.getByRole("table", { name: "Library files" }),
+  ).toBeVisible();
   await page.getByLabel("Rows per page", { exact: true }).selectOption("25");
   await expect(
     page.getByRole("row", { name: "Fixture episode 61", exact: true }),
