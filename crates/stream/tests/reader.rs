@@ -531,12 +531,19 @@ async fn response_waits_use_spare_capacity_without_moving_the_stall() {
             1
         } else {
             assert!(first.is_err(), "original status lines are still blocked");
-            assert_eq!(
-                fast.body_commands(),
-                0,
-                "the cold first pool took the whole window"
-            );
-            assert_eq!(downloads.available_permits(), permits - PREFETCH);
+            if priority == 0 {
+                assert!(
+                    fast.body_commands() > 0,
+                    "pending connects on the first pool leave work for its peer"
+                );
+                assert!(
+                    downloads.available_permits() > 0,
+                    "finished peer requests leave admission capacity for a hedge"
+                );
+            } else {
+                assert_eq!(fast.body_commands(), 0, "priority levels stay separate");
+                assert_eq!(downloads.available_permits(), permits - PREFETCH);
+            }
             0
         };
 
@@ -545,9 +552,9 @@ async fn response_waits_use_spare_capacity_without_moving_the_stall() {
             reader.read_exact(&mut received[consumed..]),
         )
         .await;
-        if permits > PREFETCH && priority == 0 && !transfer {
+        if priority == 0 {
             result
-                .expect("every head is rescued before the originals reply")
+                .expect("every stalled head is rescued by the same-priority peer")
                 .unwrap();
             assert!(received == corpus.data[..READ_BYTES], "exact bytes");
             assert!(trace.summary().hedges > 0);

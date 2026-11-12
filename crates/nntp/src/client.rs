@@ -969,6 +969,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn playback_spreads_between_providers_before_global_admission() {
+        let first = LoopbackServer::start(Vec::new()).await.unwrap();
+        let second = LoopbackServer::start(Vec::new()).await.unwrap();
+        let downloads = Downloads::new(1);
+        let held = downloads.acquire(true, 1).await.unwrap();
+        let client = Client::new([provider(&first, &downloads), provider(&second, &downloads)]);
+        let providers = client.snapshot();
+        let mut a = Box::pin(client.body("a@loopback.invalid", Workload::Stream, None));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(a.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert!(providers[0].provider.pool.busy_permille(false) > 0);
+        assert_eq!(providers[1].provider.pool.busy_permille(false), 0);
+        let mut b = Box::pin(client.body("b@loopback.invalid", Workload::Stream, None));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(b.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(
+            providers[0].provider.pool.busy_permille(false),
+            providers[1].provider.pool.busy_permille(false)
+        );
+        assert_eq!(
+            (first.peak_connections(), second.peak_connections()),
+            (0, 0)
+        );
+        drop((a, b, held));
+        for entry in providers.iter() {
+            assert_eq!(entry.provider.pool.busy_permille(false), 0);
+        }
+        assert_eq!(downloads.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn a_stat_probe_closes_without_resetting_the_back_off() {
         let corpus = Corpus::generate(1025, 1, 1024);
         let server = LoopbackServer::start(corpus.articles.clone())

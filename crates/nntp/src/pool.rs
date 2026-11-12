@@ -66,6 +66,8 @@ pub struct Pool {
     busy: Arc<AtomicUsize>,
     warm_busy: Arc<AtomicUsize>,
     warm_waiting: Arc<AtomicUsize>,
+    /// Playback requests waiting for global admission or a provider connection.
+    stream_waiting: Arc<AtomicUsize>,
     /// Connection tasks running.
     live: Arc<AtomicUsize>,
     state: Arc<Mutex<State>>,
@@ -339,6 +341,7 @@ impl Pool {
             busy: Arc::default(),
             warm_busy: Arc::default(),
             warm_waiting: Arc::default(),
+            stream_waiting: Arc::default(),
             live: Arc::default(),
             state: Arc::default(),
             changed: Arc::default(),
@@ -491,11 +494,21 @@ impl Pool {
         self.downloads.available_permits()
     }
 
-    /// In-flight requests per mille of capacity. Warming also counts pending
-    /// connections so a cold burst does not all choose the same provider.
+    /// Requests per mille of capacity. Playback includes requests still awaiting
+    /// admission and uses the throttled limit; warming also counts pending connects.
     pub(crate) fn busy_permille(&self, warming: bool) -> usize {
-        let capacity = self.config.max_connections * self.config.pipeline_depth;
-        let pending = if warming { self.lock().connecting } else { 0 };
+        let (capacity, pending) = if warming {
+            (
+                self.config.max_connections * self.config.pipeline_depth,
+                self.lock().connecting,
+            )
+        } else {
+            let state = self.lock();
+            (
+                self.limit(&state) * self.config.pipeline_depth,
+                self.stream_waiting.load(Ordering::Relaxed),
+            )
+        };
         self.busy().saturating_add(pending).saturating_mul(1000) / capacity
     }
 
@@ -557,6 +570,7 @@ impl Pool {
         // Shared by retries; only admission waits spend it, not transfers.
         let mut budget = self.stream_wait;
         loop {
+            let stream_waiting = stream.then(|| Load::acquire(&self.stream_waiting));
             if let Some(budget) = &tag.wire {
                 budget
                     .clone()
@@ -596,6 +610,7 @@ impl Pool {
                 _busy: Load::acquire(&self.busy),
                 _warm: (tag.workload == Workload::Warm).then(|| Load::acquire(&self.warm_busy)),
             };
+            drop(stream_waiting);
             let request = Request {
                 command,
                 message_id: message_id.to_owned(),
@@ -1177,6 +1192,49 @@ fn enqueue(conn: &mut Connection, in_flight: &mut VecDeque<Request>, request: Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn playback_load_counts_admission_waits_and_releases_cancelled_waiters() {
+        let endpoint = Endpoint::new(
+            "127.0.0.1",
+            1,
+            crate::TlsMode::Plain,
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let downloads = Downloads::new(1);
+        let held = downloads.acquire(true, 1).await.unwrap();
+        let pool = Pool::new(
+            endpoint,
+            PoolConfig {
+                max_connections: 4,
+                pipeline_depth: 2,
+                idle_timeout: Duration::from_secs(60),
+                min_connections: 0,
+            },
+            Arc::clone(&downloads),
+        )
+        .unwrap();
+        let mut request = Box::pin(pool.body("poc@loopback.invalid"));
+        assert!(
+            std::future::poll_fn(|cx| Poll::Ready(request.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(pool.busy(), 0);
+        assert_eq!(pool.busy_permille(false), 125);
+        // Playback ranks this pool against its current capacity, rather than the
+        // configured ceiling the server has just refused.
+        pool.lock().throttle = Some((2, Instant::now()));
+        assert_eq!(pool.busy_permille(false), 250);
+        drop(request);
+        assert_eq!(pool.busy_permille(false), 0);
+        assert_eq!(pool.lock().connecting, 0);
+        assert_eq!(downloads.available_permits(), 0);
+        drop(held);
+        assert_eq!(downloads.available_permits(), 1);
+    }
 
     #[tokio::test]
     async fn expired_admission_reuses_an_idle_connection_but_never_opens_one() {
