@@ -1,0 +1,87 @@
+# Warming pipeline POC — 2026-11-12
+
+The target is 10 decimal MB/s of newly committed final-media cache data. Cached
+replay and aggregate provider bandwidth do not satisfy this target.
+
+## Change
+
+The application now fills a bounded contiguous source window of at most eight
+cache blocks (33,554,432 bytes). The reader stays open across those blocks, so its
+adaptive article window can keep working during cache publication. Each block
+still has its own strict read, source-revision check, durable publication and
+checkpoint. Playback waits and pause/cancel interrupt the read. A failed or
+interrupted attempt does not publish a partial block.
+
+Source allowance is reserved durably before opening the window. A window is
+clipped to the requested contiguous range, remaining daily allowance, and the
+next known cached block. Cached blocks remain separate steps and consume no
+source allowance. Wire admission remains independent and durable. Interrupted
+reservations remain charged conservatively, as before.
+
+The single-block `Queue::tick` shares the same implementation and remains
+available to incremental callers. The application uses `Queue::tick_window`.
+
+Library link queries split item-specific and broad searches into disjoint SQL
+branches. Item-specific searches can use the existing item index without changing
+root/group/video filters, ordering, pagination or repair authority. No database
+migration or persistent job format change is required.
+
+## Deterministic loopback POC
+
+The two arms use seed 1025, 160 articles of 716,800 decoded bytes, a 500 ms reply
+delay, the same provider limits, a fresh durable cache and identical policy. The
+source contains 114,688,000 bytes. The source-memory budget is 64 MB and provider
+capacity is 40 connections. Corpus generation precedes timing. Complete cache
+verification follows timing. This is generated data, not live provider evidence.
+
+| Reader lifetime | Seconds | Committed MB/s | BODY commands |
+| --- | ---: | ---: | ---: |
+| One cache block | 20.450 | 5.608 | 187 |
+| Eight-block window | 8.135 | 14.098 | 163 |
+
+The explicit POC test asserts at least 10 MB/s for the windowed arm. It is ignored
+in the ordinary suite because it deliberately injects latency. Run it with:
+
+```sh
+cargo test -p infinidysk-prefetch --test queue warming_window_throughput_poc --locked -- --ignored --nocapture
+```
+
+These values are one local comparison, not a guarantee for every provider, file,
+archive layout or storage volume.
+
+## Safety coverage
+
+Additional checks exercise cached blocks inside a source range, daily source
+allowance, gaps between requested ranges, controls after a committed block, and
+source changes between blocks. Existing foreground-preemption and stored/encrypted
+member checks also exercise the windowed path. The two archive checks now expect
+one window to finish their two-block fixture, then verify plaintext and tail bytes.
+Library item lookups exercise mixed items, video filtering, groups, roots and
+pagination on both database backends when PostgreSQL testing is configured.
+
+## Real-provider POC
+
+An isolated installation has one copied source record under a generic name,
+separate SQLite databases and fresh cache folders outside the production cache
+namespace. It has no production library mounts or Arr/Plex connections. Routine
+health and cleanup are disabled. The provider configuration stays private on the
+host. Each arm includes 998 synthetic terminal jobs to exercise ledger overhead.
+A bounded 512 MB range is read into a separate folder on the NAS. Provider reads
+are real and consume the isolated arm's explicit source/wire allowances.
+
+The baseline completed 536,870,912 newly committed bytes in 159.458 seconds:
+**3.367 MB/s**, with 554,282,769 wire bytes. No cached bytes, playback readers or
+imports were counted. The candidate image is still building; its result and
+release verification remain pending.
+
+## Local validation
+
+- `cargo fmt --all --check`: passed.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo test --workspace --locked`: passed (the explicit latency POC stays ignored).
+- A separate PostgreSQL database passed `postgres_storage_round_trips`, including
+  the new mixed-item library lookup cases.
+
+Debug information and incremental compilation were disabled for the full local
+suite to bound temporary build storage. No application performance policy changed.
+

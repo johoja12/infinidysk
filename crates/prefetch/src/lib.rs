@@ -845,6 +845,17 @@ impl Queue {
     }
     /// One block at most. The caller owns process cancellation and current settings.
     pub async fn tick(&self, settings: &Settings) -> anyhow::Result<bool> {
+        self.tick_bounded(settings, 1).await
+    }
+
+    /// Fill a contiguous source window while publishing and checkpointing each block.
+    /// Source and wire allowances are reserved before read-ahead; playback and controls
+    /// interrupt the window without publishing a partial block.
+    pub async fn tick_window(&self, settings: &Settings) -> anyhow::Result<bool> {
+        self.tick_bounded(settings, 8).await
+    }
+
+    async fn tick_bounded(&self, settings: &Settings, blocks: u64) -> anyhow::Result<bool> {
         let Ok(_step) = self.step.try_lock() else {
             return Ok(false);
         };
@@ -906,7 +917,7 @@ impl Queue {
             drop(current);
             job
         };
-        let Some(job) = selected else {
+        let Some(mut job) = selected else {
             return Ok(false);
         };
         let _rate = self
@@ -951,7 +962,25 @@ impl Queue {
             drop(current);
             return Ok(false);
         }
-        let length = BLOCK.min(job.size - job.offset);
+        let mut end = job.ranges[job.range]
+            .end
+            .min(job.offset.saturating_add(blocks * BLOCK));
+        if blocks > 1 {
+            // A cached block starts a new step: cache hits never consume source allowance.
+            let next = job.offset.saturating_add(BLOCK);
+            if let Some(cached) = cache
+                .coverage(&key)
+                .await?
+                .iter()
+                .filter_map(|r| {
+                    let start = r.start.max(next);
+                    (start < r.end).then_some(start)
+                })
+                .min()
+            {
+                end = end.min(cached);
+            }
+        }
         let Some(permit) = cache.try_buffer() else {
             return Ok(false);
         };
@@ -967,11 +996,18 @@ impl Queue {
             {
                 return Ok(false);
             }
-            if current.charged.saturating_add(length) > settings.daily_fill_bytes {
+            let available = settings.daily_fill_bytes.saturating_sub(current.charged);
+            if end - job.offset > available {
+                end = job
+                    .offset
+                    .saturating_add(available / BLOCK * BLOCK)
+                    .min(end);
+            }
+            if end <= job.offset {
                 return Ok(false);
             }
             let mut next = current.clone();
-            next.charged = next.charged.saturating_add(length);
+            next.charged = next.charged.saturating_add(end - job.offset);
             self.save(&mut current, next).await?;
             drop(current);
         }
@@ -979,95 +1015,113 @@ impl Queue {
             .vfs
             .open_warming(&source, usize::from(settings.connections_per_job))
             .await?;
-        reader.set_end(job.offset + length);
-        let mut bytes = vec![0; usize::try_from(length)?];
-        let transfer = async {
-            reader.seek(std::io::SeekFrom::Start(job.offset)).await?;
-            reader.read_exact(&mut bytes).await?;
-            Ok::<_, std::io::Error>(())
-        };
-        let interrupted = async {
-            loop {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                if self.foreground() {
-                    break;
+        reader.set_end(end);
+        let mut seek = true;
+        let mut permit = Some(permit);
+        let mut progressed = false;
+        while job.offset < end {
+            let length = BLOCK.min(end - job.offset);
+            let Some(reserved) = permit.take().or_else(|| cache.try_buffer()) else {
+                return Ok(progressed);
+            };
+            let started = std::time::Instant::now();
+            let mut bytes = vec![0; usize::try_from(length)?];
+            let transfer = async {
+                if seek {
+                    reader.seek(std::io::SeekFrom::Start(job.offset)).await?;
+                    seek = false;
                 }
-                let ledger = self.ledger.lock().await;
-                if ledger.paused
-                    || !ledger
-                        .jobs
-                        .iter()
-                        .any(|j| j.id == job.id && j.state == State::Queued)
-                {
-                    break;
+                reader.read_exact(&mut bytes).await?;
+                Ok::<_, std::io::Error>(())
+            };
+            let interrupted = async {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if self.foreground() {
+                        break;
+                    }
+                    let ledger = self.ledger.lock().await;
+                    if ledger.paused
+                        || !ledger
+                            .jobs
+                            .iter()
+                            .any(|j| j.id == job.id && j.state == State::Queued)
+                    {
+                        break;
+                    }
                 }
+            };
+            let transferred = tokio::select! { result=tokio::time::timeout(Duration::from_secs(30),transfer)=>Some(result), ()=interrupted=>None };
+            let Some(transferred) = transferred else {
+                return Ok(progressed);
+            };
+            let source_ms = started.elapsed().as_millis();
+            if !matches!(transferred, Ok(Ok(()))) {
+                if self.wire.blocked() {
+                    return self.defer_wire(&job).await;
+                }
+                // An inconclusive/circuit failure is urgent work, never proof of permanent damage.
+                self.db
+                    .request_recheck(ItemId(job.item), Recheck::Playback)
+                    .await?;
+                self.retry(&job).await?;
+                return Ok(true);
             }
-        };
-        let transferred = tokio::select! { result=tokio::time::timeout(Duration::from_secs(30),transfer)=>Some(result), ()=interrupted=>None };
-        drop(reader);
-        let Some(transferred) = transferred else {
-            return Ok(false);
-        };
-        if !matches!(transferred, Ok(Ok(()))) {
-            if self.wire.blocked() {
-                return self.defer_wire(&job).await;
-            }
-            // An inconclusive/circuit failure is urgent work, never proof of permanent damage.
-            self.db
-                .request_recheck(ItemId(job.item), Recheck::Playback)
-                .await?;
-            self.retry(&job).await?;
-            return Ok(true);
-        }
-        let current = self.db.item(ItemId(job.item)).await?;
-        if let Some(current) = current {
-            if self.vfs.cache_key(&current).await? != key {
-                self.finish(job.id, State::Superseded, "source identity changed")
+            let current = self.db.item(ItemId(job.item)).await?;
+            if let Some(current) = current {
+                if self.vfs.cache_key(&current).await? != key {
+                    self.finish(job.id, State::Superseded, "source identity changed")
+                        .await?;
+                    return Ok(true);
+                }
+            } else {
+                self.finish(job.id, State::Superseded, "source no longer exists")
                     .await?;
                 return Ok(true);
             }
-        } else {
-            self.finish(job.id, State::Superseded, "source no longer exists")
-                .await?;
-            return Ok(true);
-        }
-        // Serialize publication against pause/cancel. No job can report completed bytes
-        // before the complete block is safely published by the cache.
-        let ledger = self.ledger.lock().await;
-        if ledger.paused
-            || !ledger
-                .jobs
-                .iter()
-                .any(|j| j.id == job.id && j.state == State::Queued)
-        {
-            return Ok(false);
-        }
-        let published = cache
-            .put_reserved(&lease, block, Bytes::from(bytes), permit)
-            .await;
-        drop(ledger);
-        if matches!(published, Ok(true)) {
-            self.checkpoint(&job, length, true).await?;
-            Ok(true)
-        } else {
-            let mut current = self.lock_ledger().await?;
-            let mut next = current.clone();
-            if let Some(j) = next
-                .jobs
-                .iter_mut()
-                .find(|j| j.id == job.id && j.state == State::Queued)
+            // Serialize publication against pause/cancel. No job can report completed bytes
+            // before the complete block is safely published by the cache.
+            let ledger = self.ledger.lock().await;
+            if ledger.paused
+                || !ledger
+                    .jobs
+                    .iter()
+                    .any(|j| j.id == job.id && j.state == State::Queued)
             {
-                j.next_attempt = now_ms() + RETRY_MS;
-                j.updated_at = now_ms();
-                j.reason = Some(
-                    "Cache publication deferred; check storage capacity and availability"
-                        .to_owned(),
-                );
+                return Ok(false);
             }
-            self.save(&mut current, next).await?;
-            drop(current);
-            Ok(false)
+            let published = cache
+                .put_reserved(&lease, job.offset / BLOCK, Bytes::from(bytes), reserved)
+                .await;
+            drop(ledger);
+            if matches!(published, Ok(true)) {
+                self.checkpoint(&job, length, true).await?;
+                tracing::debug!(job=%job.id, offset=job.offset, bytes=length, source_ms,
+                total_ms=started.elapsed().as_millis(), "warming block committed");
+                job.offset += length;
+                progressed = true;
+            } else {
+                let mut current = self.lock_ledger().await?;
+                let mut next = current.clone();
+                if let Some(j) = next
+                    .jobs
+                    .iter_mut()
+                    .find(|j| j.id == job.id && j.state == State::Queued)
+                {
+                    j.next_attempt = now_ms() + RETRY_MS;
+                    j.updated_at = now_ms();
+                    j.reason = Some(
+                        "Cache publication deferred; check storage capacity and availability"
+                            .to_owned(),
+                    );
+                }
+                self.save(&mut current, next).await?;
+                drop(current);
+                return Ok(progressed);
+            }
         }
+        drop(reader);
+        Ok(progressed)
     }
     async fn defer_wire(&self, job: &Job) -> anyhow::Result<bool> {
         let mut current = self.lock_ledger().await?;

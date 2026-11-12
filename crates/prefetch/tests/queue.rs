@@ -67,7 +67,25 @@ async fn fixture_sized(
     LoopbackServer,
     Arc<Client>,
 ) {
-    let corpus = Corpus::generate(1025, articles, 256 * 1024);
+    fixture_geometry(t, missing, stall, articles, 256 * 1024, 4).await
+}
+
+async fn fixture_geometry(
+    t: &Temp,
+    missing: bool,
+    stall: u8,
+    articles: usize,
+    article_bytes: usize,
+    connections: usize,
+) -> (
+    Arc<Vfs>,
+    Item,
+    Arc<Cache>,
+    Corpus,
+    LoopbackServer,
+    Arc<Client>,
+) {
+    let corpus = Corpus::generate(1025, articles, article_bytes);
     let articles = corpus
         .articles
         .iter()
@@ -104,7 +122,7 @@ async fn fixture_sized(
             .iter()
             .map(|a| Segment {
                 id: a.message_id.clone(),
-                size: 256 * 1024,
+                size: u32::try_from(article_bytes).unwrap(),
                 fallbacks: vec![],
             })
             .collect(),
@@ -137,12 +155,12 @@ async fn fixture_sized(
         )
         .unwrap(),
         PoolConfig {
-            max_connections: 4,
+            max_connections: connections,
             pipeline_depth: 4,
             idle_timeout: Duration::from_secs(5),
             min_connections: 0,
         },
-        Downloads::new(16),
+        Downloads::new(connections.max(16)),
     )
     .unwrap();
     let client = Arc::new(Client::new([Provider {
@@ -169,7 +187,11 @@ async fn fixture_sized(
     let vfs = Vfs::new(
         db,
         Arc::clone(&client),
-        Budget::new(8 * 1024 * 1024),
+        Budget::new(if connections > 4 {
+            64 * 1024 * 1024
+        } else {
+            8 * 1024 * 1024
+        }),
         1024 * 1024,
         "/unused-test-mount",
     )
@@ -411,7 +433,7 @@ async fn foreground_wait_interrupts_warming_but_idle_open_does_not_block_it() {
     enqueue(&q, &item).await;
     let running = {
         let q = Arc::clone(&q);
-        tokio::spawn(async move { q.tick(&settings()).await })
+        tokio::spawn(async move { q.tick_window(&settings()).await })
     };
     tokio::time::timeout(Duration::from_secs(2), async {
         while server.body_commands() == 0 {
@@ -462,7 +484,7 @@ async fn foreground_wait_interrupts_warming_but_idle_open_does_not_block_it() {
         .unwrap()
         .unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_secs(15), q.tick(&settings()))
+        tokio::time::timeout(Duration::from_secs(15), q.tick_window(&settings()))
             .await
             .unwrap()
             .unwrap(),
@@ -537,8 +559,7 @@ async fn member_warming_case(encrypted: bool) {
         .await
         .unwrap();
     enqueue(&q, &item).await;
-    assert!(q.tick(&settings()).await.unwrap());
-    assert!(q.tick(&settings()).await.unwrap());
+    assert!(q.tick_window(&settings()).await.unwrap());
     assert_eq!(q.status().await.jobs[0].state, State::Complete);
     assert_eq!(cache.stats().await.unwrap().bytes, expected.len() as u64);
     let node = Node::Item(item);
@@ -1086,4 +1107,219 @@ async fn backfill_admission_fences_changed_sources_and_keeps_hints_after_databas
             );
         }
     }
+}
+
+/// POC: deterministic cold source, production-sized articles, 500 ms reply latency.
+/// Both arms use identical providers, data, durable cache and policy.
+#[tokio::test]
+#[ignore = "bounded latency POC; run explicitly with --ignored --nocapture"]
+async fn warming_window_throughput_poc() {
+    for window in [false, true] {
+        let t = Temp::new();
+        let (vfs, item, cache, corpus, server, _) =
+            fixture_geometry(&t, false, 2, 160, 716_800, 40).await;
+        let queue = Queue::load(vfs.db().clone(), Arc::clone(&vfs))
+            .await
+            .unwrap();
+        enqueue(&queue, &item).await;
+        let start = std::time::Instant::now();
+        loop {
+            let progress = if window {
+                queue.tick_window(&settings()).await
+            } else {
+                queue.tick(&settings()).await
+            }
+            .unwrap();
+            assert!(progress);
+            if queue.status().await.jobs[0].state == State::Complete {
+                break;
+            }
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        let mb_per_s = f64::from(u32::try_from(corpus.data.len()).unwrap()) / seconds / 1_000_000.0;
+        assert!(
+            cache
+                .verify_complete(&vfs.cache_key(&item).await.unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        println!(
+            "warming_poc window={window} bytes={} seconds={seconds:.3} committed_mb_per_s={mb_per_s:.3} body_commands={}",
+            corpus.data.len(),
+            server.body_commands()
+        );
+        if window {
+            assert!(
+                mb_per_s >= 10.0,
+                "POC must sustain at least 10 decimal MB/s"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn warming_window_stops_at_cached_blocks_and_reserves_only_cold_ranges() {
+    let t = Temp::new();
+    let (vfs, item, cache, corpus, server, _) = fixture_sized(&t, false, 0, 64).await;
+    let key = vfs.cache_key(&item).await.unwrap();
+    let lease = cache.lease(key.clone()).unwrap();
+    assert!(
+        cache
+            .put(
+                &lease,
+                1,
+                bytes::Bytes::copy_from_slice(&corpus.data[BLOCK_BYTES..2 * BLOCK_BYTES])
+            )
+            .await
+            .unwrap()
+    );
+    let queue = Queue::load(vfs.db().clone(), Arc::clone(&vfs))
+        .await
+        .unwrap();
+    enqueue(&queue, &item).await;
+    assert!(queue.tick_window(&settings()).await.unwrap());
+    assert_eq!(queue.status().await.jobs[0].verified_bytes, BLOCK);
+    assert_eq!(queue.status().await.charged_fill_bytes, BLOCK);
+    let before = server.body_commands();
+    assert!(queue.tick_window(&settings()).await.unwrap());
+    assert_eq!(server.body_commands(), before);
+    assert!(queue.tick_window(&settings()).await.unwrap());
+    let status = queue.status().await;
+    assert_eq!(status.jobs[0].state, State::Complete);
+    assert_eq!(status.jobs[0].cached_bytes, BLOCK);
+    assert_eq!(status.charged_fill_bytes, 3 * BLOCK);
+}
+
+#[tokio::test]
+async fn warming_window_keeps_daily_source_allowance_and_disjoint_ranges_bounded() {
+    let t = Temp::new();
+    let (vfs, item, _, _, server, _) = fixture_sized(&t, false, 0, 96).await;
+    let queue = Queue::load(vfs.db().clone(), Arc::clone(&vfs))
+        .await
+        .unwrap();
+    queue
+        .enqueue(
+            item.id,
+            &[
+                Range {
+                    start: 0,
+                    end: BLOCK,
+                },
+                Range {
+                    start: 3 * BLOCK,
+                    end: 4 * BLOCK,
+                },
+            ],
+            50,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+    let limited = WarmSettings {
+        daily_fill_bytes: BLOCK,
+        ..settings()
+    };
+    assert!(queue.tick_window(&limited).await.unwrap());
+    assert_eq!(queue.status().await.jobs[0].verified_bytes, BLOCK);
+    let before = server.body_commands();
+    assert!(!queue.tick_window(&limited).await.unwrap());
+    assert_eq!(server.body_commands(), before);
+    assert!(queue.tick_window(&settings()).await.unwrap());
+    assert_eq!(queue.status().await.jobs[0].state, State::Complete);
+    assert_eq!(
+        server.body_commands(),
+        32,
+        "unrequested gaps cannot be prefetched"
+    );
+}
+
+#[tokio::test]
+async fn warming_window_controls_interrupt_after_a_committed_block() {
+    for operation in [Operation::Pause, Operation::Cancel] {
+        let t = Temp::new();
+        let (vfs, item, cache, _, _server, _) = fixture_sized(&t, false, 2, 64).await;
+        let key = vfs.cache_key(&item).await.unwrap();
+        let queue = Queue::load(vfs.db().clone(), Arc::clone(&vfs))
+            .await
+            .unwrap();
+        let job = enqueue(&queue, &item).await;
+        let running = {
+            let queue = Arc::clone(&queue);
+            tokio::spawn(async move { queue.tick_window(&settings()).await })
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while queue.status().await.jobs[0].verified_bytes < BLOCK {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        queue.control(job.id, operation).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let covered: u64 = cache
+            .coverage(&key)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.end - r.start)
+            .sum();
+        assert_eq!(
+            covered, BLOCK,
+            "controls must not publish buffered future blocks"
+        );
+        assert_eq!(queue.status().await.jobs[0].verified_bytes, BLOCK);
+    }
+}
+
+#[tokio::test]
+async fn warming_window_revalidates_source_between_committed_blocks() {
+    let t = Temp::new();
+    let (vfs, item, cache, _, _server, _) = fixture_sized(&t, false, 2, 64).await;
+    let key = vfs.cache_key(&item).await.unwrap();
+    let queue = Queue::load(vfs.db().clone(), Arc::clone(&vfs))
+        .await
+        .unwrap();
+    enqueue(&queue, &item).await;
+    let running = {
+        let queue = Arc::clone(&queue);
+        tokio::spawn(async move { queue.tick_window(&settings()).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while queue.status().await.jobs[0].verified_bytes < BLOCK {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let id = item.meta_blob.unwrap();
+    let mut meta = blob::decode_meta(&vfs.db().blob(id).await.unwrap().unwrap()).unwrap();
+    if let FileMeta::Nzb(n) = &mut meta {
+        n.segments.items[0].id = "replacement@test.invalid".into();
+    }
+    vfs.db()
+        .update_blob(id, &blob::encode_meta(&meta).unwrap())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(queue.status().await.jobs[0].state, State::Superseded);
+    let covered: u64 = cache
+        .coverage(&key)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.end - r.start)
+        .sum();
+    assert_eq!(
+        covered, BLOCK,
+        "a source change cannot publish the next buffered block"
+    );
 }

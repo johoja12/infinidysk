@@ -981,9 +981,9 @@ async fn serve_inner(
                     true
                 },
                 || async {
-                    // Refresh between blocks, and release the config lock before I/O.
+                    // Refresh between bounded windows; release the config lock before I/O.
                     let settings = config.read().await.settings().prefetch.clone();
-                    prefetch.tick(&settings).await
+                    prefetch.tick_window(&settings).await
                 },
             )
             .await;
