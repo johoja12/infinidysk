@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link } from "react-router";
+import { Link, useSearchParams } from "react-router";
+import { libraryHref } from "../library-navigation";
 import { useEffect } from "react";
 import { useSettings } from "../settings";
 import { RefreshCw } from "lucide-react";
@@ -10,6 +11,7 @@ import { Failure } from "../ui";
 import { Button } from "@/components/ui/button";
 
 export function PlexClassification() {
+  const [params] = useSearchParams();
   const client = useQueryClient();
   const settings = useSettings().data?.settings;
   useEffect(() => { void client.invalidateQueries({ queryKey: ["plex-classification"] }); }, [client, settings]);
@@ -36,6 +38,6 @@ export function PlexClassification() {
     {s.enabled && !s.servers && <p className="text-warning-text">Choose an enabled Plex server for matching.</p>}
     {s.error && <p className="text-warning-text break-words" role="status">{s.error}</p>}
     {sync.isError && <Failure error={sync.error} />}
-    <p className="text-muted-foreground text-xs"><Link className="text-primary underline" to="/settings/library">Library settings</Link> select servers and enable read-only matching. Manage accounts in <Link className="text-primary underline" to="/settings/plex">Plex connections</Link>.</p>
+    <p className="text-muted-foreground text-xs"><Link className="text-primary underline" to="/settings/library">Library settings</Link> select servers and enable read-only matching. Manage accounts in <Link className="text-primary underline" to={libraryHref(params, "connections")}>Plex connections</Link>.</p>
   </div>;
 }

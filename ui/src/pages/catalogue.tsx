@@ -6,33 +6,32 @@ import { PlexClassification } from "./library-plex";
 import { toast } from "sonner";
 import { api, body } from "../api/client";
 import { ago, bytes } from "../format";
-import { Empty, Failure, Loading, PageHeader, Panel, useTitle } from "../ui";
+import { Empty, Failure, Loading, PageHeader, Panel } from "../ui";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
 const PAGE = 100;
 
-export function Catalogue() {
-  useTitle("Library");
+export function Catalogue({ embedded = false, active = true }: { embedded?: boolean; active?: boolean }) {
   const client = useQueryClient();
   const [selected, setSelected] = useState("");
   const [group, setGroup] = useState<string>();
   const [after, setAfter] = useState("");
   const [previous, setPrevious] = useState<string[]>([]);
-  const roots = useQuery({ queryKey: ["library-catalogue"], queryFn: () => body(api.GET("/api/v1/library/catalogue")), refetchInterval: 5000 });
+  const roots = useQuery({ queryKey: ["library-catalogue"], queryFn: () => body(api.GET("/api/v1/library/catalogue")), enabled: active, refetchInterval: active ? 5000 : false });
   const root = roots.data?.find((r) => r.root === selected) ?? roots.data?.[0];
   const groups = useQuery({
     queryKey: ["library-catalogue-groups", root?.root, after],
     queryFn: () => body(api.GET("/api/v1/library/catalogue/groups", { params: { query: { root: root!.root, after, limit: PAGE } } })),
-    enabled: !!root && group === undefined,
-    refetchInterval: root?.stale ? 5000 : 30000,
+    enabled: active && !!root && group === undefined,
+    refetchInterval: active ? (root?.stale ? 5000 : 30000) : false,
   });
   const files = useQuery({
     queryKey: ["library-catalogue-files", root?.root, group, after],
     queryFn: () => body(api.GET("/api/v1/library/catalogue/files", { params: { query: { root: root!.root, group, after, limit: PAGE } } })),
-    enabled: !!root && group !== undefined,
-    refetchInterval: root?.stale ? 5000 : 30000,
+    enabled: active && !!root && group !== undefined,
+    refetchInterval: active ? (root?.stale ? 5000 : 30000) : false,
   });
   const refresh = useMutation({
     mutationFn: () => body(api.POST("/api/v1/library/catalogue", { body: { root: root?.root ?? null } })),
@@ -46,8 +45,9 @@ export function Catalogue() {
     const cursor = group === undefined ? groups.data?.at(-1)?.group : files.data?.at(-1)?.path;
     if (cursor) { setPrevious([...previous, after]); setAfter(cursor); }
   };
+  if (!active) return null;
   return <>
-    <PageHeader title="Library" description="Video files linked from your configured library folders." />
+    {!embedded && <PageHeader title="Library" description="Video files linked from your configured library folders." />}
     <div className="mb-4"><PlexClassification /></div>
     {roots.isPending ? <Loading /> : roots.isError ? <Failure error={roots.error} /> : !root ?
       <Empty title="No library folders configured"><Link to="/settings/library" className="text-primary underline">Configure library folders</Link> to build the index.</Empty> : <>

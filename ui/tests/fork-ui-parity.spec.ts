@@ -3,10 +3,16 @@ const fixture = (screen: string) =>
   `/tests/fork-ui-parity.html?screen=${screen}`;
 test("fork feature navigation is visible", async ({ page }) => {
   await page.goto(fixture("nav"));
-  for (const label of ["Native Cache", "Plex Library", "Smart Prefetch"])
+  for (const label of ["Native Cache", "Library", "Smart Prefetch"])
     await expect(
       page.getByRole("link", { name: label, exact: true }),
     ).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: "Media Library", exact: true }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("link", { name: "Plex Library", exact: true }),
+  ).toHaveCount(0);
 });
 test("original cache is visible, protected and inspectable", async ({
   page,
@@ -782,4 +788,252 @@ test("cache settings show unknown storage without hiding editable saved policy",
       window.__mock.calls.filter((c) => c.method !== "GET"),
     ),
   ).toEqual([]);
+});
+
+test("one Library keeps Plex filters and local root, group and page state", async ({
+  page,
+}, info) => {
+  await page.goto(fixture("library-unified"));
+  await expect(
+    page.getByRole("heading", { name: "Library", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1 })).toHaveCount(1);
+  await page.getByRole("button", { name: "Movies", exact: true }).click();
+  await page.getByRole("button", { name: "File table", exact: true }).click();
+  await page.getByLabel("Search media and paths").fill("Fixture movie");
+  await page
+    .getByRole("button", { name: "Apply filters", exact: true })
+    .click();
+  await page
+    .getByRole("link", { name: "Plex connections", exact: true })
+    .click();
+  await expect(
+    page.getByRole("link", {
+      name: "Connections and path mappings",
+      exact: true,
+    }),
+  ).toHaveAttribute("aria-current", "page");
+  await page.getByRole("link", { name: "Browse media", exact: true }).click();
+  await expect(page.getByLabel("Search media and paths")).toHaveValue(
+    "Fixture movie",
+  );
+  await page.getByRole("link", { name: "Local files", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Fixture local-only group", exact: true }),
+  ).toBeVisible();
+  await page
+    .getByRole("combobox", { name: "Library folder", exact: true })
+    .click();
+  await page
+    .getByRole("option", { name: /^\/fixture\/local-secondary/ })
+    .click();
+  await page
+    .getByRole("button", { name: "Fixture local-only group", exact: true })
+    .click();
+  await expect(
+    page.getByRole("link", { name: /Fixture local file 001/ }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  const last = page.getByRole("link", { name: /Fixture local file 101/ });
+  await expect(last).toBeVisible();
+  await expect(last).toHaveAttribute("href", /\/explorer\?item=/);
+  await page.screenshot({
+    path: info.outputPath("generated-unified-local-files.png"),
+    fullPage: true,
+  });
+  await page.getByRole("link", { name: "Browse media", exact: true }).click();
+  await expect(page.getByLabel("Search media and paths")).toHaveValue(
+    "Fixture movie",
+  );
+  await expect(
+    page.getByRole("button", { name: "Movies", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(
+    page.getByRole("table", { name: "Library files" }),
+  ).toBeVisible();
+  const before = await page.evaluate(
+    () =>
+      window.__mock.calls.filter((c) =>
+        c.path.startsWith("/api/v1/library/catalogue"),
+      ).length,
+  );
+  await page.waitForTimeout(5500);
+  expect(
+    await page.evaluate(
+      () =>
+        window.__mock.calls.filter((c) =>
+          c.path.startsWith("/api/v1/library/catalogue"),
+        ).length,
+    ),
+  ).toBe(before);
+  await page.getByRole("link", { name: "Local files", exact: true }).click();
+  await expect(
+    page.getByRole("combobox", { name: "Library folder", exact: true }),
+  ).toContainText("/fixture/local-secondary");
+  await expect(
+    page.getByRole("link", { name: /Fixture local file 101/ }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Previous", exact: true }).click();
+  await expect(
+    page.getByRole("link", { name: /Fixture local file 001/ }),
+  ).toBeVisible();
+  await page.evaluate(() => window.__mock.router.navigate(-1));
+  await expect(page.getByLabel("Search media and paths")).toHaveValue(
+    "Fixture movie",
+  );
+  await page.evaluate(() => window.__mock.router.navigate(1));
+  await expect(
+    page.getByRole("link", { name: /Fixture local file 001/ }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      window.__mock.calls.filter((c) => c.method !== "GET"),
+    ),
+  ).toEqual([]);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+});
+
+test("Library defaults to local files without Plex and keeps explicit Plex setup available", async ({
+  page,
+}) => {
+  await page.goto(fixture("library-no-plex"));
+  await expect(
+    page.getByRole("button", { name: "Fixture local-only group", exact: true }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      window.__mock.calls.some((c) => c.path.includes("/browse")),
+    ),
+  ).toBe(false);
+  await page.getByRole("link", { name: "Browse media", exact: true }).click();
+  await expect(
+    page.getByRole("link", {
+      name: "Connect Plex and select a server",
+      exact: true,
+    }),
+  ).toBeVisible();
+  await page
+    .getByRole("link", { name: "Connections and path mappings", exact: true })
+    .click();
+  await expect(
+    page.getByRole("button", { name: "Connect Plex account", exact: true }),
+  ).toBeVisible();
+});
+
+test("Plex failure does not block local-only files or trigger automatic scans", async ({
+  page,
+}) => {
+  await page.goto(fixture("library-offline"));
+  await expect(
+    page.getByText("Fixture Plex unavailable", { exact: true }),
+  ).toBeVisible();
+  await page.getByRole("link", { name: "Local files", exact: true }).click();
+  await expect(
+    page.getByRole("button", { name: "Fixture local-only group", exact: true }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      window.__mock.calls.filter((c) => c.method !== "GET"),
+    ),
+  ).toEqual([]);
+  await page
+    .getByRole("button", { name: "Refresh index", exact: true })
+    .click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          window.__mock.calls.filter(
+            (c) =>
+              c.path === "/api/v1/library/catalogue" && c.method === "POST",
+          ).length,
+      ),
+    )
+    .toBe(1);
+});
+
+test("old Plex bookmarks retain their filters and connection view", async ({
+  page,
+}) => {
+  await page.goto(
+    fixture("library-unified") +
+      "&entry=" +
+      encodeURIComponent(
+        "/plex-library?category=movies&view=files&search=Fixture&server=fixture-server#retained",
+      ),
+  );
+  await expect(
+    page.getByRole("table", { name: "Library files" }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() => {
+      const l = window.__mock.router.state.location;
+      return {
+        path: l.pathname,
+        source: new URLSearchParams(l.search).get("source"),
+        search: new URLSearchParams(l.search).get("search"),
+        hash: l.hash,
+      };
+    }),
+  ).toEqual({
+    path: "/library",
+    source: "plex",
+    search: "Fixture",
+    hash: "#retained",
+  });
+  await page.goto(
+    fixture("library-unified") +
+      "&entry=" +
+      encodeURIComponent("/plex-library?tab=connections&server=fixture-server"),
+  );
+  await expect(
+    page.getByRole("link", {
+      name: "Connections and path mappings",
+      exact: true,
+    }),
+  ).toHaveAttribute("aria-current", "page");
+  expect(
+    await page.evaluate(() =>
+      new URLSearchParams(window.__mock.router.state.location.search).get(
+        "server",
+      ),
+    ),
+  ).toBe("fixture-server");
+});
+
+test("combined media includes local files without Plex matches by default", async ({
+  page,
+}, info) => {
+  await page.goto(fixture("library-unified"));
+  await expect(
+    page.getByRole("button", { name: "All media", exact: true }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await expect(
+    page.getByText("Fixture unindexed video", { exact: true }).first(),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Unmatched", exact: true }).click();
+  await expect(
+    page.getByText("Fixture unindexed video", { exact: true }).first(),
+  ).toBeVisible();
+  await expect(page.getByText("Fixture Series", { exact: true })).toHaveCount(
+    0,
+  );
+  await page.screenshot({
+    path: info.outputPath("generated-combined-media.png"),
+    fullPage: true,
+  });
+  expect(
+    await page.evaluate(() =>
+      window.__mock.calls.filter((c) => c.method !== "GET"),
+    ),
+  ).toEqual([]);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
 });
