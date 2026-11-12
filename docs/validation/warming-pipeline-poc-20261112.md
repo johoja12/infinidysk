@@ -22,6 +22,16 @@ reservations remain charged conservatively, as before.
 The single-block `Queue::tick` shares the same implementation and remains
 available to incremental callers. The application uses `Queue::tick_window`.
 
+Warming connection acquisition also watches for pool changes while opening a
+new connection. If an existing connection becomes idle, the request can reuse it
+while the reserved connection keeps opening. It does not pipeline behind a busy
+connection or consume the playback headroom. Foreground and queue connection acquisition keep their existing behavior. Warming
+provider selection counts connections still opening when comparing providers on
+the same priority level. A cold burst can use several providers without changing
+priority or backbone fallback semantics. Delayed-greeting regressions failed before
+these changes and pass afterward: one checks reuse of an idle connection, and the
+other checks an even split across equal-capacity providers.
+
 Library link queries split item-specific and broad searches into disjoint SQL
 branches. Item-specific searches can use the existing item index without changing
 root/group/video filters, ordering, pagination or repair authority. No database
@@ -84,10 +94,29 @@ The baseline completed 536,870,912 newly committed bytes in 159.458 seconds:
 **3.367 MB/s**, with 554,282,769 wire bytes. The initial eight-block/24-article
 candidate completed the same amount in 82.247 seconds: **6.528 MB/s**. No cached
 bytes, playback readers or imports were counted. This did not meet the target.
-The next candidate raises the spare-capacity article ceiling to 64 and the bounded
-source window to sixteen blocks. The connection floor under pressure, target
+The sixteen-block/64-article candidate completed in 159.846 seconds: **3.359 MB/s**.
+It also missed the target. Per-block timings put about 95% of elapsed time in source
+reads. A separate 64 MB connection trace showed requests waiting on new handshakes
+while established connections sat idle. The next candidate allows warming
+requests to reuse idle connections while those handshakes continue. It retains
+the spare-capacity article ceiling of 64 and the sixteen-block source window. The connection floor under pressure, target
 quarter reserve, global memory admission, strict reads and playback priority stay
-enforced. Final POC and rollout results are recorded in PR #268 and the deployment
+enforced.
+
+An intermediate unoptimized diagnostic with the idle-connection fix committed
+536,870,912 uncached bytes in 62.735 seconds: **8.558 MB/s**. This is not a release
+image or acceptance result. Disabling warming after its first committed block
+stopped further progress, with no source failure attempt recorded. A second
+regression then confirmed that six cold warming requests all chose one provider
+while its handshakes were pending. Pending connections now contribute to warming
+provider selection; queue and playback selection are unchanged.
+
+The final unoptimized diagnostic committed the same range in 76.663 seconds
+(**7.003 MB/s**). A sample showed about 108% CPU with no active provider transfers,
+so this diagnostic also includes unoptimized processing time. It remains below
+target and does not establish release acceptance.
+
+Final POC and rollout results are recorded in PR #268 and the deployment
 receipt; neither the first candidate nor its measurements establish acceptance.
 
 ## Local validation

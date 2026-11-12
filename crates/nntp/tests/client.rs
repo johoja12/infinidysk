@@ -59,7 +59,7 @@ async fn an_unexpected_reply_keeps_its_text_without_control_characters() {
         let mut lines = BufReader::new(read).lines();
         while lines.next_line().await.unwrap().is_some() {
             write
-                .write_all(b"400 Too many \x1b[31mconnections\r\n")
+                .write_all(b"500 Too many \x1b[31mconnections\r\n")
                 .await
                 .unwrap();
         }
@@ -68,7 +68,59 @@ async fn an_unexpected_reply_keeps_its_text_without_control_characters() {
     let Err(Error::Status { code, reply }) = body(&client, "a@test").await else {
         panic!("an unexpected reply fails with its status")
     };
-    assert_eq!((code, &*reply), (400, "Too many [31mconnections"));
+    assert_eq!((code, &*reply), (500, "Too many [31mconnections"));
+}
+
+#[tokio::test]
+async fn a_400_reply_is_retried_on_a_fresh_connection() {
+    for workload in [Workload::Stream, Workload::Warm] {
+        let corpus = Corpus::generate(1025, 1, ARTICLE_SIZE);
+        let article = corpus.articles[0].clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                // The first session ends: 400 to the next command, then close.
+                let first = accepted.fetch_add(1, Ordering::SeqCst) == 0;
+                let wire = article.wire.clone();
+                let id = article.message_id.clone();
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    write.write_all(b"200 ready\r\n").await.unwrap();
+                    let mut lines = BufReader::new(read).lines();
+                    while lines.next_line().await.unwrap().is_some() {
+                        if first {
+                            write.write_all(b"400 session ends\r\n").await.unwrap();
+                            return;
+                        }
+                        let head = format!("222 0 <{id}> body follows\r\n");
+                        write.write_all(head.as_bytes()).await.unwrap();
+                        write.write_all(&wire).await.unwrap();
+                    }
+                });
+            }
+        });
+        let downloads = Downloads::new(4);
+        let client = Client::new([provider(port, 0, None, &downloads)]);
+
+        let got = client
+            .body(&corpus.articles[0].message_id, workload, None)
+            .await
+            .unwrap();
+        assert_eq!(got.data, corpus.data);
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+        // [retrieved, not found, cancelled, timeout, auth, network, protocol, ...]
+        let stats = client.stats();
+        let index = if workload == Workload::Stream { 0 } else { 3 };
+        let attempts = stats[0].workloads[index].attempts;
+        assert_eq!(attempts[..7], [1, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(downloads.available_permits(), 4);
+        if workload == Workload::Warm {
+            assert_eq!(stats[0].workloads[0].attempts.iter().sum::<u64>(), 0);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1342,4 +1394,51 @@ async fn requests_during_the_connect_backoff_count_one_connect_failure() {
         stats.workloads[0].failed, 21,
         "every caller still saw its failure"
     );
+}
+
+#[tokio::test]
+async fn warming_spreads_pending_connections_across_equal_priority_providers() {
+    let corpus = Corpus::generate(1025, 6, ARTICLE_SIZE);
+    let impairment = Impairment {
+        handshake_delay: Duration::from_secs(2),
+        ..Impairment::default()
+    };
+    let a = LoopbackServer::start_impaired(corpus.articles.clone(), impairment)
+        .await
+        .unwrap();
+    let b = LoopbackServer::start_impaired(corpus.articles.clone(), impairment)
+        .await
+        .unwrap();
+    let downloads = Downloads::new(16);
+    let configured = |port| {
+        let mut provider = provider(port, 0, None, &downloads);
+        provider.pool = Pool::new(
+            Endpoint::new(
+                "127.0.0.1",
+                port,
+                TlsMode::Plain,
+                None,
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+            PoolConfig {
+                max_connections: 16,
+                pipeline_depth: 2,
+                idle_timeout: Duration::from_secs(5),
+                min_connections: 0,
+            },
+            Arc::clone(&downloads),
+        )
+        .unwrap();
+        provider
+    };
+    let client = Client::new([configured(a.addr().port()), configured(b.addr().port())]);
+    let fetch =
+        |index: usize| client.body(&corpus.articles[index].message_id, Workload::Warm, None);
+    let (r0, r1, r2, r3, r4, r5) =
+        tokio::join!(fetch(0), fetch(1), fetch(2), fetch(3), fetch(4), fetch(5));
+    for result in [r0, r1, r2, r3, r4, r5] {
+        result.unwrap();
+    }
+    assert_eq!((a.body_commands(), b.body_commands()), (3, 3));
 }

@@ -416,7 +416,7 @@ impl Pool {
             reserved
         };
         // Dropping a new connection's load leaves it idle in the pool.
-        join_all((0..reserved).map(|_| self.open(self.connecting(), None))).await;
+        join_all((0..reserved).map(|_| self.open(self.connecting(), None, None))).await;
     }
 
     /// Ends every connection now, abandoning the requests on them.
@@ -489,10 +489,12 @@ impl Pool {
         self.downloads.available_permits()
     }
 
-    /// In-flight requests per mille of capacity.
-    pub(crate) fn busy_permille(&self) -> usize {
+    /// In-flight requests per mille of capacity. Warming also counts pending
+    /// connections so a cold burst does not all choose the same provider.
+    pub(crate) fn busy_permille(&self, warming: bool) -> usize {
         let capacity = self.config.max_connections * self.config.pipeline_depth;
-        self.busy().saturating_mul(1000) / capacity
+        let pending = if warming { self.lock().connecting } else { 0 };
+        self.busy().saturating_add(pending).saturating_mul(1000) / capacity
     }
 
     /// Requests in flight or queued on a connection.
@@ -550,7 +552,8 @@ impl Pool {
         let (mut failed, mut unanswered) = (0, 0);
         let provider = tag.provider;
         let stream = tag.workload == Workload::Stream;
-        let deadline = tokio::time::Instant::now() + self.stream_wait;
+        // Shared by retries; only admission waits spend it, not transfers.
+        let mut budget = self.stream_wait;
         loop {
             if let Some(budget) = &tag.wire {
                 budget
@@ -559,27 +562,24 @@ impl Pool {
                     .await
                     .map_err(|error| Failure::Request(Error::Io(error.into())))?;
             }
-            let wait = async {
-                let download = self
-                    .downloads
-                    .acquire(
-                        stream,
-                        self.weight(tag.probe.as_ref().map(|probe| probe.size)),
-                    )
+            let admitted = tokio::time::Instant::now();
+            let deadline = stream.then(|| admitted + budget);
+            let acquire = self.downloads.acquire(
+                stream,
+                self.weight(tag.probe.as_ref().map(|probe| probe.size)),
+            );
+            let download = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, acquire)
                     .await
-                    .ok_or(Failure::Request(Error::Closed))?;
-                tag.step(Step::Permitted { provider });
-                let (tx, load, ahead, connection) =
-                    self.worker(stream, tag.fresh, tag.lane).await?;
-                Ok::<_, Failure>((download, tx, load, ahead, connection))
-            };
-            let (download, tx, load, ahead, connection) = if stream {
-                tokio::time::timeout_at(deadline, wait)
-                    .await
-                    .map_err(|_| Failure::Request(Error::Unavailable))??
-            } else {
-                wait.await?
-            };
+                    .map_err(|_| Failure::Request(Error::Unavailable))?,
+                None => acquire.await,
+            }
+            .ok_or(Failure::Request(Error::Closed))?;
+            tag.step(Step::Permitted { provider });
+            let (tx, load, ahead, connection) = self
+                .worker(tag.workload, tag.fresh, tag.lane, deadline)
+                .await?;
+            budget = budget.saturating_sub(admitted.elapsed());
             tag.step(Step::Connected {
                 provider,
                 ahead: u16::try_from(ahead).unwrap_or(u16::MAX),
@@ -606,9 +606,10 @@ impl Pool {
                 Some(Err(Error::Timeout)) if stream => {
                     return Err(Failure::Request(Error::Timeout));
                 }
-                Some(Err(Error::Closed | Error::Io(_) | Error::Timeout))
-                    if failed < MAX_RETRIES =>
-                {
+                // A 400 ends the session (RFC 3977 §3.2.1); the server closes after it.
+                Some(Err(
+                    Error::Closed | Error::Io(_) | Error::Timeout | Error::Status { code: 400, .. },
+                )) if failed < MAX_RETRIES => {
                     failed += 1;
                 }
                 Some(result) => return result.map_err(Failure::Request),
@@ -624,14 +625,24 @@ impl Pool {
     /// instead. A `fresh` request never pipelines: it waits for an idle connection instead.
     /// For limits of four or more, background work leaves one idle or unopened slot for
     /// playback and waits for pending connections before pipelining.
+    /// Past the admission `deadline` it fails as [`Error::Unavailable`], except that a
+    /// cold connect it started itself runs on, so a hung provider is blamed for it.
     async fn worker(
         &self,
-        stream: bool,
+        workload: Workload,
         fresh: bool,
         lane: Option<Lane>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<(mpsc::Sender<Request>, Load, usize, u32), Failure> {
-        let mut impatient = false;
+        let stream = workload == Workload::Stream;
+        let (mut impatient, mut first) = (false, true);
         loop {
+            // A spent budget still takes a connection that is free right away.
+            if !std::mem::take(&mut first)
+                && deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            {
+                return Err(Failure::Request(Error::Unavailable));
+            }
             let mut changed = pin!(self.changed.notified());
             changed.as_mut().enable();
             let (reserved, live, held) = {
@@ -682,6 +693,11 @@ impl Pool {
                             w.link.id,
                         ));
                     }
+                    _ if deadline
+                        .is_some_and(|deadline| tokio::time::Instant::now() >= deadline) =>
+                    {
+                        return Err(Failure::Request(Error::Unavailable));
+                    }
                     _ if open == 0
                         && state
                             .failed_at
@@ -700,16 +716,35 @@ impl Pool {
                 (reserved, live, held)
             };
             if reserved {
-                let mut open = Box::pin(self.open(self.connecting(), lane));
+                let now = tokio::time::Instant::now();
+                // A detached connect keeps only the endpoint's own deadline.
+                let until = deadline
+                    .filter(|_| !(stream && live))
+                    .map(|deadline| deadline.max(now + STREAM_CONNECT_WAIT));
+                let mut open = Box::pin(self.open(self.connecting(), lane, until));
                 let opened = if stream && live {
-                    let patience = STREAM_CONNECT_WAIT.min(self.endpoint.timeout() / 2);
-                    if let Ok(opened) = timeout(patience, &mut open).await {
+                    let mut patience = now + STREAM_CONNECT_WAIT.min(self.endpoint.timeout() / 2);
+                    if let Some(deadline) = deadline {
+                        patience = patience.min(deadline);
+                    }
+                    if let Ok(opened) = tokio::time::timeout_at(patience, &mut open).await {
                         opened
                     } else {
                         // Joins the pool idle if it ever connects.
                         tokio::spawn(open);
                         impatient = true;
                         continue;
+                    }
+                } else if workload == Workload::Warm {
+                    tokio::select! {
+                        opened = &mut open => opened,
+                        () = &mut changed => {
+                            // A live connection may have become idle while this
+                            // handshake is pending. Keep opening the reserved slot,
+                            // but let this request compete for that idle connection.
+                            tokio::spawn(open);
+                            continue;
+                        }
                     }
                 } else {
                     open.await
@@ -719,9 +754,13 @@ impl Pool {
                 }
                 continue;
             }
-            match held {
+            let wake = match (held.map(tokio::time::Instant::from), deadline) {
+                (Some(held), Some(deadline)) => Some(held.min(deadline)),
+                (held, deadline) => held.or(deadline),
+            };
+            match wake {
                 Some(until) => {
-                    let _ = tokio::time::timeout_at(until.into(), changed).await;
+                    let _ = tokio::time::timeout_at(until, changed).await;
                 }
                 None => changed.await,
             }
@@ -733,10 +772,12 @@ impl Pool {
     }
 
     /// `None` when the connect was refused but other connections can take the request.
+    /// The connect ends by `until` or the endpoint timeout, whichever comes first.
     fn open(
         &self,
         connecting: Connecting,
         lane: Option<Lane>,
+        until: Option<tokio::time::Instant>,
     ) -> impl Future<Output = Result<Option<(mpsc::Sender<Request>, Load, u32)>, Failure>> + Send + 'static
     {
         let (endpoint, config) = (self.endpoint.clone(), self.config);
@@ -745,7 +786,9 @@ impl Pool {
         let stats = Arc::clone(&self.stats);
         async move {
             let started = Instant::now();
-            let conn = match Connection::connect_staged(&endpoint).await {
+            let limit = tokio::time::Instant::now() + endpoint.timeout();
+            let until = until.map_or(limit, |until| until.min(limit));
+            let conn = match Connection::connect_staged_until(&endpoint, until).await {
                 Ok(conn) => conn,
                 Err((stage, error)) => {
                     stats.connect_failed();
@@ -1125,6 +1168,49 @@ fn enqueue(conn: &mut Connection, in_flight: &mut VecDeque<Request>, request: Re
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn expired_admission_reuses_an_idle_connection_but_never_opens_one() {
+        let server = infinidysk_testkit::LoopbackServer::start(Vec::new())
+            .await
+            .unwrap();
+        let endpoint = Endpoint::new(
+            "127.0.0.1",
+            server.addr().port(),
+            crate::TlsMode::Plain,
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let config = PoolConfig {
+            max_connections: 2,
+            pipeline_depth: 2,
+            idle_timeout: Duration::from_secs(60),
+            min_connections: 0,
+        };
+        let pool = Pool::new(endpoint, config, Downloads::new(4)).unwrap();
+        let deadline = Some(tokio::time::Instant::now());
+        assert!(matches!(
+            pool.worker(Workload::Stream, false, None, deadline).await,
+            Err(Failure::Request(Error::Unavailable))
+        ));
+        assert_eq!(server.peak_connections(), 0);
+        assert_eq!(pool.lock().connecting, 0);
+
+        let Ok((_, load, _, connection)) = pool.worker(Workload::Stream, false, None, None).await
+        else {
+            panic!("a connection opens before admission expires");
+        };
+        drop(load);
+        let Ok((_, load, _, reused)) = pool.worker(Workload::Stream, false, None, deadline).await
+        else {
+            panic!("an idle connection is reusable after admission expires");
+        };
+        assert_eq!(reused, connection);
+        assert_eq!(server.peak_connections(), 1);
+        drop(load);
+        pool.abort();
+    }
+
     #[test]
     fn slow_failing_retries_keep_doubling_the_backoff() {
         let start = Instant::now();
@@ -1138,5 +1224,88 @@ mod tests {
         }
         let backoff = state.backoff.map(|b| (b.delay, b.failures));
         assert_eq!(backoff, Some((MAX_CONNECT_BACKOFF, 7)));
+    }
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)] // Loopback setup and outcomes are assertions.
+    async fn warming_reuses_a_released_connection_while_another_is_connecting() {
+        use crate::TlsMode;
+        use infinidysk_testkit::{Corpus, Impairment, LoopbackServer};
+        const ARTICLE_SIZE: usize = 16 * 1024;
+        const DOWNLOADS: usize = 64;
+        let corpus = Corpus::generate(1025, 2, ARTICLE_SIZE);
+        let server = LoopbackServer::start_impaired(
+            corpus.articles.clone(),
+            Impairment {
+                handshake_delay: Duration::from_secs(2),
+                response_delay: Duration::from_millis(100),
+                ..Impairment::default()
+            },
+        )
+        .await
+        .unwrap();
+        let downloads = Downloads::new(DOWNLOADS);
+        let pool = Arc::new(
+            Pool::new(
+                Endpoint::new(
+                    "127.0.0.1",
+                    server.addr().port(),
+                    TlsMode::Plain,
+                    None,
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+                PoolConfig {
+                    max_connections: 4,
+                    pipeline_depth: 4,
+                    idle_timeout: Duration::from_secs(10),
+                    min_connections: 1,
+                },
+                downloads,
+            )
+            .unwrap(),
+        );
+        pool.prewarm(1).await;
+        let first = tokio::spawn({
+            let pool = Arc::clone(&pool);
+            let id = corpus.articles[0].message_id.clone();
+            async move {
+                pool.fetch(
+                    Command::Body,
+                    &id,
+                    &Tag {
+                        workload: Workload::Warm,
+                        ..Tag::UNTRACKED
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while server.body_commands() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.fetch(
+                Command::Body,
+                &corpus.articles[1].message_id,
+                &Tag {
+                    workload: Workload::Warm,
+                    ..Tag::UNTRACKED
+                },
+            ),
+        )
+        .await
+        .expect(
+            "background work must reuse the released connection before the new handshake finishes",
+        )
+        .ok()
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.offset, ARTICLE_SIZE as u64);
+        assert!(first.await.unwrap().is_ok());
     }
 }
