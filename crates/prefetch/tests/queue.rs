@@ -1117,7 +1117,7 @@ async fn warming_window_throughput_poc() {
     for window in [false, true] {
         let t = Temp::new();
         let (vfs, item, cache, corpus, server, _) =
-            fixture_geometry(&t, false, 2, 160, 716_800, 40).await;
+            fixture_geometry(&t, false, 2, 160, 716_800, 96).await;
         let queue = Queue::load(vfs.db().clone(), Arc::clone(&vfs))
             .await
             .unwrap();
@@ -1322,4 +1322,39 @@ async fn warming_window_revalidates_source_between_committed_blocks() {
         covered, BLOCK,
         "a source change cannot publish the next buffered block"
     );
+}
+
+#[tokio::test]
+async fn deep_warming_window_cancels_without_committing_inflight_articles() {
+    let t = Temp::new();
+    let (vfs, item, cache, corpus, server, _) =
+        fixture_geometry(&t, false, 0, 96, 716_800, 96).await;
+    for article in &corpus.articles {
+        server.stall_article(&article.message_id, 1, Duration::from_secs(30));
+    }
+    let queue = Queue::load(vfs.db().clone(), Arc::clone(&vfs))
+        .await
+        .unwrap();
+    let job = enqueue(&queue, &item).await;
+    let running = {
+        let queue = Arc::clone(&queue);
+        tokio::spawn(async move { queue.tick_window(&settings()).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.body_commands() < 32 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    queue.control(job.id, Operation::Cancel).await.unwrap();
+    assert!(
+        !tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    assert_eq!(cache.stats().await.unwrap().bytes, 0);
+    assert_eq!(queue.status().await.jobs[0].verified_bytes, 0);
 }

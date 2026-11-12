@@ -981,9 +981,22 @@ async fn serve_inner(
                     true
                 },
                 || async {
-                    // Refresh between bounded windows; release the config lock before I/O.
+                    // Never hold the config lock across I/O. A policy change drops the
+                    // in-flight window, just like shutdown, before applying the next policy.
                     let settings = config.read().await.settings().prefetch.clone();
-                    prefetch.tick_window(&settings).await
+                    let changed = async {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            if config.read().await.settings().prefetch != settings {
+                                break;
+                            }
+                        }
+                    };
+                    tokio::select! {
+                        biased;
+                        () = changed => Ok(false),
+                        result = prefetch.tick_window(&settings) => result,
+                    }
                 },
             )
             .await;

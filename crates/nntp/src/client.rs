@@ -103,7 +103,7 @@ fn warm_target(floor: usize, held: usize, total: usize, free: usize, pressure: b
     }
     held.saturating_add(free)
         .saturating_sub(total.div_ceil(4))
-        .clamp(floor, 24)
+        .clamp(floor, 64)
 }
 
 /// Exclusive use of the providers for a diagnostic: background requests wait at
@@ -935,7 +935,7 @@ mod tests {
         assert_eq!(warm_target(2, 12, 40, 28, true), 2);
         assert_eq!(warm_target(3, 0, 8, 0, false), 3);
         assert_eq!(warm_target(3, 0, 0, 0, false), 3);
-        assert_eq!(warm_target(2, 0, 400, 400, false), 24);
+        assert_eq!(warm_target(2, 0, 400, 400, false), 64);
         assert_eq!(warm_target(2, 0, 4, 4, false), 3);
         assert_eq!(warm_target(99, 0, 0, 0, true), 8);
     }

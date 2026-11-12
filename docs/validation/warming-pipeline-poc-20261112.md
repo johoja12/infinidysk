@@ -5,11 +5,12 @@ replay and aggregate provider bandwidth do not satisfy this target.
 
 ## Change
 
-The application now fills a bounded contiguous source window of at most eight
-cache blocks (33,554,432 bytes). The reader stays open across those blocks, so its
-adaptive article window can keep working during cache publication. Each block
+The application now fills a bounded contiguous source window of at most sixteen
+cache blocks (67,108,864 bytes). The reader stays open across those blocks, so its
+adaptive article window (up to 64 articles with spare provider capacity) can keep working during cache publication. Each block
 still has its own strict read, source-revision check, durable publication and
-checkpoint. Playback waits and pause/cancel interrupt the read. A failed or
+checkpoint. Playback waits and pause/cancel interrupt the read. A settings change
+also drops the in-flight window before the next policy is applied. A failed or
 interrupted attempt does not publish a partial block.
 
 Source allowance is reserved durably before opening the window. A window is
@@ -37,14 +38,23 @@ verification follows timing. This is generated data, not live provider evidence.
 | Reader lifetime | Seconds | Committed MB/s | BODY commands |
 | --- | ---: | ---: | ---: |
 | One cache block | 20.450 | 5.608 | 187 |
-| Eight-block window | 8.135 | 14.098 | 163 |
+| Initial eight-block window, 24 articles | 8.135 | 14.098 | 163 |
 
-The explicit POC test asserts at least 10 MB/s for the windowed arm. It is ignored
+The current explicit POC uses 96 connections to exercise the new 64-article
+ceiling and asserts at least 10 MB/s for the windowed arm. It is ignored
 in the ordinary suite because it deliberately injects latency. Run it with:
 
 ```sh
 cargo test -p infinidysk-prefetch --test queue warming_window_throughput_poc --locked -- --ignored --nocapture
 ```
+
+A second generated comparison exercises the final 64-article ceiling with 96
+provider connections and the same source/latency/cache protocol:
+
+| Reader lifetime | Seconds | Committed MB/s | BODY commands |
+| --- | ---: | ---: | ---: |
+| One cache block | 20.935 | 5.478 | 187 |
+| Sixteen-block window, 64 articles | 5.490 | 20.890 | 161 |
 
 These values are one local comparison, not a guarantee for every provider, file,
 archive layout or storage volume.
@@ -53,7 +63,8 @@ archive layout or storage volume.
 
 Additional checks exercise cached blocks inside a source range, daily source
 allowance, gaps between requested ranges, controls after a committed block, and
-source changes between blocks. Existing foreground-preemption and stored/encrypted
+source changes between blocks, plus cancellation with more than 32 article
+requests in flight. Existing foreground-preemption and stored/encrypted
 member checks also exercise the windowed path. The two archive checks now expect
 one window to finish their two-block fixture, then verify plaintext and tail bytes.
 Library item lookups exercise mixed items, video filtering, groups, roots and
@@ -70,9 +81,14 @@ A bounded 512 MB range is read into a separate folder on the NAS. Provider reads
 are real and consume the isolated arm's explicit source/wire allowances.
 
 The baseline completed 536,870,912 newly committed bytes in 159.458 seconds:
-**3.367 MB/s**, with 554,282,769 wire bytes. No cached bytes, playback readers or
-imports were counted. The candidate image is still building; its result and
-release verification remain pending.
+**3.367 MB/s**, with 554,282,769 wire bytes. The initial eight-block/24-article
+candidate completed the same amount in 82.247 seconds: **6.528 MB/s**. No cached
+bytes, playback readers or imports were counted. This did not meet the target.
+The next candidate raises the spare-capacity article ceiling to 64 and the bounded
+source window to sixteen blocks. The connection floor under pressure, target
+quarter reserve, global memory admission, strict reads and playback priority stay
+enforced. Final POC and rollout results are recorded in PR #268 and the deployment
+receipt; neither the first candidate nor its measurements establish acceptance.
 
 ## Local validation
 

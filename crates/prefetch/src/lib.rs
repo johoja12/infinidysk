@@ -37,7 +37,7 @@ const EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 #[schema(as=PrefetchSettings)]
 pub struct Settings {
     pub enabled: bool,
-    /// Minimum article window under transfer pressure; spare capacity may grow it to 24.
+    /// Minimum article window under transfer pressure; spare capacity may grow it to 64.
     pub connections_per_job: u8,
     /// Allowance for attempted final-media block fills per UTC day; provider overfetch and wire overhead are excluded.
     pub daily_fill_bytes: u64,
@@ -852,7 +852,7 @@ impl Queue {
     /// Source and wire allowances are reserved before read-ahead; playback and controls
     /// interrupt the window without publishing a partial block.
     pub async fn tick_window(&self, settings: &Settings) -> anyhow::Result<bool> {
-        self.tick_bounded(settings, 8).await
+        self.tick_bounded(settings, 16).await
     }
 
     async fn tick_bounded(&self, settings: &Settings, blocks: u64) -> anyhow::Result<bool> {

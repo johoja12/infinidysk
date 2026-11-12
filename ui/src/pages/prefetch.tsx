@@ -140,7 +140,7 @@ export function PrefetchPanel({
             <Field
               id="prefetch-connections"
               label="Warming connection floor"
-              hint="1 to 8 articles under transfer pressure. When capacity is free, the bounded window can grow to 24 with a target reserve of 25% of provider capacity. The floor can exceed that reserve on small pools. New scheduling shrinks under pressure; replies already sent may finish. Foreground seeks still interrupt warming."
+              hint="1 to 8 articles under transfer pressure. When capacity is free, the bounded window can grow to 64 with a target reserve of 25% of provider capacity. The floor can exceed that reserve on small pools. New scheduling shrinks under pressure; replies already sent may finish. Foreground seeks still interrupt warming."
             >
               <Input
                 id="prefetch-connections"
