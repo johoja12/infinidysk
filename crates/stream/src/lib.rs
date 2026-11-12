@@ -441,7 +441,7 @@ impl SegmentReader {
         self.strict = true;
         self.prewarm = false;
         self.background = Workload::Warm;
-        self.prefetch = 64;
+        self.prefetch = 128;
         self.initial = 2;
         self.warm_floor = floor;
         self

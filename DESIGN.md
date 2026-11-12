@@ -1089,6 +1089,6 @@ The upstream 1.x leftover-data reminder treats all configured native and origina
 Native Cache settings lead with the shared playback-cache switch and existing storage. Show running allocation, configured quota, folder count and protected files, then one flat card per existing folder with path, running write mode, configured eviction state and a capacity bar. Keep limits, reserve and priority together in each folder's disclosure; move catalogue IDs and owner paths into a secondary disclosure. Unknown or unmatched running storage stays unknown, including after editing an ID or path. New-store setup and recovery options sit below existing folders in Advanced cache settings. Preserve the page's single Save/Discard workflow, all environment locks, original paths and retention defaults.
 
 Warming settings describe a floor of 1–8 articles under pressure and an adaptive
-ceiling of 64 articles when capacity is free, retaining a target quarter of provider
+ceiling of 128 articles when capacity is free, retaining a target quarter of provider
 capacity for other transfers. Playback waits still interrupt source reads. The
 source window is bounded separately from each cache block's verification and commit.
