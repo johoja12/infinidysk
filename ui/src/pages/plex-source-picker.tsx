@@ -121,7 +121,7 @@ export function PlexSourcePicker({
       <Empty title="Connect Plex to choose sources">
         <Link
           className="text-primary underline"
-          to="/plex-library?tab=connections"
+          to="/library?source=connections"
         >
           Connect a Plex account and enable a server
         </Link>

@@ -49,8 +49,7 @@ import { Loading } from "./ui";
 const pages = [
   { to: "/overview", label: "Overview", icon: Gauge },
   { to: "/queue", label: "Queue", icon: ListOrdered },
-  { to: "/library", label: "Media Library", icon: FolderTree },
-  { to: "/plex-library", label: "Plex Library", icon: LibraryBig },
+  { to: "/library", label: "Library", icon: LibraryBig },
   { to: "/native-cache", label: "Native Cache", icon: HardDrive },
   { to: "/smart-prefetch", label: "Smart Prefetch", icon: Sparkles },
   { to: "/explorer", label: "Explorer", icon: FolderTree },

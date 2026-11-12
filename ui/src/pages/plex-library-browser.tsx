@@ -1,3 +1,4 @@
+import { libraryHref } from "../library-navigation";
 import { useEffect, useState } from "react";
 import { useSearchParams, Link } from "react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -69,7 +70,7 @@ export function PlexLibraryBrowser() {
     servers.find((s) => s.id === params.get("server")) ?? servers[0];
   const library = params.get("library") || "all",
     view = params.get("view") || "groups",
-    category = params.get("category") || "shows",
+    category = params.get("category") || "all",
     search = params.get("search") || "",
     group = params.get("group") || "";
   const [text, setText] = useState(search);
@@ -217,7 +218,7 @@ export function PlexLibraryBrowser() {
     return (
       <Empty title="No enabled Plex servers">
         <Link
-          to="/plex-library?tab=connections"
+          to={libraryHref(params, "connections")}
           className="text-primary underline"
         >
           Connect Plex and select a server

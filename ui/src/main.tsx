@@ -17,8 +17,8 @@ const Overview = named(() => import("./pages/overview"), "Overview");
 const Queue = named(() => import("./pages/queue"), "Queue");
 const CachePage = named(() => import("./pages/cache-page"), "CachePage");
 const SmartPrefetch = named(() => import("./pages/smart-prefetch"), "SmartPrefetch");
-const PlexLibrary = named(() => import("./pages/plex-library"), "PlexLibrary");
-const Catalogue = named(() => import("./pages/catalogue"), "Catalogue");
+const LibraryPage = named(() => import("./pages/plex-library"), "LibraryPage");
+const LegacyPlexLibraryRedirect = named(() => import("./pages/plex-library"), "LegacyPlexLibraryRedirect");
 const Explorer = named(() => import("./pages/explorer"), "Explorer");
 const Health = named(() => import("./pages/health"), "Health");
 const Stats = named(() => import("./pages/stats"), "Stats");
@@ -56,10 +56,10 @@ const router = createBrowserRouter(
         <Route index element={<Navigate to="/overview" replace />} />
         <Route path="overview" element={<Overview />} />
         <Route path="queue" element={<Queue />} />
-        <Route path="library" element={<Catalogue />} />
+        <Route path="library" element={<LibraryPage />} />
         <Route path="native-cache" element={<CachePage />} />
         <Route path="smart-prefetch" element={<SmartPrefetch />} />
-        <Route path="plex-library" element={<PlexLibrary />} />
+        <Route path="plex-library" element={<LegacyPlexLibraryRedirect />} />
         <Route path="explorer" element={<Explorer />} />
         <Route path="health" element={<Health />} />
         <Route path="stats" element={<Stats />} />

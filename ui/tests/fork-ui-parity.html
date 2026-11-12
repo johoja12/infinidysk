@@ -394,6 +394,55 @@
           },
         ]);
       }
+      if (path === "/api/v1/library/catalogue") {
+        if (method === "POST") return respond(null);
+        return respond(
+          ["/fixture/local", "/fixture/local-secondary"].map((root) => ({
+            root,
+            read_only: root.endsWith("secondary"),
+            stale: false,
+            completed_generation: 1,
+            requested_generation: 1,
+            requested_at: 1700000000000,
+            scanned_at: 1700000000000,
+          })),
+        );
+      }
+      if (path === "/api/v1/library/catalogue/groups")
+        return respond([
+          {
+            root: url.searchParams.get("root"),
+            group: "Fixture local-only group",
+            files: 101,
+            bytes: 808000000,
+            unavailable: 1,
+            stale: false,
+          },
+        ]);
+      if (path === "/api/v1/library/catalogue/files") {
+        const root = url.searchParams.get("root"),
+          group = "Fixture local-only group";
+        const files = Array.from({ length: 101 }, (_, i) => {
+          const relative_path = `${group}/Fixture local file ${String(i + 1).padStart(3, "0")}.mkv`;
+          return {
+            root,
+            group,
+            path: `${root}/${relative_path}`,
+            relative_path,
+            item: id,
+            link_kind: "strm",
+            stale: false,
+          };
+        });
+        const after = url.searchParams.get("after"),
+          start = after ? files.findIndex((f) => f.path === after) + 1 : 0;
+        return respond(
+          files.slice(
+            start,
+            start + Number(url.searchParams.get("limit") || 100),
+          ),
+        );
+      }
       if (path === "/api/v1/library/plex")
         return respond({
           enabled: true,
@@ -401,7 +450,8 @@
           stale: false,
           refreshing: false,
           entries: 62,
-          servers: 1,
+          servers: window.__mock.settings.plex.servers.filter((s) => s.enabled)
+            .length,
           warning: null,
           updated_at: Date.now(),
           progress: null,
@@ -424,6 +474,11 @@
         });
       }
       if (path === "/api/v1/plex/servers/fixture-server/browse") {
+        if (window.__mock.plexBrowseError)
+          return Response.json(
+            { error: "Fixture Plex unavailable" },
+            { status: 503 },
+          );
         const q = Object.fromEntries(url.searchParams),
           offset = Number(q.offset) || 0,
           limit = Number(q.limit) || 50;
@@ -432,7 +487,8 @@
             (!q.category ||
               q.category === "all" ||
               (q.category === "shows" && r.media.kind === "episode") ||
-              (q.category === "movies" && r.media.kind === "movie")) &&
+              (q.category === "movies" && r.media.kind === "movie") ||
+              (q.category === "unmatched" && !r.matched)) &&
             (!q.search ||
               `${r.media.title} ${r.media.file} ${r.group_title}`
                 .toLowerCase()
@@ -478,15 +534,15 @@
           updated_at: Date.now(),
           refreshing: false,
           warning: null,
-          coverage_checked: 62,
-          coverage_total: 62,
+          coverage_checked: libraryFiles.length,
+          coverage_total: libraryFiles.length,
           coverage_ready: true,
           coverage_at: Date.now(),
           totals: {
-            files: 62,
-            internal: 61,
+            files: libraryFiles.length,
+            internal: libraryFiles.filter((r) => r.mapping === "internal").length,
             attention: 1,
-            unmatched: 0,
+            unmatched: libraryFiles.filter((r) => !r.matched).length,
             external: 0,
           },
           matched_files: selected.length,
@@ -738,7 +794,7 @@
     const [
       { SmartPrefetch },
       { CachePage },
-      { PlexLibrary },
+      { LibraryPage, LegacyPlexLibraryRedirect },
       { Nav },
       { NativeCachePanel },
     ] = await Promise.all([
@@ -750,6 +806,23 @@
     ]);
     const screen =
       new URL(location.href).searchParams.get("screen") ?? "settings";
+    if (screen === "library-no-plex") window.__mock.settings.plex.servers = [];
+    if (screen === "library-offline") window.__mock.plexBrowseError = true;
+    if (screen === "library-unified")
+      libraryFiles.push({
+        ...libraryFiles[0],
+        key: "fixture-unindexed",
+        media: {
+          ...media,
+          kind: "unknown",
+          rating_key: "native:fixture-unindexed",
+          title: "Fixture unindexed video",
+          file: "/fixture/local/unindexed.mkv",
+        },
+        group: "unmatched/fixture-unindexed",
+        group_title: "Fixture unindexed video",
+        matched: false,
+      });
     function CacheSettingsFixture() {
       const [value, setValue] = React.useState(
         window.__mock.settings.native_cache,
@@ -772,23 +845,32 @@
       ? CacheSettingsFixture
       : screen === "cache"
         ? CachePage
-        : screen === "plex"
-          ? PlexLibrary
+        : screen === "plex" || screen.startsWith("library-")
+          ? LibraryPage
           : screen === "nav"
             ? Nav
             : SmartPrefetch;
     const router = createMemoryRouter(
-      [{ path: "*", element: React.createElement(component) }],
+      [
+        {
+          path: "/plex-library",
+          element: React.createElement(LegacyPlexLibraryRedirect),
+        },
+        { path: "/library", element: React.createElement(LibraryPage) },
+        { path: "*", element: React.createElement(component) },
+      ],
       {
         initialEntries: [
-          screen === "settings"
-            ? "/smart-prefetch?tab=settings"
-            : screen === "activity"
-              ? "/smart-prefetch"
-              : "/",
+          new URL(location.href).searchParams.get("entry") ||
+            (screen === "settings"
+              ? "/smart-prefetch?tab=settings"
+              : screen === "activity"
+                ? "/smart-prefetch"
+                : "/"),
         ],
       },
     );
+    window.__mock.router = router;
     const client = new QueryClient({
       defaultOptions: {
         queries: { retry: false, refetchOnWindowFocus: false },
