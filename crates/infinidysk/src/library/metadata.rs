@@ -19,6 +19,9 @@ use tokio::sync::{Mutex as AsyncMutex, RwLock, Semaphore};
 use utoipa::ToSchema;
 
 const DAY: i64 = 86_400_000;
+// A full catalogue takes hundreds of sequential pages; each request still has
+// the Plex client's 15-second deadline. Keep the full sync bounded separately.
+const SYNC_TIMEOUT: Duration = Duration::from_mins(5);
 const MAX_ITEMS: usize = 100_000;
 const MAX_MATCHES: usize = 100;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
@@ -218,6 +221,9 @@ impl Metadata {
         }
     }
     pub async fn tick(&self, force: bool) -> anyhow::Result<()> {
+        self.tick_with_timeout(force, SYNC_TIMEOUT).await
+    }
+    async fn tick_with_timeout(&self, force: bool, timeout: Duration) -> anyhow::Result<()> {
         let Ok(_gate) = self.gate.try_lock() else {
             return Ok(());
         };
@@ -240,16 +246,32 @@ impl Metadata {
             current.refreshing = true;
         }
         let _refreshing = Refreshing(&self.current);
-        let fetched =
-            tokio::time::timeout(Duration::from_secs(25), self.fetch(&settings, force)).await;
-        let Ok(Ok(entries)) = fetched else {
-            let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
-            current.error = Some(
-                "Plex classification sync incomplete; previous complete snapshot retained".into(),
-            );
-            current.retry_at = now_ms() + 60_000;
-            drop(current);
-            return Ok(());
+        let entries = match tokio::time::timeout(timeout, self.fetch(&settings, force)).await {
+            Ok(Ok(entries)) => entries,
+            result => {
+                let reason = match result {
+                    Err(_) => "Plex classification sync timed out".to_owned(),
+                    Ok(Err(error)) => error.to_string(),
+                    Ok(Ok(_)) => unreachable!("successful fetch handled above"),
+                };
+                let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
+                let retained = current
+                    .index
+                    .as_ref()
+                    .is_some_and(|index| index.saved.scope == expected);
+                let snapshot = if retained {
+                    "previous complete snapshot retained"
+                } else {
+                    "no complete snapshot available"
+                };
+                current.error = Some(format!(
+                    "Plex classification sync incomplete: {reason}; {snapshot}"
+                ));
+                current.retry_at = now_ms() + 60_000;
+                drop(current);
+                tracing::warn!(%reason, snapshot_retained = retained, "Plex classification sync incomplete");
+                return Ok(());
+            }
         };
         if !force && self.is_busy() {
             return Ok(());
@@ -657,6 +679,9 @@ mod tests {
         );
         assert_eq!(headers.get("X-Plex-Token").unwrap(), "fixture-secret");
         let mode = remote.mode.load(Ordering::SeqCst);
+        if mode == 8 {
+            tokio::time::sleep(Duration::from_secs(7)).await;
+        }
         if mode == 1 && uri.path().starts_with("/library/") {
             return Response::builder()
                 .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -839,6 +864,58 @@ mod tests {
             assert!(matched.stale);
             assert!(f.service.status().await.error.is_some());
         }
+    }
+    #[tokio::test]
+    async fn healthy_sync_can_take_longer_than_twenty_five_seconds() {
+        let f = Fixture::new().await;
+        // Four healthy requests, each below the client's 15-second timeout,
+        // exceed the old 25-second deadline for the complete sync.
+        f.remote.mode.store(8, Ordering::SeqCst);
+        let started = tokio::time::Instant::now();
+        f.service.tick(true).await.unwrap();
+        assert!(started.elapsed() > Duration::from_secs(25));
+        let status = f.service.status().await;
+        assert_eq!(status.entries, 1);
+        assert!(status.updated_at.is_some());
+        assert!(!status.stale);
+        assert!(status.error.is_none());
+    }
+    #[tokio::test]
+    async fn initial_failure_reports_reason_and_absent_snapshot() {
+        let f = Fixture::new().await;
+        f.remote.mode.store(1, Ordering::SeqCst);
+        f.service.tick(true).await.unwrap();
+        let status = f.service.status().await;
+        let error = status.error.unwrap();
+        assert!(error.contains("Plex could not be reached"));
+        assert!(error.contains("no complete snapshot available"));
+        assert!(!error.contains("retained"));
+        assert!(status.updated_at.is_none());
+        assert!(f.db.plex_classification().await.unwrap().is_none());
+    }
+    #[tokio::test]
+    async fn full_sync_timeout_preserves_complete_snapshot_and_clears_refreshing() {
+        let f = Fixture::new().await;
+        f.service.tick(true).await.unwrap();
+        let before = f.db.plex_classification().await.unwrap();
+        let updated_at = f.service.status().await.updated_at;
+        f.remote.mode.store(4, Ordering::SeqCst);
+        f.service
+            .tick_with_timeout(true, Duration::from_millis(100))
+            .await
+            .unwrap();
+        let status = f.service.status().await;
+        let error = status.error.unwrap();
+        assert!(error.contains("timed out"));
+        assert!(error.contains("previous complete snapshot retained"));
+        assert!(status.stale);
+        assert!(!status.refreshing);
+        assert_eq!(status.updated_at, updated_at);
+        assert_eq!(f.db.plex_classification().await.unwrap(), before);
+        f.remote.release.notify_one();
+        f.remote.mode.store(0, Ordering::SeqCst);
+        f.service.tick(true).await.unwrap();
+        assert!(f.service.status().await.error.is_none());
     }
     #[tokio::test]
     async fn ambiguous_filenames_do_not_override_exact_indexed_library_paths() {
