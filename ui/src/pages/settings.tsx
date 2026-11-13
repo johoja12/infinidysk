@@ -586,6 +586,9 @@ export function Settings() {
   if (settings.isPending) return <Loading />;
   if (settings.isError) return <Failure error={settings.error} />;
   if (!draft) return <Loading />;
+  const importPercent = draft.health.import_sample_depth == null
+    ? draft.health.check_percent
+    : draft.health.import_check_percent;
 
   const view = settings.data;
   const locked = (path: string) => view.locked.some((l) => l === path || path.startsWith(`${l}.`) || l.startsWith(`${path}.`));
@@ -913,6 +916,50 @@ export function Settings() {
                       onValueChange={([concurrency]) => patch("queue", { concurrency })}
                     />
                   </Field>
+                  <Field id="health-import-depth" layout="row"
+                    label={label("Import check depth", "health.import_sample_depth")}
+                    hint="Checked before an import completes. Select a separate preset or custom percentage for imports.">
+                    <Select value={draft.health.import_sample_depth ?? draft.health.sample_depth}
+                      disabled={locked("health.import_sample_depth")}
+                      onValueChange={(depth) => patch("health", { import_sample_depth: depth as Doc["health"]["sample_depth"] })}>
+                      <SelectTrigger id="health-import-depth" aria-label="Import check depth"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="standard">Standard (v1 default)</SelectItem>
+                        <SelectItem value="quick">Quick</SelectItem>
+                        <SelectItem value="enhanced">Enhanced</SelectItem>
+                        <SelectItem value="deep">Deep</SelectItem>
+                        <SelectItem value="complete">Complete</SelectItem>
+                        <SelectItem value="percent">Custom percentage</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  {(draft.health.import_sample_depth ?? draft.health.sample_depth) === "percent" && (
+                  <Field
+                    id="health-import-percent"
+                    layout="row"
+                    label={
+                      <span className="flex w-full flex-wrap items-center justify-between gap-2">
+                        {label("Import sample size", "health.import_check_percent")}
+                        <span className="font-mono tabular-nums">
+                          {importPercent === 100 ? "Every segment" : `${importPercent}%`}
+                        </span>
+                      </span>
+                    }
+                    hint="Checked before an import completes. At 100%, a passed import counts as its first health check; the whole file is not downloaded."
+                    error={invalid("health.import_check_percent")}
+                  >
+                    <Slider
+                      id="health-import-percent"
+                      aria-label="Import sample size"
+                      min={5}
+                      max={100}
+                      step={5}
+                      disabled={locked("health.import_check_percent") || (draft.health.import_sample_depth == null && locked("health.import_sample_depth"))}
+                      value={[importPercent]}
+                      onValueChange={([import_check_percent]) => patch("health", { import_check_percent, import_sample_depth: "percent" })}
+                    />
+                  </Field>
+                  )}
                   <Field
                     label={label("Blocked files", "queue.extra_blocklist")}
                     hint={
@@ -1030,7 +1077,7 @@ export function Settings() {
                           </span>
                         </span>
                       }
-                      hint="Applies to imports and subsequent health checks. At 100%, every article is checked for availability; the entire file is not downloaded and verified."
+                      hint="Applies to health checks. At 100%, every article is checked for availability; the entire file is not downloaded and verified."
                       error={invalid("health.check_percent")}
                     >
                       <Slider

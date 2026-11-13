@@ -84,6 +84,40 @@ async fn env_overrides_win_are_never_stored_and_masked_secrets_survive_saves() {
 }
 
 #[tokio::test]
+async fn import_sample_percent_defaults_independently_and_rejects_invalid_values() {
+    let path =
+        std::env::temp_dir().join(format!("infinidysk-config-{}.sqlite", uuid::Uuid::now_v7()));
+    let db = Db::connect(&format!("sqlite:{}", path.display()))
+        .await
+        .expect("connect");
+    db.write_config(&[("health", r#"{"check_percent":100}"#)], &[])
+        .await
+        .expect("legacy settings");
+    let store = ConfigStore::load(db.clone(), []).await.expect("load");
+    assert_eq!(store.settings().health.check_percent, 100);
+    assert_eq!(store.settings().health.import_check_percent, 5);
+
+    assert!(
+        serde_json::from_str::<Settings>(
+            r#"{"health":{"check_percent":100,"import_check_percent":null}}"#,
+        )
+        .is_err()
+    );
+    for percent in [4, 101] {
+        let mut settings = store.settings().clone();
+        settings.health.import_check_percent = percent;
+        let error = settings.validate().expect_err("invalid percentage");
+        assert_eq!(error.path(), Some("health.import_check_percent"));
+    }
+
+    drop(store);
+    db.close().await;
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
 async fn a_readarr_instance_stops_loading_with_what_to_do() {
     let path =
         std::env::temp_dir().join(format!("infinidysk-config-{}.sqlite", uuid::Uuid::now_v7()));
@@ -702,5 +736,39 @@ async fn source_policies_require_configured_servers_and_keep_environment_authori
     db.close().await;
     for suffix in ["", "-wal", "-shm"] {
         let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+    }
+}
+
+#[tokio::test]
+async fn fork_import_sampling_migrates_and_stays_independent_after_save() {
+    use infinidysk::config::HealthSampleDepth;
+    for (preset, percent) in [("percent", 100), ("deep", 25), ("complete", 5)] {
+        let db = Db::connect("sqlite::memory:").await.expect("db");
+        let raw = format!(r#"{{"sample_depth":"{preset}","check_percent":{percent}}}"#);
+        db.write_config(&[("health", raw.as_str())], &[])
+            .await
+            .expect("old fork config");
+        let mut store = ConfigStore::load(db.clone(), []).await.expect("load");
+        let before = store.settings().health.clone();
+        assert_eq!(before.import_sample_depth, Some(before.sample_depth));
+        assert_eq!(before.import_check_percent, percent);
+        let mut settings = store.settings().clone();
+        settings.health.sample_depth = HealthSampleDepth::Quick;
+        settings.health.check_percent = 10;
+        settings.health.import_check_percent = 5;
+        store.save(settings).await.expect("save");
+        drop(store);
+        let store = ConfigStore::load(db.clone(), []).await.expect("reload");
+        assert_eq!(
+            store.settings().health.import_sample_depth,
+            before.import_sample_depth
+        );
+        assert_eq!(store.settings().health.import_check_percent, 5);
+        assert_eq!(
+            store.settings().health.sample_depth,
+            HealthSampleDepth::Quick
+        );
+        drop(store);
+        db.close().await;
     }
 }

@@ -505,10 +505,14 @@ impl Default for Network {
 pub struct Health {
     /// Run routine checks. Rechecks, playback reports and repairs run regardless.
     pub enabled: bool,
-    /// Share of segments each check probes, 5 to 100; at least 5 segments.
+    /// Share of segments each health check probes, 5 to 100; at least 5 segments.
     pub check_percent: u8,
     /// V1 size-based depth, or an explicit custom percentage.
     pub sample_depth: HealthSampleDepth,
+    /// Share of segments an import probes, 5 to 100; at least 5 segments.
+    pub import_check_percent: u8,
+    /// Import depth; absent retains the existing size-based health policy.
+    pub import_sample_depth: Option<HealthSampleDepth>,
     /// Ask the Arr that imported a broken file for a replacement.
     pub auto_repair: bool,
     /// Keep serving files with a few small gaps instead of replacing them.
@@ -527,6 +531,8 @@ impl Default for Health {
             enabled: true,
             check_percent: infinidysk_core::media::SAMPLE_PERCENT,
             sample_depth: HealthSampleDepth::Standard,
+            import_check_percent: infinidysk_core::media::SAMPLE_PERCENT,
+            import_sample_depth: None,
             auto_repair: true,
             degraded_tolerance: true,
             unowned_action: UnownedAction::Delete,
@@ -1234,6 +1240,12 @@ impl Settings {
             d.health.check_percent,
         );
         reset(
+            "health.import_check_percent",
+            &mut self.health.import_check_percent,
+            &CHECK_PERCENT,
+            d.health.import_check_percent,
+        );
+        reset(
             "queue.concurrency",
             &mut self.queue.concurrency,
             &QUEUE_CONCURRENCY,
@@ -1409,6 +1421,12 @@ impl Settings {
             "health.check_percent",
             "Check percent",
             self.health.check_percent,
+            &CHECK_PERCENT,
+        )?;
+        check(
+            "health.import_check_percent",
+            "Import check percent",
+            self.health.import_check_percent,
             &CHECK_PERCENT,
         )?;
         check(
@@ -1886,6 +1904,16 @@ impl ConfigStore {
     /// Validates and persists `new`. [`MASK`] secrets keep their current value.
     pub async fn save(&mut self, mut new: Settings) -> Result<(), Error> {
         new.restore_secrets(&self.settings);
+        if new.health.import_sample_depth.is_none()
+            && new.health.sample_depth != self.settings.health.sample_depth
+        {
+            new.health.import_sample_depth = Some(
+                self.settings
+                    .health
+                    .import_sample_depth
+                    .unwrap_or(self.settings.health.sample_depth),
+            );
+        }
         new.validate_in(&self.default_cache_dir)?;
         let mut tree = serde_json::to_value(&new)?;
         let current = serde_json::to_value(&self.settings)?;
@@ -1942,11 +1970,30 @@ fn effective(
 ) -> Result<Settings, Error> {
     let mut tree = serde_json::to_value(Settings::default())?;
     merge(&mut tree, Value::Object(stored.clone()));
+    if let Some(health) = stored.get("health")
+        && health.get("sample_depth").is_some()
+        && health.get("import_check_percent").is_none()
+        && health.get("import_sample_depth").is_none()
+        && let Some(percent) = health.get("check_percent")
+    {
+        set(
+            &mut tree,
+            &["health".into(), "import_check_percent".into()],
+            percent.clone(),
+        );
+    }
     for o in env {
         set(&mut tree, &o.path, o.value.clone());
     }
     reject_readarr(&tree)?;
     let mut settings: Settings = serde_json::from_value(tree)?;
+    if settings.health.import_sample_depth.is_none()
+        && stored
+            .get("health")
+            .is_some_and(|health| health.get("sample_depth").is_some())
+    {
+        settings.health.import_sample_depth = Some(settings.health.sample_depth);
+    }
     settings.reset_invalid();
     settings.validate_in(default_cache_dir)?;
     Ok(settings)

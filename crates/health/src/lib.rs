@@ -377,6 +377,8 @@ impl Health {
 
     pub async fn run(&self) {
         tokio::time::sleep(STARTUP_DELAY).await;
+        // Checked every turn, so a steady stream of due work cannot hold it off.
+        let mut reconcile_at = tokio::time::Instant::now();
         loop {
             // Persisted holds also recover after a crash, when no handles survive.
             if let Ok(held) = self.db.reader_held_repairs().await {
@@ -385,6 +387,10 @@ impl Health {
                         tracing::warn!(reason=%error, "reader-held repair recovery deferred");
                     }
                 }
+            }
+            if tokio::time::Instant::now() >= reconcile_at {
+                self.forget_deleted().await;
+                reconcile_at = tokio::time::Instant::now() + IDLE_POLL;
             }
             match self.step().await {
                 Ok(true) => {}
@@ -433,6 +439,39 @@ impl Health {
             self.wake.notify_one();
         }
         Ok(())
+    }
+
+    /// Drops the inconclusive streaks of items deleted since they
+    /// were recorded. Item ids are never reused, so a missing item is gone for good.
+    async fn forget_deleted(&self) {
+        let ids: Vec<ItemId> = self
+            .inconclusive
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .copied()
+            .collect();
+        let mut gone = Vec::new();
+        for id in ids {
+            match self.db.item(id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => gone.push(id),
+                Err(error) => {
+                    tracing::warn!(reason = %error, "could not check health bookkeeping against the library");
+                    return;
+                }
+            }
+        }
+        if gone.is_empty() {
+            return;
+        }
+        let mut inconclusive = self
+            .inconclusive
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for id in &gone {
+            inconclusive.remove(id);
+        }
     }
 
     async fn housekeep(&self) {
@@ -1800,6 +1839,8 @@ pub async fn first_check(
 
 #[cfg(test)]
 mod tests {
+    use infinidysk_core::ItemKind;
+
     use super::*;
 
     // Compile-time guard: borrowed iterators in `stream::iter` once made this future `!Send`.
@@ -1944,6 +1985,33 @@ mod tests {
         drop(store);
         drop(db);
         std::fs::remove_dir_all(path).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn deleted_items_leave_no_health_bookkeeping() {
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let content = db.item(ItemId::CONTENT).await.unwrap().unwrap();
+        let kept = Item::child(&content, "kept.mkv", ItemKind::NzbFile).unwrap();
+        let gone = Item::child(&content, "gone.mkv", ItemKind::NzbFile).unwrap();
+        db.insert(&[kept.clone(), gone.clone()], &[]).await.unwrap();
+        db.delete_item(gone.id).await.unwrap();
+        let (_arr, arr) = watch::channel(Vec::new());
+        let (_settings, settings) = watch::channel(Settings::default());
+        let health = Health::new(db, Arc::new(Client::new([])), arr, settings).unwrap();
+        for id in [kept.id, gone.id] {
+            health.inconclusive.lock().unwrap().insert(id, 1);
+        }
+
+        health.forget_deleted().await;
+
+        let inconclusive: Vec<ItemId> = health
+            .inconclusive
+            .lock()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(inconclusive, [kept.id]);
     }
 
     #[test]

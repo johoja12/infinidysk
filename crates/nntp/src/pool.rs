@@ -190,6 +190,8 @@ pub(crate) struct Tag {
     /// another request: a hedge queued behind a slow article is as slow as it.
     pub(crate) fresh: bool,
     pub(crate) lane: Option<Lane>,
+    /// A provider's miss is remembered, so later requests skip that provider.
+    pub(crate) remember: bool,
 }
 
 impl Tag {
@@ -207,6 +209,7 @@ impl Tag {
         sink: None,
         fresh: false,
         lane: None,
+        remember: true,
     };
 
     fn step(&self, step: Step) {

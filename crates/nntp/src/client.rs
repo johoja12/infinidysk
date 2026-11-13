@@ -600,6 +600,49 @@ impl Client {
         .map(drop)
     }
 
+    /// [`body_with`](Self::body_with) for a dry run: a provider's miss is not remembered,
+    /// so later requests still ask that provider. Misses remembered earlier are skipped
+    /// as usual.
+    pub async fn body_unremembered(
+        &self,
+        message_id: &str,
+        workload: Workload,
+        probe: Option<&Probe>,
+        begin: Option<u64>,
+    ) -> Result<Body, Error> {
+        let tag = Tag {
+            workload,
+            probe: probe.cloned(),
+            begin,
+            remember: false,
+            ..Tag::UNTRACKED
+        };
+        self.body_tagged(message_id, tag).await
+    }
+
+    /// A dry-run BODY that retains operation lane isolation without remembering misses.
+    pub async fn body_unremembered_in_lane(
+        &self,
+        message_id: &str,
+        lane: Lane,
+        workload: Workload,
+        probe: Option<&Probe>,
+        begin: Option<u64>,
+    ) -> Result<Body, Error> {
+        self.body_tagged(
+            message_id,
+            Tag {
+                lane: Some(lane),
+                workload,
+                probe: probe.cloned(),
+                begin,
+                remember: false,
+                ..Tag::UNTRACKED
+            },
+        )
+        .await
+    }
+
     /// A playback body racing a slow fetch of the same article: waits for an idle
     /// connection rather than pipeline behind another request.
     pub async fn hedge(
@@ -882,7 +925,7 @@ impl Client {
                 failed |= matches!(outcome, Outcome::Failure | Outcome::Fatal);
                 if matches!(outcome, Outcome::Miss) {
                     missed.extend(backbone);
-                    if error.is_none() {
+                    if error.is_none() && base.remember {
                         self.missing.insert(group, message_id);
                     }
                 }
