@@ -82,7 +82,11 @@ async fn a_new_repair_never_joins_an_old_provider_flight_or_reuses_its_cached_bo
         let cache = cache.clone();
         let client = client.clone();
         let id = id.clone();
-        tokio::spawn(async move { cache.body(&client, &id, Some(0), None, None).await })
+        tokio::spawn(async move {
+            cache
+                .body(&client, &id, Workload::Health, Some(0), None, None)
+                .await
+        })
     };
     tokio::time::timeout(Duration::from_secs(5), gate.blocked())
         .await
@@ -93,7 +97,7 @@ async fn a_new_repair_never_joins_an_old_provider_flight_or_reuses_its_cached_bo
         .expect("repair publication");
     let bytes = tokio::time::timeout(
         Duration::from_secs(2),
-        cache.body(&client, &id, Some(0), None, None),
+        cache.body(&client, &id, Workload::Stream, Some(0), None, None),
     )
     .await
     .expect("new revision is independent of held original")
@@ -111,7 +115,7 @@ async fn a_new_repair_never_joins_an_old_provider_flight_or_reuses_its_cached_bo
     cache.insert_revision(&id, RepairRevision::Base, Bytes::from_static(b"original"));
     assert_eq!(
         cache
-            .body(&client, &id, Some(0), None, None)
+            .body(&client, &id, Workload::Stream, Some(0), None, None)
             .await
             .expect("late base cannot win")
             .as_ref(),
@@ -119,21 +123,31 @@ async fn a_new_repair_never_joins_an_old_provider_flight_or_reuses_its_cached_bo
     );
     assert_eq!(
         cache
-            .body(&client, "untouched@fixture", None, None, None)
+            .body(
+                &client,
+                "untouched@fixture",
+                Workload::Stream,
+                None,
+                None,
+                None
+            )
             .await
             .expect("unrelated original key")
             .as_ref(),
         b"retained"
     );
     assert!(
-        cache.body(&client, &id, Some(1), None, None).await.is_err(),
+        cache
+            .body(&client, &id, Workload::Stream, Some(1), None, None)
+            .await
+            .is_err(),
         "a hot repair still checks source geometry"
     );
     let poison = format!("{id}\0repair-v1\0malformed");
     cache.insert(&poison, Bytes::from_static(b"invalid!"));
     assert!(
         cache
-            .body(&client, &poison, None, None, None)
+            .body(&client, &poison, Workload::Stream, None, None, None)
             .await
             .is_err(),
         "raw IDs cannot collide with revision namespaces"
@@ -166,7 +180,11 @@ async fn abandoned_original_bodies_keep_their_admission_stamp_after_publication(
         let cache = cache.clone();
         let client = client.clone();
         let id = id.clone();
-        tokio::spawn(async move { cache.body(&client, &id, Some(0), None, None).await })
+        tokio::spawn(async move {
+            cache
+                .body(&client, &id, Workload::Stream, Some(0), None, None)
+                .await
+        })
     };
     tokio::time::timeout(Duration::from_secs(5), gate.blocked())
         .await
@@ -189,7 +207,7 @@ async fn abandoned_original_bodies_keep_their_admission_stamp_after_publication(
     );
     assert_eq!(
         cache
-            .body(&client, &id, Some(0), None, None)
+            .body(&client, &id, Workload::Stream, Some(0), None, None)
             .await
             .expect("repair")
             .as_ref(),
@@ -224,7 +242,14 @@ async fn versioned_disk_keys_survive_reopen_and_never_fall_back_to_old_base_byte
         .expect("repair");
     assert_eq!(
         cache
-            .body(&client, "disk@fixture", Some(0), None, None)
+            .body(
+                &client,
+                "disk@fixture",
+                Workload::Stream,
+                Some(0),
+                None,
+                None
+            )
             .await
             .expect("repaired disk key")
             .as_ref(),
@@ -246,7 +271,14 @@ async fn versioned_disk_keys_survive_reopen_and_never_fall_back_to_old_base_byte
     cache.configure(&config).await;
     assert_eq!(
         cache
-            .body(&client, "disk@fixture", Some(0), None, None)
+            .body(
+                &client,
+                "disk@fixture",
+                Workload::Stream,
+                Some(0),
+                None,
+                None
+            )
             .await
             .expect("repair after reopen")
             .as_ref(),
@@ -263,7 +295,14 @@ async fn versioned_disk_keys_survive_reopen_and_never_fall_back_to_old_base_byte
         .expect("evict payload only");
     assert!(
         cache
-            .body(&client, "disk@fixture", Some(0), None, None)
+            .body(
+                &client,
+                "disk@fixture",
+                Workload::Stream,
+                Some(0),
+                None,
+                None
+            )
             .await
             .is_err(),
         "absent repair must not return old original bytes"

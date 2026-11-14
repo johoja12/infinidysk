@@ -665,12 +665,11 @@ impl Health {
 
     /// Asks for a media analysis of `id` soon. `false` if there is no such file.
     pub async fn request_analysis(&self, id: ItemId) -> Result<bool, Error> {
-        if self.db.health(id).await?.is_none() {
-            return Ok(false);
+        let accepted = self.db.request_media_probe(id, now_ms()).await?;
+        if accepted {
+            self.wake.notify_one();
         }
-        self.db.request_media_probe(id, now_ms()).await?;
-        self.wake.notify_one();
-        Ok(true)
+        Ok(accepted)
     }
 
     async fn analyze(
@@ -2012,6 +2011,8 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(inconclusive, [kept.id]);
+        assert!(!health.request_analysis(gone.id).await.unwrap());
+        assert!(health.request_analysis(kept.id).await.unwrap());
     }
 
     #[test]

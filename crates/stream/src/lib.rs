@@ -1172,7 +1172,11 @@ async fn fetch(
                 Err(error) => Err(error),
             }
         }
-        Source::Shared(cache) => cache.body(client, id, begin, probe, progress).await,
+        Source::Shared(cache) => {
+            cache
+                .body(client, id, workload, begin, probe, progress)
+                .await
+        }
         Source::Hedge(Some(cache)) => cache.hedge(client, id, begin, probe).await,
         Source::Hedge(None) => client
             .hedge(id, probe, begin)

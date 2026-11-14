@@ -1,21 +1,21 @@
 //! Mounts the tree and reads it through the kernel. Needs Linux, `/dev/fuse` and root (the
-//! test switches filesystem UID for cross-UID checks): `cargo test -p infinidysk-fuse -- --ignored`.
+//! test switches filesystem UID for cross-UID checks): `cargo test -p infinidysk-mount -- --ignored`.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)] // Test helpers outside `#[test]` fns; panics are the assertions.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use infinidysk_core::{
     BlobId, FileMeta, ItemId, ItemKind, JobId, NzbFile, Segment, Segments, blob,
 };
 use infinidysk_db::{Db, HistoryEntry, Item, JobStatus};
-use infinidysk_fuse::{Config, run};
+use infinidysk_mount::{Config, run};
 use infinidysk_nntp::{Client, Downloads, Endpoint, Pool, PoolConfig, Provider, TlsMode};
 use infinidysk_stream::Budget;
 use infinidysk_testkit::{LoopbackServer, post};
-use infinidysk_vfs::Vfs;
+use infinidysk_vfs::{Tracing, Vfs};
 use tokio_util::sync::CancellationToken;
 
 const ARTICLE: usize = 4096;
@@ -149,6 +149,10 @@ async fn kernel(native: bool) {
         .with_native_cache(cache.clone()),
     );
     let mount_probe = vfs.mount_probe();
+    vfs.sessions().set_tracing(Some(Tracing {
+        until: Instant::now() + Duration::from_secs(600),
+        capacity: 10_000,
+    }));
     let task = tokio::spawn(run(
         Arc::clone(&vfs),
         Config {
@@ -186,11 +190,11 @@ async fn kernel(native: bool) {
             root,
             [".ids", "README", "completed-symlinks", "content", "nzbs"]
         );
-        infinidysk_fuse::answers(&mount).unwrap();
+        infinidysk_mount::answers(&mount).unwrap();
         let plain = mount.parent().unwrap().join("plain");
         std::fs::create_dir_all(&plain).unwrap();
         assert!(
-            infinidysk_fuse::answers(&plain).is_err(),
+            infinidysk_mount::answers(&plain).is_err(),
             "not a FUSE mount"
         );
 
@@ -331,4 +335,32 @@ async fn kernel(native: bool) {
     assert_eq!(reported.max_background, Some(64));
     assert_eq!(reported.congestion_threshold, Some(48));
     assert_eq!(waiting, Some(0));
+
+    // Every traced FUSE read is timed from its arrival to its reply, and the open's own
+    // work before the stream started is kept.
+    let traced = vfs.sessions().traced();
+    assert!(!traced.is_empty(), "reads were traced");
+    let mut requests = 0;
+    for session in &traced {
+        let summary = session.trace.as_ref().unwrap().summary();
+        assert_eq!(summary.requests_pending, 0, "no request left behind");
+        assert_eq!(summary.requests_unmatched, 0);
+        assert_eq!(summary.requests_failed, 0);
+        assert!(summary.open_before_ns.is_some(), "the open replied");
+        assert_eq!(session.handle().is_some(), summary.open_reply_ns.is_some());
+        if summary.requests > 0 {
+            assert!(summary.first_request_ns.is_some());
+            assert!(summary.first_reply_ns.is_some());
+            assert!(summary.in_request_ns > 0);
+        }
+        requests += summary.requests;
+    }
+    assert!(requests > 0, "reads reached the daemon");
+    let ops = vfs.sessions().fuse_ops();
+    assert!(ops.seen > 0, "metadata calls were counted while tracing");
+    assert_eq!(ops.seen, ops.fast + ops.listed.len() as u64 + ops.dropped);
+    assert!(
+        vfs.sessions().pending_ops().is_empty(),
+        "every metadata call replied"
+    );
 }

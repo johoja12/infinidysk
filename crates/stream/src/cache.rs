@@ -111,11 +111,12 @@ struct Inflight {
     flights: HashMap<Arc<str>, WeakFlight>,
 }
 
-/// A flight's generation, the flight, and the wait of the reader that started it.
+/// A flight's generation, future, leader wait and starting workload.
 type WeakFlight = (
     u64,
     WeakShared<BoxFuture<'static, Landed>>,
     Option<Arc<Wait>>,
+    Workload,
 );
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -416,6 +417,7 @@ impl Cache {
         self: &Arc<Self>,
         client: &Arc<Client>,
         message_id: &str,
+        workload: Workload,
         begin: Option<u64>,
         probe: Option<&Probe>,
         progress: Option<Progress>,
@@ -444,7 +446,8 @@ impl Cache {
                 key: key.as_ref().into(),
                 revision,
             };
-            let (flight, joined) = self.flight(client, stamped, begin, probe, progress.clone());
+            let (flight, joined) =
+                self.flight(client, stamped, workload, begin, probe, progress.clone());
             let result = flight.await;
             if client.repair_revision(message_id) != revision {
                 continue;
@@ -467,13 +470,14 @@ impl Cache {
         &self,
         client: &Client,
         stamp: &Stamped,
+        workload: Workload,
         begin: Option<u64>,
         probe: Option<&Probe>,
         progress: Option<&Progress>,
     ) -> Body {
         self.misses.fetch_add(1, Ordering::Relaxed);
         let body = client
-            .body_with(&stamp.message, Workload::Stream, probe, progress, begin)
+            .body_with(&stamp.message, workload, probe, progress, begin)
             .await;
         if client.repair_revision(&stamp.message) != stamp.revision {
             return Err(Arc::new(Error::Unavailable));
@@ -519,18 +523,21 @@ impl Cache {
         self: &Arc<Self>,
         client: &Arc<Client>,
         stamp: Stamped,
+        workload: Workload,
         begin: Option<u64>,
         probe: Option<&Probe>,
         progress: Option<Progress>,
     ) -> (Flight, bool) {
         let mut inflight = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((generation, flight, leader)) =
-            inflight
-                .flights
-                .get(&stamp.key)
-                .and_then(|(generation, weak, leader)| {
-                    Some((*generation, weak.upgrade()?, leader.clone()))
-                })
+        if let Some((generation, flight, leader)) = inflight
+            .flights
+            .get(&stamp.key)
+            .filter(|(_, _, _, started)| {
+                workload != Workload::Stream || *started == Workload::Stream
+            })
+            .and_then(|(generation, weak, leader, _)| {
+                Some((*generation, weak.upgrade()?, leader.clone()))
+            })
         {
             drop(inflight);
             if let Some(probe) = probe {
@@ -565,7 +572,14 @@ impl Cache {
                 return Ok((data, true));
             }
             let body = cache
-                .fetch(&client, &stamp, begin, probe.as_ref(), progress.as_ref())
+                .fetch(
+                    &client,
+                    &stamp,
+                    workload,
+                    begin,
+                    probe.as_ref(),
+                    progress.as_ref(),
+                )
                 .await;
             drop(landing);
             Ok((body?, false))
@@ -573,7 +587,9 @@ impl Cache {
         .boxed()
         .shared();
         if let Some(weak) = flight.downgrade() {
-            inflight.flights.insert(key, (generation, weak, leader));
+            inflight
+                .flights
+                .insert(key, (generation, weak, leader, workload));
         }
         drop(inflight);
         (flight, false)
@@ -600,7 +616,7 @@ impl Drop for Landing {
         if inflight
             .flights
             .get(&self.key)
-            .is_some_and(|(generation, _, _)| *generation == self.generation)
+            .is_some_and(|(generation, _, _, _)| *generation == self.generation)
         {
             inflight.flights.remove(&self.key);
         }
@@ -618,6 +634,35 @@ mod tests {
     use std::sync::{TryLockError, mpsc};
 
     use super::*;
+
+    #[test]
+    fn replacing_background_flights_preserves_sharing_and_cleanup() {
+        for background in [Workload::Health, Workload::Queue] {
+            let client = Arc::new(Client::new([]));
+            let cache = Arc::new(Cache::new(true, 1 << 20));
+            let flight = |workload| {
+                cache.flight(
+                    &client,
+                    Stamped::new("priority@test", RepairRevision::Base).unwrap(),
+                    workload,
+                    None,
+                    None,
+                    None,
+                )
+            };
+            let (original, joined) = flight(background);
+            assert!(!joined);
+            let (follower, joined) = flight(background);
+            assert!(joined, "background readers still share");
+            let (playback, joined) = flight(Workload::Stream);
+            assert!(!joined, "playback replaces the background flight");
+            drop((original, follower));
+            assert!(flight(Workload::Stream).1, "old cleanup preserves playback");
+            assert!(flight(background).1, "background can join playback");
+            drop(playback);
+            assert!(cache.inflight.lock().unwrap().flights.is_empty());
+        }
+    }
 
     #[test]
     fn disable_clears_an_insertion_paused_after_its_enabled_check() {
