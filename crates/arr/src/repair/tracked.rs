@@ -537,6 +537,55 @@ where
     Ok(())
 }
 
+/// Continue the same journaled attempt after its accepted replacement failed.
+/// The coordinator must first verify failed replacement history and reserve the
+/// search. Existing pending mutations are observed rather than dispatched again.
+pub async fn search_again_tracked<F, Fut>(
+    http: &reqwest::Client,
+    arr: &Arr,
+    progress: &mut Regrab,
+    checkpoint: F,
+) -> Result<(), Error>
+where
+    F: Fn(Regrab) -> Fut,
+    Fut: Future<Output = Result<(), Error>>,
+{
+    if progress.version != 1 {
+        return Err(Error::Unexpected("unsupported regrab journal version"));
+    }
+    if !matches!(
+        progress.stage,
+        RegrabStage::Submitted
+            | RegrabStage::Blocklisted
+            | RegrabStage::DeletePending
+            | RegrabStage::Deleted
+            | RegrabStage::SearchPending
+            | RegrabStage::Replaced
+    ) {
+        return Err(Error::Unexpected("journal is not awaiting a replacement"));
+    }
+    if progress.stage == RegrabStage::Submitted {
+        let s = Session::open(http, arr).await?;
+        library_authority(&s, &progress.owner).await?;
+        let mut next = progress.clone();
+        // Keep the acknowledged blocklist. Do not accept the failed grab as a
+        // successful own-search result when continuing to delete and search.
+        next.stage = RegrabStage::Blocklisted;
+        next.search_since = Some(
+            super::newest_grabs(&s, &progress.owner)
+                .await?
+                .iter()
+                .map(|grab| grab.id)
+                .max()
+                .unwrap_or(0),
+        );
+        next.wait_until = 0;
+        next.command = None;
+        save(progress, next, &checkpoint).await?;
+    }
+    replace_tracked(http, arr, progress, Duration::ZERO, checkpoint).await
+}
+
 /// Advances only facts established by GETs. It never dispatches a mutation.
 pub async fn observe_tracked(
     http: &reqwest::Client,

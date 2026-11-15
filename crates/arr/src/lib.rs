@@ -18,9 +18,12 @@ use uuid::Uuid;
 
 pub use repair::tracked::{
     Regrab, RegrabStage, legacy_replacement_observed, observe_tracked, regrab_replaced,
-    replace_tracked,
+    replace_tracked, search_again_tracked,
 };
-pub use repair::{Import, Owner, all_imports, imports, owner, owner_of_file, replace};
+pub use repair::{
+    Import, Owner, all_imports, imports, owner, owner_of_file, replace, replacement_failed,
+    search_again,
+};
 
 /// What the Arr shows in place of a stored secret.
 const MASK: &str = "********";

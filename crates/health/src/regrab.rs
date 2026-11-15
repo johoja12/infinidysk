@@ -75,6 +75,19 @@ pub enum Control {
     Abandon,
     Resume,
 }
+pub(super) fn search_again_pending(row: &RegrabIntent) -> bool {
+    serde_json::from_str::<Saved>(&row.payload).is_ok_and(|saved| {
+        !saved.abandoned
+            && saved.progress.version == 1
+            && matches!(
+                saved.progress.stage,
+                RegrabStage::Blocklisted
+                    | RegrabStage::DeletePending
+                    | RegrabStage::Deleted
+                    | RegrabStage::SearchPending
+            )
+    })
+}
 impl Health {
     pub async fn run_regrab_observer(&self) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
@@ -263,6 +276,29 @@ impl Health {
         job_name: &str,
         existing: Option<RegrabIntent>,
     ) -> Result<Result<(), arr::Error>, Error> {
+        self.tracked_regrab_with_retry(item, arr, owner, job_name, existing, false)
+            .await
+    }
+    pub(super) async fn tracked_search_again(
+        &self,
+        item: &Item,
+        arr: &Arr,
+        owner: &Owner,
+        job_name: &str,
+        existing: RegrabIntent,
+    ) -> Result<Result<(), arr::Error>, Error> {
+        self.tracked_regrab_with_retry(item, arr, owner, job_name, Some(existing), true)
+            .await
+    }
+    async fn tracked_regrab_with_retry(
+        &self,
+        item: &Item,
+        arr: &Arr,
+        owner: &Owner,
+        job_name: &str,
+        existing: Option<RegrabIntent>,
+        search_again: bool,
+    ) -> Result<Result<(), arr::Error>, Error> {
         let writing = self.db.write_permit().await;
         if self.db.legacy_repair_held(item.id).await? {
             return Ok(Err(arr::Error::Unexpected(
@@ -403,16 +439,20 @@ impl Health {
             }
         };
         drop(writing);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(25),
-            arr::replace_tracked(
-                &self.http,
-                arr,
-                &mut saved.progress,
-                self.arr_wait,
-                checkpoint,
-            ),
-        )
+        let result = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+            if search_again {
+                arr::search_again_tracked(&self.http, arr, &mut saved.progress, checkpoint).await
+            } else {
+                arr::replace_tracked(
+                    &self.http,
+                    arr,
+                    &mut saved.progress,
+                    self.arr_wait,
+                    checkpoint,
+                )
+                .await
+            }
+        })
         .await
         .unwrap_or(Err(arr::Error::Uncertain(
             "repair pass timed out; journal observation will resume",

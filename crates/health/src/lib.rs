@@ -48,6 +48,8 @@ const CONCURRENCY_IDLE: usize = 16;
 const CONCURRENCY_STREAMING: usize = 4;
 const ARR_WAIT: Duration = Duration::from_secs(120);
 const HIDDEN_WAIT_MS: i64 = DAY_MS;
+/// Slack for the Arr's clock when telling grabs made after a replacement request.
+const GRAB_SLACK_MS: i64 = 10 * MINUTE_MS;
 const ARR_RETRY_MS: i64 = HOUR_MS;
 /// Retry delay for a repair held back by the shared search limit.
 const SEARCH_WAIT_MS: i64 = infinidysk_db::SEARCH_WINDOW_MS;
@@ -555,7 +557,7 @@ impl Health {
         let work = async {
             match status.state {
                 HealthState::Repairing => self.repair(&item, status, &settings, &mut writing).await,
-                HealthState::Hidden => self.reconcile(&item, status, &mut writing).await,
+                HealthState::Hidden => self.reconcile(&item, status, &settings, &mut writing).await,
                 _ if !media::is_checkable(&item.name) => {
                     let ignored = HealthStatus {
                         state: HealthState::Ignored,
@@ -1446,12 +1448,14 @@ impl Health {
         Ok(())
     }
 
-    /// Hourly look at a `hidden` file: gone once the Arr has its replacement, back to
-    /// repairing (or `action_needed`) when the wait runs out.
+    /// Hourly look at a `hidden` file: gone once the Arr has its replacement, searched
+    /// again once that replacement failed, back to repairing (or `action_needed`) when the
+    /// wait runs out.
     async fn reconcile(
         &self,
         item: &Item,
         status: HealthStatus,
+        settings: &Settings,
         writing: &mut Writing,
     ) -> Result<(), Error> {
         if self.db.legacy_repair_held(item.id).await? {
@@ -1478,7 +1482,41 @@ impl Health {
             .await?;
             return Ok(self.db.delete_item(item.id).await?);
         }
+        // Resume from the saved owner even after the Arr deleted its file. The
+        // pending journal is the authority; fresh discovery may now find nothing.
+        if settings.auto_repair
+            && let Some(row) = self.db.regrab_intent(item.id).await?
+            && regrab::search_again_pending(&row)
+        {
+            let saved: regrab::Saved = serde_json::from_str(&row.payload)?;
+            let arr = self
+                .arr
+                .borrow()
+                .iter()
+                .find(|arr| arr.id.to_string() == saved.arr_id)
+                .cloned();
+            if let Some(arr) = arr
+                && self
+                    .search_again(item, status, &arr, &saved.progress.owner, None, writing)
+                    .await?
+            {
+                return Ok(());
+            }
+            self.db.set_health(item.id, &next, Recheck::None).await?;
+            return Ok(());
+        }
         let lookup = self.released(writing, self.owner(item)).await?;
+        if let Lookup::Found {
+            arr, owner, job, ..
+        } = &lookup
+            && !owner.replaced()
+            && settings.auto_repair
+            && self
+                .search_again(item, status, arr, owner, *job, writing)
+                .await?
+        {
+            return Ok(());
+        }
         match lookup {
             Lookup::Found { arr, owner, .. } if owner.replaced() => {
                 tracing::info!(path = %item.path, arr = %arr.name, "replacement imported; deleting the broken file");
@@ -1516,6 +1554,84 @@ impl Health {
         // Rechecks wait until the file is visible again.
         self.db.set_health(item.id, &next, Recheck::None).await?;
         Ok(())
+    }
+
+    /// When the replacement the Arr accepted for hidden `item` has since failed, deletes
+    /// the file in the Arr and searches, the fallback the request would have taken had the
+    /// Arr found nothing. The same attempt, so it spends no budget. `true` once done.
+    async fn search_again(
+        &self,
+        item: &Item,
+        status: HealthStatus,
+        arr: &Arr,
+        owner: &arr::Owner,
+        job: Option<JobId>,
+        writing: &mut Writing,
+    ) -> Result<bool, Error> {
+        let Some(hidden_until) = status.hidden_until else {
+            return Ok(false);
+        };
+        if (self.in_use)(item.id) || self.db.item_remap_pending(item.id).await? {
+            return Ok(false);
+        }
+        // The Arr's search may grab during the wait before hiding; its clock may drift.
+        let wait_ms = i64::try_from(self.arr_wait.as_millis()).unwrap_or(i64::MAX);
+        let since = hidden_until
+            .saturating_sub(HIDDEN_WAIT_MS)
+            .saturating_sub(wait_ms)
+            .saturating_sub(GRAB_SLACK_MS);
+        let Some(existing) = self.db.regrab_intent(item.id).await? else {
+            return Ok(false);
+        };
+        let job = job.map(|j| j.to_string());
+        if !regrab::search_again_pending(&existing) {
+            let failed = arr::replacement_failed(&self.http, arr, job.as_deref(), owner, since);
+            match self.released(writing, failed).await {
+                Ok(true) => {}
+                Ok(false) => return Ok(false),
+                Err(error) => {
+                    tracing::debug!(path = %item.path, arr = %arr.name, reason = %error, "could not tell whether the replacement failed");
+                    return Ok(false);
+                }
+            }
+            let (kind, ids) = owner.searches();
+            if !self
+                .db
+                .reserve_searches(arr.id, kind, ids, now_ms())
+                .await?
+            {
+                tracing::info!(path = %item.path, arr = %arr.name, "search limit reached; searching again waits");
+                return Ok(false);
+            }
+        }
+        let asked = self.tracked_search_again(
+            item,
+            arr,
+            owner,
+            job.as_deref().unwrap_or_default(),
+            existing,
+        );
+        if let Err(error) = self.released(writing, asked).await? {
+            tracing::warn!(path = %item.path, arr = %arr.name, reason = %error, "could not search again after a failed replacement");
+            return Ok(false);
+        }
+        let now = now_ms();
+        tracing::info!(path = %item.path, arr = %arr.name, "replacement failed; deleted the file in the Arr and searching again");
+        let message = format!("{}'s replacement failed; searching again", arr.name);
+        self.record(
+            item,
+            HealthResult::Missing,
+            Repair::ReplacementRequested,
+            &message,
+        )
+        .await?;
+        let next = HealthStatus {
+            next_check: Some(now + HOUR_MS),
+            hidden_until: Some(now + HIDDEN_WAIT_MS),
+            ..status
+        };
+        self.db.set_health(item.id, &next, Recheck::None).await?;
+        Ok(true)
     }
 
     /// Finds the Arr instance and media that imported `item`.
