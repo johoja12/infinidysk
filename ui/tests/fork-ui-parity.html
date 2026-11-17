@@ -736,7 +736,7 @@
               reserved_wire_bytes: 4200000,
               wire_day: 1,
               wire_blocked: false,
-              jobs: queueJobs,
+              jobs: window.__mock.queueOverride || queueJobs,
               history: (window.__mock.historyOverride || historyJobs).map(
                 (job) => ({
                   job,
@@ -876,6 +876,7 @@
         queries: { retry: false, refetchOnWindowFocus: false },
       },
     });
+    window.__mock.queryClient = client;
     createRoot(document.getElementById("root")).render(
       React.createElement(
         QueryClientProvider,
