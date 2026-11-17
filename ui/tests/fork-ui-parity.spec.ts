@@ -319,6 +319,114 @@ test("warming filters, grouped history and current coverage match v1 workflows",
     .toBe(true);
 });
 
+test("current warming hides files below the configured minimum", async ({
+  page,
+}) => {
+  await page.goto(fixture("activity"));
+  await expect(page.getByRole("article")).toHaveCount(20);
+  await page.evaluate(async () => {
+    const mock = window.__mock;
+    const data = mock.queryClient.getQueryData(["prefetch"]);
+    mock.queueOverride = data.jobs.map((job, i) => ({
+      ...job,
+      size: i < 24 ? 99_999_999 : i === 24 ? 100_000_000 : 100_000_001,
+      family: i < 24 ? "backfill" : "plex",
+      state: "queued",
+      next_attempt: 0,
+      attribution:
+        i < 24
+          ? {
+              playback: [
+                {
+                  server: "fixture-server",
+                  viewer: "excluded",
+                  viewer_name: "Excluded fixture viewer",
+                  session: "fixture-session",
+                  player: null,
+                  observed_at: 1700000000000,
+                },
+              ],
+              policy: null,
+            }
+          : job.attribution,
+    }));
+    mock.settings.native_cache.min_file_mb = 100;
+    await Promise.all([
+      mock.queryClient.invalidateQueries({ queryKey: ["settings"] }),
+      mock.queryClient.invalidateQueries({ queryKey: ["prefetch"] }),
+    ]);
+  });
+  await expect(
+    page.getByRole("tab", { name: "Activity · 2", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("article")).toHaveCount(2);
+  await expect(
+    page.getByText("Fixture queued file 24", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Fixture queued file 25", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByLabel("Filter source", { exact: true })
+      .locator("option")
+      .filter({ hasText: "Playback gap fill" }),
+  ).toHaveCount(0);
+  await expect(
+    page
+      .getByLabel("Filter viewer", { exact: true })
+      .locator("option")
+      .filter({ hasText: "Excluded fixture viewer" }),
+  ).toHaveCount(0);
+
+  const minimum = async (mb: number) =>
+    page.evaluate(async (value) => {
+      window.__mock.settings.native_cache.min_file_mb = value;
+      await window.__mock.queryClient.invalidateQueries({
+        queryKey: ["settings"],
+      });
+    }, mb);
+  await minimum(101);
+  await expect(
+    page.getByRole("tab", { name: "Activity · 0", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("article")).toHaveCount(0);
+  await expect(
+    page.getByText("No matching active jobs", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("0 waiting · 0 deferred", { exact: true }),
+  ).toBeVisible();
+
+  await minimum(0);
+  await expect(
+    page.getByRole("tab", { name: "Activity · 26", exact: true }),
+  ).toBeVisible();
+  await expect(page.getByRole("article")).toHaveCount(20);
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(page.getByRole("article")).toHaveCount(6);
+  await minimum(100);
+  // The old second page must clamp after ineligible rows are removed.
+  await expect(page.getByRole("article")).toHaveCount(2);
+  await page.getByRole("tab", { name: /Warming history/ }).click();
+  await expect(page.getByRole("article")).toHaveCount(2);
+  await expect(
+    page.getByText("Fixture warming file", { exact: true }),
+  ).toBeVisible();
+  await page.getByLabel("History type").selectOption("gaps");
+  await expect(page.getByRole("article")).toHaveCount(2);
+  expect(
+    await page.evaluate(() =>
+      window.__mock.calls.filter((c) => c.method !== "GET"),
+    ),
+  ).toEqual([]);
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= innerWidth,
+    ),
+  ).toBe(true);
+});
+
 test("predictions offer search, profile, source and current cache filters", async ({
   page,
 }) => {

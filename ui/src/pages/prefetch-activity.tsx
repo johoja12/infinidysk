@@ -15,7 +15,6 @@ import {
   rows,
   source,
   state,
-  terminal,
   viewers,
   rangeCoverage,
   type Job,
@@ -134,9 +133,20 @@ export function PrefetchActivity() {
   });
   const data = query.data,
     now = Date.now();
+  const minimumFileBytes =
+    (settings.data?.settings.native_cache.min_file_mb ?? 0) * 1_000_000;
+  const currentRows = useMemo(
+    () =>
+      data
+        ? rows(data, false, false, false).filter(
+            (r) => r.job.size >= minimumFileBytes,
+          )
+        : [],
+    [data, minimumFileBytes],
+  );
   const allRows = useMemo(
-    () => (data ? rows(data, history, gaps, grouped) : []),
-    [data, history, gaps, grouped],
+    () => (history && data ? rows(data, true, gaps, grouped) : currentRows),
+    [data, history, gaps, grouped, currentRows],
   );
   const displayState = (job: Job) =>
     state(job, data?.rates ?? [], data?.paused ?? false, now);
@@ -214,7 +224,7 @@ export function PrefetchActivity() {
       />
     );
   const cfg = settings.data.settings.prefetch;
-  const active = data.jobs.filter((j) => !terminal(j)),
+  const active = currentRows.map((r) => r.job),
     running = data.rates.filter((r) => r.active).length;
   const today = new Date().toISOString().slice(0, 10);
   const completed = rows(data, true, false, false)

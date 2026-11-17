@@ -1064,7 +1064,11 @@ Report one finding per issue with `file:line`, the rule (section › heading), a
 ### Smart Prefetch activity and history
 
 Show queue state, current active workers, completed-today count and daily budget as
-four compact summary tiles. Activity contains active/waiting jobs only. Terminal
+four compact summary tiles. Activity contains active/waiting jobs only. Hide jobs
+whose source file size is below Native Cache's current minimum file size, using
+decimal MB, before deriving Activity counts, filter options and pagination. Files
+at the threshold remain visible; zero disables this display cutoff. Keep historical
+attempts visible even when their file size is below the current minimum. Terminal
 outcomes belong to Warming history, with separate file warming and playback gap
 fills. Group repeated file/revision/range attempts while retaining each run in
 Details. Use source/viewer badges, proportional progress bars, human file names,
