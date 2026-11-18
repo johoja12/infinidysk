@@ -536,7 +536,7 @@
           warning: null,
           coverage_checked: libraryFiles.length,
           coverage_total: libraryFiles.length,
-          coverage_ready: true,
+          coverage_ready: !window.__mock.plexCoveragePending,
           coverage_at: Date.now(),
           totals: {
             files: libraryFiles.length,
@@ -812,6 +812,7 @@
     const screen =
       new URL(location.href).searchParams.get("screen") ?? "settings";
     if (screen === "library-no-plex") window.__mock.settings.plex.servers = [];
+    if (screen === "library-coverage") window.__mock.plexCoveragePending = true;
     if (screen === "library-offline") window.__mock.plexBrowseError = true;
     if (screen === "library-unified")
       libraryFiles.push({

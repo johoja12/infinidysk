@@ -2,13 +2,79 @@
 use infinidysk_core::FileMeta;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::apply::CsFile;
 use crate::csharp::{LongRange, MultipartFile};
 
 /// Open only the original offline revision ledger. It is never created or upgraded.
-pub struct Ledger(sqlx::SqlitePool);
+pub struct Ledger {
+    db: sqlx::SqlitePool,
+    index: Option<RevisionIndex>,
+}
+// A stopped, checkpointed ledger cannot change for this reader's lifetime.
+// Keep the fast path bounded; larger or unusual ledgers retain paged SQL reads.
+const INDEX_ROWS: u16 = 4096;
+struct RevisionIndex {
+    epoch: String,
+    stamps: HashMap<String, String>,
+}
+impl RevisionIndex {
+    async fn load(db: &sqlx::SqlitePool) -> Result<Option<Self>, sqlx::Error> {
+        // HashMap lookup must have the same equality as the original SQL.
+        // Nonstandard affinities, composite keys or collations keep the SQL path.
+        let schema: Option<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='Revisions' AND length(sql)<=4096"
+        ).fetch_optional(db).await?;
+        if schema
+            .as_ref()
+            .is_none_or(|sql| sql.to_ascii_uppercase().contains("COLLATE"))
+        {
+            return Ok(None);
+        }
+        let columns: Vec<(String, String, i64)> =
+            sqlx::query_as("SELECT name,type,pk FROM pragma_table_info('Revisions')")
+                .fetch_all(db)
+                .await?;
+        if columns.iter().filter(|(_, _, pk)| *pk != 0).count() != 1
+            || !columns.iter().any(|(name, kind, pk)| {
+                name == "Hash" && kind.eq_ignore_ascii_case("TEXT") && *pk == 1
+            })
+            || !columns
+                .iter()
+                .any(|(name, kind, _)| name == "Stamp" && kind.eq_ignore_ascii_case("TEXT"))
+        {
+            return Ok(None);
+        }
+        let epochs: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT CASE WHEN length(Id)<=256 THEN Id END FROM Identity LIMIT 2",
+        )
+        .fetch_all(db)
+        .await?;
+        let [Some(epoch)] = epochs.as_slice() else {
+            return Ok(None);
+        };
+        // Limit both row count and string length before allocating the index.
+        let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT CASE WHEN length(Hash)<=256 THEN Hash END,CASE WHEN length(Stamp)<=256 THEN Stamp END FROM Revisions LIMIT $1"
+        ).bind(i64::from(INDEX_ROWS) + 1).fetch_all(db).await?;
+        if rows.len() > usize::from(INDEX_ROWS) {
+            return Ok(None);
+        }
+        let mut stamps = HashMap::with_capacity(rows.len());
+        for (id, stamp) in rows {
+            let (Some(id), Some(stamp)) = (id, stamp) else {
+                return Ok(None);
+            };
+            stamps.insert(id, stamp);
+        }
+        Ok(Some(Self {
+            epoch: epoch.clone(),
+            stamps,
+        }))
+    }
+}
 impl Ledger {
     pub async fn open(path: &std::path::Path) -> Result<Self, sqlx::Error> {
         Self::open_inner(path, false).await
@@ -30,17 +96,23 @@ impl Ledger {
         Self::open_inner(path, true).await
     }
     async fn open_inner(path: &std::path::Path, immutable: bool) -> Result<Self, sqlx::Error> {
-        Ok(Self(
-            sqlx::sqlite::SqlitePoolOptions::new()
-                .max_connections(1)
-                .connect_with(
-                    sqlx::sqlite::SqliteConnectOptions::new()
-                        .filename(path)
-                        .read_only(true)
-                        .immutable(immutable),
-                )
-                .await?,
-        ))
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(path)
+                    .read_only(true)
+                    .immutable(immutable),
+            )
+            .await?;
+        // Indexing is optional. Schema/read errors still reach generation's
+        // original validation path instead of inventing an empty ledger.
+        let index = if immutable {
+            RevisionIndex::load(&db).await.ok().flatten()
+        } else {
+            None
+        };
+        Ok(Self { db, index })
     }
 }
 
@@ -145,37 +217,53 @@ impl Source {
     }
     /// The repair revision ledger must be read from the same offline snapshot as the cache.
     pub async fn generation(&self, ledger: &Ledger) -> Result<String, sqlx::Error> {
-        let revisions = &ledger.0;
-        let epochs: Vec<String> = sqlx::query_scalar("SELECT Id FROM Identity LIMIT 2")
-            .fetch_all(revisions)
-            .await?;
-        if epochs.len() != 1 {
-            return Err(sqlx::Error::Protocol(
-                "repair ledger identity is ambiguous".into(),
-            ));
-        }
         let mut hash = Sha256::new();
-        hash.update(epochs[0].as_bytes());
-        for chunk in self.dependencies.chunks(256) {
-            // Bound both query count and memory; ordering and duplicate ids match C#.
-            let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-                "SELECT Hash,Stamp FROM Revisions WHERE Hash IN (",
-            );
-            let mut args = query.separated(",");
-            for id in chunk {
-                args.push_bind(id);
+        if let Some(index) = &ledger.index {
+            hash.update(index.epoch.as_bytes());
+            // Iterate the original dependency order, including duplicates, just
+            // as the SQL path and original C# generation calculation do.
+            for chunk in self.dependencies.chunks(256) {
+                for id in chunk {
+                    if let Some(stamp) = index.stamps.get(id) {
+                        hash.update(id.as_bytes());
+                        hash.update(stamp.as_bytes());
+                    }
+                }
+                // Keep long dependency lists cooperative with playback tasks.
+                tokio::task::yield_now().await;
             }
-            args.push_unseparated(")");
-            let stamps: std::collections::HashMap<String, String> = query
-                .build_query_as::<(String, String)>()
+        } else {
+            let revisions = &ledger.db;
+            let epochs: Vec<String> = sqlx::query_scalar("SELECT Id FROM Identity LIMIT 2")
                 .fetch_all(revisions)
-                .await?
-                .into_iter()
-                .collect();
-            for id in chunk {
-                if let Some(stamp) = stamps.get(id) {
-                    hash.update(id.as_bytes());
-                    hash.update(stamp.as_bytes());
+                .await?;
+            if epochs.len() != 1 {
+                return Err(sqlx::Error::Protocol(
+                    "repair ledger identity is ambiguous".into(),
+                ));
+            }
+            hash.update(epochs[0].as_bytes());
+            for chunk in self.dependencies.chunks(256) {
+                // Bound both query count and memory; ordering and duplicate ids match C#.
+                let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                    "SELECT Hash,Stamp FROM Revisions WHERE Hash IN (",
+                );
+                let mut args = query.separated(",");
+                for id in chunk {
+                    args.push_bind(id);
+                }
+                args.push_unseparated(")");
+                let stamps: std::collections::HashMap<String, String> = query
+                    .build_query_as::<(String, String)>()
+                    .fetch_all(revisions)
+                    .await?
+                    .into_iter()
+                    .collect();
+                for id in chunk {
+                    if let Some(stamp) = stamps.get(id) {
+                        hash.update(id.as_bytes());
+                        hash.update(stamp.as_bytes());
+                    }
                 }
             }
         }
@@ -289,6 +377,229 @@ mod tests {
             })
             .is_err()
         );
+    }
+    struct TempLedger(std::path::PathBuf);
+    impl Drop for TempLedger {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    async fn ledger_fixture(schema: &'static str) -> (TempLedger, sqlx::SqlitePool) {
+        let dir = std::env::temp_dir().join(format!("id-ledger-index-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let db = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(dir.join("ledger.db"))
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        sqlx::raw_sql(schema).execute(&db).await.unwrap();
+        (TempLedger(dir), db)
+    }
+    const LEDGER_SCHEMA: &str = "CREATE TABLE Identity(Id TEXT NOT NULL); INSERT INTO Identity VALUES('fixture-epoch'); CREATE TABLE Revisions(Hash TEXT PRIMARY KEY,Stamp TEXT NOT NULL);";
+    fn source(dependencies: &[&str]) -> Source {
+        Source {
+            version: 1,
+            base_generation: "fixture-base".into(),
+            dependencies: dependencies.iter().map(|s| (*s).into()).collect(),
+            fingerprint: vec![],
+            size: 0,
+            mapped_identity: None,
+        }
+    }
+    #[tokio::test]
+    async fn immutable_generation_index_matches_sql_for_order_duplicates_missing_and_empty_dependencies()
+     {
+        let (fixture, db) = ledger_fixture(LEDGER_SCHEMA).await;
+        sqlx::query("INSERT INTO Revisions VALUES('a','stamp-a'),('b','stamp-b')")
+            .execute(&db)
+            .await
+            .unwrap();
+        db.close().await;
+        let indexed = Ledger::open_in_place(&fixture.0.join("ledger.db"))
+            .await
+            .unwrap();
+        let paged = Ledger::open(&fixture.0.join("ledger.db")).await.unwrap();
+        assert_eq!(indexed.index.as_ref().unwrap().stamps.len(), 2);
+        assert!(paged.index.is_none());
+        for dependencies in [
+            vec![],
+            vec!["missing"],
+            vec!["a", "b"],
+            vec!["b", "a", "a", "missing"],
+        ] {
+            let source = source(&dependencies);
+            assert_eq!(
+                source.generation(&indexed).await.unwrap(),
+                source.generation(&paged).await.unwrap()
+            );
+        }
+        let mut expected = Sha256::new();
+        for value in [
+            "fixture-epoch",
+            "b",
+            "stamp-b",
+            "a",
+            "stamp-a",
+            "a",
+            "stamp-a",
+        ] {
+            expected.update(value.as_bytes());
+        }
+        assert_eq!(
+            source(&["b", "a", "a", "missing"])
+                .generation(&indexed)
+                .await
+                .unwrap(),
+            format!("fixture-base:{}", upper(&expected.finalize()))
+        );
+    }
+    #[tokio::test]
+    async fn mutable_generation_reads_current_stamps_instead_of_using_an_index() {
+        let (fixture, db) = ledger_fixture(LEDGER_SCHEMA).await;
+        sqlx::query("INSERT INTO Revisions VALUES('a','first')")
+            .execute(&db)
+            .await
+            .unwrap();
+        let ledger = Ledger::open(&fixture.0.join("ledger.db")).await.unwrap();
+        let source = source(&["a"]);
+        let before = source.generation(&ledger).await.unwrap();
+        sqlx::query("UPDATE Revisions SET Stamp='second'")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert_ne!(before, source.generation(&ledger).await.unwrap());
+        assert!(ledger.index.is_none());
+    }
+    #[tokio::test]
+    async fn immutable_index_bounds_and_collations_fall_back_without_dropping_revisions() {
+        for (schema, rows, stamps, expected_index) in [
+            (LEDGER_SCHEMA, 4096, "stamp", true),
+            (LEDGER_SCHEMA, 4097, "stamp", false),
+            (LEDGER_SCHEMA, 1, "long", false),
+            (
+                "CREATE TABLE Identity(Id TEXT NOT NULL); INSERT INTO Identity VALUES('fixture-epoch'); CREATE TABLE Revisions(Hash TEXT COLLATE NOCASE PRIMARY KEY,Stamp TEXT NOT NULL);",
+                1,
+                "stamp",
+                false,
+            ),
+        ] {
+            let (fixture, db) = ledger_fixture(schema).await;
+            let mut tx = db.begin().await.unwrap();
+            for n in 0..rows {
+                sqlx::query("INSERT INTO Revisions VALUES($1,$2)")
+                    .bind(format!("HASH-{n}"))
+                    .bind(if stamps == "long" {
+                        "x".repeat(257)
+                    } else {
+                        stamps.into()
+                    })
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+            db.close().await;
+            let indexed = Ledger::open_in_place(&fixture.0.join("ledger.db"))
+                .await
+                .unwrap();
+            let paged = Ledger::open(&fixture.0.join("ledger.db")).await.unwrap();
+            assert_eq!(indexed.index.is_some(), expected_index);
+            let last = format!("HASH-{}", rows - 1);
+            for dependencies in [vec![last.as_str()], vec!["hash-0"]] {
+                let source = source(&dependencies);
+                assert_eq!(
+                    source.generation(&indexed).await.unwrap(),
+                    source.generation(&paged).await.unwrap()
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn ambiguous_or_missing_ledger_identity_never_gains_an_index_or_a_generation() {
+        for identity in [
+            "DELETE FROM Identity",
+            "INSERT INTO Identity VALUES('another-epoch')",
+        ] {
+            let (fixture, db) = ledger_fixture(LEDGER_SCHEMA).await;
+            sqlx::query(identity).execute(&db).await.unwrap();
+            db.close().await;
+            let ledger = Ledger::open_in_place(&fixture.0.join("ledger.db"))
+                .await
+                .unwrap();
+            assert!(ledger.index.is_none());
+            assert!(source(&["a"]).generation(&ledger).await.is_err());
+        }
+    }
+    #[tokio::test]
+    async fn empty_immutable_ledger_still_derives_the_identity_bound_generation() {
+        let (fixture, db) = ledger_fixture(LEDGER_SCHEMA).await;
+        db.close().await;
+        let indexed = Ledger::open_in_place(&fixture.0.join("ledger.db"))
+            .await
+            .unwrap();
+        assert!(indexed.index.as_ref().unwrap().stamps.is_empty());
+        let mut expected = Sha256::new();
+        expected.update(b"fixture-epoch");
+        assert_eq!(
+            source(&["absent"]).generation(&indexed).await.unwrap(),
+            format!("fixture-base:{}", upper(&expected.finalize()))
+        );
+    }
+    #[tokio::test]
+    #[ignore = "explicit generated repair-ledger generation timing"]
+    async fn generated_generation_index_timing() {
+        let (fixture, db) = ledger_fixture(LEDGER_SCHEMA).await;
+        let mut tx = db.begin().await.unwrap();
+        for n in 0..883 {
+            sqlx::query("INSERT INTO Revisions VALUES($1,'fixture-stamp')")
+                .bind(format!("{:064X}", n + 1_000_000))
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        db.close().await;
+        let indexed = Ledger::open_in_place(&fixture.0.join("ledger.db"))
+            .await
+            .unwrap();
+        let paged = Ledger::open(&fixture.0.join("ledger.db")).await.unwrap();
+        let mut source = source(&[]);
+        source.dependencies = (0..125_405).map(|n| format!("{n:064X}")).collect();
+        let expected = source.generation(&paged).await.unwrap();
+        for (label, ledger) in [("paged", &paged), ("indexed", &indexed)] {
+            let started = std::time::Instant::now();
+            for _ in 0..5 {
+                assert_eq!(source.generation(ledger).await.unwrap(), expected);
+            }
+            println!(
+                "{label} generated source generation mean ms: {}",
+                started.elapsed().as_millis() / 5
+            );
+        }
+    }
+    #[tokio::test]
+    async fn indexed_generation_yields_to_other_runtime_work() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let (fixture, db) = ledger_fixture(LEDGER_SCHEMA).await;
+        db.close().await;
+        let ledger = Ledger::open_in_place(&fixture.0.join("ledger.db"))
+            .await
+            .unwrap();
+        let mut source = source(&[]);
+        source.dependencies = vec!["absent".into(); 2048];
+        let progressed = Arc::new(AtomicBool::new(false));
+        let other = Arc::clone(&progressed);
+        let task = tokio::spawn(async move {
+            other.store(true, Ordering::Release);
+        });
+        source.generation(&ledger).await.unwrap();
+        assert!(progressed.load(Ordering::Acquire));
+        task.await.unwrap();
     }
     /// Run after the linked C# writer, using its receipt path. No provider is contacted.
     #[tokio::test]

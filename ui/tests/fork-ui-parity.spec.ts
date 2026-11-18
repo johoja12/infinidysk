@@ -1224,3 +1224,17 @@ test("file details wrap long source and mount paths without overflow", async ({ 
   }
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
+
+
+test("Library remains usable while slow coverage polls at a bounded interval", async ({ page }) => {
+  await page.clock.install();
+  await page.goto(fixture("library-coverage"));
+  await expect(page.getByRole("button", {name:/^Open /}).first()).toBeVisible();
+  await expect(page.getByRole("button", {name:"Refresh library", exact:true})).toBeEnabled();
+  const calls = () => page.evaluate(() => window.__mock.calls.filter(c => c.path.includes("/browse")).length);
+  const initial = await calls();
+  await page.clock.runFor(3000);
+  expect(await calls()).toBe(initial);
+  await page.clock.runFor(2500);
+  expect(await calls()).toBe(initial + 1);
+});

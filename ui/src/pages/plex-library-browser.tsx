@@ -115,11 +115,11 @@ export function PlexLibraryBrowser() {
       ),
     enabled: !!server,
     refetchInterval: (q) =>
-      !q.state.data?.snapshot ||
-      q.state.data.refreshing ||
-      !q.state.data.coverage_ready
+      !q.state.data?.snapshot
         ? 1000
-        : 30000,
+        : q.state.data.refreshing || !q.state.data.coverage_ready
+          ? 5000
+          : 30000,
   });
   const refresh = useMutation({
     mutationFn: () =>
@@ -526,6 +526,9 @@ export function PlexLibraryBrowser() {
                       {g.artwork_key && (
                         <img
                           loading="lazy"
+                          decoding="async"
+                          width={80}
+                          height={112}
                           alt=""
                           className="absolute inset-0 size-full object-cover"
                           src={`/api/v1/plex/servers/${encodeURIComponent(server.id)}/artwork/${encodeURIComponent(g.artwork_key)}`}

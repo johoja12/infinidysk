@@ -5,12 +5,17 @@ use crate::{
 use reqwest::header::{ACCEPT, HeaderValue};
 use reqwest::{Method, Url};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::time::Duration;
 use uuid::Uuid;
 
 const LIMIT: usize = 4 * 1024 * 1024;
+#[derive(Default)]
+struct Paging {
+    window: Option<u32>,
+    concurrent: bool,
+}
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
@@ -349,10 +354,20 @@ impl Client {
         limit: u32,
         window: Option<u32>,
     ) -> Result<Vec<xml::Node>, Error> {
-        self.pages_mapped(server, path, tag, limit, window, |node| {
-            let bytes = node.bytes();
-            Ok((node, bytes))
-        })
+        self.pages_mapped(
+            server,
+            path,
+            tag,
+            limit,
+            Paging {
+                window,
+                ..Paging::default()
+            },
+            |node| {
+                let bytes = node.bytes();
+                Ok((node, bytes))
+            },
+        )
         .await
     }
     /// Retain only the requested representation while complete-page checks remain shared.
@@ -362,7 +377,7 @@ impl Client {
         path: &str,
         tag: &str,
         limit: u32,
-        window: Option<u32>,
+        paging: Paging,
         map: impl Fn(xml::Node) -> Result<(T, usize), Error>,
     ) -> Result<Vec<T>, Error> {
         let mut out = Vec::new();
@@ -370,16 +385,35 @@ impl Client {
         let mut seen = HashSet::new();
         let mut expected = None;
         let mut start = 0_u32;
+        let mut pending = VecDeque::new();
         for _ in 0..1000 {
-            let separator = if path.contains('?') { '&' } else { '?' };
-            let root = self
-                .xml(
-                    server,
-                    &format!(
-                        "{path}{separator}X-Plex-Container-Start={start}&X-Plex-Container-Size=100"
-                    ),
-                )
-                .await?;
+            if pending.is_empty() {
+                // Prove the total with page one, then retain at most four bounded
+                // XML pages. Results are still validated and consumed in order.
+                let end = if paging.concurrent {
+                    expected.unwrap_or(start + 1)
+                } else {
+                    start + 1
+                };
+                let fetch = |offset| async move {
+                    if offset >= end {
+                        return Ok(None);
+                    }
+                    let separator = if path.contains('?') { '&' } else { '?' };
+                    self.xml(server, &format!("{path}{separator}X-Plex-Container-Start={offset}&X-Plex-Container-Size=100"))
+                        .await.map(Some)
+                };
+                let pages = tokio::try_join!(
+                    fetch(start),
+                    fetch(start + 100),
+                    fetch(start + 200),
+                    fetch(start + 300)
+                )?;
+                pending.extend([pages.0, pages.1, pages.2, pages.3].into_iter().flatten());
+            }
+            let root = pending
+                .pop_front()
+                .ok_or(Error::Invalid("incomplete Plex snapshot"))?;
             if root.name != "MediaContainer" {
                 return Err(Error::Invalid("invalid Plex container"));
             }
@@ -455,7 +489,7 @@ impl Client {
                 out.push(item);
             }
             start += count;
-            if window.is_some_and(|n| start >= n)
+            if paging.window.is_some_and(|n| start >= n)
                 || total == Some(start)
                 || (total.is_none() && count < 100)
             {
@@ -614,37 +648,51 @@ impl Client {
             "show" => format!("/library/sections/{}/allLeaves", library.id),
             _ => return Err(Error::Invalid("unsupported Plex library")),
         };
-        self.pages_mapped(server, &path, "Video", 100_000, None, |node| {
-            let mut files = std::collections::BTreeSet::new();
-            let mut file_sizes = std::collections::HashMap::new();
-            for part in node.children("Media").flat_map(|m| m.children("Part")) {
-                if let Some(path) = part.text("file") {
-                    if !crate::safe_path(path) {
-                        return Err(Error::Invalid("invalid Plex catalogue path"));
-                    }
-                    files.insert(path.to_owned());
-                    if let Some(size) = part.number::<u64>("size") {
-                        file_sizes.insert(path.to_owned(), size);
-                    }
-                    if files.len() > 64 {
-                        return Err(Error::Invalid("too many Plex media parts"));
+        self.pages_mapped(
+            server,
+            &path,
+            "Video",
+            100_000,
+            Paging {
+                concurrent: true,
+                ..Paging::default()
+            },
+            |node| {
+                let mut files = std::collections::BTreeSet::new();
+                let mut file_sizes = std::collections::HashMap::new();
+                for part in node.children("Media").flat_map(|m| m.children("Part")) {
+                    if let Some(path) = part.text("file") {
+                        if !crate::safe_path(path) {
+                            return Err(Error::Invalid("invalid Plex catalogue path"));
+                        }
+                        files.insert(path.to_owned());
+                        if let Some(size) = part.number::<u64>("size") {
+                            file_sizes.insert(path.to_owned(), size);
+                        }
+                        if files.len() > 64 {
+                            return Err(Error::Invalid("too many Plex media parts"));
+                        }
                     }
                 }
-            }
-            let entry = CatalogueMedia {
-                media: media(&node)?,
-                files: files.into_iter().collect(),
-                file_sizes,
-                year: node.number("year"),
-            };
-            // Full XML includes cast, tags and stream details which this catalogue
-            // does not use. Drop each page's tree after extracting compact rows.
-            let bytes =
-                serde_json::to_vec(&(&entry.media, &entry.files, entry.year, &entry.file_sizes))
-                    .map_err(|_| Error::Invalid("cannot size Plex catalogue"))?
-                    .len();
-            Ok((entry, bytes))
-        })
+                let entry = CatalogueMedia {
+                    media: media(&node)?,
+                    files: files.into_iter().collect(),
+                    file_sizes,
+                    year: node.number("year"),
+                };
+                // Full XML includes cast, tags and stream details which this catalogue
+                // does not use. Drop each page's tree after extracting compact rows.
+                let bytes = serde_json::to_vec(&(
+                    &entry.media,
+                    &entry.files,
+                    entry.year,
+                    &entry.file_sizes,
+                ))
+                .map_err(|_| Error::Invalid("cannot size Plex catalogue"))?
+                .len();
+                Ok((entry, bytes))
+            },
+        )
         .await
     }
 
@@ -812,8 +860,17 @@ impl Client {
         }
         let mut url = server_url(&server.url)?;
         let prefix = url.path().trim_end_matches('/').to_owned();
-        url.set_path(&format!("{prefix}{path}"));
+        url.set_path(&format!("{prefix}/photo/:/transcode"));
         url.set_query(None);
+        // Library cards display 80 x 112 pixels. Ask Plex for a 2x thumbnail;
+        // keep the validated source relative and the token in the header.
+        url.query_pairs_mut().extend_pairs([
+            ("url", path),
+            ("width", "160"),
+            ("height", "224"),
+            ("minSize", "1"),
+            ("upscale", "0"),
+        ]);
         let bytes = self
             .send(
                 Method::GET,
@@ -1202,6 +1259,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_catalogue_rejects_changed_totals_offsets_duplicates_and_partial_pages() {
+        for damage in ["total", "offset", "duplicate", "partial"] {
+            let f = fixture(move |uri, _| {
+                let url = Url::parse(&format!("http://fixture{uri}")).unwrap();
+                let start = url
+                    .query_pairs()
+                    .find(|(key, _)| key == "X-Plex-Container-Start")
+                    .unwrap()
+                    .1
+                    .parse::<u32>()
+                    .unwrap();
+                let total = if damage == "total" && start == 200 {
+                    501
+                } else {
+                    500
+                };
+                let offset = if damage == "offset" && start == 300 {
+                    999
+                } else {
+                    start
+                };
+                let from = if damage == "duplicate" && start == 400 {
+                    0
+                } else {
+                    start
+                };
+                let count = if damage == "partial" && start == 300 {
+                    99
+                } else {
+                    100
+                };
+                response(200, xml_page(offset, total, from..from + count))
+            })
+            .await;
+            let library = Library {
+                id: "7".into(),
+                title: "Fixture".into(),
+                kind: "movie".into(),
+            };
+            assert!(
+                matches!(
+                    f.client.catalogue(&f.server, &library).await,
+                    Err(Error::Invalid(_))
+                ),
+                "{damage}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn catalogue_without_a_total_keeps_sequential_complete_page_checks() {
+        let f = fixture(|uri, _| {
+            let start = if uri
+                .query()
+                .unwrap_or_default()
+                .contains("X-Plex-Container-Start=100")
+            {
+                100
+            } else {
+                0
+            };
+            response(
+                200,
+                xml_page(start, 101, start..(start + 100).min(101)).replace(" totalSize='101'", ""),
+            )
+        })
+        .await;
+        let library = Library {
+            id: "7".into(),
+            title: "Fixture".into(),
+            kind: "movie".into(),
+        };
+        let rows = f.client.catalogue(&f.server, &library).await.unwrap();
+        assert_eq!(rows.len(), 101);
+        assert_eq!(rows[100].media.rating_key, "100");
+    }
+
+    #[tokio::test]
     async fn catalogue_discards_unused_xml_without_raising_snapshot_bounds() {
         const TOTAL: u32 = 1_200;
         let unused = "<Genre tag='fixture'/>".repeat(800);
@@ -1254,6 +1388,87 @@ mod tests {
                 .is_err()
         );
     }
+    #[tokio::test]
+    async fn artwork_requests_a_bounded_thumbnail_with_header_authentication() {
+        let f = fixture(|uri, headers| {
+            assert_eq!(headers.get("X-Plex-Token").unwrap(), "fixture-server-token");
+            match uri.path() {
+                "/prefix/library/metadata/42" => response(200, "<MediaContainer><Directory ratingKey='42' thumb='/library/metadata/42/thumb/1'/></MediaContainer>"),
+                "/prefix/photo/:/transcode" => {
+                    let url = Url::parse(&format!("http://fixture{uri}")).unwrap();
+                    let params: std::collections::HashMap<_,_> = url.query_pairs().collect();
+                    assert_eq!(params.get("url").unwrap(), "/library/metadata/42/thumb/1");
+                    assert_eq!(params.get("width").unwrap(), "160");
+                    assert_eq!(params.get("height").unwrap(), "224");
+                    assert_eq!(params.get("upscale").unwrap(), "0");
+                    assert!(!uri.to_string().contains("token"));
+                    response(200, vec![255_u8,216,255,0])
+                }
+                _ => panic!("unexpected artwork request"),
+            }
+        }).await;
+        let (bytes, content_type) = f.client.artwork(&f.server, "42").await.unwrap();
+        assert_eq!(bytes, [255, 216, 255, 0]);
+        assert_eq!(content_type, "image/jpeg");
+    }
+
+    #[tokio::test]
+    async fn catalogue_fetches_four_pages_at_a_time_and_retains_offset_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Default)]
+        struct Counts {
+            active: AtomicUsize,
+            maximum: AtomicUsize,
+        }
+        async fn request(State(counts): State<Arc<Counts>>, uri: Uri) -> Response<Body> {
+            let url = Url::parse(&format!("http://fixture{uri}")).unwrap();
+            let start = url
+                .query_pairs()
+                .find(|(key, _)| key == "X-Plex-Container-Start")
+                .unwrap()
+                .1
+                .parse::<u32>()
+                .unwrap();
+            let active = counts.active.fetch_add(1, Ordering::SeqCst) + 1;
+            counts.maximum.fetch_max(active, Ordering::SeqCst);
+            // Complete later offsets first; the resulting catalogue stays ordered.
+            tokio::time::sleep(Duration::from_millis(40 - u64::from(start % 400) / 10)).await;
+            counts.active.fetch_sub(1, Ordering::SeqCst);
+            response(200, xml_page(start, 900, start..(start + 100).min(900)))
+        }
+        let counts = Arc::new(Counts::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let router = Router::new()
+            .fallback(request)
+            .with_state(Arc::clone(&counts));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = Client::new(Uuid::new_v4()).unwrap();
+        let server = Server {
+            id: "fixture".into(),
+            name: "fixture".into(),
+            url: format!("http://127.0.0.1:{port}"),
+            token: Token("fixture-token".into()),
+            enabled: true,
+            account_id: None,
+            path_mappings: vec![],
+        };
+        let library = Library {
+            id: "1".into(),
+            title: "Fixture".into(),
+            kind: "movie".into(),
+        };
+        let rows = client.catalogue(&server, &library).await.unwrap();
+        task.abort();
+        assert_eq!(counts.maximum.load(Ordering::SeqCst), 4);
+        assert_eq!(rows.len(), 900);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.media.rating_key, i.to_string());
+        }
+    }
+
     #[tokio::test]
     async fn artwork_rejects_untrusted_resource_before_fetching_it() {
         for resource in [
