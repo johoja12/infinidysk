@@ -1208,3 +1208,19 @@ test("file details stay open when activity finishes", async ({ page }) => {
   await page.keyboard.press("Escape");
   await expect(dialog).toHaveCount(0);
 });
+
+
+test("file details wrap long source and mount paths without overflow", async ({ page }) => {
+  await page.goto(fixture("activity"));
+  await page.evaluate(() => { window.__mock.longFilePaths = true; });
+  await page.getByRole("article").first().getByRole("link").first().click();
+  const dialog = page.getByRole("dialog", { name: "File details", exact: true });
+  const source = dialog.getByText("/content/fixture/" + "generated-source-path-".repeat(20) + "/source.mkv", { exact: true });
+  const mount = dialog.getByText("/fixture/mount/" + "generated-mount-path-".repeat(20) + "/source.mkv", { exact: true });
+  await expect(source).toBeVisible();
+  await expect(mount).toBeVisible();
+  for (const element of [dialog, source, mount]) {
+    expect(await element.evaluate((el) => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+  }
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});

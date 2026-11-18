@@ -555,7 +555,7 @@ export function Details({
 
   const Container = embedded ? "div" : Panel;
   return (
-    <Container ref={card} className={embedded ? "min-w-0" : "mt-4 scroll-mt-4 p-4"}>
+    <Container ref={card} className={embedded ? "min-w-0 wrap-anywhere" : "mt-4 scroll-mt-4 p-4"}>
       {details.isPending ? (
         <Loading />
       ) : details.isError ? (
@@ -568,10 +568,10 @@ export function Details({
             <div className="space-y-4">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
-                  <h2 className="truncate font-medium" title={entry.name}>
+                  <h2 className={cn("font-medium", embedded ? "wrap-anywhere" : "truncate")} title={entry.name}>
                     <ReleaseName name={entry.name} />
                   </h2>
-                  <p className="text-muted-foreground truncate font-mono text-xs" title={entry.path}>
+                  <p className={cn("text-muted-foreground font-mono text-xs", embedded ? "break-all" : "truncate")} title={entry.path}>
                     {entry.path}
                   </p>
                 </div>
@@ -650,8 +650,8 @@ export function Details({
                   {warm.isSuccess && <p role="status">File queued for warming.</p>}
                 </section>
               )}
-              <div className="grid gap-6 lg:grid-cols-2">
-                <dl className="grid grid-cols-[auto_1fr] content-start gap-x-4 gap-y-1.5">
+              <div className="grid min-w-0 grid-cols-1 gap-6 lg:grid-cols-2">
+                <dl className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] content-start gap-x-4 gap-y-1.5">
                   <Fact label="Kind">
                     {entry.kind === "directory" ? "Folder" : entry.storage === "multipart" ? "Archive or multipart file" : "File"}
                   </Fact>
@@ -694,7 +694,7 @@ export function Details({
                     <span className="font-mono text-xs">{id}</span>
                   </Fact>
                 </dl>
-                <div className="space-y-4">
+                <div className="min-w-0 space-y-4">
                   {media && <Media media={media} />}
                   {file && <ReadHistory id={id} />}
                   {(details.data.plex.matches.length > 0 || details.data.plex.warning) && <div><h3 className="text-muted-foreground mb-1.5 text-xs font-medium tracking-wide uppercase">Plex classification</h3>{details.data.plex.stale && <p className="text-warning-text text-xs">Stale Plex snapshot</p>}{details.data.plex.warning && <p className="text-warning-text text-sm">{details.data.plex.warning}</p>}<ul className="space-y-2">{details.data.plex.matches.map((m) => <li key={`${m.server}:${m.key}`} className="break-words text-sm"><span className="font-medium">{m.show_title ? `${m.show_title} · ` : ""}{m.title}</span>{m.year != null && <> ({m.year})</>}{m.season != null && <> · season {m.season}</>}{m.episode != null && <> · episode {m.episode}</>}<p className="text-muted-foreground text-xs">{m.matched_by === "filename" ? "Filename match" : m.matched_by === "indexed_path" ? "Indexed library path" : "Mapped path"} · <span className="break-all">{m.server}</span></p></li>)}</ul></div>}
@@ -708,7 +708,7 @@ export function Details({
                     ) : (
                       <ul className="space-y-0.5">
                         {links.map((l) => (
-                          <li key={l} className="truncate font-mono text-xs" title={l}>
+                          <li key={l} className={cn("font-mono text-xs", embedded ? "break-all" : "truncate")} title={l}>
                             {l}
                           </li>
                         ))}
