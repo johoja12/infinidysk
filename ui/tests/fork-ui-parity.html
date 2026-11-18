@@ -713,8 +713,8 @@
         window.__mock.coverageActive--;
         return respond({
           cache_available: true,
-          entry: { size: 8000000, name: "Fixture source.mkv", path: "/content/fixture/source.mkv", kind: "file", encrypted: false, item_id: id },
-          checks: [], links: ["/fixture/mount/source.mkv"], library_links: [], playback: [],
+          entry: { size: 8000000, name: "Fixture source.mkv", path: window.__mock.longFilePaths ? "/content/fixture/" + "generated-source-path-".repeat(20) + "/source.mkv" : "/content/fixture/source.mkv", kind: "file", encrypted: false, item_id: id },
+          checks: [], links: window.__mock.longFilePaths ? ["/fixture/mount/source.mkv", "/fixture/mount/" + "generated-mount-path-".repeat(20) + "/source.mkv"] : ["/fixture/mount/source.mkv"], library_links: [], playback: [],
           plex: { matches: [], stale: false }, has_nzb: false, repair_allowed: false,
           source_revision: window.__mock.staleCoverage
             ? "changed-fixture-revision"
