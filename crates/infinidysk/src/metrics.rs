@@ -417,6 +417,7 @@ struct ProcessMemory {
 #[derive(Clone, Serialize, ToSchema)]
 struct LiveRead {
     id: u64,
+    item_id: Uuid,
     path: String,
     /// `fuse` or `webdav`.
     delivery: &'static str,
@@ -1196,6 +1197,7 @@ impl Metrics {
                 let (stalls, stall) = s.stalls();
                 LiveRead {
                     id: s.id,
+                    item_id: s.item.0,
                     path: s.path.clone(),
                     delivery: s.delivery.label(),
                     client: s.client.clone(),
@@ -2644,6 +2646,7 @@ mod tests {
     fn a_stall_is_reported_once_until_it_ends() {
         let read = |id, waiting_ms, oldest_ms: Option<u64>| LiveRead {
             id,
+            item_id: Uuid::nil(),
             path: String::new(),
             delivery: "fuse",
             client: String::new(),

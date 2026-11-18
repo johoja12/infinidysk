@@ -700,7 +700,10 @@
             : [],
         );
       }
+      if (/\/api\/v1\/files\/[^/]+\/reads$/.test(path)) return respond([]);
+      if (/\/api\/v1\/files\/[^/]+\/removal$/.test(path)) return respond({});
       if (path.startsWith("/api/v1/files/")) {
+        if (window.__mock.fileDetailsError) return Response.json({ error: "File no longer exists" }, { status: 404 });
         window.__mock.coverageActive = (window.__mock.coverageActive || 0) + 1;
         window.__mock.coverageMax = Math.max(
           window.__mock.coverageMax || 0,
@@ -710,7 +713,9 @@
         window.__mock.coverageActive--;
         return respond({
           cache_available: true,
-          entry: { size: 8000000 },
+          entry: { size: 8000000, name: "Fixture source.mkv", path: "/content/fixture/source.mkv", kind: "file", encrypted: false, item_id: id },
+          checks: [], links: ["/fixture/mount/source.mkv"], library_links: [], playback: [],
+          plex: { matches: [], stale: false }, has_nzb: false, repair_allowed: false,
           source_revision: window.__mock.staleCoverage
             ? "changed-fixture-revision"
             : "fixture-revision",
@@ -850,6 +855,7 @@
           : screen === "nav"
             ? Nav
             : SmartPrefetch;
+    const { FileDetailsProvider } = await import("/src/file-link.tsx");
     const router = createMemoryRouter(
       [
         {
@@ -857,7 +863,7 @@
           element: React.createElement(LegacyPlexLibraryRedirect),
         },
         { path: "/library", element: React.createElement(LibraryPage) },
-        { path: "*", element: React.createElement(component) },
+        { path: "*", element: React.createElement(FileDetailsProvider, null, React.createElement(component)) },
       ],
       {
         initialEntries: [

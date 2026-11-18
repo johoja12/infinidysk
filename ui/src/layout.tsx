@@ -1,3 +1,4 @@
+import { FileDetailsProvider } from "./file-link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Component, type ReactNode, Suspense, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router";
@@ -444,7 +445,7 @@ export function Layout() {
           <LibraryBanner />
           <PageBoundary key={location.pathname}>
             <Suspense fallback={<Loading />}>
-              <Outlet />
+              <FileDetailsProvider><Outlet /></FileDetailsProvider>
             </Suspense>
           </PageBoundary>
         </main>

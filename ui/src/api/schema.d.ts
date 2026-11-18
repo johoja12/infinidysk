@@ -3906,6 +3906,8 @@ export interface components {
             head?: components["schemas"]["LiveHead"] | null;
             /** Format: int64 */
             id: number;
+            /** Format: uuid */
+            item_id: string;
             /** Format: int64 */
             opened_at: number;
             path: string;

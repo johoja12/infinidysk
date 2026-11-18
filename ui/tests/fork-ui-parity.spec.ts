@@ -1151,3 +1151,60 @@ test("combined media includes local files without Plex matches by default", asyn
     ),
   ).toBe(true);
 });
+
+test("file names open shared details without leaving Smart Prefetch", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.goto(fixture("activity"));
+  const file = page.getByRole("article").first().getByRole("link").first();
+  await expect(file).toHaveAttribute("href", /\/explorer\?item=/);
+  await file.focus();
+  await page.keyboard.press("Enter");
+  const dialog = page.getByRole("dialog", { name: "File details", exact: true });
+  await expect(dialog.getByRole("heading", { name: "Fixture source.mkv" })).toBeVisible();
+  await expect(dialog.getByRole("img", { name: /cached ranges/ })).toBeVisible();
+  await expect(dialog.getByText("/fixture/mount/source.mkv", { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => window.__mock.calls.filter((c) => c.method !== "GET"))).toEqual([]);
+  await dialog.getByRole("button", { name: "Warm file", exact: true }).click();
+  await expect(dialog.getByRole("status")).toHaveText("File queued for warming.");
+  expect(await page.evaluate(() => window.__mock.calls.filter((c) => c.method === "POST" && c.path === "/api/v1/prefetch").length)).toBe(1);
+  expect(await dialog.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(file).toBeFocused();
+  await page.getByRole("button", { name: "Predictions", exact: true }).click();
+  await page.getByRole("link", { name: "Fixture prediction", exact: true }).click();
+  await expect(dialog.getByRole("heading", { name: "Fixture source.mkv" })).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("file details show missing sources and reject changed sources before warming", async ({ page }) => {
+  await page.goto(fixture("activity"));
+  const file = page.getByRole("article").first().getByRole("link").first();
+  await file.click();
+  const dialog = page.getByRole("dialog", { name: "File details", exact: true });
+  await expect(dialog.getByRole("button", { name: "Warm file", exact: true })).toBeVisible();
+  await page.evaluate(() => { window.__mock.staleCoverage = true; });
+  await dialog.getByRole("button", { name: "Warm file", exact: true }).click();
+  await expect(dialog.getByText("The source changed. Refresh file details before warming.")).toBeVisible();
+  expect(await page.evaluate(() => window.__mock.calls.filter((c) => c.method !== "GET"))).toEqual([]);
+  await page.keyboard.press("Escape");
+  await page.evaluate(() => { window.__mock.fileDetailsError = true; window.__mock.queryClient.removeQueries({ queryKey: ["file"] }); });
+  await file.click();
+  await expect(dialog.getByText("File no longer exists")).toBeVisible();
+});
+
+test("file details stay open when activity finishes", async ({ page }) => {
+  await page.goto(fixture("activity"));
+  await page.getByRole("article").first().getByRole("link").first().click();
+  const dialog = page.getByRole("dialog", { name: "File details", exact: true });
+  await expect(dialog.getByRole("heading", { name: "Fixture source.mkv" })).toBeVisible();
+  await page.evaluate(async () => {
+    window.__mock.queueOverride = [];
+    await window.__mock.queryClient.invalidateQueries({ queryKey: ["prefetch"] });
+  });
+  await expect(page.getByRole("article")).toHaveCount(0);
+  await expect(dialog.getByRole("heading", { name: "Fixture source.mkv" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+});

@@ -1096,3 +1096,13 @@ Warming settings describe a floor of 1–8 articles under pressure and an adapti
 ceiling of 128 articles when capacity is free, retaining a target quarter of provider
 capacity for other transfers. Playback waits still interrupt source reads. The
 source window is bounded separately from each cache block's verification and commit.
+
+### Shared file details
+
+File names on Overview, Smart Prefetch activity, history and predictions, and
+active cache warming open the shared File details dialog without leaving the
+page. This dialog is an exception to the general sheet rule for detail views.
+It reuses Explorer details and actions, with current cache ranges and explicit
+unknown coverage. Playback replaces the dialog until the player closes.
+Modified clicks open the Explorer destination. Historical reads without an item
+identity remain plain text. Playback group expansion has its own button.
