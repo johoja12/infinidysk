@@ -156,6 +156,11 @@ impl Walker<'_> {
                 found.push(pointer);
             }
         }
+        // Replayed directory prefixes have no new durable state. Avoid a write
+        // transaction for every already-accepted batch, but always persist EOF.
+        if batch.seen.is_empty() && !complete {
+            return Ok(0);
+        }
         batch.links = runtime.block_on(
             futures_util::stream::iter(found.into_iter().map(|found| link(db, root, found)))
                 .buffered(16)
@@ -345,6 +350,83 @@ mod tests {
         assert_eq!(
             db.catalogue_groups(root, "", 10).await.unwrap()[0].files,
             6001
+        );
+        db.close().await;
+    }
+    #[tokio::test]
+    async fn replayed_batches_do_not_write_checkpoints_but_empty_eof_still_completes_the_directory()
+    {
+        let path = std::env::temp_dir().join(format!("id-scan-replay-{}", Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        let _temp = Temp(path.clone());
+        let id = ItemId::new();
+        let link = path.join("generated.mkv");
+        std::os::unix::fs::symlink(format!("/fixture-mount/{}", id.ids_path()), &link).unwrap();
+        let db = Db::connect("sqlite::memory:").await.unwrap();
+        let known = Known {
+            mount_dirs: vec!["/fixture-mount".into()],
+            ..Known::default()
+        };
+        let physical = identity(&path, &known).unwrap();
+        let root = path.to_str().unwrap();
+        let run = db
+            .catalogue_scan_claim(
+                root,
+                "fixture",
+                Uuid::new_v4(),
+                (&physical.device, &physical.inode),
+                0,
+            )
+            .await
+            .unwrap();
+        let directory = db
+            .catalogue_scan_directory(root, &run.worker)
+            .await
+            .unwrap()
+            .unwrap();
+        let work_db = db.clone();
+        let work_path = path.clone();
+        let worker = run.worker.clone();
+        tokio::task::spawn_blocking(move || {
+            let walk = Walker {
+                db: &work_db,
+                root: &work_path,
+                known: &known,
+                run: &run,
+                cancel: &CancellationToken::new(),
+            };
+            assert_eq!(
+                walk.checkpoint(&directory, vec![link.clone()], false)
+                    .unwrap(),
+                1
+            );
+            let runtime = tokio::runtime::Handle::current();
+            let before = runtime.block_on(work_db.catalogue_scans()).unwrap()[0].updated_at;
+            std::thread::sleep(Duration::from_millis(10));
+            assert_eq!(walk.checkpoint(&directory, vec![link], false).unwrap(), 0);
+            let after = runtime.block_on(work_db.catalogue_scans()).unwrap()[0].updated_at;
+            assert_eq!(before, after, "replay must not write a progress timestamp");
+            assert_eq!(walk.checkpoint(&directory, vec![], true).unwrap(), 1);
+        })
+        .await
+        .unwrap();
+        assert!(
+            db.catalogue_scan_directory(root, &worker)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.catalogue_scan_publish(root, "fixture", &worker, 2)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.catalogue_links(Some(root), None, None, false, "", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
         );
         db.close().await;
     }

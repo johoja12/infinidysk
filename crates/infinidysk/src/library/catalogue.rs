@@ -136,6 +136,25 @@ fn protected(settings: &Settings, mounts: &[String]) -> Vec<PathBuf> {
     paths.dedup();
     paths
 }
+enum Tick {
+    Idle,
+    Busy,
+    Worked,
+}
+impl Tick {
+    async fn wait(self, wake: &tokio::sync::Notify) {
+        let pause = match self {
+            Self::Idle => Duration::from_secs(60),
+            // A read may close immediately after admission was checked. Retry
+            // promptly while keeping the same playback/import guard in place.
+            Self::Busy => Duration::from_secs(1),
+            // Slices already bound work and check foreground admission. Continue
+            // through that guard instead of adding five idle seconds per slice.
+            Self::Worked => return,
+        };
+        tokio::select! { ()=wake.notified()=>{}, ()=tokio::time::sleep(pause)=>{} }
+    }
+}
 impl Library {
     /// Read-side catalogue requests do not canonicalize or inspect NAS paths.
     async fn catalogue_known(&self, settings: &Settings) -> Known {
@@ -158,17 +177,15 @@ impl Library {
     }
     pub(crate) async fn run_catalogue(self: Arc<Self>) {
         loop {
-            let worked = self.catalogue_tick().await;
-            let pause = Duration::from_secs(if worked { 5 } else { 60 });
-            tokio::select! {()=self.catalogue_wake.notified()=>{},()=tokio::time::sleep(pause)=>{}}
+            self.catalogue_tick().await.wait(&self.catalogue_wake).await;
         }
     }
-    pub(super) async fn catalogue_tick(&self) -> bool {
+    async fn catalogue_tick(&self) -> Tick {
         if (self.parts.busy)() {
-            return false;
+            return Tick::Busy;
         }
         let Ok(_scan) = self.catalogue_scan.try_lock() else {
-            return false;
+            return Tick::Idle;
         };
         let settings = self.settings().await;
         let configured: Vec<_> = settings
@@ -177,11 +194,11 @@ impl Library {
             .map(|dir| dir.path.clone())
             .collect();
         if self.parts.db.catalogue_retain(&configured).await.is_err() {
-            return false;
+            return Tick::Idle;
         }
         let known = self.catalogue_known(&settings).await;
         let Ok(roots) = self.parts.db.catalogue_roots().await else {
-            return false;
+            return Tick::Idle;
         };
         let now = now_ms();
         let next = settings
@@ -214,7 +231,7 @@ impl Library {
                 attempted.saturating_sub(if *requested { 60_000 } else { 0 })
             });
         let Some((root, expected, _, generation, _)) = next else {
-            return false;
+            return Tick::Idle;
         };
         let cancel = CancellationToken::new();
         let _cancel_on_drop = cancel.clone().drop_guard();
@@ -242,6 +259,7 @@ impl Library {
                     .await;
             }
             Err(_) => {
+                tracing::warn!(scope=%expected,reason="storage work exceeded the scan slice deadline", "Library folder scan deferred");
                 if !self
                     .parts
                     .db
@@ -262,7 +280,7 @@ impl Library {
                 }
             }
         }
-        true
+        Tick::Worked
     }
     async fn catalogue_scan_root(
         &self,
@@ -296,6 +314,7 @@ impl Library {
                 generation,
             )
             .await?;
+        let started_at = run.started_at;
         let worker_id = run.worker.clone();
         let worker_root = root_path;
         let db = self.parts.db.clone();
@@ -325,11 +344,14 @@ impl Library {
                 .db
                 .catalogue_scan_abandon(root, &worker_id)
                 .await?;
-        } else if !(self.parts.busy)() {
-            self.parts
+        } else if !(self.parts.busy)()
+            && self
+                .parts
                 .db
                 .catalogue_scan_publish(root, expected, &worker_id, now_ms())
-                .await?;
+                .await?
+        {
+            tracing::info!(scope=%expected,wall_ms=now_ms().saturating_sub(started_at).max(0),"Library folder scan completed");
         }
         drop(config);
         Ok(())
@@ -537,6 +559,20 @@ pub async fn files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_scan_retries_promptly_without_waiting_for_the_idle_poll() {
+        let wake = tokio::sync::Notify::new();
+        let started = tokio::time::Instant::now();
+        Tick::Busy.wait(&wake).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        // Idle polling remains slow, but an explicit refresh wakes it immediately.
+        wake.notify_one();
+        Tick::Idle.wait(&wake).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        Tick::Worked.wait(&wake).await;
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+    }
+
     use infinidysk_core::ItemId;
     #[test]
     fn bounded_walk_recognizes_exact_pointers_and_does_not_follow_directory_links() {
