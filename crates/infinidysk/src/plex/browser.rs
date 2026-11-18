@@ -15,10 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{
-        Arc, Mutex, PoisonError,
-        atomic::{AtomicI64, Ordering},
-    },
+    sync::{Arc, Mutex, PoisonError},
 };
 use tokio::sync::Semaphore;
 use utoipa::{IntoParams, ToSchema};
@@ -72,7 +69,7 @@ pub struct Totals {
     pub unmatched: usize,
     pub external: usize,
 }
-#[derive(Serialize, ToSchema)]
+#[derive(Default, Serialize, ToSchema)]
 #[schema(as=PlexBrowsePage)]
 pub struct Page {
     pub snapshot: Option<String>,
@@ -122,7 +119,7 @@ struct Snapshot {
     rows: Vec<File>,
     totals: Totals,
     at: i64,
-    completed: AtomicI64,
+    configuration: String,
     coverage: Mutex<Coverage>,
 }
 #[derive(Default)]
@@ -137,6 +134,7 @@ pub struct Cache {
     metadata: Semaphore,
     coverage: Semaphore,
     artwork: Semaphore,
+    pages: Arc<Semaphore>,
 }
 impl Default for Cache {
     fn default() -> Self {
@@ -145,6 +143,7 @@ impl Default for Cache {
             metadata: Semaphore::new(1),
             coverage: Semaphore::new(1),
             artwork: Semaphore::new(4),
+            pages: Arc::new(Semaphore::new(2)),
         }
     }
 }
@@ -156,6 +155,40 @@ fn digest(bytes: impl AsRef<[u8]>) -> String {
             let _ = write!(out, "{byte:02x}");
             out
         })
+}
+fn configuration(settings: &Settings, server: &str, library: &str) -> String {
+    digest(
+        serde_json::to_vec(&(
+            server,
+            library,
+            &settings.plex,
+            &settings.imports,
+            &settings.mount.dir,
+            &settings.providers,
+        ))
+        .expect("library configuration contains only serializable values"),
+    )
+}
+impl Current {
+    fn publish(&mut self, snapshot: Arc<Snapshot>) {
+        // One complete catalogue per configuration. Replaced coverage work must
+        // release its slot instead of delaying verification of the new catalogue.
+        self.snapshots
+            .retain(|s| s.configuration != snapshot.configuration);
+        self.snapshots.insert(0, snapshot);
+        self.snapshots.truncate(2);
+    }
+    fn snapshot(&self, key: &str, configuration: &str) -> Option<Arc<Snapshot>> {
+        self.snapshots
+            .iter()
+            .find(|s| s.scope == key && s.configuration == configuration)
+            .or_else(|| {
+                self.snapshots
+                    .iter()
+                    .find(|s| s.configuration == configuration)
+            })
+            .cloned()
+    }
 }
 async fn scope(
     admin: &Admin,
@@ -192,10 +225,21 @@ impl Cache {
         refresh: bool,
     ) -> (Option<Arc<Snapshot>>, bool, Option<String>) {
         let mut current = self.current.lock().unwrap_or_else(PoisonError::into_inner);
-        let snapshot = current.snapshots.iter().find(|s| s.scope == key).cloned();
-        let expired = snapshot
-            .as_ref()
-            .is_none_or(|s| now_ms() - s.completed.load(Ordering::Relaxed).max(s.at) > TTL);
+        // Catalogue generations and health reports may change while the complete
+        // replacement is built. Retain the last catalogue only under identical
+        // server, credentials, mappings and library settings. Actions still revalidate.
+        let configuration = configuration(&settings, &server.id, &library);
+        let snapshot = current.snapshot(key, &configuration);
+        // Do not discard an unfinished verification sweep at every metadata TTL.
+        // Explicit refresh and changed source scope still request a replacement.
+        let expired = snapshot.as_ref().is_none_or(|s| {
+            s.scope != key
+                || now_ms() - s.at > TTL
+                    && s.coverage
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .ready
+        });
         if (refresh || expired && current.retry_at.get(key).is_none_or(|at| now_ms() >= *at))
             && !current.pending.contains(key)
             && current.pending.len() < 2
@@ -215,14 +259,22 @@ impl Cache {
                     {
                         let mut current =
                             cache.current.lock().unwrap_or_else(PoisonError::into_inner);
-                        current.snapshots.retain(|s| s.scope != expected);
-                        current.snapshots.insert(0, Arc::clone(&snapshot));
-                        current.snapshots.truncate(2);
+                        current.publish(Arc::clone(&snapshot));
                     }
                     drop(permit);
-                    let _permit = cache.coverage.acquire().await.map_err(|_| Fail::Internal)?;
-                    fill_coverage(&admin, &snapshot).await;
-                    snapshot.completed.store(now_ms(), Ordering::Relaxed);
+                    let cache = Arc::clone(&cache);
+                    let admin = Arc::clone(&admin);
+                    // Coverage is optional enrichment. It must not keep metadata
+                    // refreshing or prevent another complete catalogue from publishing.
+                    tokio::spawn(async move {
+                        let work = async {
+                            let Ok(_permit) = cache.coverage.acquire().await else {
+                                return;
+                            };
+                            fill_coverage(&admin, &snapshot).await;
+                        };
+                        tokio::select! { ()=admin.cancel.cancelled()=>{}, ()=work=>{} }
+                    });
                     Ok::<_, Fail>(())
                 };
                 let result = tokio::select! {()=admin.cancel.cancelled()=>Err(Fail::Unavailable("Library refresh stopped".into())), result=work=>result};
@@ -597,7 +649,7 @@ async fn build(
         rows,
         totals,
         at: now_ms(),
-        completed: AtomicI64::new(0),
+        configuration: configuration(settings, &server.id, library),
         coverage: Mutex::new(Coverage {
             total,
             ..Coverage::default()
@@ -628,6 +680,18 @@ async fn fill_coverage(admin: &Admin, snapshot: &Snapshot) {
         None
     };
     for id in ids {
+        if !admin
+            .plex
+            .browser
+            .current
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshots
+            .iter()
+            .any(|s| std::ptr::eq(s.as_ref(), snapshot))
+        {
+            return;
+        }
         let value = if let (Some(cache), Some(candidates)) = (cache, candidates.as_ref()) {
             if candidates.contains(&id) {
                 let work = async {
@@ -663,7 +727,7 @@ async fn fill_coverage(admin: &Admin, snapshot: &Snapshot) {
     coverage.ready = true;
     coverage.at = Some(now_ms());
 }
-fn matches(row: &File, q: &Browse) -> bool {
+fn matches(row: &File, q: &Browse, cached_bytes: Option<u64>) -> bool {
     let search = q.search.as_deref().unwrap_or("").to_lowercase();
     (search.is_empty()
         || format!(
@@ -702,7 +766,7 @@ fn matches(row: &File, q: &Browse) -> bool {
         })
         && q.cache.as_deref().is_none_or(|v| {
             v == "all"
-                || match (row.cached_bytes, row.size) {
+                || match (cached_bytes, row.size) {
                     (Some(n), Some(size)) => match v {
                         "any" => n > 0,
                         "complete" => size > 0 && n >= size,
@@ -713,46 +777,80 @@ fn matches(row: &File, q: &Browse) -> bool {
                 }
         })
 }
-fn group(rows: &[File]) -> Vec<Group> {
-    let mut groups = std::collections::BTreeMap::<String, Vec<&File>>::new();
+#[derive(Clone, Copy)]
+struct Row<'a> {
+    file: &'a File,
+    cached_bytes: Option<u64>,
+}
+impl std::ops::Deref for Row<'_> {
+    type Target = File;
+    fn deref(&self) -> &File {
+        self.file
+    }
+}
+struct GroupBuilder<'a> {
+    group: Group,
+    first: &'a File,
+    seasons: HashSet<u32>,
+    qualities: HashSet<&'a str>,
+}
+fn group(rows: &[Row<'_>]) -> Vec<Group> {
+    let mut groups = HashMap::<&str, GroupBuilder<'_>>::new();
     for row in rows {
-        groups.entry(row.group.clone()).or_default().push(row);
+        let builder = groups
+            .entry(row.group.as_str())
+            .or_insert_with(|| GroupBuilder {
+                first: row.file,
+                group: Group {
+                    key: row.group.clone(),
+                    title: row.group_title.clone(),
+                    artwork_key: None,
+                    kind: row.media.kind.clone(),
+                    year: row.media.year,
+                    files: 0,
+                    seasons: 0,
+                    last_viewed_at: None,
+                    bytes: 0,
+                    cached_bytes: Some(0),
+                    attention: 0,
+                    qualities: Vec::new(),
+                },
+                seasons: HashSet::new(),
+                qualities: HashSet::new(),
+            });
+        let g = &mut builder.group;
+        // Match the first episode in title order without sorting every file.
+        let order = |file: &File| (file.media.season, file.media.episode);
+        if order(row.file) < order(builder.first)
+            || order(row.file) == order(builder.first) && row.key < builder.first.key
+        {
+            builder.first = row.file;
+            g.year = row.media.year;
+        }
+        g.files += 1;
+        g.bytes = g.bytes.saturating_add(row.size.unwrap_or(0));
+        g.cached_bytes = g
+            .cached_bytes
+            .zip(row.cached_bytes)
+            .map(|(a, b)| a.saturating_add(b));
+        g.last_viewed_at = g.last_viewed_at.max(row.media.viewed_at);
+        g.attention += usize::from(matches!(row.mapping.as_str(), "broken" | "unknown"));
+        if g.artwork_key.is_none() {
+            g.artwork_key.clone_from(&row.artwork_key);
+        }
+        if let Some(season) = row.media.season {
+            builder.seasons.insert(season);
+        }
+        builder.qualities.insert(row.quality.as_str());
     }
     groups
-        .into_iter()
-        .map(|(key, rows)| {
-            let first = rows[0];
-            let mut qualities: Vec<_> = rows
-                .iter()
-                .map(|r| r.quality.clone())
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect();
+        .into_values()
+        .map(|mut builder| {
+            builder.group.seasons = builder.seasons.len();
+            let mut qualities: Vec<_> = builder.qualities.into_iter().map(str::to_owned).collect();
             qualities.sort();
-            Group {
-                key,
-                title: first.group_title.clone(),
-                artwork_key: rows.iter().find_map(|r| r.artwork_key.clone()),
-                kind: first.media.kind.clone(),
-                year: first.media.year,
-                files: rows.len(),
-                last_viewed_at: rows.iter().filter_map(|r| r.media.viewed_at).max(),
-                seasons: rows
-                    .iter()
-                    .filter_map(|r| r.media.season)
-                    .collect::<HashSet<_>>()
-                    .len(),
-                bytes: rows.iter().filter_map(|r| r.size).sum(),
-                cached_bytes: rows
-                    .iter()
-                    .all(|r| r.cached_bytes.is_some())
-                    .then(|| rows.iter().filter_map(|r| r.cached_bytes).sum()),
-                attention: rows
-                    .iter()
-                    .filter(|r| matches!(r.mapping.as_str(), "broken" | "unknown"))
-                    .count(),
-                qualities,
-            }
+            builder.group.qualities = qualities;
+            builder.group
         })
         .collect()
 }
@@ -817,7 +915,7 @@ pub async fn browse(
         &key,
         q.refresh.unwrap_or(false),
     );
-    let mut result = Page {
+    let result = Page {
         snapshot: None,
         updated_at: None,
         refreshing,
@@ -836,7 +934,23 @@ pub async fn browse(
     let Some(snapshot) = snapshot else {
         return Ok(Json(result));
     };
-    result.snapshot = Some(key);
+    let permit = admin
+        .plex
+        .browser
+        .pages
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Fail::Internal)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        Json(render(result, &snapshot, &q))
+    })
+    .await
+    .map_err(|_| Fail::Internal)
+}
+fn render(mut result: Page, snapshot: &Snapshot, q: &Browse) -> Page {
+    result.snapshot = Some(snapshot.scope.clone());
     result.updated_at = Some(snapshot.at);
     result.totals = snapshot.totals.clone();
     let coverage = snapshot
@@ -848,46 +962,37 @@ pub async fn browse(
     result.coverage_ready = coverage.ready;
     result.coverage_at = coverage.at;
     if !coverage.ready && q.cache.as_deref().is_some_and(|v| v != "all") {
-        return Ok(Json(result));
+        return result;
     }
+    // Keep the catalogue borrowed. Only the requested file page is cloned.
     let mut rows: Vec<_> = snapshot
         .rows
         .iter()
-        .cloned()
-        .map(|mut row| {
-            row.cached_bytes = row
+        .map(|file| Row {
+            file,
+            cached_bytes: file
                 .item
-                .and_then(|id| coverage.values.get(&id).copied().flatten());
-            row
+                .and_then(|id| coverage.values.get(&id).copied().flatten()),
         })
-        .filter(|r| matches(r, &q))
+        .filter(|r| matches(r.file, q, r.cached_bytes))
         .collect();
     drop(coverage);
-    rows.sort_by(|a, b| {
-        let order = match q.sort.as_deref().unwrap_or("title") {
-            "recent" => b.media.viewed_at.cmp(&a.media.viewed_at),
-            "size" => b.size.cmp(&a.size),
-            "coverage" => b.cached_bytes.cmp(&a.cached_bytes),
-            _ => a
-                .group_title
-                .to_lowercase()
-                .cmp(&b.group_title.to_lowercase())
-                .then_with(|| a.media.season.cmp(&b.media.season))
-                .then_with(|| a.media.episode.cmp(&b.media.episode)),
-        };
-        order.then_with(|| a.key.cmp(&b.key))
-    });
     result.matched_files = rows.len();
     let mut groups = group(&rows);
-    groups.sort_by(|a, b| {
-        match q.sort.as_deref().unwrap_or("title") {
-            "size" => b.bytes.cmp(&a.bytes),
-            "coverage" => b.cached_bytes.cmp(&a.cached_bytes),
-            "recent" => b.last_viewed_at.cmp(&a.last_viewed_at),
-            _ => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-        }
-        .then_with(|| a.key.cmp(&b.key))
-    });
+    match q.sort.as_deref().unwrap_or("title") {
+        "size" => groups.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.key.cmp(&b.key))),
+        "coverage" => groups.sort_by(|a, b| {
+            b.cached_bytes
+                .cmp(&a.cached_bytes)
+                .then_with(|| a.key.cmp(&b.key))
+        }),
+        "recent" => groups.sort_by(|a, b| {
+            b.last_viewed_at
+                .cmp(&a.last_viewed_at)
+                .then_with(|| a.key.cmp(&b.key))
+        }),
+        _ => groups.sort_by_cached_key(|g| (g.title.to_lowercase(), g.key.clone())),
+    }
     result.total_groups = groups.len();
     let offset = q.offset.unwrap_or(0) as usize;
     let limit = q.limit.unwrap_or(50).clamp(1, 100) as usize;
@@ -900,9 +1005,40 @@ pub async fn browse(
         if rows.len() > offset + limit {
             result.next = u32::try_from(offset + limit).ok();
         }
-        result.files = rows.into_iter().skip(offset).take(limit).collect();
+        match q.sort.as_deref().unwrap_or("title") {
+            "recent" => rows.sort_by(|a, b| {
+                b.media
+                    .viewed_at
+                    .cmp(&a.media.viewed_at)
+                    .then_with(|| a.key.cmp(&b.key))
+            }),
+            "size" => rows.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.key.cmp(&b.key))),
+            "coverage" => rows.sort_by(|a, b| {
+                b.cached_bytes
+                    .cmp(&a.cached_bytes)
+                    .then_with(|| a.key.cmp(&b.key))
+            }),
+            _ => rows.sort_by_cached_key(|r| {
+                (
+                    r.group_title.to_lowercase(),
+                    r.media.season,
+                    r.media.episode,
+                    r.key.clone(),
+                )
+            }),
+        }
+        result.files = rows
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|r| {
+                let mut file = r.file.clone();
+                file.cached_bytes = r.cached_bytes;
+                file
+            })
+            .collect();
     }
-    Ok(Json(result))
+    result
 }
 #[derive(Deserialize, ToSchema)]
 #[schema(as=PlexBrowseResolve)]
@@ -1073,17 +1209,20 @@ mod tests {
             cache: Some("any".into()),
             ..Default::default()
         };
-        let found: Vec<_> = rows.iter().filter(|r| matches(r, &q)).collect();
+        let found: Vec<_> = rows
+            .iter()
+            .filter(|r| matches(r, &q, r.cached_bytes))
+            .collect();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].media.episode, Some(124));
         let mut unknown = rows[124].clone();
         unknown.cached_bytes = None;
-        assert!(!matches(&unknown, &q));
+        assert!(!matches(&unknown, &q, unknown.cached_bytes));
         q.cache = Some("unavailable".into());
-        assert!(matches(&unknown, &q));
+        assert!(matches(&unknown, &q, unknown.cached_bytes));
         unknown.watched_known = false;
         q.watched = Some("unwatched".into());
-        assert!(!matches(&unknown, &q));
+        assert!(!matches(&unknown, &q, unknown.cached_bytes));
     }
     #[test]
     fn grouping_aggregates_all_files_and_preserves_unknown_coverage() {
@@ -1092,12 +1231,133 @@ mod tests {
         b.media.season = Some(3);
         b.cached_bytes = None;
         b.mapping = "broken".into();
-        let groups = group(&[a, b]);
+        let groups = group(&[
+            Row {
+                file: &a,
+                cached_bytes: a.cached_bytes,
+            },
+            Row {
+                file: &b,
+                cached_bytes: b.cached_bytes,
+            },
+        ]);
         assert_eq!(groups.len(), 1);
         let g = &groups[0];
         assert_eq!((g.files, g.seasons, g.bytes, g.attention), (2, 2, 200, 1));
         assert_eq!(g.cached_bytes, None);
         assert_eq!(g.qualities, ["1080p", "4k"]);
+    }
+    fn snapshot(rows: Vec<File>) -> Snapshot {
+        Snapshot {
+            scope: "fixture-content".into(),
+            configuration: "fixture-settings".into(),
+            totals: Totals {
+                files: rows.len(),
+                ..Totals::default()
+            },
+            rows,
+            at: now_ms(),
+            coverage: Mutex::new(Coverage {
+                ready: true,
+                ..Coverage::default()
+            }),
+        }
+    }
+    #[test]
+    fn rendering_filters_the_complete_catalogue_before_paging_and_preserves_unknown_coverage() {
+        let mut rows: Vec<_> = (0..125)
+            .map(|i| row("Fixture", &format!("/media/{i}.mkv"), i))
+            .collect();
+        rows[124].media.title = "fixture needle".into();
+        let snapshot = snapshot(rows);
+        let q = Browse {
+            view: Some("files".into()),
+            search: Some("needle".into()),
+            ..Browse::default()
+        };
+        let page = render(Page::default(), &snapshot, &q);
+        assert_eq!(page.matched_files, 1);
+        assert_eq!(page.files[0].media.episode, Some(124));
+        assert_eq!(page.files[0].cached_bytes, None);
+        let q = Browse {
+            view: Some("files".into()),
+            offset: Some(100),
+            limit: Some(10),
+            ..Browse::default()
+        };
+        let page = render(Page::default(), &snapshot, &q);
+        assert_eq!(page.matched_files, 125);
+        assert_eq!(page.total_groups, 1);
+        assert_eq!(page.files.len(), 10);
+        assert_eq!(page.files[0].media.episode, Some(100));
+        assert_eq!(page.next, Some(110));
+        let q = Browse {
+            view: Some("groups".into()),
+            ..Browse::default()
+        };
+        let page = render(Page::default(), &snapshot, &q);
+        assert_eq!(page.groups[0].files, 125);
+        assert_eq!(page.groups[0].cached_bytes, None);
+    }
+    #[test]
+    fn catalogue_changes_retain_a_complete_snapshot_only_with_identical_configuration() {
+        let saved = Arc::new(snapshot(vec![row("Fixture", "/media/fixture.mkv", 1)]));
+        let mut current = Current {
+            snapshots: vec![Arc::clone(&saved)],
+            ..Current::default()
+        };
+        assert!(Arc::ptr_eq(
+            &current.snapshot("new-content", "fixture-settings").unwrap(),
+            &saved
+        ));
+        assert!(
+            current
+                .snapshot("new-content", "changed-credentials-or-mappings")
+                .is_none()
+        );
+        let mut replacement = snapshot(Vec::new());
+        replacement.scope = "new-content".into();
+        let replacement = Arc::new(replacement);
+        current.publish(Arc::clone(&replacement));
+        assert_eq!(current.snapshots.len(), 1);
+        assert!(Arc::ptr_eq(&current.snapshots[0], &replacement));
+        assert!(!current.snapshots.iter().any(|s| Arc::ptr_eq(s, &saved)));
+        let mut settings = Settings::default();
+        let before = configuration(&settings, "server", "all");
+        settings.mount.dir.push_str("/changed");
+        assert_ne!(configuration(&settings, "server", "all"), before);
+        assert_ne!(configuration(&settings, "another-server", "all"), before);
+        assert_ne!(configuration(&Settings::default(), "server", "1"), before);
+    }
+    #[test]
+    #[ignore = "explicit generated catalogue performance measurement"]
+    fn generated_catalogue_render_timing() {
+        let rows = (0..54_428)
+            .map(|i| {
+                let mut file = row("Fixture", &format!("/media/fixture-{i}.mkv"), i);
+                file.group = format!("fixture-group-{:05}", i % 8810);
+                file.group_title = file.group.clone();
+                file
+            })
+            .collect();
+        let snapshot = snapshot(rows);
+        let q = Browse {
+            view: Some("groups".into()),
+            limit: Some(50),
+            ..Browse::default()
+        };
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            let page = render(Page::default(), &snapshot, &q);
+            assert_eq!(
+                (page.matched_files, page.total_groups, page.groups.len()),
+                (54_428, 8810, 50)
+            );
+        }
+        println!(
+            "generated catalogue mean render ms: {}",
+            started.elapsed().as_millis() / 5
+        );
     }
     #[test]
     fn resolution_metadata_wins_and_sd_is_a_token() {
