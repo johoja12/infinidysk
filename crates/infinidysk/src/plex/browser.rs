@@ -247,9 +247,12 @@ impl Cache {
             current.pending.insert(key.to_owned());
             let cache = Arc::clone(self);
             let expected = key.to_owned();
+            let queued = std::time::Instant::now();
             tokio::spawn(async move {
                 let work = async {
                     let permit = cache.metadata.acquire().await.map_err(|_| Fail::Internal)?;
+                    let queue_ms = queued.elapsed().as_secs_f64() * 1000.0;
+                    let started = std::time::Instant::now();
                     let built = build(&admin, &settings, &server, &library, &expected).await?;
                     let latest = admin.config.read().await.settings().clone();
                     if scope(&admin, &latest, &server.id, &library).await? != expected {
@@ -261,6 +264,12 @@ impl Cache {
                             cache.current.lock().unwrap_or_else(PoisonError::into_inner);
                         current.publish(Arc::clone(&snapshot));
                     }
+                    tracing::info!(
+                        queue_ms,
+                        metadata_ms = started.elapsed().as_secs_f64() * 1000.0,
+                        files = snapshot.rows.len(),
+                        "Library catalogue refresh completed"
+                    );
                     drop(permit);
                     let cache = Arc::clone(&cache);
                     let admin = Arc::clone(&admin);
@@ -657,6 +666,7 @@ async fn build(
     })
 }
 async fn fill_coverage(admin: &Admin, snapshot: &Snapshot) {
+    let started = std::time::Instant::now();
     let ids: HashSet<_> = snapshot.rows.iter().filter_map(|r| r.item).collect();
     let cache = admin.vfs.native_cache();
     let legacy_expected = admin
@@ -726,6 +736,13 @@ async fn fill_coverage(admin: &Admin, snapshot: &Snapshot) {
         .unwrap_or_else(PoisonError::into_inner);
     coverage.ready = true;
     coverage.at = Some(now_ms());
+    tracing::info!(
+        coverage_ms = started.elapsed().as_secs_f64() * 1000.0,
+        checked = coverage.checked,
+        total = coverage.total,
+        unknown = coverage.values.values().filter(|v| v.is_none()).count(),
+        "Library cache coverage refresh completed"
+    );
 }
 fn matches(row: &File, q: &Browse, cached_bytes: Option<u64>) -> bool {
     let search = q.search.as_deref().unwrap_or("").to_lowercase();
