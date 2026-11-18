@@ -1,3 +1,4 @@
+import { FileLink } from "../file-link";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronRight, CircleAlert, Info } from "lucide-react";
 import { type PointerEvent, type ReactNode, memo, useLayoutEffect, useRef, useState } from "react";
@@ -417,7 +418,7 @@ function Now({ live }: { live: Live }) {
               <TableRow key={r.id}>
                 <TableCell className="w-full max-w-0">
                   <div className="truncate font-medium" title={r.path}>
-                    <ReleaseName name={displayName(r.path)} />
+                    <FileLink item={r.item_id} className="hover:text-primary"><ReleaseName name={displayName(r.path)} /></FileLink>
                   </div>
                   <div className="text-muted-foreground text-xs whitespace-normal wrap-anywhere">
                     {r.delivery === "fuse" ? "FUSE" : "WebDAV"} · <Client client={r.client} /> · opened {ago(r.opened_at)}
@@ -847,16 +848,13 @@ const Reads = memo(function Reads({ reads }: { reads: Read[] }) {
                 return [
                   <TableRow key={key}>
                     <TableCell className="w-full max-w-0">
-                      <button
-                        type="button"
-                        className="flex w-full min-w-0 items-start gap-1.5 text-left"
-                        aria-expanded={expanded}
-                        onClick={() => toggle(key)}
-                      >
-                        <ChevronRight className={cn("text-muted-foreground mt-0.5 size-4 shrink-0 transition-transform", expanded && "rotate-90")} />
+                      <div className="flex w-full min-w-0 items-start gap-1.5 text-left">
+                        <button type="button" aria-label="Show playback opens" aria-expanded={expanded} onClick={() => toggle(key)} className="relative shrink-0 after:absolute after:-inset-1">
+                          <ChevronRight className={cn("text-muted-foreground mt-0.5 size-4 transition-transform", expanded && "rotate-90")} />
+                        </button>
                         <span className="min-w-0">
                           <span className="block font-medium whitespace-normal wrap-anywhere" title={latest.path}>
-                            <ReleaseName name={displayName(latest.path)} />
+                            <FileLink item={latest.item_id} className="hover:text-primary"><ReleaseName name={displayName(latest.path)} /></FileLink>
                           </span>
                           <span className="text-muted-foreground block text-xs whitespace-normal wrap-anywhere">
                             {latest.delivery === "fuse" ? "FUSE" : "WebDAV"} · {caller(latest.client).name} · {g.length} opens
@@ -864,7 +862,7 @@ const Reads = memo(function Reads({ reads }: { reads: Read[] }) {
                             {stalls > 0 && <span className="text-warning-text sm:hidden"> · {count(stalls, "stall")}</span>}
                           </span>
                         </span>
-                      </button>
+                      </div>
                     </TableCell>
                     <TableCell className="text-muted-foreground hidden sm:table-cell" title={stamp(latest.closed_at)}>
                       {ago(latest.closed_at)}
@@ -925,7 +923,7 @@ function ReadRow({ read: r, nested }: { read: Read; nested?: boolean }) {
             <span className="size-4 shrink-0" aria-hidden />
             <div className="min-w-0">
               <div className="font-medium whitespace-normal wrap-anywhere" title={r.path}>
-                <ReleaseName name={displayName(r.path)} />
+                <FileLink item={r.item_id} className="hover:text-primary"><ReleaseName name={displayName(r.path)} /></FileLink>
               </div>
               <div className="text-muted-foreground text-xs whitespace-normal wrap-anywhere">
                 {r.delivery === "fuse" ? "FUSE" : "WebDAV"} · <Client client={r.client} />

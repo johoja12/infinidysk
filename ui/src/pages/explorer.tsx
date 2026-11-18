@@ -55,6 +55,7 @@ import {
   RowActions,
   Status,
 } from "../ui";
+import { CacheRangeMap } from "./cache-range-map";
 import { copyStreamLink, download, playable, Player } from "./player";
 
 type Entry = Schemas["FileEntry"];
@@ -495,12 +496,14 @@ function Remove({ id, onRemoved }: { id: string; onRemoved: () => void }) {
   );
 }
 
-function Details({
+export function Details({
   id,
   actions,
   onClose,
   onRemoved,
+  embedded = false,
 }: {
+  embedded?: boolean;
   id: string;
   actions: Actions;
   onClose: () => void;
@@ -510,7 +513,7 @@ function Details({
   const details = useQuery({
     queryKey: ["file", id],
     queryFn: () => body(api.GET("/api/v1/files/{id}", { params: { path: { id } } })),
-    refetchInterval: (q) => (q.state.data?.media?.pending ? 2000 : false),
+    refetchInterval: (q) => (q.state.data?.media?.pending ? 2000 : embedded ? 5000 : false),
   });
   const analyze = useMutation({
     mutationFn: () => body(api.POST("/api/v1/files/{id}/analyze", { params: { path: { id } } })),
@@ -529,16 +532,30 @@ function Details({
     },
     onError: (e) => toast.error(e.message),
   });
+  const warm = useMutation({
+    mutationFn: async () => {
+      const fresh = await body(api.GET("/api/v1/files/{id}", { params: { path: { id } } }));
+      if (!fresh.source_revision || fresh.source_revision !== details.data?.source_revision || fresh.entry.size !== details.data?.entry.size)
+        throw new Error("The source changed. Refresh file details before warming.");
+      return body(api.POST("/api/v1/prefetch", { body: { item: id, ranges: [], priority: 50, intent: crypto.randomUUID() } }));
+    },
+    onSuccess: () => {
+      toast.success("File queued for warming");
+      void client.invalidateQueries({ queryKey: ["prefetch"] });
+    },
+  });
   const card = useRef<HTMLDivElement>(null);
   useEffect(() => {
+    if (embedded) return;
     card.current?.scrollIntoView({
       behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
       block: "nearest",
     });
-  }, [details.isSuccess]);
+  }, [details.isSuccess, embedded]);
 
+  const Container = embedded ? "div" : Panel;
   return (
-    <Panel ref={card} className="mt-4 scroll-mt-4 p-4">
+    <Container ref={card} className={embedded ? "min-w-0" : "mt-4 scroll-mt-4 p-4"}>
       {details.isPending ? (
         <Loading />
       ) : details.isError ? (
@@ -620,6 +637,19 @@ function Details({
                 )}
                 <Remove id={id} onRemoved={onRemoved} />
               </div>
+              {file && (
+                <section className="space-y-3" aria-label="Cached byte ranges">
+                  <h3 className="font-medium">Cached byte ranges</h3>
+                  {details.data.cache_available && !details.data.cache_warning ? (
+                    <CacheRangeMap size={entry.size ?? 0} ranges={details.data.cached_ranges} />
+                  ) : <p className="text-muted-foreground">{details.data.cache_warning || "Cache coverage is unavailable for this file."}</p>}
+                  <Button variant="outline" size="sm" disabled={warm.isPending || !details.data.cache_available || !details.data.source_revision} onClick={() => warm.mutate()}>
+                    {warm.isPending ? "Queuing…" : "Warm file"}
+                  </Button>
+                  {warm.error && <Failure error={warm.error} />}
+                  {warm.isSuccess && <p role="status">File queued for warming.</p>}
+                </section>
+              )}
               <div className="grid gap-6 lg:grid-cols-2">
                 <dl className="grid grid-cols-[auto_1fr] content-start gap-x-4 gap-y-1.5">
                   <Fact label="Kind">
@@ -711,7 +741,7 @@ function Details({
           );
         })()
       )}
-    </Panel>
+    </Container>
   );
 }
 

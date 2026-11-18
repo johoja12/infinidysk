@@ -1,5 +1,6 @@
+import { FileLink } from "../file-link";
 import { useMemo, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router";
+import { useSearchParams } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, Pause, Play, RefreshCw, Search } from "lucide-react";
 import { api, body, type Schemas } from "../api/client";
@@ -594,12 +595,12 @@ export function PrefetchActivity() {
                 >
                   <div className="grid min-w-0 gap-4 p-4 sm:grid sm:grid-cols-[minmax(0,3fr)_7rem_minmax(10rem,1fr)_8.5rem]">
                     <div className="min-w-0">
-                      <Link
-                        to={`/files/${j.item}`}
+                      <FileLink
+                        item={j.item}
                         className="break-words text-sm font-medium hover:text-primary"
                       >
                         {data.names[j.item] || j.item.slice(0, 8)}
-                      </Link>
+                      </FileLink>
                       <div className="mt-2 flex flex-wrap gap-1">
                         {[
                           ...new Set(row.runs.map((run) => source(run.job))),
@@ -813,9 +814,9 @@ export function PrefetchActivity() {
           )}
           {data.followup.entries.map((r) => (
             <p key={r.item}>
-              <Link className="text-primary" to={`/files/${r.item}`}>
+              <FileLink className="text-primary" item={r.item}>
                 {data.names[r.item] || r.item.slice(0, 8)}
-              </Link>{" "}
+              </FileLink>{" "}
               · {pretty(r.status)} · {pretty(r.regrab.stage)}
               {r.warmed_at && (
                 <> · Full warm {new Date(r.warmed_at).toLocaleString()}</>
@@ -824,13 +825,13 @@ export function PrefetchActivity() {
                 <>
                   {" "}
                   · replacement{" "}
-                  <Link
-                    to={`/files/${r.replacement_item}`}
+                  <FileLink
+                    item={r.replacement_item}
                     className="text-primary"
                   >
                     {data.names[r.replacement_item] ||
                       r.replacement_item.slice(0, 8)}
-                  </Link>
+                  </FileLink>
                 </>
               )}
             </p>

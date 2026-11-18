@@ -1,3 +1,4 @@
+import { FileLink } from "../file-link";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router";
 import { api, body, type Schemas } from "../api/client";
@@ -240,12 +241,12 @@ export function OriginalCacheOverview({
                   className="flex flex-wrap items-center justify-between gap-3 border-b p-4 last:border-0"
                 >
                   <div className="min-w-0">
-                    <Link
+                    <FileLink
                       className="break-words text-sm font-medium hover:text-primary"
-                      to={`/files/${job.item}`}
+                      item={job.item}
                     >
                       {warming.data?.names[job.item] || job.item.slice(0, 8)}
-                    </Link>
+                    </FileLink>
                     <p className="mt-1 text-xs text-muted-foreground">
                       {source(job)}
                     </p>

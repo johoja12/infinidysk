@@ -824,7 +824,7 @@ export function PlexLibraryBrowser() {
                       Warm file
                     </Button>
                     <Button variant="outline" asChild>
-                      <Link to={`/files/${resolved.data.item}`}>
+                      <Link to={`/explorer?item=${resolved.data.item}`}>
                         Source details
                       </Link>
                     </Button>

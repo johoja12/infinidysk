@@ -543,7 +543,7 @@ export function OriginalCacheBrowser() {
                   {selected.source_present && (
                     <Link
                       className="text-primary hover:underline"
-                      to={`/files/${selected.item}`}
+                      to={`/explorer?item=${selected.item}`}
                     >
                       Open imported file
                     </Link>

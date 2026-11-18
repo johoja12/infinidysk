@@ -1,5 +1,5 @@
+import { FileLink } from "../file-link";
 import { useState } from "react";
-import { Link } from "react-router";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -213,12 +213,12 @@ export function PredictionResults({
               <div className="flex flex-wrap justify-between gap-2">
                 <p className="min-w-0 break-words text-sm font-medium">
                   {p.item ? (
-                    <Link
+                    <FileLink
                       className="hover:text-primary"
-                      to={`/files/${p.item}`}
+                      item={p.item}
                     >
                       {p.title}
-                    </Link>
+                    </FileLink>
                   ) : (
                     p.title
                   )}
