@@ -3,6 +3,7 @@ use super::*;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 mod eviction;
+mod recovery;
 
 struct Fixture {
     path: PathBuf,

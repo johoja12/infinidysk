@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 const OVERHEAD: u64 = 65_536;
 mod eviction;
+mod recovery;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(as = LegacyCacheEvictionPolicy)]
@@ -133,6 +134,7 @@ pub struct Writer {
     written: AtomicU64,
     probes: HashMap<String, Arc<Semaphore>>,
     eviction: Arc<AsyncMutex<eviction::State>>,
+    recovery: Arc<AsyncMutex<recovery::State>>,
     #[cfg(test)]
     fault: Option<Fault>,
 }
@@ -170,6 +172,7 @@ impl Writer {
             written: AtomicU64::new(0),
             probes,
             eviction: Arc::default(),
+            recovery: Arc::default(),
             #[cfg(test)]
             fault: None,
         }))
