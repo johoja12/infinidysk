@@ -67,6 +67,10 @@ impl Writer {
     /// A deadline never cancels deletion. The owned task retains admission,
     /// original ownership and the entry guard until physical and metadata work ends.
     pub async fn maintain(self: &Arc<Self>, context: Maintenance) -> Result<(), Error> {
+        if context.cache.settings.recovery_mode {
+            return Ok(());
+        }
+        self.recover_pending().await?;
         if !self.settings.folders.iter().any(|f| f.eviction.is_some()) {
             return Ok(());
         }
