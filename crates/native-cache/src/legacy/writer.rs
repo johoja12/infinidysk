@@ -313,18 +313,37 @@ impl Writer {
             }
         }
         let mut free = HashMap::new();
+        let assigned = existing.as_ref().map(|entry| entry.folder.as_str());
         for folder in &self.settings.folders {
+            if assigned.is_some_and(|id| id != folder.id) {
+                continue;
+            }
             let Some(root) = self.legacy.roots.get(&folder.id).cloned() else {
                 continue;
             };
             let Some(probe) = self.probes.get(&folder.id) else {
                 continue;
             };
-            let Ok(permit) = probe.clone().try_acquire_owned() else {
-                continue;
-            };
+            // Existing entries cannot move to another volume. A busy or slow
+            // probe is not a placement refusal. Publication is already owned;
+            // foreground callers retain their outer cache I/O deadline.
+            let permit =
+                if assigned.is_some() {
+                    probe.clone().acquire_owned().await.map_err(|_| {
+                        Error::Invalid("compatible cache storage probe is unavailable")
+                    })?
+                } else {
+                    let Ok(permit) = probe.clone().try_acquire_owned() else {
+                        continue;
+                    };
+                    permit
+                };
+            #[cfg(test)]
+            let testing = self.clone();
             let job = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                #[cfg(test)]
+                testing.point("storage_probe")?;
                 root.validate()?;
                 let stat = nix::sys::statvfs::fstatvfs(&root.file)?;
                 if stat.flags().contains(nix::sys::statvfs::FsFlags::ST_RDONLY) {
@@ -337,10 +356,22 @@ impl Writer {
                     stat.fragment_size(),
                 ))
             });
-            if let Ok(Ok(Ok(bytes))) =
-                tokio::time::timeout(std::time::Duration::from_secs(1), job).await
-            {
-                free.insert(folder.id.clone(), bytes);
+            let result = if assigned.is_some() {
+                Some(job.await)
+            } else {
+                tokio::time::timeout(std::time::Duration::from_secs(1), job)
+                    .await
+                    .ok()
+            };
+            match result {
+                Some(Ok(Ok(bytes))) => {
+                    free.insert(folder.id.clone(), bytes);
+                }
+                Some(Ok(Err(error))) if assigned.is_some() => return Err(error),
+                Some(Err(_)) if assigned.is_some() => {
+                    return Err(Error::Invalid("compatible cache storage probe task failed"));
+                }
+                _ => {}
             }
         }
         let gate = self.gate.lock().await;

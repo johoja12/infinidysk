@@ -667,3 +667,101 @@ async fn process_death_at_publication_boundaries_preserves_old_data_and_recovers
         assert_eq!(read(&writer.legacy, 0).await.unwrap(), bytes(0));
     }
 }
+
+#[tokio::test]
+async fn assigned_storage_probe_waits_for_busy_volume_instead_of_declining() {
+    let f = Fixture::new().await;
+    let writer = f.open(8).await;
+    assert!(put(&writer, 0).await.unwrap());
+    let busy = writer.probes["a"].clone().acquire_owned().await.unwrap();
+    let mut writing = tokio::spawn({
+        let writer = writer.clone();
+        async move { put(&writer, 1).await }
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(1200), &mut writing)
+            .await
+            .is_err()
+    );
+    drop(busy);
+    assert!(writing.await.unwrap().unwrap());
+    assert_eq!(read(&writer.legacy, 1).await.unwrap(), bytes(1));
+    assert_eq!(accounting(&writer.legacy).await.1, 0);
+}
+
+#[tokio::test]
+async fn assigned_storage_probe_survives_slow_filesystem_validation() {
+    struct Release(Arc<(Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+    let f = Fixture::new().await;
+    let mut writer = f.open(8).await;
+    assert!(put(&writer, 0).await.unwrap());
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    fault(
+        &mut writer,
+        Fault::Gate("storage_probe", entered.clone(), gate.clone()),
+    );
+    let release = Release(gate);
+    let mut writing = tokio::spawn({
+        let writer = writer.clone();
+        async move { put(&writer, 1).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !entered.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let pending = tokio::time::timeout(std::time::Duration::from_millis(1200), &mut writing)
+        .await
+        .is_err();
+    drop(release);
+    assert!(pending);
+    assert!(writing.await.unwrap().unwrap());
+    assert_eq!(read(&writer.legacy, 1).await.unwrap(), bytes(1));
+    assert_eq!(accounting(&writer.legacy).await.1, 0);
+}
+
+#[tokio::test]
+async fn fresh_storage_probe_skips_busy_volume_and_preserves_placement_failover() {
+    let f = Fixture::new().await;
+    let writer = f.open(8).await;
+    let _busy = writer.probes["a"].clone().acquire_owned().await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), put(&writer, 0))
+            .await
+            .unwrap()
+            .unwrap()
+    );
+    let entry = writer
+        .legacy
+        .find(ITEM, GENERATION, SIZE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.folder, "b");
+    assert_eq!(read(&writer.legacy, 0).await.unwrap(), bytes(0));
+}
+
+#[tokio::test]
+async fn assigned_storage_probe_reports_invalid_volume_instead_of_capacity_decline() {
+    let f = Fixture::new().await;
+    let writer = f.open(8).await;
+    assert!(put(&writer, 0).await.unwrap());
+    std::fs::write(f.path.join("a/.infinidysk-volume"), b"changed").unwrap();
+    let error = put(&writer, 1).await.unwrap_err();
+    assert!(
+        std::error::Error::source(&error)
+            .unwrap()
+            .to_string()
+            .contains("volume")
+    );
+    assert_eq!(accounting(&writer.legacy).await.1, 0);
+}
