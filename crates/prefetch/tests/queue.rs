@@ -1358,3 +1358,6 @@ async fn deep_warming_window_cancels_without_committing_inflight_articles() {
     assert_eq!(cache.stats().await.unwrap().bytes, 0);
     assert_eq!(queue.status().await.jobs[0].verified_bytes, 0);
 }
+
+#[path = "queue/publication.rs"]
+mod publication;

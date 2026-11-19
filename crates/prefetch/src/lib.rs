@@ -276,7 +276,7 @@ pub struct Queue {
     vfs: Arc<Vfs>,
     ledger: Mutex<Ledger>,
     /// A step holds this across its I/O. Controls use the ledger only and stay responsive.
-    step: Mutex<()>,
+    step: Arc<Mutex<()>>,
     changed: Notify,
     wire: Arc<infinidysk_nntp::wire::Budget>,
     watched: Mutex<watched::Tracker>,
@@ -346,7 +346,7 @@ impl Queue {
             db,
             vfs,
             ledger: Mutex::new(ledger),
-            step: Mutex::new(()),
+            step: Arc::new(Mutex::new(())),
             changed: Notify::new(),
             wire,
             watched: Mutex::default(),
@@ -441,11 +441,12 @@ impl Queue {
             self.rates
                 .snapshot(std::time::Instant::now(), now_ms(), self.wire.received());
         rates.retain(|r| {
-            !ledger.paused
-                && ledger
-                    .jobs
-                    .iter()
-                    .any(|j| j.id == r.job && j.run == r.run && j.state == State::Queued)
+            r.active
+                || !ledger.paused
+                    && ledger
+                        .jobs
+                        .iter()
+                        .any(|j| j.id == r.job && j.run == r.run && j.state == State::Queued)
         });
         Status {
             rates,
@@ -856,7 +857,7 @@ impl Queue {
     }
 
     async fn tick_bounded(&self, settings: &Settings, blocks: u64) -> anyhow::Result<bool> {
-        let Ok(_step) = self.step.try_lock() else {
+        let Ok(mut step) = self.step.clone().try_lock_owned() else {
             return Ok(false);
         };
         self.wire
@@ -920,7 +921,7 @@ impl Queue {
         let Some(mut job) = selected else {
             return Ok(false);
         };
-        let _rate = self
+        let mut rate = self
             .rates
             .begin(job.id, job.run, std::time::Instant::now(), now_ms());
         let source = self.db.item(ItemId(job.item)).await?;
@@ -1079,8 +1080,9 @@ impl Queue {
                     .await?;
                 return Ok(true);
             }
-            // Serialize publication against pause/cancel. No job can report completed bytes
-            // before the complete block is safely published by the cache.
+            // Admit publication against pause/cancel, then release the control ledger
+            // before storage I/O. The owned write may finish after a pause; checkpoint
+            // revalidates controls before acknowledging its durable bytes.
             let ledger = self.ledger.lock().await;
             if ledger.paused
                 || !ledger
@@ -1090,10 +1092,28 @@ impl Queue {
             {
                 return Ok(false);
             }
-            let published = cache
-                .put_reserved(&lease, job.offset / BLOCK, Bytes::from(bytes), reserved)
-                .await;
             drop(ledger);
+            // The publication owns admission and activity until durability is known,
+            // even if a policy change cancels this window. No replacement step can
+            // fetch the same block while this write is still finishing.
+            let publication = tokio::spawn({
+                let cache = cache.clone();
+                let lease = lease.clone();
+                async move {
+                    let published = cache
+                        .put_reserved_background(
+                            &lease,
+                            job.offset / BLOCK,
+                            Bytes::from(bytes),
+                            reserved,
+                        )
+                        .await;
+                    (published, step, rate)
+                }
+            });
+            let (published, admitted_step, active_rate) = publication.await?;
+            step = admitted_step;
+            rate = active_rate;
             if matches!(published, Ok(true)) {
                 self.checkpoint(&job, length, true).await?;
                 tracing::debug!(job=%job.id, offset=job.offset, bytes=length, source_ms,
@@ -1101,6 +1121,15 @@ impl Queue {
                 job.offset += length;
                 progressed = true;
             } else {
+                let reason = match published {
+                    Err(error) => {
+                        tracing::warn!(job=%job.id, reason=%error, "Warming cache publication failed");
+                        "Cache publication failed; check storage diagnostics"
+                    }
+                    Ok(_) => {
+                        "Cache publication declined; check writable cache folders and storage policy"
+                    }
+                };
                 let mut current = self.lock_ledger().await?;
                 let mut next = current.clone();
                 if let Some(j) = next
@@ -1110,10 +1139,7 @@ impl Queue {
                 {
                     j.next_attempt = now_ms() + RETRY_MS;
                     j.updated_at = now_ms();
-                    j.reason = Some(
-                        "Cache publication deferred; check storage capacity and availability"
-                            .to_owned(),
-                    );
+                    j.reason = Some(reason.to_owned());
                 }
                 self.save(&mut current, next).await?;
                 drop(current);
@@ -1141,6 +1167,9 @@ impl Queue {
     }
     async fn checkpoint(&self, original: &Job, bytes: u64, source: bool) -> anyhow::Result<()> {
         let mut current = self.lock_ledger().await?;
+        if current.paused {
+            return Ok(());
+        }
         let mut next = current.clone();
         let Some(job) = next.jobs.iter_mut().find(|j| {
             j.id == original.id
