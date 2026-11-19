@@ -195,7 +195,14 @@ impl Drop for ItemGuard {
             .remove(&self.item);
     }
 }
+pub type GenerationFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<String>, Error>> + Send + 'a>>;
+
 pub trait Reader: Send + Sync {
+    /// Resolve original provenance against the already opened repair ledger.
+    fn original_generation<'a>(&'a self, _key: &'a Key) -> GenerationFuture<'a> {
+        Box::pin(async { Ok(None) })
+    }
     /// Administrative access uses the already owned store, never a second opener.
     fn catalogue(&self) -> Option<&Legacy> {
         None
@@ -499,8 +506,20 @@ impl Legacy {
         })
     }
     pub async fn entries(&self, after: &str, limit: u32) -> Result<Vec<Entry>, Error> {
-        Ok(sqlx::query_as("SELECT Key AS key,Folder AS folder,ItemId AS item,Length AS size,Pinned AS pinned,Generation AS generation,ChunkSize AS chunk FROM Entries WHERE Key>$1 ORDER BY Key LIMIT $2")
-            .bind(after).bind(limit.clamp(1,64)).fetch_all(&self.db).await?)
+        self.entries_in_folder(after, limit, None).await
+    }
+    /// Restrict migration to a registered source folder before applying pagination.
+    pub async fn entries_in_folder(
+        &self,
+        after: &str,
+        limit: u32,
+        folder: Option<&str>,
+    ) -> Result<Vec<Entry>, Error> {
+        if folder.is_some_and(|id| !self.roots.contains_key(id)) {
+            return Err(Error::Invalid("legacy source folder is not configured"));
+        }
+        Ok(sqlx::query_as("SELECT Key AS key,Folder AS folder,ItemId AS item,Length AS size,Pinned AS pinned,Generation AS generation,ChunkSize AS chunk FROM Entries WHERE Key>$1 AND ($3 IS NULL OR Folder=$3) ORDER BY Key LIMIT $2")
+            .bind(after).bind(limit.clamp(1,64)).bind(folder).fetch_all(&self.db).await?)
     }
     /// Resolve only an exact independently verified identity; never scan or guess.
     pub async fn find(
@@ -842,7 +861,7 @@ impl Legacy {
         let Some(lease) = cache.lease(key.clone()) else {
             return Ok(false);
         };
-        if cache.get(&lease, start / BLOCK).await.is_some() {
+        if cache.read(&lease, start / BLOCK).await?.is_some() {
             if entry.pinned != 0 {
                 cache.pin(key, true).await?;
             }
@@ -869,7 +888,7 @@ impl Legacy {
             })?
             .map_err(|_| Error::Io(io::Error::other("legacy cache read task failed")))??;
         let copied = cache
-            .put_reserved(&lease, start / BLOCK, data, permit)
+            .put_native_reserved(&lease, start / BLOCK, data, permit)
             .await?;
         if copied && pinned {
             cache.pin(key, true).await?;

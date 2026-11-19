@@ -34,6 +34,9 @@ impl Drop for Fixture {
 }
 impl Fixture {
     async fn new(chunk: i64) -> Self {
+        Self::with_generation(chunk, false).await
+    }
+    async fn with_generation(chunk: i64, rust_generation: bool) -> Self {
         let root = std::env::temp_dir()
             .canonicalize()
             .unwrap()
@@ -41,8 +44,13 @@ impl Fixture {
         let source = root.join("legacy");
         std::fs::create_dir_all(&source).unwrap();
         let item = Uuid::new_v4();
-        let generation = "v3:fixture:content:revision".to_owned();
         let bytes = vec![13; 2 * BLOCK_BYTES + 17];
+        let key = Key::new(item, b"converted source", bytes.len() as u64);
+        let generation = if rust_generation {
+            format!("rust-v2:{}", key.revision())
+        } else {
+            "v3:fixture:content:revision".to_owned()
+        };
         let text = item.simple().to_string();
         let key_text = format!(
             "{}:{text}{}:{generation}:{}",
@@ -133,7 +141,7 @@ impl Fixture {
         }
         db.close().await;
         Self {
-            key: Key::new(item, b"converted source", bytes.len() as u64),
+            key,
             root,
             catalogue,
             folder: Folder {
@@ -518,4 +526,195 @@ fn device_parts(device: u64) -> (u64, u64) {
     {
         (nix::sys::stat::major(device), nix::sys::stat::minor(device))
     }
+}
+
+/// Uses the real source store to exercise the same read-through behavior as production.
+struct RunningSource {
+    legacy: Legacy,
+    entry: infinidysk_native_cache::legacy::Entry,
+    writes: std::sync::atomic::AtomicUsize,
+}
+impl infinidysk_native_cache::legacy::Reader for RunningSource {
+    fn read<'a>(
+        &'a self,
+        _key: &'a Key,
+        block: u64,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> infinidysk_native_cache::legacy::ReadFuture<'a> {
+        Box::pin(async move { self.legacy.read_block(&self.entry, block, permit).await })
+    }
+    fn writable(&self) -> bool {
+        true
+    }
+    fn write<'a>(
+        &'a self,
+        _key: &'a Key,
+        _block: u64,
+        _data: Bytes,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> infinidysk_native_cache::legacy::WriteFuture<'a> {
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Box::pin(async { Ok(true) })
+    }
+}
+
+#[tokio::test]
+async fn migration_copies_to_v2_despite_a_running_compatible_reader_and_writer() {
+    let fixture = Fixture::new(0).await;
+    let original = std::fs::read(fixture.payload()).unwrap();
+    let legacy = Legacy::open(&fixture.catalogue, std::slice::from_ref(&fixture.folder))
+        .await
+        .unwrap();
+    assert!(
+        legacy
+            .entries_in_folder("", 1, Some("unknown"))
+            .await
+            .is_err()
+    );
+    let entry = legacy
+        .entries_in_folder("", 1, Some(&fixture.folder.id))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let source = std::sync::Arc::new(RunningSource {
+        legacy: legacy.clone(),
+        entry: entry.clone(),
+        writes: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let cache = fixture.destination().await;
+    cache.set_legacy_reader(source.clone()).unwrap();
+    let lease = cache.lease(fixture.key.clone()).unwrap();
+    assert!(cache.get(&lease, 0).await.is_some());
+    assert_eq!(cache.stats().await.unwrap().files, 0);
+    for _ in 0..2 {
+        for block in legacy.blocks(&entry, -1, 64).await.unwrap() {
+            assert!(
+                legacy
+                    .copy_block(&cache, &entry, &fixture.key, block)
+                    .await
+                    .unwrap()
+            );
+        }
+    }
+    let stats = cache.stats().await.unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, fixture.bytes.len() as u64);
+    assert_eq!(source.writes.load(std::sync::atomic::Ordering::Relaxed), 0);
+    drop(lease);
+    assert!(
+        !cache
+            .evict(&fixture.key, "migration-pin-check")
+            .await
+            .unwrap()
+    );
+    let lease = cache.lease(fixture.key.clone()).unwrap();
+    assert_eq!(std::fs::read(fixture.payload()).unwrap(), original);
+    assert_eq!(
+        cache.get(&lease, 0).await.unwrap(),
+        &fixture.bytes[..BLOCK_BYTES]
+    );
+}
+
+#[tokio::test]
+async fn v2_write_preference_bypasses_compatible_writer_and_requires_a_destination() {
+    let fixture = Fixture::new(0).await;
+    let legacy = Legacy::open(&fixture.catalogue, std::slice::from_ref(&fixture.folder))
+        .await
+        .unwrap();
+    let source = std::sync::Arc::new(RunningSource {
+        entry: legacy.entries("", 1).await.unwrap().pop().unwrap(),
+        legacy,
+        writes: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let root = fixture.root.join("v2-preferred");
+    std::fs::create_dir(&root).unwrap();
+    let mut settings = Settings {
+        enabled: true,
+        prefer_native_writes: true,
+        min_file_mb: 0,
+        metadata_path: fixture
+            .root
+            .join("v2-preferred-metadata")
+            .to_str()
+            .unwrap()
+            .into(),
+        ..Settings::default()
+    };
+    assert!(settings.validate().is_err());
+    settings.folders.push(FolderSettings {
+        id: Uuid::new_v4(),
+        path: root.to_str().unwrap().into(),
+        min_free_bytes: 0,
+        ..FolderSettings::default()
+    });
+    let cache = Cache::open(settings).await.unwrap();
+    cache.set_legacy_reader(source.clone()).unwrap();
+    let lease = cache.lease(fixture.key.clone()).unwrap();
+    assert!(
+        cache
+            .put(
+                &lease,
+                0,
+                Bytes::copy_from_slice(&fixture.bytes[..BLOCK_BYTES])
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(cache.stats().await.unwrap().bytes, BLOCK);
+    assert_eq!(source.writes.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn rust_generation_migration_filters_before_pagination_and_rejects_stale_identity() {
+    let fixture = Fixture::with_generation(0, true).await;
+    let db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(SqliteConnectOptions::new().filename(&fixture.catalogue))
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO Entries VALUES($1,'other-folder',$2,$3,0,'different-generation',0)")
+        .bind("0".repeat(64))
+        .bind(fixture.item.simple().to_string())
+        .bind(i64::try_from(fixture.bytes.len()).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    let legacy = Legacy::open(&fixture.catalogue, std::slice::from_ref(&fixture.folder))
+        .await
+        .unwrap();
+    let entries = legacy
+        .entries_in_folder("", 1, Some(&fixture.folder.id))
+        .await
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.key, fixture.entry);
+    assert!(Legacy::matches(
+        entry,
+        fixture.key.item(),
+        &format!("rust-v2:{}", fixture.key.revision()),
+        fixture.key.size()
+    ));
+    assert!(!Legacy::matches(
+        entry,
+        fixture.key.item(),
+        "rust-v2:stale",
+        fixture.key.size()
+    ));
+    let cache = fixture.destination().await;
+    for block in legacy.blocks(entry, -1, 64).await.unwrap() {
+        assert!(
+            legacy
+                .copy_block(&cache, entry, &fixture.key, block)
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        cache.stats().await.unwrap().bytes,
+        fixture.bytes.len() as u64
+    );
 }

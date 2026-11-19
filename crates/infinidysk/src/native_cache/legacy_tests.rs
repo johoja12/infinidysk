@@ -1109,3 +1109,52 @@ fn device_parts(device: u64) -> (u64, u64) {
         (nix::sys::stat::major(device), nix::sys::stat::minor(device))
     }
 }
+
+#[tokio::test]
+async fn running_migration_resolves_original_and_rust_generations_without_reopening_owner_locks() {
+    for provenance in [true, false] {
+        let mut fixture = Fixture::new(provenance).await;
+        enable_writes(&mut fixture);
+        let cache = fixture.cache().await;
+        let vfs = fixture.vfs(cache.clone());
+        let key = vfs.cache_key(&fixture.items[0]).await.unwrap();
+        if !provenance {
+            let lease = cache.lease(key.clone()).unwrap();
+            assert!(
+                cache
+                    .put(
+                        &lease,
+                        0,
+                        axum::body::Bytes::copy_from_slice(&fixture.bytes[..BLOCK_BYTES])
+                    )
+                    .await
+                    .unwrap()
+            );
+        }
+        let catalogue = cache.legacy_reader().unwrap().catalogue().unwrap();
+        let generation = if provenance {
+            cache
+                .legacy_reader()
+                .unwrap()
+                .original_generation(&key)
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            format!("rust-v2:{}", key.revision())
+        };
+        let entry = catalogue
+            .find(key.item(), &generation, key.size())
+            .await
+            .unwrap()
+            .unwrap();
+        let mapped = super::legacy_mapping(&vfs, &entry, None).await;
+        assert!(matches!(mapped, Ok(Some(actual)) if actual == key));
+        let mut stale = entry;
+        stale.generation = Some("rust-v2:stale".into());
+        assert!(matches!(
+            super::legacy_mapping(&vfs, &stale, None).await,
+            Ok(None)
+        ));
+    }
+}
