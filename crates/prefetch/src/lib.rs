@@ -1123,7 +1123,7 @@ impl Queue {
             } else {
                 let reason = match published {
                     Err(error) => {
-                        tracing::warn!(job=%job.id, reason=%error, "Warming cache publication failed");
+                        tracing::warn!(job=%job.id, reason=%std::error::Error::source(&error).unwrap_or(&error), "Warming cache publication failed");
                         "Cache publication failed; check storage diagnostics"
                     }
                     Ok(_) => {
