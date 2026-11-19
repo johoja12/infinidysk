@@ -3,7 +3,7 @@
 use serde::Serialize;
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
 use utoipa::ToSchema;
@@ -80,26 +80,22 @@ struct Inner {
 }
 #[derive(Default)]
 pub(super) struct Window {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
 }
-pub(super) struct Active<'a> {
-    owner: &'a Window,
+pub(super) struct Active {
+    owner: Arc<Mutex<Inner>>,
     key: Key,
 }
-impl Drop for Active<'_> {
+impl Drop for Active {
     fn drop(&mut self) {
-        let mut state = self
-            .owner
-            .inner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut state = self.owner.lock().unwrap_or_else(PoisonError::into_inner);
         if state.active == Some(self.key) {
             state.active = None;
         }
     }
 }
 impl Window {
-    pub(super) fn begin(&self, job: Uuid, run: u32, at: Instant, wall: i64) -> Active<'_> {
+    pub(super) fn begin(&self, job: Uuid, run: u32, at: Instant, wall: i64) -> Active {
         let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let key = (job, run);
         if !state.tracks.contains_key(&key)
@@ -118,7 +114,10 @@ impl Window {
             .or_insert_with(|| Track::new(at, wall));
         state.active = Some(key);
         drop(state);
-        Active { owner: self, key }
+        Active {
+            owner: self.inner.clone(),
+            key,
+        }
     }
     pub(super) fn record(&self, job: Uuid, run: u32, bytes: u64, at: Instant, wall: i64) {
         if let Some(track) = self
@@ -133,12 +132,12 @@ impl Window {
     }
     pub(super) fn forget(&self, job: Option<Uuid>) {
         let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let active = state.active;
+        // Controls clear historical rates, but only the step's Drop guard can
+        // declare admitted I/O drained. A slow publication may still be finishing.
         state
             .tracks
-            .retain(|(id, _), _| job.is_some_and(|j| j != *id));
-        if job.is_none() || state.active.is_some_and(|(id, _)| Some(id) == job) {
-            state.active = None;
-        }
+            .retain(|key, _| Some(*key) == active || job.is_some_and(|j| j != key.0));
     }
     pub(super) fn observe_wire(&self, at: Instant, wall: i64, bytes: u64) {
         let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);

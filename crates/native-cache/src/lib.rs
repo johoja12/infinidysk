@@ -798,6 +798,30 @@ impl Cache {
         data: Bytes,
         permit: OwnedSemaphorePermit,
     ) -> Result<bool, Error> {
+        self.publish_reserved(lease, block, data, permit, Some(self.deadline()))
+            .await
+    }
+    /// Await durable publication for background warming, including slow owned writes.
+    /// Callers must not hold control locks while waiting. Dropping this future does
+    /// not cancel an already owned physical write or release its buffer allowance.
+    pub async fn put_reserved_background(
+        &self,
+        lease: &Lease,
+        block: u64,
+        data: Bytes,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<bool, Error> {
+        self.publish_reserved(lease, block, data, permit, None)
+            .await
+    }
+    async fn publish_reserved(
+        &self,
+        lease: &Lease,
+        block: u64,
+        data: Bytes,
+        permit: OwnedSemaphorePermit,
+        deadline: Option<Duration>,
+    ) -> Result<bool, Error> {
         if self.settings.recovery_mode {
             return Ok(false);
         }
@@ -812,9 +836,12 @@ impl Cache {
             return Ok(false);
         }
         if let Some(legacy) = self.legacy.get().filter(|r| r.writable()) {
-            return if let Ok(result) =
-                tokio::time::timeout(self.deadline(), legacy.write(key, block, data, permit)).await
-            {
+            let writing = legacy.write(key, block, data, permit);
+            let result = match deadline {
+                Some(deadline) => tokio::time::timeout(deadline, writing).await.ok(),
+                None => Some(writing.await),
+            };
+            return if let Some(result) = result {
                 result
             } else {
                 self.failed.fetch_add(1, Ordering::Relaxed);
@@ -917,7 +944,10 @@ impl Cache {
                 observation.success(0);
                 Ok::<_, io::Error>(guard)
             });
-            let Ok(Ok(Ok(_guard))) = tokio::time::timeout(self.deadline(), writing).await else {
+            let Some(Ok(Ok(_guard))) = (match deadline {
+                Some(deadline) => tokio::time::timeout(deadline, writing).await.ok(),
+                None => Some(writing.await),
+            }) else {
                 self.failed.fetch_add(1, Ordering::Relaxed);
                 return Ok(false);
             };
