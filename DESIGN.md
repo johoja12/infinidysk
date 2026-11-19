@@ -1053,6 +1053,8 @@ Report one finding per issue with `file:line`, the rule (section › heading), a
 
 ### Fork feature screens
 
+- Native Cache settings expose v2 write routing as a persisted `Toggle` in Playback cache. Explain that it requires writable v2 folders and a restart, while old v1 blocks remain readable. Retain compatible-write settings for rollback; selecting the write target does not start a copy or delete source data.
+
 - Native Cache is a top-level page at `/native-cache`. Show original-format storage separately from any new Rust store. Original folder totals, names, ranges and pin reasons come from the original catalogue. Do not present zero new-store totals as an empty original cache. Read-only mode, recovery mode and disabled eviction have visible states. Manual removal uses confirmation and preserves active readers and health pins.
 - Native Cache uses Overview, Files, Evictions and Diagnostics tabs. Overview leads with original allocated/quota storage, catalogue file and hold counts, runtime hit rate and compatible bytes added since restart. Show folder usage bars, priority and write/eviction state, active warming and recent files. Do not invent a 24-hour bandwidth-saved metric from old traffic rows.
 - Files filters the whole original catalogue by name or ID, folder and cached/complete/partial/empty/held state, with recent/name/coverage sorting and stable cursor pages. Show coverage bars and a visual exact-range/gap map in the range dialog. Keep raw identity and diagnostics collapsed. Preserve pin, health-hold and active-reader guards.

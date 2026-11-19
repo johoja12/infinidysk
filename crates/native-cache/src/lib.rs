@@ -56,6 +56,8 @@ pub enum Error {
 #[schema(as = NativeCacheSettings)]
 pub struct Settings {
     pub enabled: bool,
+    /// Route new blocks to v2 folders even while compatible writes remain configured.
+    pub prefer_native_writes: bool,
     /// Explicit reconstruction mode: existing manifests may restore folder ownership; payload mutation stays off.
     pub recovery_mode: bool,
     pub metadata_path: String,
@@ -72,6 +74,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            prefer_native_writes: false,
             recovery_mode: false,
             metadata_path: "/config/native-cache-v2".to_owned(),
             folders: vec![],
@@ -164,6 +167,14 @@ impl Settings {
         }
         if let Some(legacy) = &self.legacy {
             legacy.validate(self)?;
+        }
+        if self.enabled
+            && self.prefer_native_writes
+            && !self.folders.iter().any(|f| f.enabled && !f.read_only)
+        {
+            return Err(Error::Invalid(
+                "v2 writes require an enabled writable v2 folder",
+            ));
         }
         if self.enabled && !self.folders.iter().any(|f| f.enabled) && self.legacy.is_none() {
             return Err(Error::Invalid("enable at least one native cache folder"));
@@ -688,12 +699,17 @@ impl Cache {
             .set(reader)
             .map_err(|_| Error::Invalid("legacy cache reader is already installed"))
     }
+    /// Migration requires an explicit writable v2 destination.
+    pub fn can_migrate(&self) -> bool {
+        !self.settings.recovery_mode && self.folders.iter().any(|f| !f.settings.read_only)
+    }
     /// Warming must not fetch misses when no destination can retain the result.
     pub fn can_fill(&self, key: &Key) -> bool {
         !self.settings.recovery_mode
             && key.size >= u64::from(self.settings.min_file_mb) * MB
             && (self.folders.iter().any(|f| !f.settings.read_only)
-                || self.legacy.get().is_some_and(|r| r.writable()))
+                || (!self.settings.prefer_native_writes
+                    && self.legacy.get().is_some_and(|r| r.writable())))
     }
     async fn read(&self, lease: &Lease, block: u64) -> Result<Option<Bytes>, Error> {
         let key = &lease.key;
@@ -798,7 +814,7 @@ impl Cache {
         data: Bytes,
         permit: OwnedSemaphorePermit,
     ) -> Result<bool, Error> {
-        self.publish_reserved(lease, block, data, permit, Some(self.deadline()))
+        self.publish_reserved(lease, block, data, permit, Some(self.deadline()), false)
             .await
     }
     /// Await durable publication for background warming, including slow owned writes.
@@ -811,7 +827,18 @@ impl Cache {
         data: Bytes,
         permit: OwnedSemaphorePermit,
     ) -> Result<bool, Error> {
-        self.publish_reserved(lease, block, data, permit, None)
+        self.publish_reserved(lease, block, data, permit, None, false)
+            .await
+    }
+    /// Migration always publishes to v2, independently of playback write routing.
+    async fn put_native_reserved(
+        &self,
+        lease: &Lease,
+        block: u64,
+        data: Bytes,
+        permit: OwnedSemaphorePermit,
+    ) -> Result<bool, Error> {
+        self.publish_reserved(lease, block, data, permit, None, true)
             .await
     }
     async fn publish_reserved(
@@ -821,6 +848,7 @@ impl Cache {
         data: Bytes,
         permit: OwnedSemaphorePermit,
         deadline: Option<Duration>,
+        native_only: bool,
     ) -> Result<bool, Error> {
         if self.settings.recovery_mode {
             return Ok(false);
@@ -835,7 +863,11 @@ impl Cache {
         if data.len() as u64 != BLOCK.min(key.size - start) {
             return Ok(false);
         }
-        if let Some(legacy) = self.legacy.get().filter(|r| r.writable()) {
+        if let Some(legacy) = self
+            .legacy
+            .get()
+            .filter(|r| !native_only && !self.settings.prefer_native_writes && r.writable())
+        {
             let writing = legacy.write(key, block, data, permit);
             let result = match deadline {
                 Some(deadline) => tokio::time::timeout(deadline, writing).await.ok(),

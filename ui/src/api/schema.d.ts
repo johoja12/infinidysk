@@ -3481,9 +3481,13 @@ export interface components {
         };
         LegacyCacheImport: {
             cursor?: components["schemas"]["LegacyCacheCursor"];
-            folders: components["schemas"]["LegacyCacheFolder"][];
+            folders?: components["schemas"]["LegacyCacheFolder"][];
             /** @description Offline/checkpointed 1.x native metadata directory, containing both ledgers. */
-            metadata_path: string;
+            metadata_path?: string;
+            /** @description Restrict the entire cursor walk to one configured source folder. */
+            source_folder?: string | null;
+            /** @description Reuse the running store and its owner locks instead of opening an offline store. */
+            use_running?: boolean;
         };
         LegacyCacheInventory: {
             entries: components["schemas"]["LegacyCacheInventoryEntry"][];
@@ -4561,6 +4565,11 @@ export interface components {
              * @default 100
              */
             min_file_mb: number;
+            /**
+             * @description Route new blocks to v2 folders even while compatible writes remain configured.
+             * @default false
+             */
+            prefer_native_writes: boolean;
             /**
              * @description Explicit reconstruction mode: existing manifests may restore folder ownership; payload mutation stays off.
              * @default false
@@ -6499,6 +6508,7 @@ export interface components {
              *       "legacy": null,
              *       "metadata_path": "/config/native-cache-v2",
              *       "min_file_mb": 100,
+             *       "prefer_native_writes": false,
              *       "recovery_mode": false
              *     }
              */

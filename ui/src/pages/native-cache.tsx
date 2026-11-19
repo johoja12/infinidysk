@@ -61,6 +61,14 @@ export function NativeCachePanel({
           disabled={locked("native_cache.enabled")}
           onChange={(enabled) => patch({ enabled })}
         />
+        <Toggle
+          id="native-prefer-v2-writes"
+          label={<>Write new blocks to v2 storage <Locked locked={locked("native_cache.prefer_native_writes")} /></>}
+          hint="New blocks use writable v2 folders after restart. Existing v1 blocks and compatible write settings are retained."
+          checked={value.prefer_native_writes ?? false}
+          disabled={locked("native_cache.prefer_native_writes")}
+          onChange={(prefer_native_writes) => patch({ prefer_native_writes })}
+        />
         {value.recovery_mode && (
           <p role="status" className="text-sm text-warning-text">
             Recovery mode is selected. Writes and eviction stay on hold after

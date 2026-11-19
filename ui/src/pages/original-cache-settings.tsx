@@ -66,7 +66,7 @@ export function OriginalCacheSettings({
                 ? "Storage unavailable"
                 : inventory.data
                   ? inventory.data.writable
-                    ? "Running: compatible writes"
+                    ? "Compatible writes available"
                     : "Running: read only"
                   : "Checking running storage"}
             </Badge>

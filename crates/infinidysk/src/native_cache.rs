@@ -104,6 +104,12 @@ impl LegacyReader {
     }
 }
 impl infinidysk_native_cache::legacy::Reader for LegacyReader {
+    fn original_generation<'a>(
+        &'a self,
+        key: &'a infinidysk_native_cache::Key,
+    ) -> infinidysk_native_cache::legacy::GenerationFuture<'a> {
+        Box::pin(Self::original_generation(self, key))
+    }
     fn catalogue(&self) -> Option<&infinidysk_native_cache::legacy::Legacy> {
         Some(&self.legacy)
     }
@@ -341,8 +347,16 @@ impl Default for LegacyCursor {
 #[schema(as = LegacyCacheImport)]
 pub struct LegacyImport {
     /// Offline/checkpointed 1.x native metadata directory, containing both ledgers.
+    #[serde(default)]
     pub metadata_path: String,
+    #[serde(default)]
     pub folders: Vec<infinidysk_native_cache::legacy::Folder>,
+    /// Reuse the running store and its owner locks instead of opening an offline store.
+    #[serde(default)]
+    pub use_running: bool,
+    /// Restrict the entire cursor walk to one configured source folder.
+    #[serde(default)]
+    pub source_folder: Option<String>,
     #[serde(default)]
     pub cursor: LegacyCursor,
 }
@@ -363,18 +377,46 @@ pub async fn import_legacy(
 ) -> Result<Json<LegacyReport>, Fail> {
     use infinidysk_native_cache::legacy::Legacy;
     let cache = admin.vfs.native_cache().ok_or_else(unavailable)?;
-    let path = std::path::Path::new(&request.metadata_path);
-    if !path.is_absolute() || request.cursor.offset < -1 || request.cursor.after_key.len() > 64 {
-        return Err(Fail::Unavailable(
-            "Legacy import needs an absolute metadata path and valid cursor".into(),
+    if request.cursor.offset < -1 || request.cursor.after_key.len() > 64 {
+        return Err(Fail::Bad("Invalid legacy import cursor".into()));
+    }
+    if !cache.can_migrate() {
+        return Err(Fail::Bad(
+            "Legacy import requires a writable v2 destination".into(),
         ));
     }
-    let legacy = Legacy::open(&path.join("catalogue.db"), &request.folders)
-        .await
-        .map_err(|e| fail(&e))?;
-    let revisions = infinidysk_import::native::Ledger::open(&path.join("repair-revisions.db"))
-        .await
-        .map_err(|_| Fail::Unavailable("Cannot read the original repair revision ledger".into()))?;
+    let (legacy, revisions) = if request.use_running {
+        if !request.metadata_path.is_empty()
+            || !request.folders.is_empty()
+            || request.source_folder.is_none()
+        {
+            return Err(Fail::Bad(
+                "Running import requires one source folder and no offline paths".into(),
+            ));
+        }
+        let legacy = cache
+            .legacy_reader()
+            .and_then(|r| r.catalogue())
+            .ok_or(Fail::NotFound)?
+            .clone();
+        (legacy, None)
+    } else {
+        let path = std::path::Path::new(&request.metadata_path);
+        if !path.is_absolute() {
+            return Err(Fail::Bad(
+                "Offline import requires an absolute metadata path".into(),
+            ));
+        }
+        let legacy = Legacy::open(&path.join("catalogue.db"), &request.folders)
+            .await
+            .map_err(|e| fail(&e))?;
+        let revisions = infinidysk_import::native::Ledger::open(&path.join("repair-revisions.db"))
+            .await
+            .map_err(|_| {
+                Fail::Unavailable("Cannot read the original repair revision ledger".into())
+            })?;
+        (legacy, Some(revisions))
+    };
     let mut report = LegacyReport {
         cursor: request.cursor,
         complete: false,
@@ -387,8 +429,16 @@ pub async fn import_legacy(
     // cursor is safe: complete blocks already published under the exact key are reused.
     let mut mapped: Option<(String, Option<infinidysk_native_cache::Key>)> = None;
     for _ in 0..16 {
+        if request.use_running && !admin.vfs.sessions().open().is_empty() {
+            report.paused = true;
+            break;
+        }
         let Some(entry) = legacy
-            .entries(&report.cursor.after_key, 1)
+            .entries_in_folder(
+                &report.cursor.after_key,
+                1,
+                request.source_folder.as_deref(),
+            )
             .await
             .map_err(|e| fail(&e))?
             .pop()
@@ -401,7 +451,7 @@ pub async fn import_legacy(
         {
             key.clone()
         } else {
-            let key = legacy_mapping(&admin, &entry, &revisions).await?;
+            let key = legacy_mapping(&admin.vfs, &entry, revisions.as_ref()).await?;
             mapped = Some((entry.key.clone(), key.clone()));
             key
         };
@@ -453,16 +503,31 @@ pub async fn import_legacy(
     Ok(Json(report))
 }
 async fn legacy_mapping(
-    admin: &Admin,
+    vfs: &infinidysk_vfs::Vfs,
     entry: &infinidysk_native_cache::legacy::Entry,
-    revisions: &infinidysk_import::native::Ledger,
+    revisions: Option<&infinidysk_import::native::Ledger>,
 ) -> Result<Option<infinidysk_native_cache::Key>, Fail> {
     let Ok(uuid) = uuid::Uuid::parse_str(&entry.item) else {
         return Ok(None);
     };
     let item = infinidysk_core::ItemId(uuid);
-    let db = admin.queue.db();
-    let Some(source) = db.import_source(item).await? else {
+    let db = vfs.db();
+    let Some(item) = db.item(item).await? else {
+        return Ok(None);
+    };
+    let key = vfs
+        .cache_key(&item)
+        .await
+        .map_err(|_| Fail::Unavailable("Cannot verify source metadata".into()))?;
+    if infinidysk_native_cache::legacy::Legacy::matches(
+        entry,
+        uuid,
+        &format!("rust-v2:{}", key.revision()),
+        key.size(),
+    ) {
+        return Ok(Some(key));
+    }
+    let Some(source) = db.import_source(infinidysk_core::ItemId(uuid)).await? else {
         return Ok(None);
     };
     let Ok(source) = serde_json::from_str::<infinidysk_import::native::Source>(&source) else {
@@ -471,14 +536,6 @@ async fn legacy_mapping(
     if source.version != 1 {
         return Ok(None);
     }
-    let Some(item) = db.item(item).await? else {
-        return Ok(None);
-    };
-    let key = admin
-        .vfs
-        .cache_key(&item)
-        .await
-        .map_err(|_| Fail::Unavailable("Cannot verify imported source metadata".into()))?;
     let Ok(fingerprint) = <[u8; 32]>::try_from(source.fingerprint.as_slice()) else {
         return Ok(None);
     };
@@ -486,9 +543,24 @@ async fn legacy_mapping(
     if original != key {
         return Ok(None);
     }
-    let generation = source.generation(revisions).await.map_err(|_| {
-        Fail::Unavailable("Cannot verify the original repair revision ledger".into())
-    })?;
+    let generation = if let Some(revisions) = revisions {
+        source.generation(revisions).await.map_err(|_| {
+            Fail::Unavailable("Cannot verify the original repair revision ledger".into())
+        })?
+    } else {
+        let reader = vfs
+            .native_cache()
+            .and_then(|c| c.legacy_reader())
+            .ok_or(Fail::NotFound)?;
+        let Some(generation) = reader
+            .original_generation(&key)
+            .await
+            .map_err(|e| fail(&e))?
+        else {
+            return Ok(None);
+        };
+        generation
+    };
     Ok(
         infinidysk_native_cache::legacy::Legacy::matches(entry, uuid, &generation, source.size)
             .then_some(key),

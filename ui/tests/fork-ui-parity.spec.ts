@@ -1238,3 +1238,17 @@ test("Library remains usable while slow coverage polls at a bounded interval", a
   await page.clock.runFor(2500);
   expect(await calls()).toBe(initial + 1);
 });
+
+
+test("v2 write preference retains legacy settings and respects environment locks", async ({ page }) => {
+  await page.goto(fixture("cache-settings"));
+  const before = await page.evaluate(() => JSON.stringify(window.__mock.settings.native_cache.legacy));
+  const preference = page.getByRole("switch", { name: "Write new blocks to v2 storage" });
+  await expect(preference).not.toBeChecked();
+  await preference.click();
+  await expect(preference).toBeChecked();
+  expect(await page.evaluate(() => window.__mock.settings.native_cache.prefer_native_writes)).toBe(true);
+  expect(await page.evaluate(() => JSON.stringify(window.__mock.settings.native_cache.legacy))).toBe(before);
+  await page.goto(fixture("cache-settings-locked"));
+  await expect(page.getByRole("switch", { name: /Write new blocks to v2 storage/ })).toBeDisabled();
+});
