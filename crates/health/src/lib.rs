@@ -503,10 +503,14 @@ impl Health {
             .due_health_work(now_ms(), settings.enabled, 1)
             .await?
             .pop();
-        let urgent = primary.as_ref().is_some_and(|(_, status)| {
+        let urgent = if let Some((item, status)) = &primary {
             status.recheck != Recheck::None
                 || matches!(status.state, HealthState::Repairing | HealthState::Hidden)
-        });
+                // Playback confirmation remains urgent after its first recheck is consumed.
+                || self.db.health_is_urgent(item.id).await?
+        } else {
+            false
+        };
         let maintenance =
             primary.is_none() || !urgent || self.priority_streak.load(Ordering::Relaxed) >= 4;
         let mut chosen = None;

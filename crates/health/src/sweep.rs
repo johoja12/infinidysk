@@ -665,6 +665,47 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn due_playback_confirmation_precedes_routine_health_work() {
+        let server = LoopbackServer::start(post("sweep", "fixture.bin", &[7; 16], 16))
+            .await
+            .expect("server");
+        let (db, client, playback, routine) = fixture(&server).await;
+        let health = Health::new(
+            db.clone(),
+            client,
+            watch::channel(Vec::new()).1,
+            watch::channel(super::super::Settings {
+                enabled: true,
+                ..Default::default()
+            })
+            .1,
+        )
+        .expect("health");
+        db.request_recheck(playback.id, Recheck::Playback)
+            .await
+            .expect("request");
+        let (_, mut status) = db.health(playback.id).await.expect("health").expect("file");
+        status.state = infinidysk_db::HealthState::Suspect;
+        status.next_check = Some(now_ms() - 1);
+        db.set_health(playback.id, &status, Recheck::Playback)
+            .await
+            .expect("consume the initial playback recheck");
+        let (_, pending) = db.health(playback.id).await.expect("health").expect("file");
+        assert_eq!(pending.recheck, Recheck::None);
+        assert!(
+            db.health_is_urgent(playback.id)
+                .await
+                .expect("urgent marker")
+        );
+
+        assert!(health.step().await.expect("health step"));
+        let (_, checked) = db.health(playback.id).await.expect("health").expect("file");
+        assert!(checked.last_check.is_some());
+        let (_, untouched) = db.health(routine.id).await.expect("health").expect("file");
+        assert!(untouched.last_check.is_none());
+    }
+
+    #[tokio::test]
     async fn sampled_probe_budget_and_known_holes_are_bounded() {
         let articles = post("budget", "fixture.bin", &vec![7; 20_000], 10);
         let server = LoopbackServer::start(articles.clone())
