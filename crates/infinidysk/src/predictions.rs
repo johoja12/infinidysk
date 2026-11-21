@@ -1227,10 +1227,28 @@ mod tests {
                 .any(|p| p.rating_key == "watched")
         );
         assert!(f.state.scoped.load(Ordering::SeqCst) > 0);
-        assert_eq!(f.queue.status().await.jobs.len(), 2);
+        let playback = snapshot
+            .predictions
+            .iter()
+            .find(|p| p.source == Source::Playback)
+            .unwrap();
+        let queued = f.queue.status().await.jobs;
+        assert_eq!(queued.len(), 2);
+        let playback_job = queued
+            .iter()
+            .find(|job| Some(job.item) == playback.item)
+            .unwrap();
+        assert_eq!(playback_job.ranges.len(), 1);
+        assert_eq!(playback_job.ranges[0].start, 0);
+        assert_eq!(playback_job.ranges[0].end, playback.size);
         let options = f.config.read().await.settings().prefetch.clone();
         assert!(f.queue.tick(&options).await.unwrap());
         assert!(f.queue.tick(&options).await.unwrap());
+        for item in &f.files {
+            let key = f.vfs.cache_key(item).await.unwrap();
+            let cache = f.vfs.native_cache().unwrap();
+            assert_eq!(cache.verify_complete(&key).await.unwrap(), Some(true));
+        }
         let before = f.server.body_commands();
         assert_eq!(before, 32);
         f.service.tick(true).await.unwrap();
