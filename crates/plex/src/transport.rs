@@ -11,10 +11,16 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const LIMIT: usize = 4 * 1024 * 1024;
+const PAGE_SIZE: u32 = 100;
+const RECENT_HISTORY_WINDOW: u32 = 1000;
+const RESPONSE_TOO_LARGE: &str = "Plex response exceeds size limit";
+const INCOMPLETE_SNAPSHOT: &str = "incomplete Plex snapshot";
+
 #[derive(Default)]
 struct Paging {
     window: Option<u32>,
     concurrent: bool,
+    page_size: Option<u32>,
 }
 #[derive(Clone, Copy, Debug, thiserror::Error)]
 pub enum Error {
@@ -116,12 +122,12 @@ impl Client {
                 .content_length()
                 .is_some_and(|len| len > LIMIT as u64)
             {
-                return Err(Error::Invalid("Plex response exceeds size limit"));
+                return Err(Error::Invalid(RESPONSE_TOO_LARGE));
             }
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| Error::Unavailable)? {
                 if chunk.len() > LIMIT.saturating_sub(bytes.len()) {
-                    return Err(Error::Invalid("Plex response exceeds size limit"));
+                    return Err(Error::Invalid(RESPONSE_TOO_LARGE));
                 }
                 bytes.extend_from_slice(&chunk);
             }
@@ -386,6 +392,7 @@ impl Client {
         let mut expected = None;
         let mut start = 0_u32;
         let mut pending = VecDeque::new();
+        let page_size = paging.page_size.unwrap_or(PAGE_SIZE);
         for _ in 0..1000 {
             if pending.is_empty() {
                 // Prove the total with page one, then retain at most four bounded
@@ -400,20 +407,20 @@ impl Client {
                         return Ok(None);
                     }
                     let separator = if path.contains('?') { '&' } else { '?' };
-                    self.xml(server, &format!("{path}{separator}X-Plex-Container-Start={offset}&X-Plex-Container-Size=100"))
+                    self.xml(server, &format!("{path}{separator}X-Plex-Container-Start={offset}&X-Plex-Container-Size={page_size}"))
                         .await.map(Some)
                 };
                 let pages = tokio::try_join!(
                     fetch(start),
-                    fetch(start + 100),
-                    fetch(start + 200),
-                    fetch(start + 300)
+                    fetch(start + page_size),
+                    fetch(start + 2 * page_size),
+                    fetch(start + 3 * page_size)
                 )?;
                 pending.extend([pages.0, pages.1, pages.2, pages.3].into_iter().flatten());
             }
             let root = pending
                 .pop_front()
-                .ok_or(Error::Invalid("incomplete Plex snapshot"))?;
+                .ok_or(Error::Invalid(INCOMPLETE_SNAPSHOT))?;
             if root.name != "MediaContainer" {
                 return Err(Error::Invalid("invalid Plex container"));
             }
@@ -449,7 +456,7 @@ impl Client {
                 .collect();
             let count =
                 u32::try_from(page.len()).map_err(|_| Error::Invalid("Plex page too large"))?;
-            if count > 100
+            if count > page_size
                 || start.saturating_add(count) > limit
                 || total.is_some_and(|n| start.saturating_add(count) > n)
             {
@@ -491,12 +498,12 @@ impl Client {
             start += count;
             if paging.window.is_some_and(|n| start >= n)
                 || total == Some(start)
-                || (total.is_none() && count < 100)
+                || (total.is_none() && count < page_size)
             {
                 return Ok(out);
             }
-            if count == 0 || (count < 100 && total.is_some_and(|total| start < total)) {
-                return Err(Error::Invalid("incomplete Plex snapshot"));
+            if count == 0 || (count < page_size && total.is_some_and(|total| start < total)) {
+                return Err(Error::Invalid(INCOMPLETE_SNAPSHOT));
             }
         }
         Err(Error::Invalid("Plex snapshot exceeded page limit"))
@@ -978,15 +985,35 @@ impl Client {
         &self,
         server: &Server,
     ) -> Result<(Vec<Media>, usize), Error> {
-        let nodes = self
-            .pages_window(
+        const PATH: &str = "/status/sessions/history/all?sort=viewedAt%3Adesc";
+        // Plex sorts by timestamp only. Events with the same timestamp can
+        // move across page boundaries between requests.
+        let nodes = match self
+            .pages_mapped(
                 server,
-                "/status/sessions/history/all?sort=viewedAt%3Adesc",
+                PATH,
                 "Video",
                 u32::MAX,
-                Some(1000),
+                Paging {
+                    window: Some(RECENT_HISTORY_WINDOW),
+                    page_size: Some(RECENT_HISTORY_WINDOW),
+                    ..Paging::default()
+                },
+                |node| {
+                    let bytes = node.bytes();
+                    Ok((node, bytes))
+                },
             )
-            .await?;
+            .await
+        {
+            // Servers may cap page sizes, or the larger response may exceed
+            // our XML size limit. Fall back to the validated smaller pages.
+            Err(Error::Invalid(RESPONSE_TOO_LARGE | INCOMPLETE_SNAPSHOT)) => {
+                self.pages_window(server, PATH, "Video", u32::MAX, Some(RECENT_HISTORY_WINDOW))
+                    .await?
+            }
+            result => result?,
+        };
         let mut missing = 0;
         let mut items = Vec::new();
         for node in &nodes {
@@ -1728,28 +1755,44 @@ mod tests {
     }
     #[tokio::test]
     async fn recent_history_is_a_complete_bounded_window() {
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let called = Arc::clone(&calls);
-        let f = fixture(move |uri, _| {
-            called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let start = uri
-                .query()
-                .unwrap_or_default()
-                .split('&')
-                .find_map(|v| v.strip_prefix("X-Plex-Container-Start="))
-                .unwrap()
-                .parse::<u32>()
-                .unwrap();
-            response(200, xml_page(start, 50_000, start..start + 100))
-        })
-        .await;
-        let items = f
-            .client
-            .recent_history(&f.server)
-            .await
-            .expect("bounded complete window");
-        assert_eq!(items.len(), 1000);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 10);
+        for capped in [false, true] {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let called = Arc::clone(&calls);
+            let f = fixture(move |uri, _| {
+                called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let request_number = |key: &str| {
+                    uri.query()
+                        .unwrap_or_default()
+                        .split('&')
+                        .find_map(|v| v.strip_prefix(key))
+                        .unwrap()
+                        .parse::<u32>()
+                        .unwrap()
+                };
+                let start = request_number("X-Plex-Container-Start=");
+                let size = request_number("X-Plex-Container-Size=");
+                let count = if capped { size.min(PAGE_SIZE) } else { size };
+                // On the uncapped server, tied events would overlap two pages
+                // if the client split the request.
+                let first = if !capped && start > 0 {
+                    start - 1
+                } else {
+                    start
+                };
+                response(200, xml_page(start, 50_000, first..first + count))
+            })
+            .await;
+            let items = f
+                .client
+                .recent_history(&f.server)
+                .await
+                .expect("bounded complete window");
+            assert_eq!(items.len(), RECENT_HISTORY_WINDOW as usize);
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::SeqCst),
+                if capped { 11 } else { 1 }
+            );
+        }
     }
     #[tokio::test]
     async fn history_rewatches_preserve_distinct_event_identity() {
