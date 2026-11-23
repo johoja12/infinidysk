@@ -8,10 +8,11 @@ mod rates;
 pub use rates::Rate;
 mod watched;
 use sha2::{Digest as _, Sha256};
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 use std::time::Duration;
 
@@ -28,6 +29,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 const MAX_JOBS: usize = 1000;
+const GAP_TURNS: u8 = 4;
 const MAX_RANGES: usize = 64;
 const RETRY_MS: i64 = 5 * 60 * 1000;
 const EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -244,6 +246,7 @@ pub struct History {
 )]
 pub struct Status {
     pub paused: bool,
+    pub waiting_for_playback: bool,
     pub recovery_mode: bool,
     pub pending_backfills: usize,
     pub rates: Vec<Rate>,
@@ -277,6 +280,7 @@ pub struct Queue {
     ledger: Mutex<Ledger>,
     /// A step holds this across its I/O. Controls use the ledger only and stay responsive.
     step: Arc<Mutex<()>>,
+    gap_turns: AtomicU8,
     changed: Notify,
     wire: Arc<infinidysk_nntp::wire::Budget>,
     watched: Mutex<watched::Tracker>,
@@ -347,6 +351,7 @@ impl Queue {
             vfs,
             ledger: Mutex::new(ledger),
             step: Arc::new(Mutex::new(())),
+            gap_turns: AtomicU8::new(0),
             changed: Notify::new(),
             wire,
             watched: Mutex::default(),
@@ -415,10 +420,19 @@ impl Queue {
                 ));
             }
         }
+        let encode_started = std::time::Instant::now();
         let raw = serde_json::to_string(&next)?;
+        let write_started = std::time::Instant::now();
         let _writing = self.db.write_permit().await;
         self.uncertain.store(true, Ordering::Release);
         self.db.save_prefetch(&raw, &events).await?;
+        tracing::debug!(
+            jobs = next.jobs.len(),
+            ledger_bytes = raw.len(),
+            encode_ms = write_started.duration_since(encode_started).as_secs_f64() * 1000.0,
+            persist_ms = write_started.elapsed().as_secs_f64() * 1000.0,
+            "warming ledger saved"
+        );
         *current = next;
         self.uncertain.store(false, Ordering::Release);
         self.changed.notify_waiters();
@@ -452,6 +466,7 @@ impl Queue {
             rates,
             recent_wire_bytes_per_second,
             paused: ledger.paused,
+            waiting_for_playback: !ledger.paused && self.foreground(),
             pending_backfills: self.vfs.backfills().stats().0,
             dropped_backfills: self.vfs.backfills().stats().1,
             recovery_mode: self
@@ -644,22 +659,62 @@ impl Queue {
             );
         }
         let ranges = normalize(ranges, key.size())?;
+        let cache = self
+            .vfs
+            .native_cache()
+            .context("native cache must be available before warming")?;
         ensure!(
-            self.vfs.native_cache().is_some(),
-            "native cache must be available before warming"
+            automatic.is_none() || cache.meets_file_minimum(key.size()),
+            "source is below the cache minimum"
         );
+        let backfill_scope = automatic
+            .filter(|(_, _, family)| *family == Family::Backfill)
+            .map(|(scope, _, _)| scope);
+        // Never edit ranges while the executor owns a selected job.
+        let idle_step = backfill_scope.and_then(|_| self.step.try_lock().ok());
         let mut current = self.lock_ledger().await?;
         if let Some(existing) = current.jobs.iter().find(|j| {
             j.item == key.item()
                 && j.revision == key.revision()
                 && j.intent == intent
-                && j.ranges == ranges
+                && (j.ranges == ranges
+                    || backfill_scope.is_some_and(|scope| {
+                        j.automatic_scope.as_deref() == Some(scope)
+                            && ranges.iter().all(|r| {
+                                j.ranges
+                                    .iter()
+                                    .any(|old| old.start <= r.start && old.end >= r.end)
+                            })
+                    }))
                 && (automatic.is_some()
                     || matches!(j.state, State::Queued | State::Paused | State::Complete))
         }) {
             return Ok(existing.clone());
         }
         let mut next = current.clone();
+        if idle_step.is_some()
+            && let Some(scope) = backfill_scope
+            && let Some((job, changed)) = next.jobs.iter_mut().find_map(|job| {
+                if job.item != key.item()
+                    || job.revision != key.revision()
+                    || job.automatic_scope.as_deref() != Some(scope)
+                    || job.attribution != *attribution
+                {
+                    return None;
+                }
+                let merged = merge_pending_gap(job, &ranges)?;
+                let changed = merged != job.ranges;
+                job.offset = merged[0].start;
+                job.ranges = merged;
+                Some((job.clone(), changed))
+            })
+        {
+            if changed {
+                self.save(&mut current, next).await?;
+            }
+            return Ok(job);
+        }
+        drop(idle_step);
         // Keep bounded terminal history, never discard a pending job to admit another.
         if next.jobs.len() >= MAX_JOBS
             && let Some(i) = next
@@ -795,6 +850,10 @@ impl Queue {
             }
             let key = self.vfs.cache_key(&item).await?;
             if key.size() == 0
+                || self
+                    .vfs
+                    .native_cache()
+                    .is_some_and(|cache| !cache.meets_file_minimum(key.size()))
                 || u128::from(served) * 100
                     < u128::from(key.size()) * u128::from(settings.finish_watched.percent)
             {
@@ -895,23 +954,26 @@ impl Queue {
                     dirty = true;
                 }
             }
-            let job = next
-                .jobs
-                .iter()
-                .filter(|j| j.state == State::Queued && j.next_attempt <= now)
-                .min_by_key(|j| {
-                    let full =
-                        j.ranges.len() == 1 && j.ranges[0].start == 0 && j.ranges[0].end == j.size;
-                    (
-                        !(full || j.family == Family::Backfill)
-                            || !protected.contains(&ItemId(j.item)),
-                        std::cmp::Reverse(j.priority),
-                        j.updated_at,
-                        j.created_at,
-                        j.id,
-                    )
-                })
-                .cloned();
+            if let Some(cache) = self.vfs.native_cache() {
+                for job in &mut next.jobs {
+                    if job.state == State::Queued
+                        && job.automatic_scope.is_some()
+                        && !cache.meets_file_minimum(job.size)
+                    {
+                        job.state = State::Superseded;
+                        job.reason = Some("Source is below the cache minimum".into());
+                        job.updated_at = now;
+                        dirty = true;
+                    }
+                }
+            }
+            let job = select_job(
+                &next.jobs,
+                now,
+                &protected,
+                self.gap_turns.load(Ordering::Relaxed),
+            )
+            .cloned();
             if dirty {
                 self.save(&mut current, next).await?;
             }
@@ -921,6 +983,15 @@ impl Queue {
         let Some(mut job) = selected else {
             return Ok(false);
         };
+        let turns = self.gap_turns.load(Ordering::Relaxed);
+        self.gap_turns.store(
+            if full_file_warm(&job) {
+                0
+            } else {
+                turns.saturating_add(1)
+            },
+            Ordering::Relaxed,
+        );
         let mut rate = self
             .rates
             .begin(job.id, job.run, std::time::Instant::now(), now_ms());
@@ -1096,6 +1167,7 @@ impl Queue {
             // The publication owns admission and activity until durability is known,
             // even if a policy change cancels this window. No replacement step can
             // fetch the same block while this write is still finishing.
+            let publication_started = std::time::Instant::now();
             let publication = tokio::spawn({
                 let cache = cache.clone();
                 let lease = lease.clone();
@@ -1115,9 +1187,12 @@ impl Queue {
             step = admitted_step;
             rate = active_rate;
             if matches!(published, Ok(true)) {
+                let checkpoint_started = std::time::Instant::now();
                 self.checkpoint(&job, length, true).await?;
                 tracing::debug!(job=%job.id, offset=job.offset, bytes=length, source_ms,
-                total_ms=started.elapsed().as_millis(), "warming block committed");
+                    publication_ms=checkpoint_started.duration_since(publication_started).as_millis(),
+                    checkpoint_ms=checkpoint_started.elapsed().as_millis(),
+                    total_ms=started.elapsed().as_millis(), "warming block committed");
                 job.offset += length;
                 progressed = true;
             } else {
@@ -1248,6 +1323,71 @@ impl Queue {
         result
     }
 }
+fn select_job<'a>(
+    jobs: &'a [Job],
+    now: i64,
+    protected: &HashSet<ItemId>,
+    gap_turns: u8,
+) -> Option<&'a Job> {
+    let ready = || {
+        jobs.iter()
+            .filter(|j| j.state == State::Queued && j.next_attempt <= now)
+    };
+    if gap_turns >= GAP_TURNS
+        && let Some(full) = ready()
+            .filter(|j| full_file_warm(j))
+            .min_by_key(|j| (j.updated_at, j.created_at, j.id))
+    {
+        return Some(full);
+    }
+    ready().min_by_key(|j| {
+        (
+            !(full_file_warm(j) || j.family == Family::Backfill)
+                || !protected.contains(&ItemId(j.item)),
+            std::cmp::Reverse(j.priority),
+            j.updated_at,
+            j.created_at,
+            j.id,
+        )
+    })
+}
+
+fn full_file_warm(job: &Job) -> bool {
+    job.family != Family::Backfill
+        && job.ranges
+            == [Range {
+                start: 0,
+                end: job.size,
+            }]
+}
+
+fn merge_pending_gap(job: &Job, incoming: &[Range]) -> Option<Vec<Range>> {
+    if job.family != Family::Backfill
+        || job.state != State::Queued
+        || job.run != 0
+        || job.verified_bytes != 0
+        || job.source_bytes != 0
+        || job.cached_bytes != 0
+        || job.attempts != 0
+        || job.reason.is_some()
+        || job.range != 0
+        || job
+            .ranges
+            .first()
+            .is_none_or(|first| first.start != job.offset)
+        || !job.ranges.iter().any(|existing| {
+            incoming
+                .iter()
+                .any(|new| existing.start <= new.end && new.start <= existing.end)
+        })
+    {
+        return None;
+    }
+    let mut combined = job.ranges.clone();
+    combined.extend_from_slice(incoming);
+    normalize(&combined, job.size).ok()
+}
+
 fn normalize(ranges: &[Range], size: u64) -> anyhow::Result<Vec<Range>> {
     ensure!(
         size > 0 && !ranges.is_empty() && ranges.len() <= MAX_RANGES,
@@ -1503,5 +1643,98 @@ mod attribution_history_tests {
         drop(queue);
         db.close().await;
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    fn job(family: Family, priority: u8, updated_at: i64) -> Job {
+        let size = 4 * BLOCK;
+        let end = if family == Family::Backfill {
+            BLOCK
+        } else {
+            size
+        };
+        Job {
+            id: Uuid::new_v4(),
+            item: Uuid::new_v4(),
+            revision: "a".repeat(64),
+            size,
+            ranges: vec![Range { start: 0, end }],
+            priority,
+            intent: Uuid::new_v4(),
+            automatic_scope: None,
+            attribution: Attribution::default(),
+            family,
+            state: State::Queued,
+            created_at: updated_at,
+            updated_at,
+            expires_at: 1000,
+            next_attempt: 0,
+            attempts: 0,
+            run: 0,
+            verified_bytes: 0,
+            source_bytes: 0,
+            cached_bytes: 0,
+            reason: None,
+            range: 0,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn ready_full_file_jobs_get_a_turn_and_deferred_jobs_do_not() {
+        let mut jobs = [
+            job(Family::Backfill, 100, 1),
+            job(Family::Read, 40, 2),
+            job(Family::Plex, 30, 3),
+        ];
+        let protected = HashSet::new();
+        assert_eq!(
+            select_job(&jobs, 10, &protected, GAP_TURNS - 1).map(|j| j.family),
+            Some(Family::Backfill)
+        );
+        assert_eq!(
+            select_job(&jobs, 10, &protected, GAP_TURNS).map(|j| j.family),
+            Some(Family::Read)
+        );
+        jobs[1].next_attempt = 11;
+        assert_eq!(
+            select_job(&jobs, 10, &protected, GAP_TURNS).map(|j| j.family),
+            Some(Family::Plex)
+        );
+        jobs[2].state = State::Paused;
+        assert_eq!(
+            select_job(&jobs, 10, &protected, GAP_TURNS).map(|j| j.family),
+            Some(Family::Backfill)
+        );
+    }
+
+    #[test]
+    fn coalescing_preserves_controls_progress_and_disjoint_gaps() {
+        let mut job = job(Family::Backfill, 100, 1);
+        let touching = [Range {
+            start: BLOCK,
+            end: 2 * BLOCK,
+        }];
+        let disjoint = [Range {
+            start: 2 * BLOCK,
+            end: 3 * BLOCK,
+        }];
+        assert_eq!(
+            merge_pending_gap(&job, &touching),
+            Some(vec![Range {
+                start: 0,
+                end: 2 * BLOCK
+            }])
+        );
+        assert!(merge_pending_gap(&job, &disjoint).is_none());
+        job.state = State::Paused;
+        assert!(merge_pending_gap(&job, &touching).is_none());
+        job.state = State::Queued;
+        job.verified_bytes = BLOCK;
+        assert!(merge_pending_gap(&job, &touching).is_none());
     }
 }

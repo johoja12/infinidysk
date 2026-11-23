@@ -38,7 +38,10 @@ impl Queue {
                 continue;
             }
             let key = self.vfs.cache_key(&item).await?;
-            if key.revision() != hint.revision || key.size() != hint.size {
+            if key.revision() != hint.revision
+                || key.size() != hint.size
+                || !cache.meets_file_minimum(key.size())
+            {
                 journal.acknowledge(hint.id);
                 continue;
             }

@@ -5565,6 +5565,7 @@ export interface components {
             /** Format: int64 */
             reserved_wire_bytes?: number | null;
             state_available: boolean;
+            waiting_for_playback: boolean;
             wire_blocked: boolean;
             /** Format: int64 */
             wire_day?: number | null;

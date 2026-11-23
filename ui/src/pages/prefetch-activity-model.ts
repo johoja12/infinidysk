@@ -107,12 +107,14 @@ export function state(
   rates: Schemas["PrefetchRate"][],
   paused: boolean,
   now: number,
+  waitingForPlayback = false,
 ) {
   if (j.state !== "queued") return j.state;
   if (paused) return "paused";
   if (rates.some((r) => r.job === j.id && r.run === j.run && r.active))
     return "running";
-  return j.next_attempt > now ? "deferred" : "queued";
+  if (j.next_attempt > now) return "deferred";
+  return waitingForPlayback ? "waiting_for_playback" : "queued";
 }
 export function rows(
   data: Schemas["PrefetchView"],
@@ -120,15 +122,29 @@ export function rows(
   gaps: boolean,
   grouped: boolean,
 ): Row[] {
-  if (!history)
-    return data.jobs
-      .filter((j) => !terminal(j))
-      .map((job) => ({
-        key: job.id,
-        job,
-        at: job.updated_at,
-        runs: [{ job, at: job.updated_at }],
-      }));
+  if (!history) {
+    const current = new Map<string, Row>();
+    const running = new Set(data.rates.filter((r) => r.active).map((r) => `${r.job}:${r.run}`));
+    const rank = (job: Job) =>
+      running.has(`${job.id}:${job.run}`) ? 2 : job.state === "queued" ? 1 : 0;
+    for (const job of data.jobs.filter((j) => !terminal(j))) {
+      const key = job.family === "backfill"
+        ? JSON.stringify([job.item, job.revision])
+        : job.id;
+      const at = job.updated_at;
+      const group = current.get(key);
+      if (!group) {
+        current.set(key, { key, job, at, runs: [{ job, at }] });
+        continue;
+      }
+      group.runs.push({ job, at });
+      if (rank(job) > rank(group.job) ||
+        (rank(job) === rank(group.job) && job.next_attempt < group.job.next_attempt))
+        group.job = job;
+      group.at = Math.max(group.at, at);
+    }
+    return [...current.values()];
+  }
   const attempts = new Map<string, { job: Job; at: number }>();
   for (const h of data.history)
     attempts.set(`${h.job.id}:${h.job.run}`, { job: h.job, at: h.recorded_at });

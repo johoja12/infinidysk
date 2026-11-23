@@ -703,10 +703,14 @@ impl Cache {
     pub fn can_migrate(&self) -> bool {
         !self.settings.recovery_mode && self.folders.iter().any(|f| !f.settings.read_only)
     }
+    /// Minimum applies to the whole source, including range-only warming.
+    pub fn meets_file_minimum(&self, size: u64) -> bool {
+        size >= u64::from(self.settings.min_file_mb) * MB
+    }
     /// Warming must not fetch misses when no destination can retain the result.
     pub fn can_fill(&self, key: &Key) -> bool {
         !self.settings.recovery_mode
-            && key.size >= u64::from(self.settings.min_file_mb) * MB
+            && self.meets_file_minimum(key.size)
             && (self.folders.iter().any(|f| !f.settings.read_only)
                 || (!self.settings.prefer_native_writes
                     && self.legacy.get().is_some_and(|r| r.writable())))

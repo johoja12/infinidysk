@@ -153,13 +153,14 @@ export function PrefetchActivity() {
     [data, history, gaps, grouped, currentRows],
   );
   const displayState = (job: Job) =>
-    state(job, data?.rates ?? [], data?.paused ?? false, now);
+    state(job, data?.rates ?? [], data?.paused ?? false, now,
+      Boolean(settings.data?.settings.prefetch.enabled && data?.waiting_for_playback));
   const filtered = allRows.filter((r) => {
     const j = r.job;
     return (
       (filter === "all" ||
         ["fully-cached", "partial", "unknown"].includes(filter) ||
-        displayState(j) === filter) &&
+        (history ? displayState(j) === filter : r.runs.some((run) => displayState(run.job) === filter))) &&
       (origin === "all" || r.runs.some((run) => source(run.job) === origin)) &&
       (viewer === "all" ||
         r.runs.some((run) => viewers(run.job).includes(viewer))) &&
@@ -242,7 +243,9 @@ export function PrefetchActivity() {
       ? "Recovery hold"
       : data.paused
         ? "Paused"
-        : "Active";
+        : data.waiting_for_playback && active.length
+          ? "Waiting for playback"
+          : "Active";
   const metric = (label: string, value: string, foot: string) => (
     <div className="min-w-0 rounded-lg border bg-card p-4">
       <p className="text-xs text-muted-foreground">{label}</p>
@@ -318,7 +321,7 @@ export function PrefetchActivity() {
         {metric(
           "Queue status",
           queueState,
-          `${active.filter((j) => displayState(j) === "queued").length} waiting · ${active.filter((j) => displayState(j) === "deferred").length} deferred`,
+          `${active.filter((j) => ["queued", "waiting_for_playback"].includes(displayState(j))).length} waiting · ${active.filter((j) => displayState(j) === "deferred").length} deferred`,
         )}
         {metric(
           "Warming now",
@@ -455,6 +458,7 @@ export function PrefetchActivity() {
                 : [
                     ["running", "Running"],
                     ["queued", "Queued"],
+                    ["waiting_for_playback", "Waiting for playback"],
                     ["deferred", "Deferred"],
                     ["paused", "Paused"],
                   ]) as [string, string][]),
@@ -578,14 +582,18 @@ export function PrefetchActivity() {
           {visible
             .slice(safePage * pageSize, (safePage + 1) * pageSize)
             .map((row) => {
+              const groupedGaps = !history && row.runs.length > 1;
+              const displayed = groupedGaps ? row.runs.map((run) => run.job) : [row.job];
+              const summed = (read: (job: Job) => number) => displayed.reduce((sum, job) => sum + read(job), 0);
               const j = row.job,
                 rate = data.rates.find(
                   (r) => r.job === j.id && r.run === j.run,
                 ),
-                total = requested(j),
+                total = summed(requested),
+                verified = summed((job) => job.verified_bytes),
                 pct = Math.min(
                   100,
-                  (j.verified_bytes / Math.max(1, total)) * 100,
+                  (verified / Math.max(1, total)) * 100,
                 ),
                 status = displayState(j);
               const name = fileName(data, j.item);
@@ -633,7 +641,7 @@ export function PrefetchActivity() {
                         ))}
                         {row.runs.length > 1 && (
                           <Badge variant="outline">
-                            {row.runs.length} runs
+                            {row.runs.length} {groupedGaps ? "gap jobs" : "runs"}
                           </Badge>
                         )}
                       </div>
@@ -669,7 +677,7 @@ export function PrefetchActivity() {
                     </div>
                     <div className="min-w-0 space-y-2">
                       <p className="text-xs tabular-nums">
-                        {bytes(j.verified_bytes)}{" "}
+                        {bytes(verified)}{" "}
                         <span className="text-muted-foreground">
                           / {bytes(total)}
                         </span>
@@ -684,7 +692,7 @@ export function PrefetchActivity() {
                       <p className="text-xs text-muted-foreground">
                         {rate?.active
                           ? `${rate.recent_fill_bytes_per_second == null ? "Collecting speed" : bytes(rate.recent_fill_bytes_per_second) + "/s"}`
-                          : `${bytes(j.source_bytes)} from source · ${bytes(j.cached_bytes)} cached`}
+                          : `${bytes(summed((job) => job.source_bytes))} from source · ${bytes(summed((job) => job.cached_bytes))} cached`}
                       </p>
                       {rate?.stalled && (
                         <p className="text-xs text-warning-text">
@@ -693,7 +701,7 @@ export function PrefetchActivity() {
                       )}
                     </div>
                     <div className="flex flex-wrap gap-1">
-                      {actions(j).map((operation) => (
+                      {!groupedGaps && actions(j).map((operation) => (
                         <Button
                           key={operation}
                           size="sm"
@@ -712,7 +720,7 @@ export function PrefetchActivity() {
                     <summary className="cursor-pointer text-muted-foreground">
                       Details
                       {row.runs.length > 1
-                        ? ` · ${row.runs.length} attempts`
+                        ? ` · ${row.runs.length} ${groupedGaps ? "gap jobs" : "attempts"}`
                         : ""}
                     </summary>
                     <div className="mt-3 space-y-2 break-words text-muted-foreground">
@@ -759,7 +767,19 @@ export function PrefetchActivity() {
                           {new Date(p.observed_at).toLocaleString()}.
                         </p>
                       ))}
-                      {row.runs.length > 1 &&
+                      {groupedGaps && row.runs.map(({ job }) => (
+                        <div key={job.id} className="flex flex-wrap items-center gap-2">
+                          <span>{pretty(displayState(job))} · {job.ranges.map((r) => `${bytes(r.start)}–${bytes(r.end)}`).join(", ")} · {bytes(job.verified_bytes)} verified</span>
+                          {job.reason && <span>{job.reason}</span>}
+                          {actions(job).map((operation) => (
+                            <Button key={operation} size="sm" variant="ghost" disabled={control.isPending}
+                              onClick={() => control.mutate({ id: job.id, operation })}>
+                              {pretty(operation)}
+                            </Button>
+                          ))}
+                        </div>
+                      ))}
+                      {!groupedGaps && row.runs.length > 1 &&
                         row.runs.map((run) => {
                           const pastOutcome = run.job === j ? undefined : recoveryFor(run.job);
                           return (
