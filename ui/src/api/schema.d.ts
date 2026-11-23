@@ -5355,6 +5355,14 @@ export interface components {
              */
             percent: number;
         };
+        PrefetchHealthCheck: {
+            /** Format: int64 */
+            checked_at: number;
+            file_name: string;
+            repair: components["schemas"]["CheckRepair"];
+            result: components["schemas"]["CheckResult"];
+            verified_repair: boolean;
+        };
         PrefetchHistory: {
             job: components["schemas"]["PrefetchJob"];
             /** Format: int64 */
@@ -5563,6 +5571,9 @@ export interface components {
         };
         PrefetchView: components["schemas"]["PrefetchStatus"] & {
             followup: components["schemas"]["PrefetchRepairSnapshot"];
+            health_checks: {
+                [key: string]: components["schemas"]["PrefetchHealthCheck"];
+            };
             names: {
                 [key: string]: string;
             };

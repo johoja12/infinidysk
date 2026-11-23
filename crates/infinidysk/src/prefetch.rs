@@ -35,6 +35,16 @@ pub struct View {
     pub queue: Status,
     pub followup: followups::Snapshot,
     pub names: std::collections::HashMap<Uuid, String>,
+    pub health_checks: std::collections::BTreeMap<Uuid, WarmingHealthCheck>,
+}
+#[derive(Serialize, ToSchema)]
+#[schema(as = PrefetchHealthCheck)]
+pub struct WarmingHealthCheck {
+    file_name: String,
+    checked_at: i64,
+    result: crate::admin::CheckResult,
+    repair: crate::admin::CheckRepair,
+    verified_repair: bool,
 }
 #[utoipa::path(get,operation_id="prefetch_status",path="/api/v1/prefetch",responses((status=200,body=View)))]
 pub async fn status(State(admin): State<Arc<Admin>>) -> Json<View> {
@@ -76,6 +86,34 @@ pub async fn status(State(admin): State<Arc<Admin>>) -> Json<View> {
     let mut ids: Vec<Uuid> = jobs.iter().map(|j| j.item).collect();
     ids.sort_unstable();
     ids.dedup();
+    let health_checks = admin
+        .vfs
+        .db()
+        .latest_item_checks(&ids)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|check| {
+            (
+                check.item_id.0,
+                WarmingHealthCheck {
+                    file_name: check.path.rsplit('/').next().unwrap_or_default().to_owned(),
+                    checked_at: check.created_at,
+                    result: check.result.into(),
+                    repair: check.repair.into(),
+                    verified_repair: check.message.as_deref()
+                        == Some(infinidysk_health::VERIFIED_REPAIR),
+                },
+            )
+        })
+        .collect();
+    let followup = admin
+        .prefetch_followups
+        .snapshot(Arc::clone(&admin), jobs)
+        .await;
+    ids.extend(followup.entries.iter().filter_map(|r| r.replacement_item));
+    ids.sort_unstable();
+    ids.dedup();
     let names = admin
         .vfs
         .db()
@@ -84,14 +122,11 @@ pub async fn status(State(admin): State<Arc<Admin>>) -> Json<View> {
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let followup = admin
-        .prefetch_followups
-        .snapshot(Arc::clone(&admin), jobs)
-        .await;
     Json(View {
         queue,
         followup,
         names,
+        health_checks,
     })
 }
 #[utoipa::path(post,operation_id="prefetch_enqueue",path="/api/v1/prefetch",request_body=Request,responses((status=200,body=Job)))]

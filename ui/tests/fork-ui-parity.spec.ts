@@ -427,6 +427,68 @@ test("current warming hides files below the configured minimum", async ({
   ).toBe(true);
 });
 
+test("warming history retains the original warning and reports verified recovery", async ({
+  page,
+}) => {
+  await page.goto(fixture("activity"));
+  await expect(page.getByRole("article").first()).toBeVisible();
+  await page.evaluate(async () => {
+    const mock = window.__mock;
+    const data = mock.queryClient.getQueryData(["prefetch"]);
+    const job = { ...data.history[0].job, family: "read", state: "failed", verified_bytes: 4000000,
+      reason: "Source read was inconclusive; urgent health check requested" };
+    const replacement = "00000000-0000-4000-8000-000000000289";
+    mock.historyOverride = [job];
+    mock.warmingNames = { [replacement]: "Fixture replacement.mkv" };
+    mock.warmingChecks = {
+      [job.item]: {
+        file_name: "Fixture removed file.mkv",
+        checked_at: job.updated_at + 1000,
+        result: "missing",
+        repair: "replaced",
+        verified_repair: false,
+      },
+    };
+    mock.warmingFollowup = {
+      ...data.followup,
+      entries: [{
+        item: job.item,
+        status: "replacement",
+        replacement_item: replacement,
+        warmed_at: null,
+        regrab: { stage: "replaced", updated_at: job.updated_at + 1000 },
+      }],
+    };
+    await mock.queryClient.invalidateQueries({ queryKey: ["prefetch"] });
+  });
+  await page.getByRole("tab", { name: /Warming history/ }).click();
+  await page.getByRole("searchbox", { name: "Search warming" }).fill("Fixture removed");
+  const row = page.getByRole("article", { name: "Warming file Fixture removed file.mkv" });
+  await expect(row.getByText("Warming failed", { exact: true })).toBeVisible();
+  await expect(row.getByText("Replacement imported", { exact: true })).toBeVisible();
+  await expect(row.getByText(/Source read was inconclusive/)).toBeVisible();
+  await expect(row.getByRole("progressbar")).toHaveAttribute("aria-valuenow", "50");
+  await row.getByText("Details", { exact: true }).click();
+  await expect(row.getByRole("link", { name: "Fixture replacement.mkv" })).toBeVisible();
+  await expect(row.getByText(/Replacement fully warmed/)).toHaveCount(0);
+
+  await page.evaluate(async () => {
+    const mock = window.__mock;
+    mock.warmingFollowup.entries[0].warmed_at = Date.now();
+    await mock.queryClient.invalidateQueries({ queryKey: ["prefetch"] });
+  });
+  await expect(row.getByText(/Replacement fully warmed/)).toBeVisible();
+  await page.evaluate(async () => {
+    const mock = window.__mock;
+    mock.warmingFollowup.stale = true;
+    mock.warmingChecks[mock.historyOverride[0].item].repair = "none";
+    await mock.queryClient.invalidateQueries({ queryKey: ["prefetch"] });
+  });
+  await expect(row.getByText("Recovery status awaiting refresh", { exact: true })).toBeVisible();
+  await expect(row.getByRole("link", { name: "Fixture replacement.mkv" })).toHaveCount(0);
+  await expect(row.getByText(/Replacement fully warmed/)).toHaveCount(0);
+});
+
 test("predictions offer search, profile, source and current cache filters", async ({
   page,
 }) => {

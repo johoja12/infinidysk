@@ -1074,8 +1074,11 @@ attempts visible even when their file size is below the current minimum. Termina
 outcomes belong to Warming history, with separate file warming and playback gap
 fills. Group repeated file/revision/range attempts while retaining each run in
 Details. Use source/viewer badges, proportional progress bars, human file names,
-search, state/source/viewer filters, sorting and bounded pagination. Keep queue
-accounting, repair follow-up and raw identifiers in collapsed details.
+search, state/source/viewer filters, sorting and bounded pagination. Show the
+latest verified recovery outcome beside the original warming status and progress.
+Use retained health history for the original filename when the file is removed.
+Put recovery timestamps, replacement links, replacement warming and queue
+accounting in Details.
 
 Coverage filters use current cache metadata bound to the exact source revision
 and file size, fetched at most four requests at once. Job completion records past
