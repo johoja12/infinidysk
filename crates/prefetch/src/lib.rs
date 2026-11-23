@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -29,7 +29,6 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 const MAX_JOBS: usize = 1000;
-const GAP_TURNS: u8 = 4;
 const MAX_RANGES: usize = 64;
 const RETRY_MS: i64 = 5 * 60 * 1000;
 const EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -280,7 +279,7 @@ pub struct Queue {
     ledger: Mutex<Ledger>,
     /// A step holds this across its I/O. Controls use the ledger only and stay responsive.
     step: Arc<Mutex<()>>,
-    gap_turns: AtomicU8,
+    automatic_turn: AtomicUsize,
     last_turn_manual: AtomicBool,
     needs_gap_compaction: AtomicBool,
     changed: Notify,
@@ -353,7 +352,7 @@ impl Queue {
             vfs,
             ledger: Mutex::new(ledger),
             step: Arc::new(Mutex::new(())),
-            gap_turns: AtomicU8::new(0),
+            automatic_turn: AtomicUsize::new(0),
             last_turn_manual: AtomicBool::new(false),
             needs_gap_compaction: AtomicBool::new(true),
             changed: Notify::new(),
@@ -987,10 +986,10 @@ impl Queue {
                 &next.jobs,
                 now,
                 &protected,
-                self.gap_turns.load(Ordering::Relaxed),
+                self.automatic_turn.load(Ordering::Relaxed),
                 self.last_turn_manual.load(Ordering::Relaxed),
             )
-            .cloned();
+            .map(|(job, next_turn)| (job.clone(), next_turn));
             if dirty {
                 self.save(&mut current, next).await?;
             }
@@ -998,22 +997,12 @@ impl Queue {
             drop(current);
             job
         };
-        let Some(mut job) = selected else {
+        let Some((mut job, next_turn)) = selected else {
             return Ok(false);
         };
-        let manual = job.automatic_scope.is_none();
-        self.last_turn_manual.store(manual, Ordering::Relaxed);
-        if !manual {
-            let turns = self.gap_turns.load(Ordering::Relaxed);
-            self.gap_turns.store(
-                if full_file_warm(&job) {
-                    0
-                } else {
-                    turns.saturating_add(1)
-                },
-                Ordering::Relaxed,
-            );
-        }
+        self.last_turn_manual
+            .store(job.automatic_scope.is_none(), Ordering::Relaxed);
+        self.automatic_turn.store(next_turn, Ordering::Relaxed);
         let mut rate = self
             .rates
             .begin(job.id, job.run, std::time::Instant::now(), now_ms());
@@ -1352,15 +1341,51 @@ impl Queue {
         result
     }
 }
+#[derive(Clone, Copy)]
+enum AutomaticLane {
+    Playback,
+    Gap,
+    Prediction,
+}
+
+// Four playback, two gap, and one prediction turn per cycle when all lanes are busy.
+const AUTOMATIC_TURNS: [AutomaticLane; 7] = [
+    AutomaticLane::Playback,
+    AutomaticLane::Gap,
+    AutomaticLane::Playback,
+    AutomaticLane::Prediction,
+    AutomaticLane::Playback,
+    AutomaticLane::Gap,
+    AutomaticLane::Playback,
+];
+
+fn automatic_lane(job: &Job) -> AutomaticLane {
+    match job.family {
+        Family::Backfill => AutomaticLane::Gap,
+        Family::Read => AutomaticLane::Playback,
+        Family::Plex
+            if full_file_warm(job)
+                && job
+                    .attribution
+                    .policy
+                    .as_ref()
+                    .is_some_and(|origin| origin.source == "playback") =>
+        {
+            AutomaticLane::Playback
+        }
+        Family::Plex => AutomaticLane::Prediction,
+    }
+}
+
 fn select_job<'a>(
     jobs: &'a [Job],
     now: i64,
     protected: &HashSet<ItemId>,
-    gap_turns: u8,
+    automatic_turn: usize,
     last_turn_manual: bool,
-) -> Option<&'a Job> {
+) -> Option<(&'a Job, usize)> {
     let ready = || jobs.iter().filter(|j| runnable(j, now));
-    let rank = |j: &&Job| {
+    let rank = |j: &Job| {
         (
             !(full_file_warm(j) || j.family == Family::Backfill)
                 || !protected.contains(&ItemId(j.item)),
@@ -1372,29 +1397,33 @@ fn select_job<'a>(
     };
     let manual = ready()
         .filter(|j| j.automatic_scope.is_none())
-        .min_by_key(rank);
-    if manual.is_some() && !last_turn_manual {
-        return manual;
+        .min_by_key(|j| rank(j));
+    if let Some(manual) = manual.filter(|_| !last_turn_manual) {
+        return Some((manual, automatic_turn));
     }
     let full: HashSet<_> = ready()
         .filter(|j| full_file_warm(j))
         .map(|j| (j.item, j.revision.as_str(), j.size))
         .collect();
-    let automatic = || {
-        ready().filter(|j| {
-            j.automatic_scope.is_some()
-                && !(j.family == Family::Backfill
-                    && full.contains(&(j.item, j.revision.as_str(), j.size)))
-        })
-    };
-    if gap_turns >= GAP_TURNS
-        && let Some(full) = automatic()
-            .filter(|j| full_file_warm(j))
-            .min_by_key(|j| (j.updated_at, j.created_at, j.id))
-    {
-        return Some(full);
+    let mut best = [None; 3];
+    for job in ready().filter(|j| j.automatic_scope.is_some()) {
+        if job.family == Family::Backfill
+            && full.contains(&(job.item, job.revision.as_str(), job.size))
+        {
+            continue;
+        }
+        let lane = &mut best[automatic_lane(job) as usize];
+        if lane.is_none_or(|current| rank(job) < rank(current)) {
+            *lane = Some(job);
+        }
     }
-    automatic().min_by_key(rank).or(manual)
+    for offset in 0..AUTOMATIC_TURNS.len() {
+        let turn = (automatic_turn + offset) % AUTOMATIC_TURNS.len();
+        if let Some(job) = best[AUTOMATIC_TURNS[turn] as usize] {
+            return Some((job, (turn + 1) % AUTOMATIC_TURNS.len()));
+        }
+    }
+    manual.map(|job| (job, automatic_turn))
 }
 
 fn runnable(job: &Job, now: i64) -> bool {
@@ -1763,31 +1792,71 @@ mod scheduling_tests {
     }
 
     #[test]
-    fn ready_full_file_jobs_get_a_turn_and_deferred_jobs_do_not() {
+    fn automatic_rotation_prefers_playback_without_starving_gaps_or_predictions() {
         let mut jobs = [
             job(Family::Backfill, 100, 1),
             job(Family::Read, 40, 2),
-            job(Family::Plex, 30, 3),
+            job(Family::Plex, 90, 3),
         ];
         let protected = HashSet::new();
+        let mut turn = 0;
+        let order: Vec<_> = (0..AUTOMATIC_TURNS.len())
+            .map(|_| {
+                let (job, next) = select_job(&jobs, 10, &protected, turn, false).unwrap();
+                turn = next;
+                job.family
+            })
+            .collect();
         assert_eq!(
-            select_job(&jobs, 10, &protected, GAP_TURNS - 1, false).map(|j| j.family),
-            Some(Family::Backfill)
+            order,
+            [
+                Family::Read,
+                Family::Backfill,
+                Family::Read,
+                Family::Plex,
+                Family::Read,
+                Family::Backfill,
+                Family::Read
+            ]
         );
-        assert_eq!(
-            select_job(&jobs, 10, &protected, GAP_TURNS, false).map(|j| j.family),
-            Some(Family::Read)
-        );
+        assert_eq!(turn, 0);
+
         jobs[1].next_attempt = 11;
         assert_eq!(
-            select_job(&jobs, 10, &protected, GAP_TURNS, false).map(|j| j.family),
-            Some(Family::Plex)
-        );
-        jobs[2].state = State::Paused;
-        assert_eq!(
-            select_job(&jobs, 10, &protected, GAP_TURNS, false).map(|j| j.family),
+            select_job(&jobs, 10, &protected, 0, false).map(|(j, _)| j.family),
             Some(Family::Backfill)
         );
+        jobs[0].state = State::Paused;
+        assert_eq!(
+            select_job(&jobs, 10, &protected, 0, false).map(|(j, _)| j.family),
+            Some(Family::Plex)
+        );
+    }
+
+    #[test]
+    fn plex_playback_full_file_and_speculative_full_file_are_separate_lanes() {
+        let mut jobs = [
+            job(Family::Backfill, 100, 1),
+            job(Family::Plex, 30, 2),
+            job(Family::Plex, 99, 3),
+        ];
+        jobs[1].attribution.policy = Some(PolicyOrigin {
+            source: "playback".into(),
+            server: "fixture-server".into(),
+            viewer: "fixture-viewer".into(),
+            viewer_name: None,
+            source_title: None,
+            source_path: None,
+            observed_at: 1,
+        });
+        let run = |jobs: &[Job], turn| {
+            select_job(jobs, 10, &HashSet::new(), turn, false).map(|(j, _)| j.id)
+        };
+        assert_eq!(run(&jobs, 0), Some(jobs[1].id));
+        assert_eq!(run(&jobs, 1), Some(jobs[0].id));
+        assert_eq!(run(&jobs, 3), Some(jobs[2].id));
+        jobs[1].ranges[0].end = BLOCK;
+        assert_eq!(run(&jobs, 0), Some(jobs[0].id));
     }
 
     #[test]
@@ -1799,25 +1868,25 @@ mod scheduling_tests {
         ];
         jobs[2].automatic_scope = None;
         let protected = HashSet::from([ItemId(jobs[0].item)]);
-        let run = |jobs: &[Job], turns, manual| {
-            select_job(jobs, 10, &protected, turns, manual).map(|j| j.id)
+        let run = |jobs: &[Job], turn, manual| {
+            select_job(jobs, 10, &protected, turn, manual).map(|(j, next)| (j.id, next))
         };
-        assert_eq!(run(&jobs, 0, false), Some(jobs[2].id));
-        assert_eq!(run(&jobs, 0, true), Some(jobs[0].id));
-        assert_eq!(run(&jobs, GAP_TURNS, true), Some(jobs[1].id));
+        assert_eq!(run(&jobs, 0, false), Some((jobs[2].id, 0)));
+        assert_eq!(run(&jobs, 0, true), Some((jobs[1].id, 1)));
+        assert_eq!(run(&jobs, 1, true), Some((jobs[0].id, 2)));
         jobs[2].next_attempt = 11;
-        assert_eq!(run(&jobs, 0, false), Some(jobs[0].id));
+        assert_eq!(run(&jobs, 0, false), Some((jobs[1].id, 1)));
         jobs[2].next_attempt = 0;
         jobs[0].state = State::Paused;
         jobs[1].state = State::Paused;
-        assert_eq!(run(&jobs, 0, true), Some(jobs[2].id));
+        assert_eq!(run(&jobs, 0, true), Some((jobs[2].id, 0)));
     }
 
     #[test]
     fn gap_falls_back_when_the_matching_full_warm_can_no_longer_run() {
         let mut jobs = [job(Family::Backfill, 100, 1), job(Family::Read, 40, 2)];
         jobs[1].item = jobs[0].item;
-        let run = |jobs: &[Job]| select_job(jobs, 10, &HashSet::new(), 0, false).map(|j| j.id);
+        let run = |jobs: &[Job]| select_job(jobs, 10, &HashSet::new(), 1, false).map(|(j, _)| j.id);
         assert_eq!(run(&jobs), Some(jobs[1].id));
         jobs[1].next_attempt = 11;
         assert_eq!(run(&jobs), Some(jobs[0].id));
