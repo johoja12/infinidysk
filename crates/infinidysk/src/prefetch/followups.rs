@@ -146,15 +146,19 @@ impl Followups {
     }
 }
 async fn collect(admin: &Admin, settings: &Settings, jobs: &[Job]) -> Result<Vec<Followup>, ()> {
-    let mut recent = BTreeMap::<Uuid, i64>::new();
+    let mut recent = BTreeMap::<Uuid, (bool, i64)>::new();
     for job in jobs {
+        let priority = (
+            job.state == State::Failed || job.reason.is_some(),
+            job.updated_at,
+        );
         recent
             .entry(job.item)
-            .and_modify(|at| *at = (*at).max(job.updated_at))
-            .or_insert(job.updated_at);
+            .and_modify(|previous| *previous = (*previous).max(priority))
+            .or_insert(priority);
     }
     let mut ids: Vec<_> = recent.into_iter().collect();
-    ids.sort_by_key(|(id, at)| (std::cmp::Reverse(*at), *id));
+    ids.sort_by_key(|(id, priority)| (std::cmp::Reverse(*priority), *id));
     let mut entries = Vec::new();
     let mut inspected = 0;
     for (id, _) in ids.into_iter().take(32) {

@@ -750,12 +750,13 @@
               ),
               history_available: true,
               state_available: true,
-              names: {
+              names: window.__mock.warmingNames || {
                 ...fixtureNames,
                 [id]: "Fixture warming file",
                 [other]: "Fixture fully cached file",
               },
-              followup: {
+              health_checks: window.__mock.warmingChecks || {},
+              followup: window.__mock.warmingFollowup || {
                 updated_at: 1,
                 refreshing: false,
                 stale: false,

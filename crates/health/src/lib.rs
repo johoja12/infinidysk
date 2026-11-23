@@ -34,6 +34,8 @@ use structure::Verdict;
 
 /// Lets the mount and the first streams settle before checks compete for connections.
 const STARTUP_DELAY: Duration = Duration::from_secs(20);
+/// Durable health history message recorded after checking repaired source bytes.
+pub const VERIFIED_REPAIR: &str = "Repaired source passed its health check";
 const IDLE_POLL: Duration = Duration::from_secs(60);
 const MINUTE_MS: i64 = 60 * 1000;
 const HOUR_MS: i64 = 60 * MINUTE_MS;
@@ -946,7 +948,15 @@ impl Health {
                 self.count(HEALTHY);
                 let (state, result, message) = match outcome {
                     Outcome::Degraded(m) => (HealthState::Degraded, HealthResult::Degraded, m),
-                    _ => (HealthState::Healthy, HealthResult::Healthy, String::new()),
+                    _ => (
+                        HealthState::Healthy,
+                        HealthResult::Healthy,
+                        if checked_repair.is_some() {
+                            VERIFIED_REPAIR.to_owned()
+                        } else {
+                            String::new()
+                        },
+                    ),
                 };
                 next.state = state;
                 next.repair_attempts = 0;

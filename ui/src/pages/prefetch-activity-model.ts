@@ -9,6 +9,89 @@ export type Row = {
 export const terminal = (j: Job) => !["queued", "paused"].includes(j.state);
 export const requested = (j: Job) =>
   j.ranges.reduce((n, r) => n + Math.max(0, r.end - r.start), 0);
+export const fileName = (
+  data: Schemas["PrefetchView"] | undefined,
+  item: string,
+) => data?.names[item] || data?.health_checks?.[item]?.file_name || item.slice(0, 8);
+
+type Recovery = {
+  label: string;
+  tone: "success" | "warning";
+  at?: number;
+  replacement?: string | null;
+  warmed?: number | null;
+};
+export function recovery(
+  job: Job,
+  check: Schemas["PrefetchHealthCheck"] | undefined,
+  followup: Schemas["PrefetchRepairFollowup"] | undefined,
+  stale: boolean,
+): Recovery | undefined {
+  const requested =
+    job.reason === "Source read was inconclusive; urgent health check requested";
+  if (job.state !== "failed" && !requested) return;
+  const observed =
+    check &&
+    check.checked_at >= (check.result === "healthy" ? job.updated_at : job.created_at)
+      ? check
+      : undefined;
+  const journal =
+    followup && followup.regrab.updated_at >= job.created_at ? followup : undefined;
+  if (
+    observed?.repair === "replaced" ||
+    (!stale && journal?.regrab.stage === "replaced")
+  ) {
+    return {
+      label: "Replacement imported",
+      tone: "success",
+      at:
+        observed?.repair === "replaced"
+          ? observed.checked_at
+          : journal?.regrab.updated_at,
+      replacement: stale ? undefined : journal?.replacement_item,
+      warmed: stale ? undefined : journal?.warmed_at,
+    };
+  }
+  if (observed?.repair === "action_needed" || observed?.repair === "deleted")
+    return {
+      label:
+        observed.repair === "deleted" ? "Original removed" : "Automatic recovery failed",
+      tone: "warning",
+      at: observed.checked_at,
+    };
+  if (!stale && journal) {
+    const stage = journal.regrab.stage;
+    if (stage === "abandoned" || journal.regrab.abandoned)
+      return {
+        label: "Recovery abandoned",
+        tone: "warning",
+        at: journal.regrab.updated_at,
+      };
+    if (stage === "unreadable" || stage === "unsupported")
+      return { label: "Recovery status unavailable", tone: "warning" };
+    return { label: "Regrab in progress", tone: "warning", at: journal.regrab.updated_at };
+  }
+  if (stale && journal)
+    return { label: "Recovery status awaiting refresh", tone: "warning" };
+  if (observed) {
+    const label =
+      observed.repair === "replacement_requested"
+        ? "Regrab requested"
+        : observed.result === "healthy"
+          ? observed.verified_repair
+            ? "Repair verified"
+            : "Health check passed"
+          : observed.result === "inconclusive"
+            ? "Health check inconclusive"
+            : "Source damage detected";
+    return {
+      label,
+      tone: observed.result === "healthy" ? "success" : "warning",
+      at: observed.checked_at,
+    };
+  }
+  if (requested) return { label: "Urgent health check requested", tone: "warning" };
+}
 export function source(j: Job) {
   if (j.family === "backfill") return "Playback gap fill";
   if (j.family === "read") return "Finish watched";

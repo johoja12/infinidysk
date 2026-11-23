@@ -428,6 +428,31 @@ async fn exercise(db: &Db) {
         Some(Repair::ActionNeeded)
     );
     assert_eq!(db.item_checks(file.id, 5).await.expect("query").len(), 1);
+    let deleted = ItemId::new();
+    let replaced = HealthCheck {
+        created_at: 15,
+        item_id: deleted,
+        path: String::from("/removed/fixture.mkv"),
+        result: HealthResult::Missing,
+        repair: Repair::Replaced,
+        message: None,
+    };
+    db.record_health_check(&HealthCheck {
+        created_at: 14,
+        repair: Repair::ReplacementRequested,
+        ..replaced.clone()
+    })
+    .await
+    .expect("record search");
+    db.record_health_check(&replaced)
+        .await
+        .expect("record replacement");
+    let latest = db
+        .latest_item_checks(&[file.id.0, deleted.0, ItemId::new().0])
+        .await
+        .expect("query latest checks");
+    assert_eq!(latest.len(), 2);
+    assert!(latest.contains(&replaced));
 
     // Health work: unchecked first, recheck reasons survive a concurrent write, hidden
     // items leave listings.

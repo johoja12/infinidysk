@@ -3346,6 +3346,41 @@ impl Db {
             .collect()
     }
 
+    /// Latest retained health check per item, including items removed after recovery.
+    pub async fn latest_item_checks(&self, ids: &[Uuid]) -> Result<Vec<HealthCheck>, Error> {
+        type Row = (Uuid, i64, String, i16, i16, Option<String>);
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = &ids[..ids.len().min(2000)];
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("${i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT h.item_id,h.created_at,h.path,h.result,h.repair,h.message FROM health_checks h \
+             WHERE h.item_id IN ({placeholders}) AND h.id=(SELECT c.id FROM health_checks c \
+             WHERE c.item_id=h.item_id ORDER BY c.created_at DESC,c.id DESC LIMIT 1)"
+        );
+        let rows: Vec<Row> = on!(self, pool => {
+            let mut query = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()));
+            for id in ids { query = query.bind(*id); }
+            query.fetch_all(pool).await?
+        });
+        rows.into_iter()
+            .map(|(item_id, created_at, path, result, repair, message)| {
+                Ok(HealthCheck {
+                    item_id: ItemId(item_id),
+                    created_at,
+                    path,
+                    result: health_result(result)?,
+                    repair: repair_action(repair)?,
+                    message,
+                })
+            })
+            .collect()
+    }
+
     /// What deleting `id` removes: its subtree's files, directories and file bytes.
     pub async fn subtree_stats(&self, id: ItemId) -> Result<SubtreeStats, Error> {
         let sql = "WITH RECURSIVE sub (id) AS ( \

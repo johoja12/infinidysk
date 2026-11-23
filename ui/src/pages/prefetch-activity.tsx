@@ -13,6 +13,8 @@ import { Badge } from "@/components/ui/badge";
 import { useFileCoverage } from "./prefetch-coverage";
 import {
   requested,
+  fileName,
+  recovery,
   rows,
   source,
   state,
@@ -134,6 +136,7 @@ export function PrefetchActivity() {
   });
   const data = query.data,
     now = Date.now();
+  const followups = new Map(data?.followup.entries.map((entry) => [entry.item, entry]));
   const minimumFileBytes =
     (settings.data?.settings.native_cache.min_file_mb ?? 0) * 1_000_000;
   const currentRows = useMemo(
@@ -164,7 +167,7 @@ export function PrefetchActivity() {
         (reason === "unrecorded" ? !j.reason : j.reason === reason)) &&
       (!search ||
         [
-          data?.names[j.item],
+          fileName(data, j.item),
           j.item,
           ...r.runs.map((run) => source(run.job)),
           ...r.runs.flatMap((run) => viewers(run.job)),
@@ -201,9 +204,7 @@ export function PrefetchActivity() {
       sort === "oldest"
         ? a.at - b.at
         : sort === "name"
-          ? (data?.names[a.job.item] ?? a.job.item).localeCompare(
-              data?.names[b.job.item] ?? b.job.item,
-            )
+          ? fileName(data, a.job.item).localeCompare(fileName(data, b.job.item))
           : sort === "progress"
             ? b.job.verified_bytes / Math.max(1, requested(b.job)) -
               a.job.verified_bytes / Math.max(1, requested(a.job))
@@ -587,19 +588,31 @@ export function PrefetchActivity() {
                   (j.verified_bytes / Math.max(1, total)) * 100,
                 ),
                 status = displayState(j);
+              const name = fileName(data, j.item);
+              const recordedRepair = data.health_checks?.[j.item]?.repair;
+              const originalRemoved =
+                !data.names[j.item] &&
+                (recordedRepair === "replaced" || recordedRepair === "deleted");
+              const recoveryFor = (job: Job) => recovery(
+                job,
+                data.health_checks?.[job.item],
+                followups.get(job.item),
+                data.followup.stale || !data.followup.available,
+              );
+              const outcome = recoveryFor(j);
               return (
                 <article
                   key={row.key}
-                  aria-label={`Warming file ${data.names[j.item] || j.item}`}
+                  aria-label={`Warming file ${name}`}
                   className="border-b last:border-0"
                 >
                   <div className="grid min-w-0 gap-4 p-4 sm:grid sm:grid-cols-[minmax(0,3fr)_7rem_minmax(10rem,1fr)_8.5rem]">
                     <div className="min-w-0">
                       <FileLink
-                        item={j.item}
+                        item={originalRemoved ? undefined : j.item}
                         className="break-words text-sm font-medium hover:text-primary"
                       >
-                        {data.names[j.item] || j.item.slice(0, 8)}
+                        {name}
                       </FileLink>
                       <div className="mt-2 flex flex-wrap gap-1">
                         {[
@@ -641,8 +654,13 @@ export function PrefetchActivity() {
                               : ""
                         }
                       >
-                        {pretty(status)}
+                        {status === "failed" && outcome ? "Warming failed" : pretty(status)}
                       </Badge>
+                      {outcome && (
+                        <p className={`mt-2 text-xs font-medium ${outcome.tone === "success" ? "text-success-text" : "text-warning-text"}`}>
+                          {outcome.label}
+                        </p>
+                      )}
                       {j.reason && (
                         <p className="mt-2 break-words text-xs text-muted-foreground">
                           {j.reason}
@@ -661,7 +679,7 @@ export function PrefetchActivity() {
                       </p>
                       <Meter
                         value={pct}
-                        label={`Attempt progress ${data.names[j.item] || j.item}`}
+                        label={`Attempt progress ${name}`}
                       />
                       <p className="text-xs text-muted-foreground">
                         {rate?.active
@@ -698,6 +716,25 @@ export function PrefetchActivity() {
                         : ""}
                     </summary>
                     <div className="mt-3 space-y-2 break-words text-muted-foreground">
+                      {outcome && (outcome.at != null || outcome.replacement || outcome.warmed != null) && (
+                        <div className="space-y-1">
+                          <p>
+                            {outcome.label}
+                            {outcome.at == null ? "" : ` · ${new Date(outcome.at).toLocaleString()}`}
+                          </p>
+                          {outcome.replacement && (
+                            <p>
+                              Replacement{" "}
+                              <FileLink item={outcome.replacement} className="text-primary">
+                                {fileName(data, outcome.replacement)}
+                              </FileLink>
+                            </p>
+                          )}
+                          {outcome.warmed != null && (
+                            <p>Replacement fully warmed · {new Date(outcome.warmed).toLocaleString()}</p>
+                          )}
+                        </div>
+                      )}
                       <p>
                         File <span className="font-mono">{j.item}</span> ·
                         revision{" "}
@@ -723,14 +760,19 @@ export function PrefetchActivity() {
                         </p>
                       ))}
                       {row.runs.length > 1 &&
-                        row.runs.map((run) => (
-                          <p key={`${run.job.id}:${run.job.run}`}>
-                            {new Date(run.at).toLocaleString()} ·{" "}
-                            {pretty(run.job.state)} ·{" "}
-                            {bytes(run.job.verified_bytes)} verified ·{" "}
-                            {source(run.job)}
-                          </p>
-                        ))}
+                        row.runs.map((run) => {
+                          const pastOutcome = run.job === j ? undefined : recoveryFor(run.job);
+                          return (
+                            <p key={`${run.job.id}:${run.job.run}`}>
+                              {new Date(run.at).toLocaleString()} ·{" "}
+                              {pretty(run.job.state)} ·{" "}
+                              {bytes(run.job.verified_bytes)} verified ·{" "}
+                              {source(run.job)}
+                              {run.job.reason && <> · {run.job.reason}</>}
+                              {pastOutcome && <> · {pastOutcome.label}</>}
+                            </p>
+                          );
+                        })}
                     </div>
                   </details>
                 </article>
@@ -812,7 +854,7 @@ export function PrefetchActivity() {
           {data.followup.stale && (
             <p>Repair follow-up needs a fresh inspection.</p>
           )}
-          {data.followup.entries.map((r) => (
+          {!data.followup.stale && data.followup.entries.map((r) => (
             <p key={r.item}>
               <FileLink className="text-primary" item={r.item}>
                 {data.names[r.item] || r.item.slice(0, 8)}
