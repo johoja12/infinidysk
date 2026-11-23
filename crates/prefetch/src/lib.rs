@@ -281,6 +281,8 @@ pub struct Queue {
     /// A step holds this across its I/O. Controls use the ledger only and stay responsive.
     step: Arc<Mutex<()>>,
     gap_turns: AtomicU8,
+    last_turn_manual: AtomicBool,
+    needs_gap_compaction: AtomicBool,
     changed: Notify,
     wire: Arc<infinidysk_nntp::wire::Budget>,
     watched: Mutex<watched::Tracker>,
@@ -352,6 +354,8 @@ impl Queue {
             ledger: Mutex::new(ledger),
             step: Arc::new(Mutex::new(())),
             gap_turns: AtomicU8::new(0),
+            last_turn_manual: AtomicBool::new(false),
+            needs_gap_compaction: AtomicBool::new(true),
             changed: Notify::new(),
             wire,
             watched: Mutex::default(),
@@ -677,6 +681,7 @@ impl Queue {
             j.item == key.item()
                 && j.revision == key.revision()
                 && j.intent == intent
+                && !(backfill_scope.is_some() && j.state == State::Superseded)
                 && (j.ranges == ranges
                     || backfill_scope.is_some_and(|scope| {
                         j.automatic_scope.as_deref() == Some(scope)
@@ -692,10 +697,12 @@ impl Queue {
             return Ok(existing.clone());
         }
         let mut next = current.clone();
+        let now = now_ms();
         if idle_step.is_some()
             && let Some(scope) = backfill_scope
             && let Some((job, changed)) = next.jobs.iter_mut().find_map(|job| {
-                if job.item != key.item()
+                if !runnable(job, now)
+                    || job.item != key.item()
                     || job.revision != key.revision()
                     || job.automatic_scope.as_deref() != Some(scope)
                     || job.attribution != *attribution
@@ -704,8 +711,11 @@ impl Queue {
                 }
                 let merged = merge_pending_gap(job, &ranges)?;
                 let changed = merged != job.ranges;
-                job.offset = merged[0].start;
-                job.ranges = merged;
+                if changed {
+                    job.offset = merged[0].start;
+                    job.ranges = merged;
+                    job.expires_at = job.expires_at.max(now + EXPIRY_MS);
+                }
                 Some((job.clone(), changed))
             })
         {
@@ -714,6 +724,7 @@ impl Queue {
             }
             return Ok(job);
         }
+        let deferred_compaction = backfill_scope.is_some() && idle_step.is_none();
         drop(idle_step);
         // Keep bounded terminal history, never discard a pending job to admit another.
         if next.jobs.len() >= MAX_JOBS
@@ -725,7 +736,6 @@ impl Queue {
             next.jobs.remove(i);
         }
         ensure!(next.jobs.len() < MAX_JOBS, "prefetch queue is full");
-        let now = now_ms();
         let job = Job {
             id: Uuid::new_v4(),
             item: key.item(),
@@ -753,6 +763,9 @@ impl Queue {
         };
         next.jobs.push(job.clone());
         self.save(&mut current, next).await?;
+        if deferred_compaction {
+            self.needs_gap_compaction.store(true, Ordering::Relaxed);
+        }
         drop(current);
         Ok(job)
     }
@@ -967,31 +980,40 @@ impl Queue {
                     }
                 }
             }
+            if self.needs_gap_compaction.load(Ordering::Relaxed) {
+                dirty |= compact_pending_gaps(&mut next.jobs, now);
+            }
             let job = select_job(
                 &next.jobs,
                 now,
                 &protected,
                 self.gap_turns.load(Ordering::Relaxed),
+                self.last_turn_manual.load(Ordering::Relaxed),
             )
             .cloned();
             if dirty {
                 self.save(&mut current, next).await?;
             }
+            self.needs_gap_compaction.store(false, Ordering::Relaxed);
             drop(current);
             job
         };
         let Some(mut job) = selected else {
             return Ok(false);
         };
-        let turns = self.gap_turns.load(Ordering::Relaxed);
-        self.gap_turns.store(
-            if full_file_warm(&job) {
-                0
-            } else {
-                turns.saturating_add(1)
-            },
-            Ordering::Relaxed,
-        );
+        let manual = job.automatic_scope.is_none();
+        self.last_turn_manual.store(manual, Ordering::Relaxed);
+        if !manual {
+            let turns = self.gap_turns.load(Ordering::Relaxed);
+            self.gap_turns.store(
+                if full_file_warm(&job) {
+                    0
+                } else {
+                    turns.saturating_add(1)
+                },
+                Ordering::Relaxed,
+            );
+        }
         let mut rate = self
             .rates
             .begin(job.id, job.run, std::time::Instant::now(), now_ms());
@@ -1014,6 +1036,13 @@ impl Queue {
         let Some(lease) = cache.lease(key.clone()) else {
             return Ok(false);
         };
+        if untouched_gap(&job)
+            && let Ok(coverage) = cache.coverage(&key).await
+            && let Some(ranges) = backfill::trim_covered(&job.ranges, &coverage, job.size)
+        {
+            self.update_unstarted_gap(&job, ranges).await?;
+            return Ok(true);
+        }
         let block = job.offset / BLOCK;
         if let Some(bytes) = cache.get(&lease, block).await {
             self.checkpoint(&job, bytes.len() as u64, false).await?;
@@ -1328,19 +1357,10 @@ fn select_job<'a>(
     now: i64,
     protected: &HashSet<ItemId>,
     gap_turns: u8,
+    last_turn_manual: bool,
 ) -> Option<&'a Job> {
-    let ready = || {
-        jobs.iter()
-            .filter(|j| j.state == State::Queued && j.next_attempt <= now)
-    };
-    if gap_turns >= GAP_TURNS
-        && let Some(full) = ready()
-            .filter(|j| full_file_warm(j))
-            .min_by_key(|j| (j.updated_at, j.created_at, j.id))
-    {
-        return Some(full);
-    }
-    ready().min_by_key(|j| {
+    let ready = || jobs.iter().filter(|j| runnable(j, now));
+    let rank = |j: &&Job| {
         (
             !(full_file_warm(j) || j.family == Family::Backfill)
                 || !protected.contains(&ItemId(j.item)),
@@ -1349,7 +1369,36 @@ fn select_job<'a>(
             j.created_at,
             j.id,
         )
-    })
+    };
+    let manual = ready()
+        .filter(|j| j.automatic_scope.is_none())
+        .min_by_key(rank);
+    if manual.is_some() && !last_turn_manual {
+        return manual;
+    }
+    let full: HashSet<_> = ready()
+        .filter(|j| full_file_warm(j))
+        .map(|j| (j.item, j.revision.as_str(), j.size))
+        .collect();
+    let automatic = || {
+        ready().filter(|j| {
+            j.automatic_scope.is_some()
+                && !(j.family == Family::Backfill
+                    && full.contains(&(j.item, j.revision.as_str(), j.size)))
+        })
+    };
+    if gap_turns >= GAP_TURNS
+        && let Some(full) = automatic()
+            .filter(|j| full_file_warm(j))
+            .min_by_key(|j| (j.updated_at, j.created_at, j.id))
+    {
+        return Some(full);
+    }
+    automatic().min_by_key(rank).or(manual)
+}
+
+fn runnable(job: &Job, now: i64) -> bool {
+    job.state == State::Queued && job.next_attempt <= now && job.expires_at > now
 }
 
 fn full_file_warm(job: &Job) -> bool {
@@ -1361,26 +1410,55 @@ fn full_file_warm(job: &Job) -> bool {
             }]
 }
 
-fn merge_pending_gap(job: &Job, incoming: &[Range]) -> Option<Vec<Range>> {
-    if job.family != Family::Backfill
-        || job.state != State::Queued
-        || job.run != 0
-        || job.verified_bytes != 0
-        || job.source_bytes != 0
-        || job.cached_bytes != 0
-        || job.attempts != 0
-        || job.reason.is_some()
-        || job.range != 0
-        || job
+fn untouched_gap(job: &Job) -> bool {
+    job.family == Family::Backfill
+        && job.state == State::Queued
+        && job.run == 0
+        && job.verified_bytes == 0
+        && job.source_bytes == 0
+        && job.cached_bytes == 0
+        && job.attempts == 0
+        && job.reason.is_none()
+        && job.range == 0
+        && job
             .ranges
             .first()
-            .is_none_or(|first| first.start != job.offset)
-        || !job.ranges.iter().any(|existing| {
-            incoming
-                .iter()
-                .any(|new| existing.start <= new.end && new.start <= existing.end)
-        })
-    {
+            .is_some_and(|first| first.start == job.offset)
+}
+
+fn compact_pending_gaps(jobs: &mut [Job], now: i64) -> bool {
+    let mut changed = false;
+    for index in 1..jobs.len() {
+        let (older, rest) = jobs.split_at_mut(index);
+        let job = &mut rest[0];
+        if !runnable(job, now) || !untouched_gap(job) {
+            continue;
+        }
+        if let Some((target, ranges)) = older.iter_mut().find_map(|target| {
+            (runnable(target, now)
+                && target.item == job.item
+                && target.revision == job.revision
+                && target.size == job.size
+                && target.automatic_scope == job.automatic_scope
+                && target.attribution == job.attribution)
+                .then(|| merge_pending_gap(target, &job.ranges))
+                .flatten()
+                .map(|ranges| (target, ranges))
+        }) {
+            target.offset = ranges[0].start;
+            target.ranges = ranges;
+            target.expires_at = target.expires_at.max(job.expires_at);
+            job.state = State::Superseded;
+            job.reason = Some("Gap ranges consolidated into an existing job".into());
+            job.updated_at = now;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn merge_pending_gap(job: &Job, incoming: &[Range]) -> Option<Vec<Range>> {
+    if !untouched_gap(job) {
         return None;
     }
     let mut combined = job.ranges.clone();
@@ -1665,7 +1743,7 @@ mod scheduling_tests {
             ranges: vec![Range { start: 0, end }],
             priority,
             intent: Uuid::new_v4(),
-            automatic_scope: None,
+            automatic_scope: Some("b".repeat(64)),
             attribution: Attribution::default(),
             family,
             state: State::Queued,
@@ -1693,23 +1771,100 @@ mod scheduling_tests {
         ];
         let protected = HashSet::new();
         assert_eq!(
-            select_job(&jobs, 10, &protected, GAP_TURNS - 1).map(|j| j.family),
+            select_job(&jobs, 10, &protected, GAP_TURNS - 1, false).map(|j| j.family),
             Some(Family::Backfill)
         );
         assert_eq!(
-            select_job(&jobs, 10, &protected, GAP_TURNS).map(|j| j.family),
+            select_job(&jobs, 10, &protected, GAP_TURNS, false).map(|j| j.family),
             Some(Family::Read)
         );
         jobs[1].next_attempt = 11;
         assert_eq!(
-            select_job(&jobs, 10, &protected, GAP_TURNS).map(|j| j.family),
+            select_job(&jobs, 10, &protected, GAP_TURNS, false).map(|j| j.family),
             Some(Family::Plex)
         );
         jobs[2].state = State::Paused;
         assert_eq!(
-            select_job(&jobs, 10, &protected, GAP_TURNS).map(|j| j.family),
+            select_job(&jobs, 10, &protected, GAP_TURNS, false).map(|j| j.family),
             Some(Family::Backfill)
         );
+    }
+
+    #[test]
+    fn manual_work_gets_the_next_turn_and_leaves_a_turn_for_automatic_work() {
+        let mut jobs = [
+            job(Family::Backfill, 100, 1),
+            job(Family::Read, 40, 2),
+            job(Family::Plex, 50, 3),
+        ];
+        jobs[2].automatic_scope = None;
+        let protected = HashSet::from([ItemId(jobs[0].item)]);
+        let run = |jobs: &[Job], turns, manual| {
+            select_job(jobs, 10, &protected, turns, manual).map(|j| j.id)
+        };
+        assert_eq!(run(&jobs, 0, false), Some(jobs[2].id));
+        assert_eq!(run(&jobs, 0, true), Some(jobs[0].id));
+        assert_eq!(run(&jobs, GAP_TURNS, true), Some(jobs[1].id));
+        jobs[2].next_attempt = 11;
+        assert_eq!(run(&jobs, 0, false), Some(jobs[0].id));
+        jobs[2].next_attempt = 0;
+        jobs[0].state = State::Paused;
+        jobs[1].state = State::Paused;
+        assert_eq!(run(&jobs, 0, true), Some(jobs[2].id));
+    }
+
+    #[test]
+    fn gap_falls_back_when_the_matching_full_warm_can_no_longer_run() {
+        let mut jobs = [job(Family::Backfill, 100, 1), job(Family::Read, 40, 2)];
+        jobs[1].item = jobs[0].item;
+        let run = |jobs: &[Job]| select_job(jobs, 10, &HashSet::new(), 0, false).map(|j| j.id);
+        assert_eq!(run(&jobs), Some(jobs[1].id));
+        jobs[1].next_attempt = 11;
+        assert_eq!(run(&jobs), Some(jobs[0].id));
+        jobs[1].next_attempt = 0;
+        jobs[1].state = State::Paused;
+        assert_eq!(run(&jobs), Some(jobs[0].id));
+        jobs[1].state = State::Cancelled;
+        assert_eq!(run(&jobs), Some(jobs[0].id));
+        jobs[1].state = State::Queued;
+        jobs[1].revision = "c".repeat(64);
+        assert_eq!(run(&jobs), Some(jobs[0].id));
+    }
+
+    #[test]
+    fn persisted_gaps_are_compacted_without_losing_disjoint_ranges_or_progress() {
+        let mut first = job(Family::Backfill, 100, 1);
+        let mut second = job(Family::Backfill, 100, 2);
+        second.item = first.item;
+        second.ranges[0] = Range {
+            start: 2 * BLOCK,
+            end: 3 * BLOCK,
+        };
+        second.offset = 2 * BLOCK;
+        let mut started = second.clone();
+        started.id = Uuid::new_v4();
+        started.verified_bytes = BLOCK;
+        first.expires_at = 30;
+        second.expires_at = 40;
+        let mut jobs = [first, second, started];
+        assert!(compact_pending_gaps(&mut jobs, 10));
+        assert_eq!(
+            jobs[0].ranges,
+            vec![
+                Range {
+                    start: 0,
+                    end: BLOCK
+                },
+                Range {
+                    start: 2 * BLOCK,
+                    end: 3 * BLOCK
+                }
+            ]
+        );
+        assert_eq!(jobs[0].expires_at, 40);
+        assert_eq!(jobs[1].state, State::Superseded);
+        assert_eq!(jobs[2].state, State::Queued);
+        assert!(!compact_pending_gaps(&mut jobs, 10));
     }
 
     #[test]
@@ -1730,7 +1885,10 @@ mod scheduling_tests {
                 end: 2 * BLOCK
             }])
         );
-        assert!(merge_pending_gap(&job, &disjoint).is_none());
+        assert_eq!(
+            merge_pending_gap(&job, &disjoint),
+            Some(vec![job.ranges[0].clone(), disjoint[0].clone()])
+        );
         job.state = State::Paused;
         assert!(merge_pending_gap(&job, &touching).is_none());
         job.state = State::Queued;
