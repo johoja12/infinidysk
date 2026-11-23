@@ -15,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
+    io::{self, Read as _},
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
 use utoipa::{IntoParams, ToSchema};
@@ -24,8 +27,10 @@ use uuid::Uuid;
 const MAX_ROWS: usize = 150_000;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
 const TTL: i64 = 300_000;
+const DISK_VERSION: u32 = 1;
+const DISK_MAX_BYTES: usize = 2 * MAX_BYTES;
 
-#[derive(Clone, Serialize, ToSchema)]
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
 #[schema(as=PlexBrowseFile)]
 pub struct File {
     pub key: String,
@@ -60,7 +65,7 @@ pub struct Group {
     pub attention: usize,
     pub qualities: Vec<String>,
 }
-#[derive(Clone, Default, Serialize, ToSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, ToSchema)]
 #[schema(as=PlexBrowseTotals)]
 pub struct Totals {
     pub files: usize,
@@ -114,14 +119,76 @@ struct Coverage {
     ready: bool,
     at: Option<i64>,
 }
+#[derive(Serialize, Deserialize)]
 struct Snapshot {
     scope: String,
     rows: Vec<File>,
     totals: Totals,
     at: i64,
     configuration: String,
+    #[serde(skip)]
     coverage: Mutex<Coverage>,
+    #[serde(skip)]
+    restored: bool,
 }
+// Keep the private pointer out of API responses while retaining it for action revalidation.
+fn save_snapshot(path: &FsPath, snapshot: &Snapshot) -> io::Result<()> {
+    let pointers: Vec<_> = snapshot
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| row.pointer.as_deref().map(|pointer| (i, pointer)))
+        .collect();
+    let bytes = serde_json::to_vec(&(DISK_VERSION, snapshot, pointers))?;
+    if bytes.len() > DISK_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot exceeds capacity",
+        ));
+    }
+    crate::backup::write_private_atomic(path, &bytes)
+}
+
+fn load_snapshot(path: &FsPath, configuration: &str) -> io::Result<Option<Snapshot>> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.take((DISK_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > DISK_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "snapshot exceeds capacity",
+        ));
+    }
+    let (version, mut snapshot, pointers): (u32, Snapshot, Vec<(usize, String)>) =
+        serde_json::from_slice(&bytes)?;
+    if version != DISK_VERSION || snapshot.configuration != configuration {
+        return Ok(None);
+    }
+    if snapshot.rows.len() > MAX_ROWS || snapshot.rows.len() != snapshot.totals.files {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid snapshot row count",
+        ));
+    }
+    for (i, pointer) in pointers {
+        let row = snapshot
+            .rows
+            .get_mut(i)
+            .filter(|row| row.pointer.is_none())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid snapshot pointer index")
+            })?;
+        row.pointer = Some(pointer);
+    }
+    snapshot.restored = true;
+    Ok(Some(snapshot))
+}
+
 #[derive(Default)]
 struct Current {
     snapshots: Vec<Arc<Snapshot>>,
@@ -130,15 +197,17 @@ struct Current {
     retry_at: HashMap<String, i64>,
 }
 pub struct Cache {
+    snapshot_path: PathBuf,
     current: Mutex<Current>,
     metadata: Semaphore,
     coverage: Semaphore,
     artwork: Semaphore,
     pages: Arc<Semaphore>,
 }
-impl Default for Cache {
-    fn default() -> Self {
+impl Cache {
+    pub(super) fn new(snapshot_path: PathBuf) -> Self {
         Self {
+            snapshot_path,
             current: Mutex::default(),
             metadata: Semaphore::new(1),
             coverage: Semaphore::new(1),
@@ -233,7 +302,8 @@ impl Cache {
         // Do not discard an unfinished verification sweep at every metadata TTL.
         // Explicit refresh and changed source scope still request a replacement.
         let expired = snapshot.as_ref().is_none_or(|s| {
-            s.scope != key
+            s.restored
+                || s.scope != key
                 || now_ms() - s.at > TTL
                     && s.coverage
                         .lock()
@@ -241,19 +311,59 @@ impl Cache {
                         .ready
         });
         if (refresh || expired && current.retry_at.get(key).is_none_or(|at| now_ms() >= *at))
-            && !current.pending.contains(key)
+            && !current.pending.contains(&configuration)
             && current.pending.len() < 2
         {
-            current.pending.insert(key.to_owned());
+            let persistent = library == "all"
+                && settings
+                    .plex
+                    .servers
+                    .iter()
+                    .find(|server| server.enabled)
+                    .is_some_and(|default| default.id == server.id);
+            let restore = persistent && snapshot.is_none();
+            current.pending.insert(configuration.clone());
+            let work_configuration = configuration.clone();
             let cache = Arc::clone(self);
             let expected = key.to_owned();
-            let queued = std::time::Instant::now();
+            let queued = Instant::now();
             tokio::spawn(async move {
                 let work = async {
                     let permit = cache.metadata.acquire().await.map_err(|_| Fail::Internal)?;
                     let queue_ms = queued.elapsed().as_secs_f64() * 1000.0;
-                    let started = std::time::Instant::now();
-                    let built = build(&admin, &settings, &server, &library, &expected).await?;
+                    if restore {
+                        let restoring = Instant::now();
+                        let path = cache.snapshot_path.clone();
+                        let configuration = work_configuration.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            load_snapshot(&path, &configuration)
+                        })
+                        .await
+                        {
+                            Ok(Ok(Some(saved))) => {
+                                tracing::info!(
+                                    files = saved.rows.len(),
+                                    restore_ms = restoring.elapsed().as_secs_f64() * 1000.0,
+                                    "Restored saved Library catalogue"
+                                );
+                                cache
+                                    .current
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .publish(Arc::new(saved));
+                            }
+                            Ok(Ok(None)) => {}
+                            Ok(Err(error)) => {
+                                tracing::warn!(reason = %error.kind(), "Could not load saved Library catalogue");
+                            }
+                            Err(error) => {
+                                tracing::warn!(reason = %error, "Library snapshot loader stopped");
+                            }
+                        }
+                    }
+                    let started = Instant::now();
+                    let (built, stages) =
+                        build(&admin, &settings, &server, &library, &expected).await?;
                     let latest = admin.config.read().await.settings().clone();
                     if scope(&admin, &latest, &server.id, &library).await? != expected {
                         return Err(Fail::Bad("Library settings changed; refresh again".into()));
@@ -268,8 +378,26 @@ impl Cache {
                         queue_ms,
                         metadata_ms = started.elapsed().as_secs_f64() * 1000.0,
                         files = snapshot.rows.len(),
+                        plex_ms = stages.plex.as_secs_f64() * 1000.0,
+                        local_db_ms = stages.local_db.as_secs_f64() * 1000.0,
+                        rows_ms = stages.rows.as_secs_f64() * 1000.0,
                         "Library catalogue refresh completed"
                     );
+                    if persistent {
+                        let path = cache.snapshot_path.clone();
+                        let saved = Arc::clone(&snapshot);
+                        match tokio::task::spawn_blocking(move || save_snapshot(&path, &saved))
+                            .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                tracing::warn!(reason = %error.kind(), "Could not save Library catalogue");
+                            }
+                            Err(error) => {
+                                tracing::warn!(reason = %error, "Library snapshot writer stopped");
+                            }
+                        }
+                    }
                     drop(permit);
                     let cache = Arc::clone(&cache);
                     let admin = Arc::clone(&admin);
@@ -288,7 +416,7 @@ impl Cache {
                 };
                 let result = tokio::select! {()=admin.cancel.cancelled()=>Err(Fail::Unavailable("Library refresh stopped".into())), result=work=>result};
                 let mut current = cache.current.lock().unwrap_or_else(PoisonError::into_inner);
-                current.pending.remove(&expected);
+                current.pending.remove(&work_configuration);
                 if let Err(error) = result {
                     let reason = match &error {
                         Fail::Bad(message)
@@ -319,7 +447,7 @@ impl Cache {
         }
         (
             snapshot,
-            current.pending.contains(key),
+            current.pending.contains(&configuration),
             current.errors.get(key).cloned(),
         )
     }
@@ -415,13 +543,51 @@ fn make_file(
         pointer,
     }
 }
+#[derive(Default)]
+struct BuildStages {
+    plex: Duration,
+    local_db: Duration,
+    rows: Duration,
+}
+
+pub(crate) async fn warm_default(admin: Arc<Admin>) {
+    let settings = admin.config.read().await.settings().clone();
+    let Some(server) = settings
+        .plex
+        .servers
+        .iter()
+        .find(|server| server.enabled)
+        .cloned()
+    else {
+        return;
+    };
+    let library = "all";
+    let Ok(key) = scope(&admin, &settings, &server.id, library).await else {
+        tracing::warn!(
+            reason = "catalogue scope unavailable",
+            "Could not pre-warm Library catalogue"
+        );
+        return;
+    };
+    admin.plex.browser.request(
+        Arc::clone(&admin),
+        settings,
+        server,
+        library.into(),
+        &key,
+        false,
+    );
+}
+
 async fn build(
     admin: &Admin,
     settings: &Settings,
     server: &Server,
     library: &str,
     key: &str,
-) -> Result<Snapshot, Fail> {
+) -> Result<(Snapshot, BuildStages), Fail> {
+    let mut stages = BuildStages::default();
+    let started = Instant::now();
     admin
         .plex
         .client
@@ -442,6 +608,8 @@ async fn build(
     if libraries.is_empty() {
         return Err(Fail::NotFound);
     }
+    stages.plex = started.elapsed();
+    let local_db = Instant::now();
     let configured: HashSet<_> = settings
         .imports
         .catalogue_dirs()
@@ -488,17 +656,22 @@ async fn build(
             items.insert(i.id.0, i);
         }
     }
+    stages.local_db = local_db.elapsed();
+    let rows_started = Instant::now();
+    let initial_plex_time = stages.plex;
     let mut rows = Vec::new();
     let mut represented = HashSet::new();
     let mut bytes = 0;
     let mut probes = 0;
     for lib in libraries {
+        let request = Instant::now();
         let all = admin
             .plex
             .client
             .catalogue(server, &lib)
             .await
             .map_err(super::fail)?;
+        stages.plex += request.elapsed();
         for entry in all {
             let paths = if entry.files.is_empty() {
                 vec![None]
@@ -653,17 +826,24 @@ async fn build(
         .filter_map(|r| r.item)
         .collect::<HashSet<_>>()
         .len();
-    Ok(Snapshot {
-        scope: key.into(),
-        rows,
-        totals,
-        at: now_ms(),
-        configuration: configuration(settings, &server.id, library),
-        coverage: Mutex::new(Coverage {
-            total,
-            ..Coverage::default()
-        }),
-    })
+    stages.rows = rows_started
+        .elapsed()
+        .saturating_sub(stages.plex.saturating_sub(initial_plex_time));
+    Ok((
+        Snapshot {
+            scope: key.into(),
+            rows,
+            totals,
+            at: now_ms(),
+            configuration: configuration(settings, &server.id, library),
+            restored: false,
+            coverage: Mutex::new(Coverage {
+                total,
+                ..Coverage::default()
+            }),
+        },
+        stages,
+    ))
 }
 async fn fill_coverage(admin: &Admin, snapshot: &Snapshot) {
     let started = std::time::Instant::now();
@@ -1079,30 +1259,40 @@ pub async fn resolve(
         .iter()
         .find(|s| s.id == id && s.enabled)
         .ok_or(Fail::NotFound)?;
-    let row = {
-        let current = admin
-            .plex
-            .browser
-            .current
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        current
-            .snapshots
-            .iter()
-            .find(|s| s.scope == q.snapshot)
-            .and_then(|s| s.rows.iter().find(|r| r.key == q.key))
-            .cloned()
-            .ok_or(Fail::NotFound)?
-    };
-    let library = if row.library == "indexed" {
-        "all"
+    let snapshot = admin
+        .plex
+        .browser
+        .current
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .snapshots
+        .iter()
+        .find(|s| s.scope == q.snapshot)
+        .cloned()
+        .ok_or(Fail::NotFound)?;
+    let row = snapshot
+        .rows
+        .iter()
+        .find(|r| r.key == q.key)
+        .cloned()
+        .ok_or(Fail::NotFound)?;
+    let restored_configuration = snapshot.restored.then(|| snapshot.configuration.clone());
+    drop(snapshot);
+    let current = if let Some(saved) = restored_configuration {
+        // The blob epoch resets at startup. Use the stored configuration and
+        // revalidate the selected Plex version or local pointer below.
+        saved == configuration(&settings, &id, "all")
     } else {
-        row.library.as_str()
+        // A full-server snapshot can contain per-library rows.
+        let library = if row.library == "indexed" {
+            "all"
+        } else {
+            row.library.as_str()
+        };
+        let expected_all = scope(&admin, &settings, &id, "all").await?;
+        q.snapshot == expected_all || q.snapshot == scope(&admin, &settings, &id, library).await?
     };
-    // A full-server snapshot can contain per-library rows; accept only one of those two scopes.
-    let expected_all = scope(&admin, &settings, &id, "all").await?;
-    let expected_library = scope(&admin, &settings, &id, library).await?;
-    if q.snapshot != expected_all && q.snapshot != expected_library {
+    if !current {
         return Err(Fail::Bad(
             "Library settings changed; refresh before opening this file".into(),
         ));
@@ -1267,6 +1457,7 @@ mod tests {
     fn snapshot(rows: Vec<File>) -> Snapshot {
         Snapshot {
             scope: "fixture-content".into(),
+            restored: false,
             configuration: "fixture-settings".into(),
             totals: Totals {
                 files: rows.len(),
@@ -1280,6 +1471,64 @@ mod tests {
             }),
         }
     }
+    #[test]
+    fn saved_catalogue_preserves_pointers_and_requires_matching_configuration() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!("library-snapshot-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("snapshot.json");
+        let mut file = row("Fixture", "/media/fixture.mkv", 1);
+        file.pointer = Some("/links/fixture.mkv".into());
+        assert!(
+            serde_json::to_value(&file)
+                .unwrap()
+                .get("pointer")
+                .is_none()
+        );
+        let original = snapshot(vec![file]);
+
+        assert!(
+            load_snapshot(&path, &original.configuration)
+                .unwrap()
+                .is_none()
+        );
+        save_snapshot(&path, &original).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let restored = load_snapshot(&path, &original.configuration)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.scope, original.scope);
+        assert_eq!(restored.rows[0].pointer, original.rows[0].pointer);
+        let page = render(
+            Page::default(),
+            &restored,
+            &Browse {
+                search: Some("fixture".into()),
+                view: Some("files".into()),
+                ..Browse::default()
+            },
+        );
+        assert_eq!(page.matched_files, 1);
+        assert!(restored.restored);
+        assert!(!restored.coverage.into_inner().unwrap().ready);
+        assert!(load_snapshot(&path, "changed-settings").unwrap().is_none());
+
+        // An interrupted write leaves only the temporary file. Readers keep the complete snapshot.
+        std::fs::write(root.join("snapshot.json.tmp"), b"invalid").unwrap();
+        assert!(
+            load_snapshot(&path, &original.configuration)
+                .unwrap()
+                .is_some()
+        );
+        std::fs::write(&path, b"invalid").unwrap();
+        assert!(load_snapshot(&path, &original.configuration).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn rendering_filters_the_complete_catalogue_before_paging_and_preserves_unknown_coverage() {
         let mut rows: Vec<_> = (0..125)
@@ -1358,6 +1607,15 @@ mod tests {
             })
             .collect();
         let snapshot = snapshot(rows);
+        let path = std::env::temp_dir().join(format!("library-snapshot-{}.json", Uuid::new_v4()));
+        save_snapshot(&path, &snapshot).unwrap();
+        let restoring = Instant::now();
+        let snapshot = load_snapshot(&path, &snapshot.configuration)
+            .unwrap()
+            .unwrap();
+        let restore_ms = restoring.elapsed().as_millis();
+        std::fs::remove_file(path).unwrap();
+        println!("generated catalogue restore ms: {restore_ms}");
         let q = Browse {
             view: Some("groups".into()),
             limit: Some(50),

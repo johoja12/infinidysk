@@ -26,6 +26,11 @@ mod files;
 use files::{Entry, Manifest, Part};
 pub use files::{Kind, LegacyView};
 
+pub(crate) fn write_private_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = files::with(path, &format!(".{}.tmp", Uuid::new_v4()));
+    files::write_atomic_from(path, &tmp, bytes, &mut files::Steps::default()).map_err(Into::into)
+}
+
 const STALE_AFTER_MS: i64 = 3 * DAY_MS;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const NOTE_MAX: usize = 500;
