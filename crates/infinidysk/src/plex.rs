@@ -60,7 +60,7 @@ impl Service {
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
     }
-    pub async fn load(db: &Db) -> anyhow::Result<Self> {
+    pub async fn load(db: &Db, config_dir: &std::path::Path) -> anyhow::Result<Self> {
         const KEY: &str = "plex_installation";
         let stored = db
             .config()
@@ -77,7 +77,9 @@ impl Service {
             id
         };
         Ok(Self {
-            browser: Arc::default(),
+            browser: Arc::new(browser::Cache::new(
+                config_dir.join("plex-library-snapshot.json"),
+            )),
             client: Client::new(installation)?,
             logins: Arc::default(),
             discovered: Mutex::default(),
@@ -681,7 +683,7 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("keys"));
         let service = Service {
-            browser: Arc::default(),
+            browser: Arc::new(browser::Cache::new(root.join("plex-library-snapshot.json"))),
             client: Client::loopback(Uuid::new_v4(), port)
                 .unwrap_or_else(|_| panic!("local client")),
             logins: Arc::default(),

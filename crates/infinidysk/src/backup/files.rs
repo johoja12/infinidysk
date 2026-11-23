@@ -156,15 +156,27 @@ pub(super) fn remove(path: &Path) -> io::Result<()> {
 /// the only writer of `path`), `Part::create`, write, `sync_all`, rename, sync the folder.
 pub(super) fn write_atomic(path: &Path, bytes: &[u8], steps: &mut Steps) -> Result<(), WriteError> {
     let tmp = with(path, ".tmp");
+    steps
+        .run(|| remove(&tmp))
+        .map_err(WriteError::Unpublished)?;
+    write_atomic_from(path, &tmp, bytes, steps)
+}
+
+/// Publishes a private file using a caller-owned temporary name in the same directory.
+pub(super) fn write_atomic_from(
+    path: &Path,
+    tmp: &Path,
+    bytes: &[u8],
+    steps: &mut Steps,
+) -> Result<(), WriteError> {
     let unpublished = WriteError::Unpublished;
-    steps.run(|| remove(&tmp)).map_err(unpublished)?;
     let (part, mut file) = steps
-        .run(|| Part::create(tmp.clone()))
+        .run(|| Part::create(tmp.to_path_buf()))
         .map_err(unpublished)?;
     steps.run(|| file.write_all(bytes)).map_err(unpublished)?;
     steps.run(|| file.sync_all()).map_err(unpublished)?;
     drop(file);
-    steps.run(|| fs::rename(&tmp, path)).map_err(unpublished)?;
+    steps.run(|| fs::rename(tmp, path)).map_err(unpublished)?;
     part.keep();
     steps
         .run(|| sync_dir(parent(path)))

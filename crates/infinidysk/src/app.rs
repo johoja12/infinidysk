@@ -891,7 +891,7 @@ async fn serve_inner(
         tokio::spawn(async move { updates.run(cancel).await })
     };
     let plex = Arc::new(
-        crate::plex::Service::load(&db)
+        crate::plex::Service::load(&db, &boot.config_dir)
             .await
             .context("initializing Plex integration")?,
     );
@@ -1043,6 +1043,7 @@ async fn serve_inner(
         cancel: cancel.clone(),
         restart: Arc::clone(&restart),
     });
+    let browser_admin = Arc::clone(&admin);
     let hooks = crate::arr::router(Arc::clone(&admin.arr));
     let adoption = Arc::new(crate::upgrade::WebDavAdoption::load(Arc::clone(&admin)).await);
     let app = sab::router(Arc::new(sab))
@@ -1061,6 +1062,7 @@ async fn serve_inner(
     let app = axum::middleware::map_request(probe_path).layer(app);
 
     info!(addr = %listener.local_addr()?, "listening");
+    tokio::spawn(crate::plex::browser::warm_default(browser_admin));
     let server = axum::serve(
         listener,
         axum::ServiceExt::<Request>::into_make_service_with_connect_info::<SocketAddr>(app),
