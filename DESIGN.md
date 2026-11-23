@@ -1071,7 +1071,10 @@ whose source file size is below Native Cache's current minimum file size, using
 decimal MB, before deriving Activity counts, filter options and pagination. Files
 at the threshold remain visible; zero disables this display cutoff. Keep historical
 attempts visible even when their file size is below the current minimum. Terminal
-outcomes belong to Warming history, with separate file warming and playback gap
+outcomes belong to Warming history. Group current playback gap jobs by file
+and source revision, with ranges and individual controls in Details. Show
+Waiting for playback when foreground reads hold warming. History has separate
+file warming and playback gap
 fills. Group repeated file/revision/range attempts while retaining each run in
 Details. Use source/viewer badges, proportional progress bars, human file names,
 search, state/source/viewer filters, sorting and bounded pagination. Show the

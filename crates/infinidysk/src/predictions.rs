@@ -732,7 +732,15 @@ impl Predictions {
                 })
                 .collect();
         }
-        if p.item.is_none() || p.ranges.is_empty() {
+        if p.item.is_some()
+            && self
+                .vfs
+                .native_cache()
+                .is_some_and(|cache| !cache.meets_file_minimum(p.size))
+        {
+            p.ranges.clear();
+            p.warning = Some("Source is below the cache minimum".to_owned());
+        } else if p.item.is_none() || p.ranges.is_empty() {
             p.warning =
                 Some("No exact imported source and path mapping could be resolved".to_owned());
         }

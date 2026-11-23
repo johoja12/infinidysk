@@ -427,6 +427,38 @@ test("current warming hides files below the configured minimum", async ({
   ).toBe(true);
 });
 
+test("current warming groups gaps and explains foreground waits", async ({ page }) => {
+  await page.goto(fixture("activity"));
+  await expect(page.getByRole("article").first()).toBeVisible();
+  await page.evaluate(async () => {
+    const mock = window.__mock;
+    const { jobs } = mock.queryClient.getQueryData(["prefetch"]);
+    const gap = { ...jobs[0], family: "backfill", verified_bytes: 0,
+      ranges: [{ start: 0, end: 1000000 }] };
+    mock.queueOverride = [
+      gap,
+      { ...gap, id: "40000000-0000-4000-8000-000000000293",
+        ranges: [{ start: 2000000, end: 3000000 }] },
+      { ...gap, id: "40000000-0000-4000-8000-000000000294",
+        revision: "different-fixture-revision" },
+    ];
+    mock.waitingForPlayback = true;
+    await mock.queryClient.invalidateQueries({ queryKey: ["prefetch"] });
+  });
+  await expect(page.getByRole("article")).toHaveCount(2);
+  const group = page.getByRole("article").filter({ has: page.getByText("2 gap jobs", { exact: true }) });
+  await expect(group.getByText("Waiting for playback", { exact: true })).toBeVisible();
+  await expect(group.getByRole("button", { name: "Pause" })).toHaveCount(0);
+  await group.getByText("Details · 2 gap jobs", { exact: true }).click();
+  await expect(group.getByRole("button", { name: "Pause" })).toHaveCount(2);
+  await expect(group.getByText(/2.0 MB–3.0 MB/)).toBeVisible();
+  await page.evaluate(async () => {
+    window.__mock.waitingForPlayback = false;
+    await window.__mock.queryClient.invalidateQueries({ queryKey: ["prefetch"] });
+  });
+  await expect(group.getByText("Queued", { exact: true })).toBeVisible();
+});
+
 test("warming history retains the original warning and reports verified recovery", async ({
   page,
 }) => {
