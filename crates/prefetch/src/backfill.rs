@@ -90,7 +90,52 @@ impl Queue {
         }
         Ok(())
     }
+    pub(super) async fn update_unstarted_gap(
+        &self,
+        original: &Job,
+        ranges: Vec<Range>,
+    ) -> anyhow::Result<()> {
+        let mut current = self.lock_ledger().await?;
+        if current.paused {
+            return Ok(());
+        }
+        let mut next = current.clone();
+        let Some(job) = next
+            .jobs
+            .iter_mut()
+            .find(|j| j.id == original.id && untouched_gap(j))
+        else {
+            return Ok(());
+        };
+        if let Some(first) = ranges.first() {
+            job.offset = first.start;
+            job.ranges = ranges;
+        } else {
+            job.state = State::Superseded;
+            job.reason = Some("Gap ranges already covered by cache".into());
+        }
+        job.updated_at = now_ms();
+        let result = self.save(&mut current, next).await;
+        drop(current);
+        result
+    }
 }
+pub(super) fn trim_covered(
+    ranges: &[Range],
+    coverage: &[infinidysk_native_cache::Coverage],
+    size: u64,
+) -> Option<Vec<Range>> {
+    let remaining: Vec<_> = ranges
+        .iter()
+        .flat_map(|r| missing(r.start, r.end, coverage))
+        .collect();
+    if remaining.is_empty() {
+        return Some(remaining);
+    }
+    let remaining = normalize(&remaining, size).ok()?;
+    (remaining != ranges).then_some(remaining)
+}
+
 fn missing(start: u64, end: u64, coverage: &[infinidysk_native_cache::Coverage]) -> Vec<Range> {
     let mut at = start;
     let mut ranges = Vec::new();
@@ -124,6 +169,49 @@ fn missing(start: u64, end: u64, coverage: &[infinidysk_native_cache::Coverage])
 mod tests {
     use super::*;
     use infinidysk_native_cache::Coverage;
+    #[test]
+    fn coverage_trim_keeps_only_whole_missing_blocks() {
+        let ranges = [Range {
+            start: 0,
+            end: 3 * BLOCK,
+        }];
+        assert_eq!(
+            trim_covered(
+                &ranges,
+                &[Coverage {
+                    start: 0,
+                    end: 3 * BLOCK
+                }],
+                3 * BLOCK
+            ),
+            Some(vec![])
+        );
+        assert_eq!(
+            trim_covered(
+                &ranges,
+                &[Coverage {
+                    start: 0,
+                    end: BLOCK + 1
+                }],
+                3 * BLOCK
+            ),
+            Some(vec![Range {
+                start: BLOCK,
+                end: 3 * BLOCK
+            }])
+        );
+        assert_eq!(
+            trim_covered(
+                &ranges,
+                &[Coverage {
+                    start: 1,
+                    end: BLOCK - 1
+                }],
+                3 * BLOCK
+            ),
+            None
+        );
+    }
     #[test]
     fn subtracts_coverage_without_inventing_a_position_or_skipping_a_hole() {
         assert_eq!(

@@ -1021,8 +1021,7 @@ async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without
             .find(|j| j.id == id)
             .unwrap()
             .verified_bytes,
-        BLOCK,
-        "own-file backfill precedes a full-file policy"
+        0
     );
     assert_eq!(
         status
@@ -1031,8 +1030,33 @@ async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without
             .find(|j| j.id == full.id)
             .unwrap()
             .verified_bytes,
-        0
+        BLOCK,
+        "manual full-file warming owns the next turn"
     );
+    queue.control(full.id, Operation::Pause).await.unwrap();
+    assert!(queue.tick(&settings()).await.unwrap());
+    let status = queue.status().await;
+    assert_eq!(
+        status.jobs.iter().find(|j| j.id == id).unwrap().ranges,
+        vec![Range {
+            start: BLOCK,
+            end: 4 * BLOCK
+        }],
+        "the fallback drops the block already warmed by the full-file job"
+    );
+    assert!(queue.tick(&settings()).await.unwrap());
+    let status = queue.status().await;
+    assert_eq!(
+        status
+            .jobs
+            .iter()
+            .find(|j| j.id == id)
+            .unwrap()
+            .source_bytes,
+        BLOCK,
+        "a paused full-file job leaves the gap runnable"
+    );
+    queue.control(full.id, Operation::Resume).await.unwrap();
     queue
         .observe_backfills(&WarmSettings::default())
         .await
