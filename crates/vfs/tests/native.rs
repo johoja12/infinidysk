@@ -27,7 +27,32 @@ impl Drop for Temp {
     }
 }
 async fn fixture(t: &Temp, missing: bool) -> (Vfs, Node, Arc<Cache>, Corpus, LoopbackServer) {
-    let corpus = Corpus::generate(1025, 16, 256 * 1024);
+    fixture_sized(t, missing, 16, 32).await
+}
+
+fn cache_settings(t: &Temp, buffer_mb: u32) -> Settings {
+    Settings {
+        enabled: true,
+        min_file_mb: 0,
+        buffer_mb,
+        metadata_path: t.0.join("metadata").to_str().unwrap().to_owned(),
+        folders: vec![FolderSettings {
+            id: uuid::Uuid::from_u128(1),
+            path: t.0.join("cache").to_str().unwrap().to_owned(),
+            min_free_bytes: 0,
+            ..FolderSettings::default()
+        }],
+        ..Settings::default()
+    }
+}
+
+async fn fixture_sized(
+    t: &Temp,
+    missing: bool,
+    articles: usize,
+    buffer_mb: u32,
+) -> (Vfs, Node, Arc<Cache>, Corpus, LoopbackServer) {
+    let corpus = Corpus::generate(1025, articles, 256 * 1024);
     let server = LoopbackServer::start(corpus.articles.clone())
         .await
         .unwrap();
@@ -59,7 +84,7 @@ async fn fixture(t: &Temp, missing: bool) -> (Vfs, Node, Arc<Cache>, Corpus, Loo
     });
     let id = BlobId::new();
     item.meta_blob = Some(id);
-    item.size = Some(BLOCK);
+    item.size = Some(corpus.data.len() as u64);
     db.insert(
         &[category, item.clone()],
         &[(id, &blob::encode_meta(&meta).unwrap())],
@@ -91,20 +116,7 @@ async fn fixture(t: &Temp, missing: bool) -> (Vfs, Node, Arc<Cache>, Corpus, Loo
         priority: 0,
         backbone: None,
     }]));
-    let cache = Cache::open(Settings {
-        enabled: true,
-        min_file_mb: 0,
-        metadata_path: t.0.join("metadata").to_str().unwrap().to_owned(),
-        folders: vec![FolderSettings {
-            id: uuid::Uuid::from_u128(1),
-            path: t.0.join("cache").to_str().unwrap().to_owned(),
-            min_free_bytes: 0,
-            ..FolderSettings::default()
-        }],
-        ..Settings::default()
-    })
-    .await
-    .unwrap();
+    let cache = Cache::open(cache_settings(t, buffer_mb)).await.unwrap();
     let vfs = Vfs::new(
         db,
         client,
@@ -181,6 +193,92 @@ async fn warm_bytes_and_seeks_are_shared_by_webdav_and_fuse_without_provider_rea
         3,
         "metrics draining cannot consume burst attribution"
     );
+}
+
+#[tokio::test]
+async fn consecutive_cold_ranges_commit_with_buffer_pressure_and_survive_restart() {
+    let t = Temp::new();
+    let (vfs, node, cache, corpus, server) = fixture_sized(&t, false, 33, 9).await;
+    let size = corpus.data.len() as u64;
+    let held = cache.try_buffer().unwrap();
+    {
+        let mut reader = vfs
+            .open(&node, origin(Delivery::WebDav))
+            .await
+            .unwrap()
+            .unwrap();
+        reader.set_end(2 * 256 * 1024);
+        let mut bytes = Vec::new();
+        let release = async {
+            tokio::time::timeout(Duration::from_millis(700), async {
+                loop {
+                    if cache.stats().await.unwrap().io.playback_buffer_waits > 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            drop(held);
+        };
+        let (read, ()) = tokio::join!(reader.read_to_end(&mut bytes), release);
+        read.unwrap();
+        drop(reader);
+        assert_eq!(bytes, corpus.data[..2 * 256 * 1024]);
+    }
+    let edges = [2 * 256 * 1024u64, BLOCK + 7 * 256 * 1024, size];
+    for pair in edges.windows(2) {
+        let [start, end] = [pair[0], pair[1]];
+        let mut reader = vfs
+            .open(&node, origin(Delivery::WebDav))
+            .await
+            .unwrap()
+            .unwrap();
+        reader.set_end(end);
+        reader.seek(SeekFrom::Start(start)).await.unwrap();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        drop(reader);
+        assert_eq!(
+            bytes,
+            corpus.data[usize::try_from(start).unwrap()..usize::try_from(end).unwrap()]
+        );
+    }
+
+    let requests = server.body_commands();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while cache.stats().await.unwrap().io.playback_published_bytes < size {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let stats = cache.stats().await.unwrap();
+    assert_eq!(stats.bytes, size);
+    assert_eq!(stats.io.playback_buffer_bypasses, 0);
+    assert_eq!(stats.io.playback_write_bypasses, 0);
+    assert_eq!(server.body_commands(), requests);
+    let db = vfs.db().clone();
+    drop(vfs);
+    drop(cache);
+    let cache = Cache::open(cache_settings(&t, 9)).await.unwrap();
+    let offline = Vfs::new(
+        db,
+        Arc::new(Client::new([])),
+        Budget::new(8 * 1024 * 1024),
+        1024 * 1024,
+        "/unused-test-mount",
+    )
+    .with_native_cache(Some(cache));
+    let mut reader = offline
+        .open(&node, origin(Delivery::Fuse))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).await.unwrap();
+    assert_eq!(bytes, corpus.data);
 }
 
 #[tokio::test]

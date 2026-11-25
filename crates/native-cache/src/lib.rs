@@ -3,6 +3,8 @@
 mod diagnostics;
 mod filesystem;
 mod manifest;
+mod playback;
+mod quota;
 mod recency;
 pub use manifest::{
     Candidate as RecoveryCandidate, Page as RecoveryPage, Report as RecoveryReport,
@@ -325,6 +327,9 @@ pub struct Cache {
     live: Arc<Mutex<Live>>,
     entries: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
     slots: Arc<Semaphore>,
+    read_slot: Arc<Semaphore>,
+    reserve_playback_slot: bool,
+    playback_prefixes: Mutex<playback::Prefixes>,
     io: Arc<traffic::Counters>,
     maintenance: Notify,
     hits: AtomicU64,
@@ -413,6 +418,7 @@ impl Cache {
         ] {
             sqlx::query(sql).execute(&db).await?;
         }
+        quota::install(&db).await?;
         let mut folders = Vec::new();
         for f in settings.folders.iter().filter(|f| f.enabled) {
             let path = Path::new(&f.path);
@@ -570,12 +576,14 @@ impl Cache {
         }
         folders.sort_by_key(|f| std::cmp::Reverse(f.settings.priority));
         let recency = recency::Updates::start(db.clone());
+        let buffer_blocks = (u64::from(settings.buffer_mb) * MB / BLOCK) as usize;
         Ok(Arc::new(Self {
             recency,
             read_timeouts: AtomicU64::new(0),
-            slots: Arc::new(Semaphore::new(
-                (u64::from(settings.buffer_mb) * MB / BLOCK).max(1) as usize,
-            )),
+            slots: Arc::new(Semaphore::new(buffer_blocks - 1)),
+            read_slot: Arc::new(Semaphore::new(1)),
+            reserve_playback_slot: buffer_blocks > 2,
+            playback_prefixes: Mutex::new(playback::Prefixes::new((buffer_blocks / 2).min(8))),
             settings,
             db,
             folders,
@@ -662,7 +670,7 @@ impl Cache {
             let Some(legacy) = self.legacy.get() else {
                 return Ok(None);
             };
-            let Ok(permit) = Arc::clone(&self.slots).acquire_owned().await else {
+            let Some(permit) = self.read_buffer().await else {
                 return Ok(None);
             };
             let bytes = legacy.read(&lease.key, block, permit).await?;
@@ -739,7 +747,7 @@ impl Cache {
         else {
             return Ok(None);
         };
-        let Ok(permit) = Arc::clone(&self.slots).acquire_owned().await else {
+        let Some(permit) = self.read_buffer().await else {
             return Ok(None);
         };
         let name = format!("{}-{}.data", key.id(), start / chunk.cast_unsigned());
@@ -798,11 +806,77 @@ impl Cache {
     fn deadline(&self) -> Duration {
         Duration::from_millis(u64::from(self.settings.io_timeout_ms))
     }
-    /// Publish only a complete, good block. A saturated writer declines the fill.
+    async fn read_buffer(&self) -> Option<OwnedSemaphorePermit> {
+        if let Ok(permit) = Arc::clone(&self.read_slot).try_acquire_owned() {
+            return Some(permit);
+        }
+        if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
+            return Some(permit);
+        }
+        Arc::clone(&self.read_slot).acquire_owned().await.ok()
+    }
+
+    /// Background writes and diagnostics leave room for one foreground fill.
     pub fn try_buffer(&self) -> Option<OwnedSemaphorePermit> {
-        // One slot always remains for cached playback, even when fills are saturated.
-        let mut reservation = Arc::clone(&self.slots).try_acquire_many_owned(2).ok()?;
-        reservation.split(1)
+        self.playback_prefixes().expire();
+        let slots = Arc::clone(&self.slots);
+        if self.reserve_playback_slot {
+            let mut reservation = slots.try_acquire_many_owned(2).ok()?;
+            reservation.split(1)
+        } else {
+            slots.try_acquire_owned().ok()
+        }
+    }
+
+    /// Wait only under contention. The read slot remains available even when
+    /// every allowed playback buffer is held by a slow writer.
+    pub async fn playback_buffer(&self) -> Option<OwnedSemaphorePermit> {
+        if let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned() {
+            return Some(permit);
+        }
+        if self.playback_prefixes().discard_oldest()
+            && let Ok(permit) = Arc::clone(&self.slots).try_acquire_owned()
+        {
+            return Some(permit);
+        }
+        self.io.playback_buffer_wait();
+        let permit = tokio::time::timeout(self.deadline(), Arc::clone(&self.slots).acquire_owned())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if permit.is_none() {
+            self.io.playback_buffer_bypass();
+        }
+        permit
+    }
+
+    pub fn playback_retry_delay(&self) -> Duration {
+        self.deadline()
+    }
+
+    /// The task owns accepted bytes through publication, even after the reader closes.
+    pub fn publish_playback(
+        self: &Arc<Self>,
+        lease: Arc<Lease>,
+        block: u64,
+        data: Bytes,
+        permit: OwnedSemaphorePermit,
+    ) {
+        let cache = self.clone();
+        tokio::spawn(async move {
+            let len = data.len() as u64;
+            match cache
+                .put_reserved_background(&lease, block, data, permit)
+                .await
+            {
+                Ok(true) => cache.io.playback_published(len),
+                Ok(false) => cache.io.playback_write_bypass(),
+                Err(error) => {
+                    cache.io.playback_write_bypass();
+                    tracing::debug!(reason=%error, "native cache playback publication failed");
+                }
+            }
+        });
     }
     pub async fn put(&self, lease: &Lease, block: u64, data: Bytes) -> Result<bool, Error> {
         let Some(permit) = self.try_buffer() else {
@@ -920,20 +994,24 @@ impl Cache {
                     .is_none_or(|(id, _)| *id == f.settings.id.to_string())
         }) {
             let folder_guard = Arc::clone(&folder.writes).lock_owned().await;
-            let used:i64=sqlx::query_scalar("SELECT COALESCE(SUM(b.len),0) FROM blocks b JOIN entries e ON e.key=b.key WHERE e.folder=$1")
-                .bind(folder.settings.id.to_string()).fetch_one(&self.db).await?;
-            let free = nix::sys::statvfs::fstatvfs(&folder.root)
-                .ok()
-                .map(|s| crate::filesystem::bytes(s.blocks_available(), s.fragment_size()));
+            let free = tokio::task::spawn_blocking({
+                let folder = folder.clone();
+                move || {
+                    nix::sys::statvfs::fstatvfs(&folder.root)
+                        .ok()
+                        .map(|s| crate::filesystem::bytes(s.blocks_available(), s.fragment_size()))
+                }
+            })
+            .await
+            .ok()
+            .flatten();
             let high = folder.settings.quota_bytes / 100 * u64::from(folder.settings.high_percent);
-            if used.cast_unsigned().saturating_add(additional) > high
-                || free.is_none_or(|free| {
-                    free < folder
-                        .settings
-                        .min_free_bytes
-                        .saturating_add(data.len() as u64)
-                })
-            {
+            if free.is_none_or(|free| {
+                free < folder
+                    .settings
+                    .min_free_bytes
+                    .saturating_add(data.len() as u64)
+            }) {
                 folder
                     .pressure
                     .fetch_max(data.len() as u64, Ordering::Relaxed);
@@ -944,7 +1022,19 @@ impl Cache {
             let len = i64::try_from(data.len())
                 .map_err(|_| Error::Invalid("cache block is too large"))?;
             let folder_id = folder.settings.id.to_string();
-            let mut reserve = self.db.begin().await?;
+            let mut reserve = self.db.begin_with("BEGIN IMMEDIATE").await?;
+            if quota::used(&mut *reserve, &folder_id)
+                .await?
+                .saturating_add(additional)
+                > high
+            {
+                reserve.rollback().await?;
+                folder
+                    .pressure
+                    .fetch_max(data.len() as u64, Ordering::Relaxed);
+                self.maintenance.notify_one();
+                continue;
+            }
             sqlx::query("INSERT INTO entries(key,item,revision,size,folder,chunk,used) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(key) DO NOTHING")
                 .bind(key.id()).bind(key.item.to_string()).bind(&key.revision).bind(key.size.cast_signed()).bind(&folder_id).bind(chunk.cast_signed()).bind(now()).execute(&mut *reserve).await?;
             let placement: (String, i64) =
@@ -970,7 +1060,6 @@ impl Cache {
             let mut observation = self.io.begin(traffic::Kind::Write);
             let writing = tokio::task::spawn_blocking(move || {
                 observation.start();
-                let (_permit, _lease) = (permit, io_lease);
                 let file = folder.file(&name, true)?;
                 file.write_all_at(&data, start % chunk)?;
                 file.sync_all()?;
@@ -978,9 +1067,9 @@ impl Cache {
                 observation.synced_write(data.len() as u64);
                 manifest::append(&folder, &recovery_record)?;
                 observation.success(0);
-                Ok::<_, io::Error>(guard)
+                Ok::<_, io::Error>((guard, permit, io_lease))
             });
-            let Some(Ok(Ok(_guard))) = (match deadline {
+            let Some(Ok(Ok((_guard, _permit, _io_lease)))) = (match deadline {
                 Some(deadline) => tokio::time::timeout(deadline, writing).await.ok(),
                 None => Some(writing.await),
             }) else {
@@ -1015,24 +1104,26 @@ impl Cache {
             return Ok(());
         }
         for folder in self.folders.iter().filter(|f| !f.settings.read_only) {
-            let mut used:i64=sqlx::query_scalar("SELECT COALESCE(SUM(b.len),0) FROM blocks b JOIN entries e ON e.key=b.key WHERE e.folder=$1").bind(folder.settings.id.to_string()).fetch_one(&self.db).await?;
+            let mut used = quota::used(&self.db, &folder.settings.id.to_string()).await?;
             let high = folder.settings.quota_bytes / 100 * u64::from(folder.settings.high_percent);
             let wanted = folder.pressure.swap(0, Ordering::Relaxed);
             let target = if wanted > 0 {
-                used.cast_unsigned()
-                    .saturating_sub(wanted)
+                used.saturating_sub(wanted)
                     .min(folder.settings.quota_bytes / 100 * u64::from(folder.settings.low_percent))
-            } else if used.cast_unsigned() >= high {
+            } else if used >= high {
                 folder.settings.quota_bytes / 100 * u64::from(folder.settings.low_percent)
             } else {
-                used.cast_unsigned()
+                used
             };
+            if used <= target && folder.settings.max_age_hours == 0 {
+                continue;
+            }
             let candidates:Vec<Row>=sqlx::query_as("SELECT e.item,e.revision,e.size,e.used,COALESCE(SUM(b.len),0) FROM entries e LEFT JOIN blocks b ON e.key=b.key WHERE e.folder=$1 AND e.pinned=0 GROUP BY e.key ORDER BY e.used LIMIT 100")
                 .bind(folder.settings.id.to_string()).fetch_all(&self.db).await?;
             let cutoff = now().saturating_sub(i64::from(folder.settings.max_age_hours) * 3_600_000);
             for (item, revision, size, used_at, bytes) in candidates {
                 let aged = folder.settings.max_age_hours > 0 && used_at < cutoff;
-                if !aged && used.cast_unsigned() <= target {
+                if !aged && used <= target {
                     continue;
                 }
                 let key = Key {
@@ -1045,7 +1136,7 @@ impl Cache {
                     .evict(&key, if aged { "age" } else { "pressure" })
                     .await?
                 {
-                    used = used.saturating_sub(bytes);
+                    used = used.saturating_sub(bytes.cast_unsigned());
                 }
             }
         }
@@ -1272,7 +1363,9 @@ impl Cache {
             misses: self.misses.load(Ordering::Relaxed),
             skipped: self.skipped.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
-            io: self.io.snapshot(self.slots.available_permits()),
+            io: self
+                .io
+                .snapshot(self.slots.available_permits() + self.read_slot.available_permits()),
             read_timeouts: self.read_timeouts.load(Ordering::Relaxed),
             recency_pending: self.recency.pending(),
             recency_dropped: self.recency.dropped(),

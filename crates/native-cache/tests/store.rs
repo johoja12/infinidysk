@@ -211,18 +211,24 @@ async fn a_symlink_payload_never_writes_the_target() {
 }
 
 #[tokio::test]
-async fn saturated_fills_reserve_a_buffer_for_cached_playback() {
+async fn saturated_background_fills_leave_buffers_for_playback_reads_and_writes() {
     let t = Temp::new();
     let cache = Cache::open(t.settings()).await.unwrap();
     let k = key(BLOCK);
     let lease = cache.lease(k).unwrap();
-    cache.put(&lease, 0, data(7)).await.unwrap();
+    assert!(cache.put(&lease, 0, data(7)).await.unwrap());
     let mut held = Vec::new();
     while let Some(slot) = cache.try_buffer() {
         held.push(slot);
     }
+    let playback = cache.playback_buffer().await.unwrap();
     assert_eq!(cache.get(&lease, 0).await.unwrap(), data(7));
     assert!(!cache.put(&lease, 0, data(7)).await.unwrap());
+    assert!(cache.playback_buffer().await.is_none());
+    let io = cache.stats().await.unwrap().io;
+    assert_eq!(io.playback_buffer_waits, 1);
+    assert_eq!(io.playback_buffer_bypasses, 1);
+    drop(playback);
     drop(held);
     assert_eq!(cache.get(&lease, 0).await.unwrap(), data(7));
 }
