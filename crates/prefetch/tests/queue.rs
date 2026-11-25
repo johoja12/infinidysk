@@ -1063,6 +1063,7 @@ async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without
     queue.reconcile_automatic(None, None).await.unwrap();
     queue.observe_reads(&settings()).await.unwrap();
     assert!(queue.tick(&settings()).await.unwrap());
+    queue.reconcile_cached_gaps().await.unwrap();
     let status = queue.status().await;
     assert_eq!(
         status
@@ -1083,8 +1084,6 @@ async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without
         BLOCK,
         "manual full-file warming owns the next turn"
     );
-    queue.control(full.id, Operation::Pause).await.unwrap();
-    assert!(queue.tick(&settings()).await.unwrap());
     let status = queue.status().await;
     assert_eq!(
         status.jobs.iter().find(|j| j.id == id).unwrap().ranges,
@@ -1092,8 +1091,9 @@ async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without
             start: BLOCK,
             end: 4 * BLOCK
         }],
-        "the fallback drops the block already warmed by the full-file job"
+        "reconciliation trims the gap before the scheduler can choose it"
     );
+    queue.control(full.id, Operation::Pause).await.unwrap();
     assert!(queue.tick(&settings()).await.unwrap());
     let status = queue.status().await;
     assert_eq!(
@@ -1121,6 +1121,78 @@ async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without
         State::Queued,
         "policy cleanup preserves manual work"
     );
+}
+
+#[tokio::test]
+async fn covered_gap_retires_even_with_a_full_file_warm_queued() {
+    let t = Temp::new();
+    let (vfs, item, cache, corpus, server, _) = fixture_sized(&t, false, 0, 96).await;
+    let queue = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
+    let full = enqueue(&queue, &item).await;
+    let mut held = Vec::new();
+    while let Some(permit) = cache.playback_buffer().await {
+        held.push(permit);
+    }
+    let mut playback = vfs
+        .open(
+            &Node::Item(item.clone()),
+            Origin {
+                delivery: Delivery::WebDav,
+                client: "fixture-player".into(),
+                player: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let mut data = vec![0; 4 * infinidysk_native_cache::BLOCK_BYTES];
+    playback.read_exact(&mut data).await.unwrap();
+    drop(playback);
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    queue.observe_backfills(&settings()).await.unwrap();
+
+    let key = vfs.cache_key(&item).await.unwrap();
+    let lease = cache.lease(key).unwrap();
+    let (blocks, _) = corpus.data[..data.len()].as_chunks::<BLOCK_BYTES>();
+    for (index, chunk) in blocks.iter().enumerate() {
+        assert!(
+            cache
+                .put(&lease, index as u64, bytes::Bytes::copy_from_slice(chunk))
+                .await
+                .unwrap()
+        );
+    }
+    drop(lease);
+    let before = server.body_commands();
+    queue.pause(true).await.unwrap();
+    queue.reconcile_cached_gaps().await.unwrap();
+    assert!(queue.status().await.jobs.iter().any(|job| job.family
+        == infinidysk_prefetch::Family::Backfill
+        && job.state == State::Queued));
+    queue.pause(false).await.unwrap();
+    queue.reconcile_cached_gaps().await.unwrap();
+    let status = queue.status().await;
+    let gap = status
+        .jobs
+        .iter()
+        .find(|job| job.family == infinidysk_prefetch::Family::Backfill)
+        .unwrap();
+    assert_eq!(gap.state, State::Superseded);
+    assert_eq!(
+        gap.reason.as_deref(),
+        Some("Gap ranges already covered by cache")
+    );
+    assert_eq!(
+        status
+            .jobs
+            .iter()
+            .find(|job| job.id == full.id)
+            .unwrap()
+            .state,
+        State::Queued
+    );
+    assert_eq!(server.body_commands(), before);
 }
 
 #[tokio::test]

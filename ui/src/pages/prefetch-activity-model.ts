@@ -116,6 +116,12 @@ export function state(
   if (j.next_attempt > now) return "deferred";
   return waitingForPlayback ? "waiting_for_playback" : "queued";
 }
+export const isFullFileWarm = (job: Job) =>
+  job.family !== "backfill" &&
+  job.ranges.length === 1 &&
+  job.ranges[0]?.start === 0 &&
+  job.ranges[0]?.end === job.size;
+
 export function rows(
   data: Schemas["PrefetchView"],
   history: boolean,
@@ -127,9 +133,13 @@ export function rows(
     const running = new Set(data.rates.filter((r) => r.active).map((r) => `${r.job}:${r.run}`));
     const rank = (job: Job) =>
       running.has(`${job.id}:${job.run}`) ? 2 : job.state === "queued" ? 1 : 0;
-    for (const job of data.jobs.filter((j) => !terminal(j))) {
-      const key = job.family === "backfill"
-        ? JSON.stringify([job.item, job.revision])
+    const jobs = data.jobs.filter((j) => !terminal(j));
+    const fileRevision = (job: Job) => JSON.stringify([job.item, job.revision, job.size]);
+    const gapFiles = new Set(jobs.filter((job) => job.family === "backfill").map(fileRevision));
+    for (const job of jobs) {
+      const revision = fileRevision(job);
+      const key = job.family === "backfill" || (isFullFileWarm(job) && gapFiles.has(revision))
+        ? revision
         : job.id;
       const at = job.updated_at;
       const group = current.get(key);

@@ -977,7 +977,11 @@ async fn serve_inner(
                     if let Err(error) = prefetch.observe_reads(&config.settings().prefetch).await {
                         warn!(reason=%error,"finish-watched admission deferred");
                     }
+                    let warming_enabled = config.settings().prefetch.enabled;
                     drop(config);
+                    if warming_enabled && let Err(error) = prefetch.reconcile_cached_gaps().await {
+                        warn!(reason=%error,"cached gap reconciliation deferred");
+                    }
                     true
                 },
                 || async {

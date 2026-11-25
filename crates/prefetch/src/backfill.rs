@@ -90,6 +90,83 @@ impl Queue {
         }
         Ok(())
     }
+    /// Reconcile a rotating batch independently of download admission. Already
+    /// covered jobs may be waiting behind playback or a full-file warming job.
+    pub async fn reconcile_cached_gaps(&self) -> anyhow::Result<()> {
+        const BATCH: usize = 8;
+        let Some(cache) = self.vfs.native_cache().filter(|c| !c.recovery_mode()) else {
+            return Ok(());
+        };
+        let batch = {
+            let ledger = self.lock_ledger().await?;
+            if ledger.paused {
+                return Ok(());
+            }
+            let now = now_ms();
+            let jobs: Vec<_> = ledger
+                .jobs
+                .iter()
+                .filter(|job| untouched_gap(job) && runnable(job, now))
+                .collect();
+            if jobs.is_empty() {
+                return Ok(());
+            }
+            let start = self.gap_sweep_cursor.fetch_add(BATCH, Ordering::Relaxed) % jobs.len();
+            let batch = jobs
+                .iter()
+                .cycle()
+                .skip(start)
+                .take(BATCH.min(jobs.len()))
+                .map(|job| (*job).clone())
+                .collect::<Vec<_>>();
+            drop(ledger);
+            batch
+        };
+        let mut updates = Vec::new();
+        for job in batch {
+            let Some(item) = self.db.item(ItemId(job.item)).await? else {
+                continue;
+            };
+            let key = self.vfs.cache_key(&item).await?;
+            if key.revision() == job.revision
+                && key.size() == job.size
+                && let Some(ranges) =
+                    trim_covered(&job.ranges, &cache.native_coverage(&key).await?, job.size)
+            {
+                updates.push((job, ranges));
+            }
+        }
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let Ok(_step) = self.step.try_lock() else {
+            return Ok(());
+        };
+        let mut current = self.lock_ledger().await?;
+        if current.paused {
+            return Ok(());
+        }
+        let mut next = current.clone();
+        let mut changed = false;
+        let now = now_ms();
+        for (original, ranges) in updates {
+            if let Some(job) = next.jobs.iter_mut().find(|job| {
+                job.id == original.id
+                    && untouched_gap(job)
+                    && runnable(job, now)
+                    && job.ranges == original.ranges
+            }) {
+                apply_unstarted_gap(job, ranges, now);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save(&mut current, next).await?;
+        }
+        drop(current);
+        Ok(())
+    }
+
     pub(super) async fn update_unstarted_gap(
         &self,
         original: &Job,
@@ -107,19 +184,23 @@ impl Queue {
         else {
             return Ok(());
         };
-        if let Some(first) = ranges.first() {
-            job.offset = first.start;
-            job.ranges = ranges;
-        } else {
-            job.state = State::Superseded;
-            job.reason = Some("Gap ranges already covered by cache".into());
-        }
-        job.updated_at = now_ms();
+        apply_unstarted_gap(job, ranges, now_ms());
         let result = self.save(&mut current, next).await;
         drop(current);
         result
     }
 }
+fn apply_unstarted_gap(job: &mut Job, ranges: Vec<Range>, now: i64) {
+    if let Some(first) = ranges.first() {
+        job.offset = first.start;
+        job.ranges = ranges;
+    } else {
+        job.state = State::Superseded;
+        job.reason = Some("Gap ranges already covered by cache".into());
+    }
+    job.updated_at = now;
+}
+
 pub(super) fn trim_covered(
     ranges: &[Range],
     coverage: &[infinidysk_native_cache::Coverage],

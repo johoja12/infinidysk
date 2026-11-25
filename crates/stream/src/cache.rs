@@ -100,6 +100,7 @@ pub struct Cache {
     memory_hits: AtomicU64,
     disk_hits: AtomicU64,
     joined: AtomicU64,
+    playback_warming_overlaps: AtomicU64,
     misses: AtomicU64,
     bytes_served: AtomicU64,
 }
@@ -185,6 +186,7 @@ impl Cache {
             memory_hits: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             joined: AtomicU64::new(0),
+            playback_warming_overlaps: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             bytes_served: AtomicU64::new(0),
         }
@@ -362,6 +364,12 @@ impl Cache {
             entered.send(()).ok();
             release.recv().ok();
         }
+    }
+
+    /// A foreground flight bypassed a live warming flight for the same article
+    /// and repair revision. The warming flight may still be awaiting admission.
+    pub fn playback_warming_overlaps(&self) -> u64 {
+        self.playback_warming_overlaps.load(Ordering::Relaxed)
     }
 
     pub fn stats(&self) -> CacheStats {
@@ -548,6 +556,17 @@ impl Cache {
             }
             return (flight, true);
         }
+        if workload == Workload::Stream
+            && inflight
+                .flights
+                .get(&stamp.key)
+                .is_some_and(|(_, flight, _, started)| {
+                    *started == Workload::Warm && flight.upgrade().is_some()
+                })
+        {
+            self.playback_warming_overlaps
+                .fetch_add(1, Ordering::Relaxed);
+        }
         inflight.generation += 1;
         let generation = inflight.generation;
         let leader = probe.and_then(|p| p.wait.clone());
@@ -637,7 +656,7 @@ mod tests {
 
     #[test]
     fn replacing_background_flights_preserves_sharing_and_cleanup() {
-        for background in [Workload::Health, Workload::Queue] {
+        for background in [Workload::Health, Workload::Queue, Workload::Warm] {
             let client = Arc::new(Client::new([]));
             let cache = Arc::new(Cache::new(true, 1 << 20));
             let flight = |workload| {
@@ -661,6 +680,19 @@ mod tests {
             assert!(flight(background).1, "background can join playback");
             drop(playback);
             assert!(cache.inflight.lock().unwrap().flights.is_empty());
+            assert_eq!(
+                cache.playback_warming_overlaps(),
+                u64::from(background == Workload::Warm)
+            );
+            let (abandoned, _) = flight(Workload::Warm);
+            drop(abandoned);
+            let (fresh_playback, joined) = flight(Workload::Stream);
+            assert!(!joined);
+            drop(fresh_playback);
+            assert_eq!(
+                cache.playback_warming_overlaps(),
+                u64::from(background == Workload::Warm)
+            );
         }
     }
 

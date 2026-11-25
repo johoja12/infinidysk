@@ -14,6 +14,7 @@ import { useFileCoverage } from "./prefetch-coverage";
 import {
   requested,
   fileName,
+  isFullFileWarm,
   recovery,
   rows,
   source,
@@ -582,8 +583,12 @@ export function PrefetchActivity() {
           {visible
             .slice(safePage * pageSize, (safePage + 1) * pageSize)
             .map((row) => {
-              const groupedGaps = !history && row.runs.length > 1;
-              const displayed = groupedGaps ? row.runs.map((run) => run.job) : [row.job];
+              const groupedJobs = !history && row.runs.length > 1;
+              const gapOnly = groupedJobs && row.runs.every(({ job }) => job.family === "backfill");
+              const fullFile = groupedJobs && !gapOnly
+                ? (isFullFileWarm(row.job) ? row.job : row.runs.find(({ job }) => isFullFileWarm(job))?.job)
+                : undefined;
+              const displayed = gapOnly ? row.runs.map((run) => run.job) : [fullFile ?? row.job];
               const summed = (read: (job: Job) => number) => displayed.reduce((sum, job) => sum + read(job), 0);
               const j = row.job,
                 rate = data.rates.find(
@@ -641,7 +646,7 @@ export function PrefetchActivity() {
                         ))}
                         {row.runs.length > 1 && (
                           <Badge variant="outline">
-                            {row.runs.length} {groupedGaps ? "gap jobs" : "runs"}
+                            {row.runs.length} {gapOnly ? "gap jobs" : groupedJobs ? "jobs" : "runs"}
                           </Badge>
                         )}
                       </div>
@@ -677,6 +682,7 @@ export function PrefetchActivity() {
                     </div>
                     <div className="min-w-0 space-y-2">
                       <p className="text-xs tabular-nums">
+                        {fullFile && <span className="mr-2 text-muted-foreground">Full-file progress</span>}
                         {bytes(verified)}{" "}
                         <span className="text-muted-foreground">
                           / {bytes(total)}
@@ -701,7 +707,7 @@ export function PrefetchActivity() {
                       )}
                     </div>
                     <div className="flex flex-wrap gap-1">
-                      {!groupedGaps && actions(j).map((operation) => (
+                      {!groupedJobs && actions(j).map((operation) => (
                         <Button
                           key={operation}
                           size="sm"
@@ -720,7 +726,7 @@ export function PrefetchActivity() {
                     <summary className="cursor-pointer text-muted-foreground">
                       Details
                       {row.runs.length > 1
-                        ? ` · ${row.runs.length} ${groupedGaps ? "gap jobs" : "attempts"}`
+                        ? ` · ${row.runs.length} ${gapOnly ? "gap jobs" : groupedJobs ? "jobs" : "attempts"}`
                         : ""}
                     </summary>
                     <div className="mt-3 space-y-2 break-words text-muted-foreground">
@@ -767,9 +773,9 @@ export function PrefetchActivity() {
                           {new Date(p.observed_at).toLocaleString()}.
                         </p>
                       ))}
-                      {groupedGaps && row.runs.map(({ job }) => (
+                      {groupedJobs && row.runs.map(({ job }) => (
                         <div key={job.id} className="flex flex-wrap items-center gap-2">
-                          <span>{pretty(displayState(job))} · {job.ranges.map((r) => `${bytes(r.start)}–${bytes(r.end)}`).join(", ")} · {bytes(job.verified_bytes)} verified</span>
+                          <span>{source(job)} · {pretty(displayState(job))} · {job.ranges.map((r) => `${bytes(r.start)}–${bytes(r.end)}`).join(", ")} · {bytes(job.verified_bytes)} verified</span>
                           {job.reason && <span>{job.reason}</span>}
                           {actions(job).map((operation) => (
                             <Button key={operation} size="sm" variant="ghost" disabled={control.isPending}
@@ -779,7 +785,7 @@ export function PrefetchActivity() {
                           ))}
                         </div>
                       ))}
-                      {!groupedGaps && row.runs.length > 1 &&
+                      {!groupedJobs && row.runs.length > 1 &&
                         row.runs.map((run) => {
                           const pastOutcome = run.job === j ? undefined : recoveryFor(run.job);
                           return (

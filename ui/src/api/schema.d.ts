@@ -3982,6 +3982,11 @@ export interface components {
             maintenance?: components["schemas"]["LiveMaintenance"] | null;
             /** @description Global download permits not in use. */
             permits_free?: number | null;
+            /**
+             * Format: int64
+             * @description Foreground article fetches that bypassed a live warming flight since startup.
+             */
+            playback_warming_overlaps: number;
             providers: components["schemas"]["LiveProvider"][];
             /**
              * Format: int64
