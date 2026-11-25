@@ -181,6 +181,8 @@ pub struct LiveView {
     /// The maintenance job running now.
     maintenance: Option<crate::maintenance::LiveMaintenance>,
     providers: Vec<LiveProvider>,
+    /// Foreground article fetches that bypassed a live warming flight since startup.
+    playback_warming_overlaps: u64,
     /// Global download permits not in use.
     permits_free: Option<usize>,
     resources: Option<Resources>,
@@ -1330,6 +1332,7 @@ impl Metrics {
                 .collect(),
             maintenance: self.sources.maintenance.get(),
             providers: live_providers,
+            playback_warming_overlaps: self.sources.cache.playback_warming_overlaps(),
             permits_free: self.sources.client.free_permits(),
             resources,
             resources_unavailable,
@@ -1777,6 +1780,11 @@ impl Metrics {
         let q = self.sources.queue.stats();
         let h = self.sources.health.stats();
         for (name, help, value) in [
+            (
+                "playback_warming_overlaps_total",
+                "Foreground article fetches that bypassed a live warming flight.",
+                self.sources.cache.playback_warming_overlaps(),
+            ),
             (
                 "cache_misses_total",
                 "Segments fetched from providers.",

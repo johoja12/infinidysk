@@ -459,6 +459,30 @@ test("current warming groups gaps and explains foreground waits", async ({ page 
   await expect(group.getByText("Queued", { exact: true })).toBeVisible();
 });
 
+test("a full-file warm and its playback gap share a current row", async ({ page }) => {
+  await page.goto(fixture("activity"));
+  await expect(page.getByRole("article").first()).toBeVisible();
+  await page.evaluate(async () => {
+    const mock = window.__mock;
+    const { jobs } = mock.queryClient.getQueryData(["prefetch"]);
+    const full = { ...jobs[0], ranges: [{ start: 0, end: jobs[0].size }] };
+    const gap = { ...full, family: "backfill", id: "40000000-0000-4000-8000-000000000306",
+      ranges: [{ start: 2000000, end: 3000000 }] };
+    mock.queueOverride = [
+      full, gap,
+      { ...gap, id: "40000000-0000-4000-8000-000000000307",
+        revision: "different-fixture-revision" },
+    ];
+    await mock.queryClient.invalidateQueries({ queryKey: ["prefetch"] });
+  });
+  await expect(page.getByRole("article")).toHaveCount(2);
+  const group = page.getByRole("article").filter({ hasText: "Full-file progress" });
+  await expect(group).toHaveCount(1);
+  await group.getByText("Details · 2 jobs", { exact: true }).click();
+  await expect(group.getByRole("button", { name: "Pause" })).toHaveCount(2);
+  await expect(group.getByText(/Playback gap fill · .*2.0 MB–3.0 MB/)).toBeVisible();
+});
+
 test("warming history retains the original warning and reports verified recovery", async ({
   page,
 }) => {

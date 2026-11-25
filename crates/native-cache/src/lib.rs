@@ -1290,7 +1290,9 @@ impl Cache {
         }
         Ok(merged)
     }
-    async fn native_coverage(&self, key: &Key) -> Result<Vec<Coverage>, Error> {
+    /// Read committed native catalogue coverage without contacting payload storage
+    /// or consulting the legacy cache. Playback still verifies payloads on read.
+    pub async fn native_coverage(&self, key: &Key) -> Result<Vec<Coverage>, Error> {
         let blocks: Vec<(i64, i64)> =
             sqlx::query_as("SELECT block,len FROM blocks WHERE key=$1 AND valid=1 ORDER BY block")
                 .bind(key.id())
