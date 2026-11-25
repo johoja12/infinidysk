@@ -483,13 +483,63 @@ async fn foreground_wait_interrupts_warming_but_idle_open_does_not_block_it() {
         .await
         .unwrap()
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !q.tick_window(&settings()).await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("warming resumes as soon as cancelled replies drain, even with an idle open handle");
+}
+
+#[tokio::test]
+async fn warming_with_an_open_reader_respects_the_shared_article_window() {
+    let t = Temp::new();
+    let (vfs, item, cache, _corpus, server, _) =
+        fixture_geometry(&t, false, 2, 24, 716_800, 64).await;
+    let _foreground = vfs
+        .open(
+            &Node::Item(item.clone()),
+            Origin {
+                delivery: Delivery::WebDav,
+                client: "fixture-reader".into(),
+                player: None,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let queue = Queue::load(vfs.db().clone(), Arc::clone(&vfs))
+        .await
+        .unwrap();
+    enqueue(&queue, &item).await;
+    assert!(!queue.status().await.waiting_for_playback);
+    let running = {
+        let queue = Arc::clone(&queue);
+        tokio::spawn(async move { queue.tick_window(&settings()).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while server.body_commands() < 8 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert_eq!(
+        server.body_commands(),
+        8,
+        "shared warming cannot fetch beyond eight overlapping articles"
+    );
     assert!(
-        tokio::time::timeout(Duration::from_secs(15), q.tick_window(&settings()))
+        tokio::time::timeout(Duration::from_secs(5), running)
             .await
             .unwrap()
-            .unwrap(),
-        "idle playback handles consume no warming allowance or connections"
+            .unwrap()
+            .unwrap()
     );
+    assert_eq!(cache.stats().await.unwrap().bytes, 2 * BLOCK);
+    assert_eq!(queue.status().await.charged_fill_bytes, 2 * BLOCK);
 }
 
 async fn member_warming_case(encrypted: bool) {

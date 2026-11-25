@@ -204,16 +204,20 @@ impl Reader {
     }
 
     /// Strict bounded adaptive window, using the provider warming class.
-    pub(crate) fn into_warming(self, floor: usize) -> Self {
+    pub(crate) fn into_warming(self, floor: usize, shared_window: Option<usize>) -> Self {
+        let warm = |reader: SegmentReader| match shared_window {
+            Some(ceiling) => reader.with_warming_window(ceiling),
+            None => reader.with_warming_floor(floor),
+        };
         match self {
             Self::Memory(_) | Self::Native(_) | Self::Revision(_) => self,
-            Self::Segments(r) => Self::Segments(r.with_warming_floor(floor)),
+            Self::Segments(r) => Self::Segments(warm(r)),
             Self::Parts(mut r) => {
-                r.inner = r.inner.with_warming_floor(floor);
+                r.inner = warm(r.inner);
                 Self::Parts(r)
             }
             Self::Crypt(mut r) => {
-                r.inner.inner = r.inner.inner.with_warming_floor(floor);
+                r.inner.inner = warm(r.inner.inner);
                 Self::Crypt(r)
             }
         }

@@ -386,6 +386,11 @@ impl Pool {
         )
     }
 
+    pub(crate) fn warming_drained(&self) -> bool {
+        self.warm_busy.load(Ordering::Relaxed) == 0
+            && self.warm_waiting.load(Ordering::Relaxed) == 0
+    }
+
     /// Fetches and decodes one body (message-id without angle brackets).
     pub async fn body(&self, message_id: &str) -> Result<Body, Error> {
         validate_message_id(message_id)?;
@@ -600,7 +605,6 @@ impl Pool {
             let (tx, load, ahead, connection) = self
                 .worker(tag.workload, tag.fresh, tag.lane, deadline)
                 .await?;
-            drop(waiting);
             budget = budget.saturating_sub(admitted.elapsed());
             tag.step(Step::Connected {
                 provider,
@@ -613,6 +617,7 @@ impl Pool {
                 _busy: Load::acquire(&self.busy),
                 _warm: (tag.workload == Workload::Warm).then(|| Load::acquire(&self.warm_busy)),
             };
+            drop(waiting);
             drop(stream_waiting);
             let request = Request {
                 command,

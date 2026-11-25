@@ -332,6 +332,7 @@ pub struct SegmentReader {
     strict: bool,
     background: Workload,
     warm_floor: usize,
+    shared_warm_window: Option<usize>,
     budget: Option<Budget>,
     cache: Option<Arc<Cache>>,
     /// Segments from here on are fetched only when read: the caller's range ends before.
@@ -386,6 +387,7 @@ impl SegmentReader {
             strict: false,
             background: Workload::Health,
             warm_floor: 2,
+            shared_warm_window: None,
             budget: None,
             cache: None,
             end,
@@ -444,7 +446,16 @@ impl SegmentReader {
         self.prefetch = 128;
         self.initial = 2;
         self.warm_floor = floor;
+        self.shared_warm_window = None;
         self
+    }
+
+    /// The caller admits the shared window and interrupts it if playback needs the reserve.
+    #[must_use]
+    pub const fn with_warming_window(self, ceiling: usize) -> Self {
+        let mut reader = self.with_warming_floor(1);
+        reader.shared_warm_window = Some(if ceiling == 0 { 1 } else { ceiling });
+        reader
     }
 
     /// Shares `budget` with other readers to bound decoded bytes held in memory.
@@ -618,7 +629,9 @@ impl SegmentReader {
     /// the opening size per segment read, so an open does not queue the whole prefetch.
     fn ahead(&self) -> usize {
         if self.background == Workload::Warm {
-            return self.client.warming_window(self.warm_floor);
+            return self
+                .shared_warm_window
+                .unwrap_or_else(|| self.client.warming_window(self.warm_floor));
         }
         if self.bounded {
             return self.prefetch;
