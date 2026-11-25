@@ -29,6 +29,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 const MAX_JOBS: usize = 1000;
+const SHARED_WARM_ARTICLES: usize = 8;
+const SHARED_WARM_BLOCKS: u64 = 2;
 const MAX_RANGES: usize = 64;
 const RETRY_MS: i64 = 5 * 60 * 1000;
 const EXPIRY_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -273,6 +275,13 @@ pub enum Operation {
     Retry,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WarmingMode {
+    Idle,
+    Shared(usize),
+    Held,
+}
+
 pub struct Queue {
     db: Db,
     vfs: Arc<Vfs>,
@@ -469,7 +478,7 @@ impl Queue {
             rates,
             recent_wire_bytes_per_second,
             paused: ledger.paused,
-            waiting_for_playback: !ledger.paused && self.foreground(),
+            waiting_for_playback: !ledger.paused && self.warming_mode() == WarmingMode::Held,
             pending_backfills: self.vfs.backfills().stats().0,
             dropped_backfills: self.vfs.backfills().stats().1,
             recovery_mode: self
@@ -906,14 +915,37 @@ impl Queue {
     pub async fn changed(&self) {
         self.changed.notified().await;
     }
-    fn foreground(&self) -> bool {
-        self.vfs.foreground_pending()
-            || self
-                .vfs
-                .sessions()
-                .open()
-                .iter()
-                .any(|s| s.waiting().is_some_and(|d| d >= Duration::from_millis(25)))
+    fn warming_mode(&self) -> WarmingMode {
+        let sessions = self.vfs.sessions().open();
+        let waiting = sessions
+            .iter()
+            .filter_map(|session| session.waiting())
+            .max();
+        if waiting.is_some_and(|age| age >= Duration::from_millis(25)) {
+            return WarmingMode::Held;
+        }
+        let demand = waiting.is_some() || self.vfs.foreground_pending();
+        if demand || !sessions.is_empty() {
+            let window = self.vfs.shared_warming_window(SHARED_WARM_ARTICLES);
+            if window > 0 {
+                return WarmingMode::Shared(window);
+            }
+        }
+        if demand {
+            WarmingMode::Held
+        } else {
+            WarmingMode::Idle
+        }
+    }
+
+    fn warming_interrupted(&self, started: WarmingMode) -> bool {
+        match self.warming_mode() {
+            WarmingMode::Held => true,
+            // A shared turn has a fixed ceiling. Resize between turns so a
+            // transient capacity sample cannot repeatedly cancel the same block.
+            WarmingMode::Shared(_) => started == WarmingMode::Idle,
+            WarmingMode::Idle => false,
+        }
     }
     /// One block at most. The caller owns process cancellation and current settings.
     pub async fn tick(&self, settings: &Settings) -> anyhow::Result<bool> {
@@ -933,8 +965,10 @@ impl Queue {
         };
         self.wire
             .configure(settings.enabled, settings.daily_wire_bytes);
+        let mode = self.warming_mode();
         if !settings.enabled
-            || self.foreground()
+            || mode == WarmingMode::Held
+            || matches!(mode, WarmingMode::Shared(_)) && !self.vfs.warming_drained()
             || self
                 .vfs
                 .native_cache()
@@ -1052,6 +1086,13 @@ impl Queue {
             drop(current);
             return Ok(false);
         }
+        if self.warming_interrupted(mode) {
+            return Ok(false);
+        }
+        let (shared_window, blocks) = match mode {
+            WarmingMode::Shared(window) => (Some(window), blocks.min(SHARED_WARM_BLOCKS)),
+            _ => (None, blocks),
+        };
         let mut end = job.ranges[job.range]
             .end
             .min(job.offset.saturating_add(blocks * BLOCK));
@@ -1103,13 +1144,20 @@ impl Queue {
         }
         let mut reader = self
             .vfs
-            .open_warming(&source, usize::from(settings.connections_per_job))
+            .open_warming(
+                &source,
+                usize::from(settings.connections_per_job),
+                shared_window,
+            )
             .await?;
         reader.set_end(end);
         let mut seek = true;
         let mut permit = Some(permit);
         let mut progressed = false;
         while job.offset < end {
+            if self.warming_interrupted(mode) {
+                return Ok(progressed);
+            }
             let length = BLOCK.min(end - job.offset);
             let Some(reserved) = permit.take().or_else(|| cache.try_buffer()) else {
                 return Ok(progressed);
@@ -1127,7 +1175,7 @@ impl Queue {
             let interrupted = async {
                 loop {
                     tokio::time::sleep(Duration::from_millis(50)).await;
-                    if self.foreground() {
+                    if self.warming_interrupted(mode) {
                         break;
                     }
                     let ledger = self.ledger.lock().await;

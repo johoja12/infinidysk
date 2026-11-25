@@ -389,6 +389,14 @@ impl Vfs {
         self.client.foreground_pending()
     }
 
+    pub fn shared_warming_window(&self, ceiling: usize) -> usize {
+        self.client.shared_warming_window(ceiling)
+    }
+
+    pub fn warming_drained(&self) -> bool {
+        self.client.warming_drained()
+    }
+
     pub fn native_cache(&self) -> Option<&Arc<infinidysk_native_cache::Cache>> {
         self.native_cache.as_ref()
     }
@@ -804,7 +812,12 @@ impl Vfs {
 
     /// Background warming has no playback session, filler or hedges. Its bounded
     /// article window follows spare provider capacity and stops at the requested end.
-    pub async fn open_warming(&self, item: &Item, floor: usize) -> Result<Reader, Error> {
+    pub async fn open_warming(
+        &self,
+        item: &Item,
+        floor: usize,
+        shared_window: Option<usize>,
+    ) -> Result<Reader, Error> {
         let report = self.report.as_ref().map(|report| {
             let (report, id) = (Arc::clone(report), item.id);
             Arc::new(move |index, fault| report(id, index, fault)) as Report
@@ -820,7 +833,7 @@ impl Vfs {
             None,
             report.as_ref(),
         )?
-        .into_warming(floor);
+        .into_warming(floor, shared_window);
         Ok(revision::RevisionReader::wrap(
             reader,
             meta,

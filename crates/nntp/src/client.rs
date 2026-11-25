@@ -96,6 +96,15 @@ pub struct Client {
     warm_lane: Lane,
 }
 
+#[derive(Default)]
+struct WarmingCapacity {
+    total: usize,
+    free: usize,
+    held: usize,
+    pressured: bool,
+    spare_permits: Option<usize>,
+}
+
 fn warm_target(floor: usize, held: usize, total: usize, free: usize, pressure: bool) -> usize {
     let floor = floor.clamp(1, 8);
     if pressure {
@@ -394,6 +403,40 @@ impl Client {
     /// reduces new scheduling to the floor; existing replies drain normally.
     #[must_use]
     pub fn warming_window(&self, floor: usize) -> usize {
+        let capacity = self.warming_capacity();
+        warm_target(
+            floor,
+            capacity.held,
+            capacity.total,
+            capacity.free,
+            capacity.pressured || self.foreground_pending(),
+        )
+    }
+
+    /// Conservative shared window after retaining a quarter of effective provider
+    /// slots and at least one foreground article's global download permits.
+    #[must_use]
+    pub fn shared_warming_window(&self, ceiling: usize) -> usize {
+        let capacity = self.warming_capacity();
+        let reserve = capacity.total.div_ceil(4);
+        let slots = capacity.spare_permits.unwrap_or_default();
+        if capacity.pressured || capacity.free < reserve || slots <= 1 {
+            return 0;
+        }
+        let provider_window = (capacity.free - reserve).saturating_add(capacity.held);
+        let permit_window = (slots - 1).saturating_add(capacity.held);
+        ceiling.min(provider_window).min(permit_window)
+    }
+
+    /// Includes abandoned warming replies until the transport releases their tickets.
+    #[must_use]
+    pub fn warming_drained(&self) -> bool {
+        self.snapshot()
+            .iter()
+            .all(|entry| entry.provider.pool.warming_drained())
+    }
+
+    fn warming_capacity(&self) -> WarmingCapacity {
         let providers = self.snapshot();
         let available = |e: &&Entry| !e.provider.pool.exhausted() && !e.breaker.is_open();
         let level = providers
@@ -401,22 +444,22 @@ impl Client {
             .filter(available)
             .map(|e| e.provider.priority)
             .min();
-        let mut total = 0usize;
-        let mut free = 0usize;
-        let mut held = 0usize;
-        let mut pressure = self.foreground_pending();
+        let mut capacity = WarmingCapacity::default();
         for entry in providers
             .iter()
             .filter(available)
             .filter(|e| Some(e.provider.priority) == level)
         {
             let (limit, busy, warm, waiting) = entry.provider.pool.warming_capacity();
-            total = total.saturating_add(limit);
-            free = free.saturating_add(limit.saturating_sub(busy));
-            held = held.saturating_add(warm);
-            pressure |= waiting;
+            capacity.total = capacity.total.saturating_add(limit);
+            capacity.free = capacity.free.saturating_add(limit.saturating_sub(busy));
+            capacity.held = capacity.held.saturating_add(warm);
+            capacity.pressured |= waiting;
+            let slots = entry.provider.pool.free_permits() / entry.provider.pool.pipeline_depth();
+            capacity.spare_permits =
+                Some(capacity.spare_permits.map_or(slots, |free| free.min(slots)));
         }
-        warm_target(floor, held, total, free, pressure)
+        capacity
     }
 
     fn snapshot(&self) -> Arc<[Entry]> {
