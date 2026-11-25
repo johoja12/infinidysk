@@ -14,10 +14,12 @@ use infinidysk_native_cache::{BLOCK, BLOCK_BYTES, Cache, Key, Lease};
 use infinidysk_stream::Gaps;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::Instant;
 
 use crate::Reader;
 
 type Lookup = Pin<Box<dyn Future<Output = Option<Bytes>> + Send>>;
+type Admission = Pin<Box<dyn Future<Output = Option<OwnedSemaphorePermit>> + Send>>;
 struct Fill {
     start: u64,
     generation: u64,
@@ -38,6 +40,9 @@ pub struct NativeReader {
     checked: Option<u64>,
     hit: Option<Bytes>,
     fill: Option<Fill>,
+    admission: Option<Admission>,
+    attempted_fill: Option<u64>,
+    retry_fill_at: Option<Instant>,
     backfill: crate::backfill::Tracker,
 }
 impl NativeReader {
@@ -68,12 +73,46 @@ impl NativeReader {
             checked: None,
             hit: None,
             fill: None,
+            admission: None,
+            attempted_fill: None,
+            retry_fill_at: None,
             backfill,
         }))
     }
     pub(crate) fn set_end(&mut self, end: u64) {
         self.end = end.min(self.lease.key().size());
         self.inner.set_end(end);
+    }
+    fn prepare_fill(&mut self, cx: &mut Context<'_>, block: u64, within: usize) -> Poll<()> {
+        if self.attempted_fill == Some(block) {
+            return Poll::Ready(());
+        }
+        let buffer = if within != 0 {
+            self.cache.resume_playback_prefix(&self.lease, self.pos)
+        } else if self.cache.can_fill(self.lease.key())
+            && self.retry_fill_at.is_none_or(|at| Instant::now() >= at)
+        {
+            let admission = self.admission.get_or_insert_with(|| {
+                let cache = self.cache.clone();
+                Box::pin(async move { cache.playback_buffer().await })
+            });
+            let permit = ready!(admission.as_mut().poll(cx));
+            self.admission = None;
+            if permit.is_none() {
+                self.retry_fill_at = Some(Instant::now() + self.cache.playback_retry_delay());
+            }
+            permit.map(|permit| (Vec::with_capacity(BLOCK_BYTES), permit))
+        } else {
+            None
+        };
+        self.attempted_fill = Some(block);
+        self.fill = buffer.map(|(bytes, permit)| Fill {
+            start: block * BLOCK,
+            generation: self.gaps.fill_generation(),
+            bytes,
+            permit,
+        });
+        Poll::Ready(())
     }
     fn read(&mut self, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         if self.pos >= self.end || buf.remaining() == 0 {
@@ -111,7 +150,7 @@ impl NativeReader {
             self.source_pos = ready!(Pin::new(&mut self.inner).poll_complete(cx))?;
             self.source_seeking = false;
         }
-        let generation = self.gaps.fill_generation();
+        ready!(self.prepare_fill(cx, block, within));
         let want = buf.remaining().min(BLOCK_BYTES - within).min(remaining);
         let mut source = ReadBuf::new(buf.initialize_unfilled_to(want));
         let outcome = ready!(Pin::new(&mut self.inner).poll_read(cx, &mut source));
@@ -123,19 +162,6 @@ impl NativeReader {
         if n == 0 {
             self.fill = None;
             return Poll::Ready(Ok(()));
-        }
-        if within == 0
-            && self.cache.can_fill(self.lease.key())
-            && self.fill.is_none()
-            && self.gaps.fill_generation() == generation
-            && let Some(permit) = self.cache.try_buffer()
-        {
-            self.fill = Some(Fill {
-                start: self.pos,
-                generation,
-                bytes: Vec::with_capacity(BLOCK_BYTES),
-                permit,
-            });
         }
         if let Some(fill) = &mut self.fill {
             if fill.start + fill.bytes.len() as u64 == self.pos
@@ -156,16 +182,17 @@ impl NativeReader {
         if self.fill.as_ref().is_some_and(|f| f.bytes.len() == whole)
             && let Some(fill) = self.fill.take()
         {
-            let cache = Arc::clone(&self.cache);
-            let lease = Arc::clone(&self.lease);
-            tokio::spawn(async move {
-                if let Err(error) = cache
-                    .put_reserved(&lease, block, Bytes::from(fill.bytes), fill.permit)
-                    .await
-                {
-                    tracing::debug!(reason=%error,"native cache fill skipped");
-                }
-            });
+            self.cache.publish_playback(
+                self.lease.clone(),
+                block,
+                Bytes::from(fill.bytes),
+                fill.permit,
+            );
+        } else if self.pos == self.end
+            && let Some(fill) = self.fill.take()
+        {
+            self.cache
+                .remember_playback_prefix(&self.lease, self.pos, fill.bytes, fill.permit);
         }
         Poll::Ready(Ok(()))
     }
@@ -199,6 +226,8 @@ impl AsyncSeek for NativeReader {
         this.checked = None;
         this.hit = None;
         this.fill = None;
+        this.admission = None;
+        this.attempted_fill = None;
         Ok(())
     }
     fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {

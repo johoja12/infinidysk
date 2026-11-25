@@ -4467,6 +4467,17 @@ export interface components {
             /** Format: int64 */
             failed: number;
             /** Format: int64 */
+            playback_buffer_bypasses: number;
+            /** Format: int64 */
+            playback_buffer_waits: number;
+            /**
+             * Format: int64
+             * @description Playback bytes confirmed present after a publication attempt.
+             */
+            playback_published_bytes: number;
+            /** Format: int64 */
+            playback_write_bypasses: number;
+            /** Format: int64 */
             queued: number;
             /** Format: int64 */
             read_requests: number;

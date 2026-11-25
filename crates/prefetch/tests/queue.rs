@@ -914,7 +914,7 @@ async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without
     let (vfs, item, cache, corpus, _server, _client) = fixture_sized(&t, false, 0, 96).await;
     let queue = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
     let mut held = Vec::new();
-    while let Some(permit) = cache.try_buffer() {
+    while let Some(permit) = cache.playback_buffer().await {
         held.push(permit);
     }
     let origin = Origin {
@@ -1080,7 +1080,7 @@ async fn backfill_admission_fences_changed_sources_and_keeps_hints_after_databas
         let (vfs, item, cache, _corpus, _server, _client) = fixture_sized(&t, false, 0, 64).await;
         let queue = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
         let mut held = Vec::new();
-        while let Some(permit) = cache.try_buffer() {
+        while let Some(permit) = cache.playback_buffer().await {
             held.push(permit);
         }
         let mut reader = vfs

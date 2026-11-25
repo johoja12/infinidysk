@@ -20,6 +20,11 @@ pub struct Stats {
     pub failed: u64,
     pub elapsed_ms: u64,
     pub available_buffer_blocks: usize,
+    pub playback_buffer_waits: u64,
+    pub playback_buffer_bypasses: u64,
+    pub playback_write_bypasses: u64,
+    /// Playback bytes confirmed present after a publication attempt.
+    pub playback_published_bytes: u64,
 }
 #[derive(Clone, Copy)]
 pub(super) enum Kind {
@@ -38,6 +43,10 @@ pub(super) struct Counters {
     active: AtomicU64,
     failed: AtomicU64,
     elapsed: AtomicU64,
+    playback_waits: AtomicU64,
+    playback_buffer_bypasses: AtomicU64,
+    playback_write_bypasses: AtomicU64,
+    playback_published: AtomicU64,
 }
 pub(super) struct Work {
     counters: Arc<Counters>,
@@ -61,6 +70,23 @@ impl Counters {
             success: false,
         }
     }
+    pub(super) fn playback_buffer_wait(&self) {
+        self.playback_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn playback_buffer_bypass(&self) {
+        self.playback_buffer_bypasses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn playback_write_bypass(&self) {
+        self.playback_write_bypasses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn playback_published(&self, bytes: u64) {
+        self.playback_published.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub(super) fn snapshot(&self, available_buffer_blocks: usize) -> Stats {
         let get = |n: &AtomicU64| n.load(Ordering::Relaxed);
         Stats {
@@ -74,6 +100,10 @@ impl Counters {
             failed: get(&self.failed),
             elapsed_ms: get(&self.elapsed),
             available_buffer_blocks,
+            playback_buffer_waits: get(&self.playback_waits),
+            playback_buffer_bypasses: get(&self.playback_buffer_bypasses),
+            playback_write_bypasses: get(&self.playback_write_bypasses),
+            playback_published_bytes: get(&self.playback_published),
         }
     }
 }
