@@ -97,9 +97,11 @@ Known failures (provider errors, missing articles, timeouts, auth failures, miss
 
 We cannot verify which media is public domain. **Never** write movie, show, episode, album, book, or release/NZB names in commits, PRs, issues, comments, code, test names, fixtures, docs, or pasted logs. Redact as `<release-name>` and describe generically ("stored RAR5 episode", "obfuscated 7z season pack").
 
-## Never merge pull requests
+## Merging pull requests
 
-Agents never merge PRs, in this repo or any infinidysk repo: no `gh pr merge`, no UI/API merge, no auto-merge. Opening the PR and reporting its URL ends the handoff. Never force-push shared branches or amend pushed commits.
+Agents may merge pull requests in this repository when the maintainer explicitly authorizes the merge. Before merging, verify the current PR head, mergeability, and required checks on that head. Use the normal GitHub merge flow and respect branch protection.
+
+Never force-push shared branches or amend pushed commits.
 
 ## Addressing reviews
 
