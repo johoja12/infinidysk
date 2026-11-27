@@ -1124,6 +1124,72 @@ async fn actual_uncached_playback_ranges_become_durable_urgent_backfills_without
 }
 
 #[tokio::test]
+async fn admission_queues_only_ranges_missing_from_cache_and_pending_gap_fills() {
+    let t = Temp::new();
+    let (vfs, item, cache, corpus, _server, _) = fixture_sized(&t, false, 0, 192).await;
+    let queue = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
+    let key = vfs.cache_key(&item).await.unwrap();
+    let lease = cache.lease(key).unwrap();
+
+    let first_gap = Range {
+        start: 4 * BLOCK,
+        end: 8 * BLOCK,
+    };
+    let second_gap = Range {
+        start: 9 * BLOCK,
+        end: 10 * BLOCK,
+    };
+    let mut original = None;
+    for (start, publish, expected) in [
+        (0, 0..4, vec![]),
+        (4, 0..0, vec![first_gap.clone()]),
+        (6, 8..9, vec![first_gap.clone(), second_gap.clone()]),
+        (6, 0..0, vec![first_gap, second_gap]),
+    ] {
+        let mut held = Vec::new();
+        while let Some(permit) = cache.playback_buffer().await {
+            held.push(permit);
+        }
+        let mut reader = vfs
+            .open(
+                &Node::Item(item.clone()),
+                Origin {
+                    delivery: Delivery::Fuse,
+                    client: "fixture-player".into(),
+                    player: None,
+                },
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        reader.seek(SeekFrom::Start(start * BLOCK)).await.unwrap();
+        reader
+            .read_exact(&mut vec![0; 4 * BLOCK_BYTES])
+            .await
+            .unwrap();
+        drop(reader);
+        drop(held);
+        assert!(vfs.backfills().stats().0 > 0);
+
+        for block in publish {
+            let start = block * BLOCK_BYTES;
+            let bytes = bytes::Bytes::copy_from_slice(&corpus.data[start..start + BLOCK_BYTES]);
+            assert!(cache.put(&lease, block as u64, bytes).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        queue.observe_backfills(&settings()).await.unwrap();
+        let status = queue.status().await;
+        assert_eq!(status.pending_backfills, 0);
+        assert!(status.history.is_empty());
+        assert_eq!(status.jobs.len(), usize::from(!expected.is_empty()));
+        if let Some(job) = status.jobs.first() {
+            assert_eq!(job.id, *original.get_or_insert(job.id));
+            assert_eq!(job.ranges, expected);
+        }
+    }
+}
+
+#[tokio::test]
 async fn covered_gap_retires_even_with_a_full_file_warm_queued() {
     let t = Temp::new();
     let (vfs, item, cache, corpus, server, _) = fixture_sized(&t, false, 0, 96).await;
@@ -1167,22 +1233,21 @@ async fn covered_gap_retires_even_with_a_full_file_warm_queued() {
     let before = server.body_commands();
     queue.pause(true).await.unwrap();
     queue.reconcile_cached_gaps().await.unwrap();
-    assert!(queue.status().await.jobs.iter().any(|job| job.family
-        == infinidysk_prefetch::Family::Backfill
-        && job.state == State::Queued));
-    queue.pause(false).await.unwrap();
-    queue.reconcile_cached_gaps().await.unwrap();
-    let status = queue.status().await;
-    let gap = status
+    let paused = queue.status().await;
+    let gap = paused
         .jobs
         .iter()
         .find(|job| job.family == infinidysk_prefetch::Family::Backfill)
         .unwrap();
-    assert_eq!(gap.state, State::Superseded);
-    assert_eq!(
-        gap.reason.as_deref(),
-        Some("Gap ranges already covered by cache")
-    );
+    assert_eq!(gap.state, State::Queued);
+    queue.pause(false).await.unwrap();
+    queue.reconcile_cached_gaps().await.unwrap();
+
+    let queue = Queue::load(vfs.db().clone(), vfs.clone()).await.unwrap();
+    let status = queue.status().await;
+    assert!(status.jobs.iter().all(|job| job.id != gap.id));
+    assert!(status.history_available);
+    assert!(status.history.iter().all(|event| event.job.id != gap.id));
     assert_eq!(
         status
             .jobs

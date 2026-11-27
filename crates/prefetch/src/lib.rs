@@ -538,7 +538,8 @@ impl Queue {
                 Some((request.scope, request.revision, Family::Plex)),
                 attribution,
             )
-            .await?;
+            .await?
+            .context("Plex warming admission skipped")?;
         if job.state == State::Complete {
             let item = self
                 .db
@@ -643,7 +644,8 @@ impl Queue {
             automatic,
             &Attribution::default(),
         )
-        .await
+        .await?
+        .context("warming admission skipped")
     }
     async fn admit_attributed(
         &self,
@@ -653,7 +655,7 @@ impl Queue {
         intent: Uuid,
         automatic: Option<(&str, &str, Family)>,
         attribution: &Attribution,
-    ) -> anyhow::Result<Job> {
+    ) -> anyhow::Result<Option<Job>> {
         ensure!(attribution.valid(), "invalid warming attribution");
         ensure!(priority <= 100, "invalid prefetch priority");
         let item = self
@@ -672,7 +674,7 @@ impl Queue {
                 "prediction source revision changed"
             );
         }
-        let ranges = normalize(ranges, key.size())?;
+        let mut ranges = normalize(ranges, key.size())?;
         let cache = self
             .vfs
             .native_cache()
@@ -684,30 +686,38 @@ impl Queue {
         let backfill_scope = automatic
             .filter(|(_, _, family)| *family == Family::Backfill)
             .map(|(scope, _, _)| scope);
+        let mut current = self.lock_ledger().await?;
+        let now = now_ms();
+        if let Some(scope) = backfill_scope
+            && let Some(remaining) = backfill::uncovered_for_admission(
+                &ranges,
+                cache.coverage(&key).await?,
+                &current.jobs,
+                &key,
+                scope,
+                now,
+            )
+        {
+            if remaining.is_empty() {
+                return Ok(None);
+            }
+            ranges = remaining;
+        }
         // Never edit ranges while the executor owns a selected job.
         let idle_step = backfill_scope.and_then(|_| self.step.try_lock().ok());
-        let mut current = self.lock_ledger().await?;
         if let Some(existing) = current.jobs.iter().find(|j| {
             j.item == key.item()
                 && j.revision == key.revision()
                 && j.intent == intent
-                && !(backfill_scope.is_some() && j.state == State::Superseded)
-                && (j.ranges == ranges
-                    || backfill_scope.is_some_and(|scope| {
-                        j.automatic_scope.as_deref() == Some(scope)
-                            && ranges.iter().all(|r| {
-                                j.ranges
-                                    .iter()
-                                    .any(|old| old.start <= r.start && old.end >= r.end)
-                            })
-                    }))
+                && !(backfill_scope.is_some()
+                    && matches!(j.state, State::Superseded | State::Queued | State::Paused))
+                && j.ranges == ranges
                 && (automatic.is_some()
                     || matches!(j.state, State::Queued | State::Paused | State::Complete))
         }) {
-            return Ok(existing.clone());
+            return Ok(Some(existing.clone()));
         }
         let mut next = current.clone();
-        let now = now_ms();
         if idle_step.is_some()
             && let Some(scope) = backfill_scope
             && let Some((job, changed)) = next.jobs.iter_mut().find_map(|job| {
@@ -732,7 +742,7 @@ impl Queue {
             if changed {
                 self.save(&mut current, next).await?;
             }
-            return Ok(job);
+            return Ok(Some(job));
         }
         let deferred_compaction = backfill_scope.is_some() && idle_step.is_none();
         drop(idle_step);
@@ -777,7 +787,7 @@ impl Queue {
             self.needs_gap_compaction.store(true, Ordering::Relaxed);
         }
         drop(current);
-        Ok(job)
+        Ok(Some(job))
     }
     pub async fn control(&self, id: Uuid, operation: Operation) -> anyhow::Result<()> {
         self.control_attributed(id, operation, None).await

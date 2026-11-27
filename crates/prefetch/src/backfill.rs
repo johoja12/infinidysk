@@ -45,44 +45,44 @@ impl Queue {
                 journal.acknowledge(hint.id);
                 continue;
             }
-            let coverage = cache.coverage(&key).await?;
-            let ranges = missing(hint.start, hint.end, &coverage);
-            if !ranges.is_empty() {
-                let mut hash = Sha256::new();
-                hash.update(b"native-backfill-v1");
-                hash.update(item.id.0.as_bytes());
-                hash.update(key.revision().as_bytes());
-                hash.update(hint.start.to_le_bytes());
-                hash.update(hint.end.to_le_bytes());
-                let mut bytes = [0; 16];
-                bytes.copy_from_slice(&hash.finalize()[..16]);
-                let now = now_ms();
-                let attribution = contexts
-                    .iter()
-                    .find(|c| c.item == hint.item.0 && c.revision == hint.revision)
-                    .map(|c| &c.attribution)
-                    .filter(|a| {
-                        a.valid()
-                            && a.playback
-                                .iter()
-                                .all(|p| now >= p.observed_at && now - p.observed_at <= 120_000)
-                    })
-                    .cloned()
-                    .unwrap_or_default();
-                let job = self
-                    .admit_attributed(
-                        item.id,
-                        &ranges,
-                        100,
-                        Uuid::from_bytes(bytes),
-                        Some((scope, key.revision(), Family::Backfill)),
-                        &attribution,
-                    )
+            let mut hash = Sha256::new();
+            hash.update(b"native-backfill-v1");
+            hash.update(item.id.0.as_bytes());
+            hash.update(key.revision().as_bytes());
+            hash.update(hint.start.to_le_bytes());
+            hash.update(hint.end.to_le_bytes());
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(&hash.finalize()[..16]);
+            let now = now_ms();
+            let attribution = contexts
+                .iter()
+                .find(|c| c.item == hint.item.0 && c.revision == hint.revision)
+                .map(|c| &c.attribution)
+                .filter(|a| {
+                    a.valid()
+                        && a.playback
+                            .iter()
+                            .all(|p| now >= p.observed_at && now - p.observed_at <= 120_000)
+                })
+                .cloned()
+                .unwrap_or_default();
+            if let Some(job) = self
+                .admit_attributed(
+                    item.id,
+                    &[Range {
+                        start: hint.start,
+                        end: hint.end,
+                    }],
+                    100,
+                    Uuid::from_bytes(bytes),
+                    Some((scope, key.revision(), Family::Backfill)),
+                    &attribution,
+                )
+                .await?
+                && matches!(job.state, State::Complete | State::Expired)
+            {
+                self.control_attributed(job.id, Operation::Retry, Some(&attribution))
                     .await?;
-                if matches!(job.state, State::Complete | State::Expired) {
-                    self.control_attributed(job.id, Operation::Retry, Some(&attribution))
-                        .await?;
-                }
             }
             // If coalescing replaced the event during database I/O, its newer nonce
             // remains pending. An uncertain durable write never acknowledges here.
@@ -150,13 +150,13 @@ impl Queue {
         let mut changed = false;
         let now = now_ms();
         for (original, ranges) in updates {
-            if let Some(job) = next.jobs.iter_mut().find(|job| {
+            if let Some(index) = next.jobs.iter().position(|job| {
                 job.id == original.id
                     && untouched_gap(job)
                     && runnable(job, now)
                     && job.ranges == original.ranges
             }) {
-                apply_unstarted_gap(job, ranges, now);
+                apply_unstarted_gap(&mut next.jobs, index, ranges, now);
                 changed = true;
             }
         }
@@ -177,28 +177,59 @@ impl Queue {
             return Ok(());
         }
         let mut next = current.clone();
-        let Some(job) = next
+        let Some(index) = next
             .jobs
-            .iter_mut()
-            .find(|j| j.id == original.id && untouched_gap(j))
+            .iter()
+            .position(|job| job.id == original.id && untouched_gap(job))
         else {
             return Ok(());
         };
-        apply_unstarted_gap(job, ranges, now_ms());
+        apply_unstarted_gap(&mut next.jobs, index, ranges, now_ms());
         let result = self.save(&mut current, next).await;
         drop(current);
         result
     }
 }
-fn apply_unstarted_gap(job: &mut Job, ranges: Vec<Range>, now: i64) {
+fn apply_unstarted_gap(jobs: &mut Vec<Job>, index: usize, ranges: Vec<Range>, now: i64) {
     if let Some(first) = ranges.first() {
+        let job = &mut jobs[index];
         job.offset = first.start;
         job.ranges = ranges;
+        job.updated_at = now;
     } else {
-        job.state = State::Superseded;
-        job.reason = Some("Gap ranges already covered by cache".into());
+        // Playback or another fill already published every block. This hint
+        // never ran, so remove it without adding an attempt to history.
+        jobs.remove(index);
     }
-    job.updated_at = now;
+}
+
+pub(super) fn uncovered_for_admission(
+    ranges: &[Range],
+    mut coverage: Vec<infinidysk_native_cache::Coverage>,
+    jobs: &[Job],
+    key: &infinidysk_native_cache::Key,
+    scope: &str,
+    now: i64,
+) -> Option<Vec<Range>> {
+    for job in jobs.iter().filter(|job| {
+        job.family == Family::Backfill
+            && matches!(job.state, State::Queued | State::Paused)
+            && job.expires_at > now
+            && job.item == key.item()
+            && job.revision == key.revision()
+            && job.size == key.size()
+            && job.automatic_scope.as_deref() == Some(scope)
+    }) {
+        // Already processed blocks must be covered by the cache itself.
+        coverage.extend(job.ranges.iter().skip(job.range).map(|range| {
+            infinidysk_native_cache::Coverage {
+                start: range.start.max(job.offset),
+                end: range.end,
+            }
+        }));
+    }
+    coverage.sort_unstable_by_key(|range| range.start);
+    trim_covered(ranges, &coverage, key.size())
 }
 
 pub(super) fn trim_covered(
