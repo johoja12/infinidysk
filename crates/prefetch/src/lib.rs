@@ -3,6 +3,7 @@
 mod attribution;
 pub use attribution::{Attribution, BackfillAttribution, PolicyOrigin, ReportedViewer};
 mod backfill;
+mod demand;
 mod lead;
 mod rates;
 pub use rates::Rate;
@@ -11,10 +12,10 @@ use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::{
-    Arc,
+    Arc, PoisonError,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, bail, ensure};
 use bytes::Bytes;
@@ -296,6 +297,8 @@ pub struct Queue {
     wire: Arc<infinidysk_nntp::wire::Budget>,
     watched: Mutex<watched::Tracker>,
     lead: Mutex<lead::Lead>,
+    /// Sync: [`Self::warming_mode`] runs outside async contexts and never awaits.
+    demand: std::sync::Mutex<demand::Demand>,
     uncertain: AtomicBool,
     rates: rates::Window,
 }
@@ -370,6 +373,7 @@ impl Queue {
             wire,
             watched: Mutex::default(),
             lead: Mutex::default(),
+            demand: std::sync::Mutex::default(),
             uncertain: AtomicBool::new(false),
             rates: rates::Window::default(),
         });
@@ -917,8 +921,36 @@ impl Queue {
     pub async fn changed(&self) {
         self.changed.notified().await;
     }
+    /// Items Plex verified as playing, trusted for `ttl`. Warming keeps yielding to
+    /// them even when they read as fast as a bulk transfer.
+    pub fn set_verified_playback(&self, items: HashSet<ItemId>, ttl: Duration) {
+        let now = Instant::now();
+        self.demand
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .set_playing(items, now + ttl);
+    }
+
     fn warming_mode(&self) -> WarmingMode {
-        let sessions = self.vfs.sessions().open();
+        let now = Instant::now();
+        let open = self.vfs.sessions().open();
+        let any_open = !open.is_empty();
+        // Bulk transfers neither hold warming nor make it share: the idle warming
+        // window already keeps a quarter of the providers free and drops to its floor
+        // while foreground reads wait for them.
+        let sessions: Vec<_> = {
+            let mut demand = self.demand.lock().unwrap_or_else(PoisonError::into_inner);
+            if any_open && demand.due(now) {
+                demand.sample(&self.vfs.sessions().playback(), now, SystemTime::now());
+            }
+            let kept = open
+                .into_iter()
+                .filter(|s| !demand.bulk(&s.client, s.item, now))
+                .collect();
+            drop(demand);
+            kept
+        };
+        let only_bulk = any_open && sessions.is_empty();
         let waiting = sessions
             .iter()
             .filter_map(|session| session.waiting())
@@ -926,7 +958,7 @@ impl Queue {
         if waiting.is_some_and(|age| age >= Duration::from_millis(25)) {
             return WarmingMode::Held;
         }
-        let demand = waiting.is_some() || self.vfs.foreground_pending();
+        let demand = waiting.is_some() || (!only_bulk && self.vfs.foreground_pending());
         if demand || !sessions.is_empty() {
             let window = self.vfs.shared_warming_window(SHARED_WARM_ARTICLES);
             if window > 0 {
