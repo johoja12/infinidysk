@@ -258,6 +258,16 @@ impl Predictions {
                 return Ok(());
             }
         };
+        // Plex-verified playback keeps warming yielding even at bulk read rates. Trust
+        // it until two refreshes are missed.
+        self.queue.set_verified_playback(
+            predictions
+                .iter()
+                .filter(|p| !p.playback.is_empty())
+                .filter_map(|p| p.item.map(ItemId))
+                .collect(),
+            Duration::from_secs(u64::from(settings.prefetch.plex.refresh_seconds) * 2 + 30),
+        );
         let saved = Saved {
             version: 1,
             scope: expected.clone(),
