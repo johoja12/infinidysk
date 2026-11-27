@@ -1084,9 +1084,11 @@ Use retained health history for the original filename when the file is removed.
 Put recovery timestamps, replacement links, replacement warming and queue
 accounting in Details.
 
-Coverage filters use current cache metadata bound to the exact source revision
-and file size, fetched at most four requests at once. Job completion records past
-verification, never current cache coverage. Missing, changed or unreadable
+Activity shows current whole-file cache coverage for the visible page. Keep
+verified attempt progress in Details and label it explicitly when current
+coverage is unavailable. History keeps recorded attempt progress. Coverage
+filters and Activity use cache metadata bound to the exact source revision and
+file size, fetched at most four requests at once. Missing, changed or unreadable
 coverage stays unknown. Predictions group the same source across profiles and
 support search, source/profile and current-cache filters. Outcome reasons are
 warming results; never relabel them as playback cache-miss causes.

@@ -236,12 +236,12 @@ test("warming filters, grouped history and current coverage match v1 workflows",
     const header = await page
       .getByText("Progress", { exact: true })
       .boundingBox();
-    const row = await page
-      .getByRole("progressbar", {
-        name: "Attempt progress Fixture warming file",
-        exact: true,
-      })
-      .boundingBox();
+    const meter = page.getByRole("progressbar", {
+      name: "Current cache coverage Fixture warming file",
+      exact: true,
+    });
+    await expect(meter).toBeVisible();
+    const row = await meter.boundingBox();
     expect(header && row && Math.abs(header.x - row.x)).toBeLessThan(2);
     const statusHeader = await page
       .getByText("Status", { exact: true })
@@ -459,6 +459,22 @@ test("current warming groups gaps and explains foreground waits", async ({ page 
   await expect(group.getByText("Queued", { exact: true })).toBeVisible();
 });
 
+test("activity shows current cache coverage even while the attempt waits", async ({ page }) => {
+  await page.goto(fixture("activity"));
+  const row = page.getByRole("article", { name: "Warming file Fixture warming file", exact: true });
+  const meter = row.getByRole("progressbar", { name: "Current cache coverage Fixture warming file" });
+  await expect(meter).toHaveAttribute("aria-valuenow", "50");
+  await page.evaluate(() => {
+    window.__mock.fullWarmingCoverage = true;
+    window.__mock.waitingForPlayback = true;
+  });
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
+  await expect(meter).toHaveAttribute("aria-valuenow", "100");
+  await expect(row.getByText("Waiting for playback", { exact: true })).toBeVisible();
+  await row.getByText("Details", { exact: true }).click();
+  await expect(row.getByText("Attempt progress · 4.0 MB / 8.0 MB verified")).toBeVisible();
+});
+
 test("a full-file warm and its playback gap share a current row", async ({ page }) => {
   await page.goto(fixture("activity"));
   await expect(page.getByRole("article").first()).toBeVisible();
@@ -476,7 +492,7 @@ test("a full-file warm and its playback gap share a current row", async ({ page 
     await mock.queryClient.invalidateQueries({ queryKey: ["prefetch"] });
   });
   await expect(page.getByRole("article")).toHaveCount(2);
-  const group = page.getByRole("article").filter({ hasText: "Full-file progress" });
+  const group = page.getByRole("article").filter({ hasText: "Details · 2 jobs" });
   await expect(group).toHaveCount(1);
   await group.getByText("Details · 2 jobs", { exact: true }).click();
   await expect(group.getByRole("button", { name: "Pause" })).toHaveCount(2);
