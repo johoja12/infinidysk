@@ -709,8 +709,18 @@
           window.__mock.coverageMax || 0,
           window.__mock.coverageActive,
         );
-        await new Promise((resolve) => setTimeout(resolve, 30));
-        window.__mock.coverageActive--;
+        try {
+          await new Promise((resolve, reject) => {
+            request.signal.throwIfAborted();
+            const timer = setTimeout(resolve, 30);
+            request.signal.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(request.signal.reason);
+            }, { once: true });
+          });
+        } finally {
+          window.__mock.coverageActive--;
+        }
         return respond({
           cache_available: true,
           entry: { size: 8000000, name: "Fixture source.mkv", path: window.__mock.longFilePaths ? "/content/fixture/" + "generated-source-path-".repeat(20) + "/source.mkv" : "/content/fixture/source.mkv", kind: "file", encrypted: false, item_id: id },
@@ -720,7 +730,7 @@
             ? "changed-fixture-revision"
             : "fixture-revision",
           cached_ranges: [
-            { start: 0, end: path.endsWith(other) ? 8000000 : 4000000 },
+            { start: 0, end: path.endsWith(other) || (path.endsWith(id) && window.__mock.fullWarmingCoverage) ? 8000000 : 4000000 },
           ],
           cache_warning: null,
         });

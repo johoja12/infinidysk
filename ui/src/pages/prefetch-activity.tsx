@@ -182,40 +182,45 @@ export function PrefetchActivity() {
   const coverageFilter = ["fully-cached", "partial", "unknown"].includes(
     filter,
   );
+  filtered.sort((a, b) =>
+    sort === "oldest"
+      ? a.at - b.at
+      : sort === "name"
+        ? fileName(data, a.job.item).localeCompare(fileName(data, b.job.item))
+        : sort === "progress"
+          ? b.job.verified_bytes / Math.max(1, requested(b.job)) -
+            a.job.verified_bytes / Math.max(1, requested(a.job))
+          : b.at - a.at,
+  );
+  const pageIndex = (count: number) =>
+    Math.min(page, Math.max(0, Math.ceil(count / pageSize) - 1));
+  const requestedPage = pageIndex(filtered.length);
+  const targets = coverageFilter
+    ? filtered
+    : history
+      ? []
+      : filtered.slice(requestedPage * pageSize, (requestedPage + 1) * pageSize);
   const coverage = useFileCoverage(
-    filtered.map((r) => r.job),
-    coverageFilter,
+    targets.map((row) => row.job),
+    coverageFilter || !history,
   );
-  const visible = filtered
-    .filter((r) => {
-      if (!coverageFilter) return true;
-      const c = coverage.results.get(`${r.job.item}:${r.job.revision}`);
-      if (!c) return false;
-      const unknown = c.ranges == null;
-      if (filter === "unknown") return unknown;
-      if (unknown) return false;
-      const n = rangeCoverage(
-        { ...r.job, ranges: [{ start: 0, end: r.job.size }] },
-        c.ranges!,
-      );
-      return filter === "fully-cached"
-        ? r.job.size > 0 && n >= r.job.size
-        : n > 0 && n < r.job.size;
-    })
-    .sort((a, b) =>
-      sort === "oldest"
-        ? a.at - b.at
-        : sort === "name"
-          ? fileName(data, a.job.item).localeCompare(fileName(data, b.job.item))
-          : sort === "progress"
-            ? b.job.verified_bytes / Math.max(1, requested(b.job)) -
-              a.job.verified_bytes / Math.max(1, requested(a.job))
-            : b.at - a.at,
-    );
-  const safePage = Math.min(
-    page,
-    Math.max(0, Math.ceil(visible.length / pageSize) - 1),
-  );
+  const visible = coverageFilter
+    ? filtered.filter(({ job }) => {
+        const current = coverage.results.get(`${job.item}:${job.revision}`);
+        if (!current) return false;
+        if (filter === "unknown") return current.ranges == null;
+        if (current.ranges == null) return false;
+        const cached = rangeCoverage(
+          { ranges: [{ start: 0, end: job.size }] },
+          current.ranges,
+        );
+        return filter === "fully-cached"
+          ? job.size > 0 && cached >= job.size
+          : cached > 0 && cached < job.size;
+      })
+    : filtered;
+  const safePage = pageIndex(visible.length);
+  const pageRows = visible.slice(safePage * pageSize, (safePage + 1) * pageSize);
   if (settings.isPending || query.isPending) return <Loading />;
   if (!data || !settings.data)
     return (
@@ -286,7 +291,7 @@ export function PrefetchActivity() {
             disabled={query.isFetching}
             onClick={() => {
               void query.refetch();
-              coverage.refresh();
+              if (coverageFilter || !history) coverage.refresh();
             }}
           >
             <RefreshCw />
@@ -527,7 +532,7 @@ export function PrefetchActivity() {
               ["newest", "Newest first"],
               ["oldest", "Oldest first"],
               ["name", "File name"],
-              ["progress", "Most progress"],
+              ["progress", "Most attempt progress"],
             ]}
             onChange={(v) => change({ sort: v })}
           />
@@ -580,9 +585,7 @@ export function PrefetchActivity() {
             <span>Progress</span>
             <span className="hidden sm:block">Actions</span>
           </div>
-          {visible
-            .slice(safePage * pageSize, (safePage + 1) * pageSize)
-            .map((row) => {
+          {pageRows.map((row) => {
               const groupedJobs = !history && row.runs.length > 1;
               const gapOnly = groupedJobs && row.runs.every(({ job }) => job.family === "backfill");
               const fullFile = groupedJobs && !gapOnly
@@ -602,6 +605,22 @@ export function PrefetchActivity() {
                 ),
                 status = displayState(j);
               const name = fileName(data, j.item);
+              const current = history
+                ? undefined
+                : coverage.results.get(
+                    `${j.item}:${j.revision}`,
+                  );
+              const cachedNow = current?.ranges == null
+                ? undefined
+                : rangeCoverage(
+                    { ranges: [{ start: 0, end: j.size }] },
+                    current.ranges,
+                  );
+              const displayedBytes = cachedNow ?? verified;
+              const displayedTotal = cachedNow == null ? total : j.size;
+              const displayedPct = cachedNow == null
+                ? pct
+                : (cachedNow / Math.max(1, j.size)) * 100;
               const recordedRepair = data.health_checks?.[j.item]?.repair;
               const originalRemoved =
                 !data.names[j.item] &&
@@ -682,23 +701,27 @@ export function PrefetchActivity() {
                     </div>
                     <div className="min-w-0 space-y-2">
                       <p className="text-xs tabular-nums">
-                        {fullFile && <span className="mr-2 text-muted-foreground">Full-file progress</span>}
-                        {bytes(verified)}{" "}
+                        {!history && (
+                          <span className="mr-2 text-muted-foreground">
+                            {cachedNow == null ? "Attempt progress" : "Cached now"}
+                          </span>
+                        )}
+                        {bytes(displayedBytes)}{" "}
                         <span className="text-muted-foreground">
-                          / {bytes(total)}
+                          / {bytes(displayedTotal)}
                         </span>
                         <span className="ml-2 text-muted-foreground">
-                          {Math.round(pct)}%
+                          {Math.round(displayedPct)}%
                         </span>
                       </p>
                       <Meter
-                        value={pct}
-                        label={`Attempt progress ${name}`}
+                        value={displayedPct}
+                        label={`${cachedNow == null ? "Attempt progress" : "Current cache coverage"} ${name}`}
                       />
                       <p className="text-xs text-muted-foreground">
                         {rate?.active
                           ? `${rate.recent_fill_bytes_per_second == null ? "Collecting speed" : bytes(rate.recent_fill_bytes_per_second) + "/s"}`
-                          : `${bytes(summed((job) => job.source_bytes))} from source · ${bytes(summed((job) => job.cached_bytes))} cached`}
+                          : `${bytes(summed((job) => job.source_bytes))} from source · ${bytes(summed((job) => job.cached_bytes))} reused from cache`}
                       </p>
                       {rate?.stalled && (
                         <p className="text-xs text-warning-text">
@@ -763,8 +786,7 @@ export function PrefetchActivity() {
                           .join(", ")}
                       </p>
                       <p>
-                        Attempt progress records verified bytes at that time.
-                        Current cache coverage can change after completion.
+                        Attempt progress · {bytes(verified)} / {bytes(total)} verified
                       </p>
                       {j.attribution?.playback.map((p, i) => (
                         <p key={i}>

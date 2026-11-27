@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useQueries } from "@tanstack/react-query";
 import { api, body } from "../api/client";
 type Target = { item: string; revision: string; size: number };
+const BATCH_SIZE = 4;
+const pendingRequests = new Set<Promise<void>>();
 export function useFileCoverage(targets: Target[], enabled: boolean) {
   const unique = [
     ...new Map(targets.map((j) => [`${j.item}:${j.revision}`, j])).values(),
@@ -15,7 +17,7 @@ export function useFileCoverage(targets: Target[], enabled: boolean) {
     : "";
   const [batch, setBatch] = useState({ scope: "", count: 0 });
   const count = batch.scope === scope ? batch.count : 0;
-  const selected = enabled ? unique.slice(0, (count + 1) * 4) : [];
+  const selected = enabled ? unique.slice(0, (count + 1) * BATCH_SIZE) : [];
   const queries = useQueries({
     queries: selected.map((j, i) => ({
       queryKey: [
@@ -26,20 +28,33 @@ export function useFileCoverage(targets: Target[], enabled: boolean) {
         epoch,
       ],
       queryFn: async ({ signal }: { signal: AbortSignal }) => {
-        const d = await body(
+        // A page, filter or refresh can replace a batch before its requests settle.
+        while (pendingRequests.size >= BATCH_SIZE) {
+          signal.throwIfAborted();
+          await Promise.race(pendingRequests);
+        }
+        signal.throwIfAborted();
+        const request = body(
           api.GET("/api/v1/files/{id}", {
             params: { path: { id: j.item } },
             signal,
           }),
         );
-        return d.source_revision === j.revision &&
-          d.entry.size === j.size &&
-          d.cache_available &&
-          !d.cache_warning
-          ? d.cached_ranges
-          : null;
+        const settled = request.then(() => {}, () => {});
+        pendingRequests.add(settled);
+        try {
+          const d = await request;
+          return d.source_revision === j.revision &&
+            d.entry.size === j.size &&
+            d.cache_available &&
+            !d.cache_warning
+            ? d.cached_ranges
+            : null;
+        } finally {
+          pendingRequests.delete(settled);
+        }
       },
-      enabled: i >= count * 4,
+      enabled: i >= count * BATCH_SIZE,
       staleTime: 15000,
       retry: false,
       refetchOnWindowFocus: false,
